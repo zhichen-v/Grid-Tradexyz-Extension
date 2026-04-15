@@ -1,150 +1,181 @@
-# TradeXYZ 網格交易系統
+# Grid Trading System
 
-基於 Hyperliquid API 的多資產網格交易系統，支援加密貨幣永續合約與 XYZ 市場（美股、指數、商品、外匯）。
+This repository contains a grid trading runtime centered on `run_grid_trading.py`.
+It is currently used mainly with the `tradexyz` exchange adapter, and also contains
+supporting code for other exchange integrations.
 
----
+This README is written for someone starting from zero: clone the repo, install the
+environment, configure credentials, choose a grid config, and run the bot.
 
-## 快速指令
+## 1. What This Repository Contains
 
-```bash
-# 所有 Python 指令透過 uv
-uv run python run_grid_trading.py config/grid/<config>.yaml
-uv run python run_grid_trading.py config/grid/<config>.yaml --debug
+- Grid strategy execution entrypoint: `run_grid_trading.py`
+- Exchange adapters: `core/adapters/exchanges/`
+- Grid coordinator, engine, tracker, and TUI: `core/services/grid/`
+- Exchange configs: `config/exchanges/`
+- Grid configs: `config/grid/`
+- Smoke scripts for TradeXYZ: `test_tradexyz_public.py`, `test_tradexyz_order.py`, `test_tradexyz_cancel_orders.py`
+- Runtime logs: `logs/`
 
-# 測試後清理掛單與持倉（每次測試完必須執行）
-uv run python test_tradexyz_cancel_orders.py
+## 2. Prerequisites
 
-# Agent Wallet 首次設定
-uv run python setup_agent_wallet.py
-```
+Before you begin, prepare:
 
----
+- Git
+- Python 3.11 or newer
+- A terminal environment that can activate a virtual environment
+- Valid exchange credentials if you plan to connect to live endpoints
 
-## TradeXYZ 架構
+This project is expected to run inside `.venv`, and the default workflow uses `uv`.
 
-TradeXYZ 基於 Hyperliquid API，透過 `dex="xyz"` 命名空間支援傳統金融資產，並與加密貨幣路徑**完全分離**。
-
-### 雙路徑下單機制
-
-| 功能 | 加密貨幣（BTC、ETH…） | XYZ 市場（NVDA、TSLA…） |
-|------|----------------------|------------------------|
-| 行情查詢 | ccxt `fetch_ticker` | HTTP POST `dex="xyz"` |
-| 訂單簿 | ccxt `fetch_order_book` | HTTP POST `dex="xyz"` |
-| 持倉查詢 | ccxt `fetch_positions` | HTTP POST `dex="xyz"` |
-| **下單 / 取消** | **ccxt** | **hyperliquid-python-sdk**（`perp_dexs=["xyz"]`） |
-| **查詢掛單** | **ccxt** | HTTP POST `frontendOpenOrders` |
-
-> ccxt 不支援 XYZ 市場符號，XYZ 下單必須走 `hyperliquid-python-sdk`。
-
-### 模組結構
-
-```
-core/adapters/exchanges/adapters/
-├── tradexyz.py           # 主 Adapter（組合 base / rest / websocket）
-├── tradexyz_base.py      # 符號辨識 / 映射，XYZ 資產清單
-├── tradexyz_rest.py      # REST API（ccxt + SDK 雙路徑）
-└── tradexyz_websocket.py # WebSocket 即時行情
-```
-
-`TradeXYZAdapter` 組合三個子元件，對外暴露與其他交易所一致的介面：
-
-```
-TradeXYZAdapter
-├── TradeXYZBase    ← 符號辨識、映射工具
-├── TradeXYZRest    ← 所有 REST 操作（行情 / 下單 / 取消 / 查詢）
-└── TradeXYZWebSocket ← 行情訂閱
-```
-
----
-
-## 支援的交易標的
-
-系統會自動依符號判斷走哪條路徑，無需手動指定。
-
-| 類別 | 符號範例 | 格式 |
-|------|----------|------|
-| 加密貨幣 | BTC、ETH、SOL | `BTC/USDC:USDC` |
-| 美股（34 檔） | TSLA、NVDA、AAPL、AMZN、META、MSFT… | `TSLA` |
-| 指數 | SP500、XYZ100 | `SP500` |
-| 商品 | GOLD、SILVER、WTIOIL、BRENTOIL、NATGAS… | `GOLD` |
-| 外匯 | EUR/USD、USD/JPY | `EUR/USD` |
-| 韓股 | SMSN、SKHX、HYUNDAI、EWY | `SMSN` |
-
-完整的美股清單定義在 `tradexyz_base.py` 的 `XYZ_ASSET_CLASSES`。
-
-### 符號辨識邏輯（`tradexyz_base.py`）
-
-```python
-def is_xyz_symbol(self, symbol: str) -> bool:
-    if symbol.startswith("xyz:"):      # xyz: 前綴 → XYZ
-        return True
-    base = self._extract_base_symbol(symbol)
-    for assets in self.XYZ_ASSET_CLASSES.values():
-        if base in assets:             # 在清單內 → XYZ
-            return True
-    return False                       # 其餘 → 加密貨幣
-```
-
----
-
-## 環境設定
-
-### 依賴安裝
+## 3. Clone the Repository
 
 ```bash
-# 透過 uv（推薦）
+git clone <your-repo-url>
+cd grid1.3
+```
+
+If you downloaded the source as a zip, unpack it first and then enter the project directory.
+
+## 4. Create and Activate the Virtual Environment
+
+### Windows PowerShell
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+### macOS / Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+If PowerShell blocks script execution, run PowerShell as yourself and allow local scripts for the current user:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+## 5. Install `uv` and Project Dependencies
+
+Install `uv` first if your machine does not have it yet:
+
+```bash
+python -m pip install uv
+```
+
+Then install the project dependencies:
+
+```bash
 uv pip install -r requirements.txt
-
-# 核心套件
-# ccxt                  加密貨幣統一 API
-# hyperliquid-python-sdk XYZ 市場下單
-# aiohttp               非同步 HTTP（XYZ 行情查詢）
-# websockets            WebSocket 數據流
-# pyyaml / rich / eth_account
 ```
 
-### 認證設定
+The main runtime dependencies include:
 
-**推薦：Agent Wallet（只有交易權限，無法提款）**
+- `ccxt`
+- `aiohttp`
+- `websockets`
+- `pyyaml`
+- `rich`
+- `hyperliquid-python-sdk`
+- `lighter-sdk`
+- `eth_account`
 
-```bash
-# 首次設定，需要主錢包私鑰
-uv run python setup_agent_wallet.py
-```
+## 6. Configure Exchange Credentials
 
-設定完成後，`.env` 會自動產生：
+There are two practical ways to provide credentials.
 
-```
-HL_WALLET_ADDRESS=0x主錢包地址
-HL_AGENT_KEY=0xAgent私鑰
-HL_AGENT_ADDRESS=0xAgent地址
-```
+### Option A: Put credentials in the exchange config file
 
-**備用：config 檔案**
+Edit `config/exchanges/tradexyz_config.yaml`:
 
 ```yaml
-# config/exchanges/tradexyz_config.yaml
 tradexyz:
   authentication:
     private_key: "0xYOUR_PRIVATE_KEY"
     wallet_address: "0xYOUR_WALLET_ADDRESS"
 ```
 
-> 含私鑰的設定檔已加入 `.gitignore`，禁止 commit。
+This is the most direct setup path.
 
-**認證優先級**
+### Option B: Use environment variables or `.env`
 
-1. 環境變數 `TRADEXYZ_API_KEY` / `TRADEXYZ_WALLET_ADDRESS`
-2. `.env` 中的 `HL_AGENT_KEY` / `HL_WALLET_ADDRESS`（自動載入）
-3. `config/exchanges/tradexyz_config.yaml`
+The runtime reads environment variables first, then falls back to the exchange config file.
 
----
+For `tradexyz`, the relevant variables are:
 
-## 網格設定
+```env
+TRADEXYZ_API_KEY=0xYOUR_PRIVATE_KEY
+TRADEXYZ_API_SECRET=0xYOUR_PRIVATE_KEY
+TRADEXYZ_WALLET_ADDRESS=0xYOUR_WALLET_ADDRESS
+```
 
-### 快速範例
+For Hyperliquid-style agent wallet flow, the runtime also supports:
 
-**XYZ 市場（NVDA 價格移動網格）**
+```env
+HL_AGENT_KEY=0xYOUR_AGENT_PRIVATE_KEY
+HL_WALLET_ADDRESS=0xYOUR_MAIN_WALLET_ADDRESS
+HL_AGENT_ADDRESS=0xYOUR_AGENT_ADDRESS
+```
+
+You can place these in a local `.env` file. The repository already ignores `.env`, so it should not be committed.
+
+## 7. Optional: Create a TradeXYZ Agent Wallet
+
+If your TradeXYZ flow uses an agent wallet, run:
+
+```bash
+uv run python setup_agent_wallet.py
+```
+
+What this script does:
+
+- Reads or prompts for your main wallet credentials
+- Approves a new agent wallet through the Hyperliquid / TradeXYZ flow
+- Writes agent credentials into `.env`
+- Clears the raw private key from `config/exchanges/tradexyz_config.yaml`
+
+Use this only if you understand your exchange account model and want the runtime to trade through an agent wallet instead of the main wallet key.
+
+## 8. Choose a Grid Config
+
+The main ready-to-run examples are under `config/grid/`:
+
+- `config/grid/tradexyz_test_follow_long.yaml`
+- `config/grid/tradexyz_test_long.yaml`
+- `config/grid/backpack_capital_protection_long.yaml`
+- `config/grid/backpack_capital_protection_short.yaml`
+
+For a first TradeXYZ run, start with one of these:
+
+- `config/grid/tradexyz_test_follow_long.yaml`: dynamic follow-long grid on `NVDA`
+- `config/grid/tradexyz_test_long.yaml`: fixed-range long grid on `NVDA`
+
+Two additional files are currently git-ignored local configs:
+
+- `config/grid/tradexyz_long.yaml`
+- `config/grid/tradexyz_long_NVDA.yaml`
+
+Those should be treated as local/private run configs rather than shared examples.
+
+## 9. Understand the Minimum Config Fields
+
+At minimum, a grid config needs a `grid_system` block with fields like:
+
+```yaml
+grid_system:
+  exchange: "tradexyz"
+  symbol: "NVDA"
+  grid_type: "follow_long"
+  grid_interval: 5.0
+  order_amount: 0.1
+  quantity_precision: 1
+```
+
+### Follow grid example
 
 ```yaml
 grid_system:
@@ -155,16 +186,16 @@ grid_system:
   follow_grid_count: 20
   follow_timeout: 60
   follow_distance: 2
-  price_offset_grids: 3
+  price_offset_grids: 0
 
-  grid_interval: 1.0
+  grid_interval: 5.0
   order_amount: 0.1
   quantity_precision: 1
   fee_rate: "0.0001"
-  order_health_check_interval: 300
+  order_health_check_interval: 60
 ```
 
-**XYZ 市場（NVDA 固定範圍網格）**
+### Fixed-range grid example
 
 ```yaml
 grid_system:
@@ -172,225 +203,155 @@ grid_system:
   symbol: "NVDA"
   grid_type: "long"
 
-  lower_price: 100.0
-  upper_price: 130.0
-  grid_interval: 1.0
-  order_amount: 0.1
+  lower_price: 155.0
+  upper_price: 195.0
+
+  grid_interval: 5.0
+  order_amount: 0.2
   quantity_precision: 1
   fee_rate: "0.0001"
+  order_health_check_interval: 60
 ```
 
-**加密貨幣（BTC 價格移動網格）**
+Common `grid_type` values:
 
-```yaml
-grid_system:
-  exchange: "tradexyz"
-  symbol: "BTC/USDC:USDC"
-  grid_type: "follow_long"
+- `long`
+- `short`
+- `follow_long`
+- `follow_short`
+- `martingale_long`
+- `martingale_short`
 
-  follow_grid_count: 100
-  follow_timeout: 300
-  follow_distance: 2
-  price_offset_grids: 5
+## 10. Run the Bot
 
-  grid_interval: 50
-  order_amount: 0.001
-  quantity_precision: 5
-  fee_rate: "0.0001"
-```
-
-### 網格類型
-
-| grid_type | 說明 |
-|-----------|------|
-| `long` / `short` | 固定範圍網格（指定 lower/upper price） |
-| `follow_long` / `follow_short` | 價格移動網格（動態跟隨，無需指定範圍） |
-| `martingale_long` / `martingale_short` | 馬丁格爾（每格遞增數量） |
-
-固定範圍網格啟動時只掛單方向訂單（做多只掛低於市價的買單），避免 taker 成交。
-
-### 核心參數
-
-| 參數 | 必填 | 說明 |
-|------|------|------|
-| `exchange` | Y | `"tradexyz"` |
-| `symbol` | Y | 交易標的（見上方格式） |
-| `grid_type` | Y | 網格類型 |
-| `grid_interval` | Y | 每格價格間隔（$） |
-| `order_amount` | Y | 每格基礎下單數量 |
-| `quantity_precision` | Y | 數量小數位（NVDA=1、BTC=8、GOLD=4） |
-| `lower_price` | 固定範圍 | 網格下限 |
-| `upper_price` | 固定範圍 | 網格上限 |
-| `follow_grid_count` | 移動網格 | 網格總數 |
-| `follow_timeout` | 移動網格 | 脫離超時秒數 |
-| `follow_distance` | 移動網格 | 脫離距離（格數） |
-| `price_offset_grids` | 移動網格 | 讓市價在網格內部的偏移格數 |
-
----
-
-## XYZ 市場注意事項
-
-### 價格精度（5 位有效數字限制）
-
-Hyperliquid API 要求價格最多 5 位有效數字，超過會收到 `tick size` 錯誤：
-
-```
-100.685  → 6 位有效數字 → 被拒絕
-100.68   → 5 位有效數字 → 通過
-```
-
-`tradexyz_rest.py` 的 `_round_to_sig_figs()` 會自動處理，無需手動調整。
-
-### 串行下單（Nonce 機制）
-
-TradeXYZ（與 Lighter 相同）因 nonce 衝突問題，`grid_engine_impl.py` 已強制設為串行下單模式，不可用 `asyncio.gather` 併發。這是正確行為，下單速度稍慢但穩定。
-
-### 數量精度參考
-
-| 標的 | `quantity_precision` |
-|------|---------------------|
-| NVDA | 1 |
-| TSLA | 1 |
-| GOLD | 4 |
-| SP500 | 1 |
-| BTC | 8 |
-
----
-
-## 四重保護系統
-
-可在網格設定中個別啟用，觸發優先級為先到先執行。
-
-### 剝頭皮（第一道防線）
-
-```yaml
-scalping_enabled: true
-scalping_trigger_percent: 15   # 買/賣單成交 15% 後觸發
-scalping_take_profit_grids: 2  # 掛出 2 格外的止盈單
-```
-
-觸發：取消反方向訂單 → 掛止盈單 → 成交後重置。
-
-### 本金保護（第二道防線）
-
-```yaml
-capital_protection_enabled: true
-capital_protection_trigger_percent: 40  # 成交更深時觸發
-```
-
-觸發：停止掛單 → 等待抵押品回到初始本金 → 平倉重置。
-
-### 止盈模式
-
-```yaml
-take_profit_enabled: true
-take_profit_percentage: 0.005  # 盈利超過本金 0.5% 觸發
-```
-
-觸發：平倉所有持倉 → 鎖定利潤 → 重置網格。
-
-### 價格鎖定
-
-```yaml
-price_lock_enabled: true
-price_lock_threshold: 260.0           # 做多時向上脫離至此凍結
-price_lock_start_at_threshold: false  # 啟動時若已超過閾值，以閾值為起點
-```
-
-觸發：凍結網格（不平倉）→ 保留訂單 → 價格回歸後自動解除。
-
----
-
-## WebSocket 訂閱設定
-
-`config/exchanges/tradexyz_config.yaml` 中的 `subscription_mode` 控制訂閱行為：
-
-```yaml
-tradexyz:
-  subscription_mode:
-    mode: predefined          # predefined（固定清單）或 dynamic（自動發現）
-    predefined:
-      symbols:
-        - BTC/USDC:USDC
-        - NVDA
-        - TSLA
-        - GOLD
-      data_types:
-        ticker: true
-        orderbook: true
-        trades: false
-        user_data: false
-```
-
----
-
-## 啟動流程
+Normal mode:
 
 ```bash
 uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml
+```
+
+Debug mode:
+
+```bash
 uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml --debug
 ```
 
-啟動順序：
+What the startup flow does:
 
-1. 讀取 yaml 設定
-2. 連接交易所（REST + WebSocket）
-3. 初始化策略、引擎、持倉追蹤器
-4. 批量掛單（串行）
-5. 啟動終端監控介面
+1. Loads the selected YAML config
+2. Builds the grid runtime config
+3. Connects the exchange adapter
+4. Creates the strategy, engine, state, and coordinator
+5. Places the startup grid orders
+6. Starts the Rich terminal UI
 
-按 `Ctrl+C` 或 `Q` 安全退出。
+Exit safely with `Ctrl+C` or `Q`.
 
----
+## 11. Smoke Checks
 
-## 現有設定檔
+Before placing real orders, use the smoke scripts to confirm connectivity and adapter behavior.
 
-位置：`config/grid/`
+Public connectivity:
 
-| 檔案 | 類型 | 說明 |
-|------|------|------|
-| `tradexyz_test_follow_long.yaml` | follow_long | NVDA 價格移動網格測試 |
-| `tradexyz_test_long.yaml` | long | NVDA 固定範圍網格測試 |
-| `tradexyz_long.yaml` | long | 正式做多設定 |
-| `backpack_capital_protection_long.yaml` | follow_long | Backpack 完整四重保護範例 |
+```bash
+uv run python test_tradexyz_public.py
+```
 
----
+Order placement flow:
 
-## 常見問題
+```bash
+uv run python test_tradexyz_order.py
+```
 
-**Q: 不需要下單，只想看行情？**
-不填 `private_key` 即可，系統以唯讀模式運行。
+Cancel-order flow:
 
-**Q: 加密貨幣和美股可以同時交易嗎？**
-每個進程對應一個設定檔。同時交易多標的需啟動多個進程，各指定不同設定檔。
-
-**Q: 日誌在哪裡？**
-`logs/` 目錄下，按模組分檔。`--debug` 可看 WebSocket 訊息和 REST 呼叫細節。
-
-**Q: 測試完如何清理？**
 ```bash
 uv run python test_tradexyz_cancel_orders.py
 ```
 
-**Q: 遇到 `tick size` 錯誤？**
-XYZ 市場價格超過 5 位有效數字。`tradexyz_rest.py` 已自動處理，若仍出現請確認使用最新版本。
+These scripts may hit real exchange endpoints. Do not run them with production credentials unless you understand the effect.
 
-**Q: 遇到 `duplicate nonce` 錯誤？**
-確認 `grid_engine_impl.py` 將 tradexyz 設為串行模式（非 `asyncio.gather`）。
+## 12. Logs and Runtime Output
 
----
+Runtime logs are written under `logs/`.
 
-## 開發注意事項
+Useful places to look when debugging:
 
-- 所有腳本用 `uv run python <script>` 執行
-- Windows 終端加 `PYTHONIOENCODING=utf-8` 避免 emoji 編碼錯誤
-- `Adapter.create_order()` 簽名須包含 `batch_mode: bool = False`
-- Lighter 和 TradeXYZ 因 nonce 機制必須串行下單
-- 固定範圍網格啟動時只掛單方向訂單，避免 taker 成交
-- **測試後務必執行清理腳本**
+- `logs/`
+- `core/services/grid/implementations/grid_engine_impl.py`
+- `core/services/grid/implementations/order_health_checker.py`
+- `core/services/grid/terminal_ui.py`
 
----
+If you need more detail, rerun with `--debug`.
 
-## 致謝
+## 13. Common Problems
 
-本專案基於 [cryptocj520/grid1.3](https://github.com/cryptocj520/grid1.3) 框架開發。
+### Config file does not exist
+
+You passed a path that `run_grid_trading.py` cannot find. Use a relative path from the repo root, for example:
+
+```bash
+uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml
+```
+
+### Credentials were not found
+
+The runtime checks:
+
+1. Environment variables / `.env`
+2. `config/exchanges/<exchange>_config.yaml`
+
+If both are empty, startup continues far enough to print warnings but trading cannot work correctly.
+
+### Spot market does not support short mode
+
+The entrypoint explicitly blocks short grid modes on spot markets.
+
+### TUI starts but no useful exchange activity appears
+
+Check:
+
+- Your credentials
+- The selected symbol
+- The selected grid config
+- Whether the exchange account has enough capital
+- Whether the selected smoke test succeeds first
+
+## 14. Project Layout
+
+```text
+grid1.3/
+├─ config/
+│  ├─ exchanges/
+│  └─ grid/
+├─ core/
+│  ├─ adapters/
+│  ├─ di/
+│  └─ services/grid/
+├─ logs/
+├─ run_grid_trading.py
+├─ setup_agent_wallet.py
+├─ test_tradexyz_public.py
+├─ test_tradexyz_order.py
+└─ test_tradexyz_cancel_orders.py
+```
+
+## 15. Security Notes
+
+- Do not commit private keys, wallet addresses, or `.env` secrets.
+- Start with small size and non-critical capital.
+- Treat all order-placement scripts as potentially live.
+- Review your config carefully before running any grid strategy.
+
+## 16. Recommended First Run
+
+If you just want to confirm the repository works end to end, this is the shortest path:
+
+1. Create `.venv` and activate it
+2. Install `uv`
+3. Run `uv pip install -r requirements.txt`
+4. Fill in `config/exchanges/tradexyz_config.yaml`
+5. Review `config/grid/tradexyz_test_follow_long.yaml`
+6. Run `uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml --debug`
+
+If that starts cleanly and the TUI appears, your environment is set up correctly.
