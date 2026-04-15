@@ -250,6 +250,8 @@ class GridCoordinator:
             # 4. 订阅订单更新
             self.engine.subscribe_order_updates(self._on_order_filled)
             self.logger.info("Order update subscription completed")
+            if hasattr(self.engine, "suspend_health_repairs"):
+                self.engine.suspend_health_repairs("startup initial grid placement")
 
             # 🔥 提前设置_running标志，确保监控任务能正常运行
             self._running = True
@@ -319,9 +321,13 @@ class GridCoordinator:
             self.logger.info(
                 "Grid system initialization completed; waiting for fills"
             )
+            if hasattr(self.engine, "resume_health_repairs"):
+                self.engine.resume_health_repairs("startup initial grid placement")
 
         except Exception as e:
             self.logger.error(f"Grid system initialization failed: {e}")
+            if hasattr(self.engine, "resume_health_repairs"):
+                self.engine.resume_health_repairs("startup initial grid placement")
             self.state.set_error()
             raise
 
@@ -1487,6 +1493,9 @@ class GridCoordinator:
             initial_orders = self.strategy.initialize(self.config, current_price)
             self.logger.info(f"Generated {len(initial_orders)} initial orders")
 
+            if hasattr(self.engine, "suspend_health_repairs"):
+                self.engine.suspend_health_repairs("fixed-range grid reset placement")
+
             placed_orders = await self.engine.place_batch_orders(initial_orders)
             self.logger.info(f"Placed {len(placed_orders)} reset orders")
 
@@ -1551,6 +1560,8 @@ class GridCoordinator:
                 f"sell_orders={sell_count}, "
                 f"active_orders={len(self.state.active_orders)}"
             )
+            if hasattr(self.engine, "resume_health_repairs"):
+                self.engine.resume_health_repairs("fixed-range grid reset placement")
 
             # 🔥 重新初始化本金（止盈后）
             if new_capital is not None:
@@ -1569,6 +1580,8 @@ class GridCoordinator:
 
         except Exception as e:
             self.logger.error(f"Fixed-range grid reset failed: {e}")
+            if hasattr(self.engine, "resume_health_repairs"):
+                self.engine.resume_health_repairs("fixed-range grid reset placement")
             raise
 
     def _is_spot_mode(self) -> bool:

@@ -58,6 +58,7 @@ class GridEngineImpl(IGridEngine):
         self._position_warning_interval: float = 60.0
         self._exchange_sync_grace_period: float = 5.0
         self._missing_order_resolution_timeout: float = 8.0
+        self._health_repairs_suspended_reason: Optional[str] = None
 
         exchange_id = getattr(exchange_adapter.config, "exchange_id", "unknown")
         self.logger.info(f"Grid execution engine initialized for {exchange_id}")
@@ -435,6 +436,40 @@ class GridEngineImpl(IGridEngine):
     def is_running(self) -> bool:
         """Return whether the engine is actively running."""
         return self._running
+
+    def suspend_health_repairs(self, reason: str) -> None:
+        """Temporarily block health-check repair actions while a local batch is in flight."""
+        normalized_reason = (reason or "unspecified").strip()
+        if self._health_repairs_suspended_reason == normalized_reason:
+            return
+
+        self._health_repairs_suspended_reason = normalized_reason
+        self.logger.info(
+            f"Health-check repairs suspended: reason={normalized_reason}"
+        )
+
+    def resume_health_repairs(self, reason: Optional[str] = None) -> None:
+        """Re-enable health-check repair actions after a protected batch finishes."""
+        active_reason = self._health_repairs_suspended_reason
+        if not active_reason:
+            return
+
+        self._health_repairs_suspended_reason = None
+        requested_reason = (reason or "").strip()
+        if requested_reason and requested_reason != active_reason:
+            self.logger.info(
+                "Health-check repairs resumed: "
+                f"cleared_reason={active_reason}, requested_by={requested_reason}"
+            )
+            return
+
+        self.logger.info(
+            f"Health-check repairs resumed: reason={active_reason}"
+        )
+
+    def get_health_repair_suspend_reason(self) -> Optional[str]:
+        """Return the current health-repair suspension reason when one is active."""
+        return self._health_repairs_suspended_reason
 
     def __repr__(self) -> str:
         return f"GridEngine(exchange={self.exchange}, running={self._running})"

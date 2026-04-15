@@ -58,44 +58,51 @@ class OrderHealthChecker:
             exchange_orders, positions = await self._fetch_orders_and_positions()
 
             unresolved_orders = await self._sync_orders_into_engine(exchange_orders)
-
-            current_price = await self.engine.get_current_price()
-            cleanup_count = await self._cleanup_duplicate_orders(exchange_orders)
-            repair_count += cleanup_count
-
-            if self._restored_missing_orders_in_sync:
+            repair_block_reason = self._get_health_repair_suspend_reason()
+            if repair_block_reason:
                 consistency_deferred = True
                 self.logger.info(
-                    "Skip gap repair and position repair because missing orders were "
-                    f"already restored in this health-check cycle: restored={self._restored_missing_orders_in_sync}"
-                )
-            elif unresolved_orders:
-                consistency_deferred = True
-                self.logger.info(
-                    "Skip gap repair and position repair because some missing orders "
-                    f"still have unresolved final status: count={unresolved_orders}"
+                    "Skip duplicate cleanup, gap repair, and position repair because "
+                    f"health-check repairs are suspended: reason={repair_block_reason}"
                 )
             else:
-                missing_orders = self._build_missing_orders(exchange_orders, current_price)
-                if missing_orders:
-                    if self._has_recent_fill():
-                        self.logger.info(
-                            f"Skip gap repair because a fill happened within the last "
-                            f"{self.RECENT_FILL_COOLDOWN_SECONDS} seconds"
-                        )
-                    else:
-                        placed_count = await self._place_missing_orders(missing_orders)
-                        repair_count += placed_count
-                        if placed_count:
-                            exchange_orders, positions = await self._fetch_orders_and_positions()
-                            unresolved_orders = await self._sync_orders_into_engine(exchange_orders)
+                current_price = await self.engine.get_current_price()
+                cleanup_count = await self._cleanup_duplicate_orders(exchange_orders)
+                repair_count += cleanup_count
 
-                if not unresolved_orders and self._should_repair_position():
-                    position_result = self._check_position_health(exchange_orders, positions)
-                    if position_result.needs_adjustment:
-                        adjusted = await self._adjust_position(position_result)
-                        if adjusted:
-                            repair_count += 1
+                if self._restored_missing_orders_in_sync:
+                    consistency_deferred = True
+                    self.logger.info(
+                        "Skip gap repair and position repair because missing orders were "
+                        f"already restored in this health-check cycle: restored={self._restored_missing_orders_in_sync}"
+                    )
+                elif unresolved_orders:
+                    consistency_deferred = True
+                    self.logger.info(
+                        "Skip gap repair and position repair because some missing orders "
+                        f"still have unresolved final status: count={unresolved_orders}"
+                    )
+                else:
+                    missing_orders = self._build_missing_orders(exchange_orders, current_price)
+                    if missing_orders:
+                        if self._has_recent_fill():
+                            self.logger.info(
+                                f"Skip gap repair because a fill happened within the last "
+                                f"{self.RECENT_FILL_COOLDOWN_SECONDS} seconds"
+                            )
+                        else:
+                            placed_count = await self._place_missing_orders(missing_orders)
+                            repair_count += placed_count
+                            if placed_count:
+                                exchange_orders, positions = await self._fetch_orders_and_positions()
+                                unresolved_orders = await self._sync_orders_into_engine(exchange_orders)
+
+                    if not unresolved_orders and self._should_repair_position():
+                        position_result = self._check_position_health(exchange_orders, positions)
+                        if position_result.needs_adjustment:
+                            adjusted = await self._adjust_position(position_result)
+                            if adjusted:
+                                repair_count += 1
 
             self._log_runtime_consistency(
                 exchange_orders=exchange_orders,
@@ -119,6 +126,16 @@ class OrderHealthChecker:
             self.engine._last_health_repair_count = repair_count
             self.engine._last_health_repair_time = time.time()
             return False
+
+    def _get_health_repair_suspend_reason(self) -> Optional[str]:
+        """Return the active reason for suspending health-check repairs."""
+        getter = getattr(self.engine, "get_health_repair_suspend_reason", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+        return getattr(self.engine, "_health_repairs_suspended_reason", None)
 
     async def _fetch_orders_and_positions(self) -> Tuple[List[OrderData], List[PositionData]]:
         """Fetch open orders and positions from the exchange."""
