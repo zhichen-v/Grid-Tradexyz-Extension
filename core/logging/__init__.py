@@ -23,11 +23,11 @@ from .logger import (
     get_performance_logger as _get_performance_logger,
     get_system_logger as _get_system_logger,
     get_trading_logger as _get_trading_logger,
-    initialize_logging,
+    initialize_logging as _initialize_logging,
     override_console_level,
     restore_console_level,
     set_config,
-    shutdown_logging,
+    shutdown_logging as _shutdown_logging,
 )
 
 _auto_initialized = False
@@ -35,7 +35,6 @@ _auto_initialized = False
 
 def _ensure_initialized() -> None:
     """Initialize logging on first use."""
-    global _auto_initialized
     if _auto_initialized:
         return
 
@@ -44,7 +43,6 @@ def _ensure_initialized() -> None:
         initialize_logging()
     else:
         initialize_logging()
-    _auto_initialized = True
 
 
 def get_logger(name: str) -> BaseLogger:
@@ -99,6 +97,32 @@ def restore_console_log_level(state: Dict[str, Any]) -> None:
     """Restore console verbosity after set_console_log_level()."""
     _ensure_initialized()
     restore_console_level(state)
+
+
+def initialize_logging(
+    log_dir: str = "logs",
+    level: str = "INFO",
+    enable_console: bool = True,
+    clear_existing: bool = True,
+) -> bool:
+    """Initialize managed logging and mark the package as ready."""
+    global _auto_initialized
+    success = _initialize_logging(
+        log_dir=log_dir,
+        level=level,
+        enable_console=enable_console,
+        clear_existing=clear_existing,
+    )
+    if success:
+        _auto_initialized = True
+    return success
+
+
+def shutdown_logging() -> None:
+    """Shutdown managed logging and reset lazy-init state."""
+    global _auto_initialized
+    _shutdown_logging()
+    _auto_initialized = False
 
 
 initialize = initialize_logging

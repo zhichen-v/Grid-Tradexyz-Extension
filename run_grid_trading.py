@@ -16,7 +16,8 @@ import yaml
 
 from core.adapters.exchanges import ExchangeConfig, ExchangeFactory
 from core.adapters.exchanges.models import ExchangeType
-from core.logging import get_system_logger
+from core.logging import get_system_logger, initialize
+from core.logging.logger import LineLimitedFileHandler
 from core.services.grid.coordinator import GridCoordinator
 from core.services.grid.implementations import (
     GridEngineImpl,
@@ -418,6 +419,8 @@ async def main(
         config_path: Configuration file path.
         debug: Whether to enable debug mode.
     """
+    initialize(clear_existing=True)
+
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -429,20 +432,26 @@ async def main(
         )
         lighter_ws_logger.setLevel(logging.DEBUG)
 
-        from logging.handlers import RotatingFileHandler
+        exchange_log_path = Path("logs/ExchangeAdapter.log").resolve()
+        has_exchange_log_handler = any(
+            isinstance(handler, logging.FileHandler)
+            and Path(getattr(handler, "baseFilename", "")).resolve() == exchange_log_path
+            for handler in lighter_ws_logger.handlers
+        )
 
-        ws_handler = RotatingFileHandler(
-            "logs/ExchangeAdapter.log",
-            maxBytes=10 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        ws_handler.setLevel(logging.DEBUG)
-        ws_formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
-        )
-        ws_handler.setFormatter(ws_formatter)
-        lighter_ws_logger.addHandler(ws_handler)
+        if not has_exchange_log_handler:
+            ws_handler = LineLimitedFileHandler(
+                str(exchange_log_path),
+                max_lines=1000,
+                encoding="utf-8",
+            )
+            ws_handler.setLevel(logging.DEBUG)
+            ws_formatter = logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
+            )
+            ws_handler.setFormatter(ws_formatter)
+            lighter_ws_logger.addHandler(ws_handler)
+
         lighter_ws_logger.propagate = False
 
         print("=" * 70)

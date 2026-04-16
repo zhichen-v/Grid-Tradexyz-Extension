@@ -34,33 +34,55 @@ class LogConfig:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
 
 
+def clear_log_files(log_dir: str = "logs") -> None:
+    """Remove existing `.log` files so each runtime starts fresh."""
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+
+    for file_path in log_path.rglob("*.log"):
+        if file_path.is_file():
+            file_path.unlink(missing_ok=True)
+
+
 class LineLimitedFileHandler(logging.FileHandler):
-    """Keep only the latest N lines in a single log file."""
+    """Reset a log file once it reaches the configured line cap."""
 
     def __init__(self, filename: str, max_lines: int = 1000, encoding: str = "utf-8"):
         self.max_lines = max(1, int(max_lines))
         super().__init__(filename, mode="a", encoding=encoding)
-        self._line_count = 0
-        self._truncate_to_last_lines()
+        self._line_count = self._read_existing_line_count()
+        if self._line_count >= self.max_lines:
+            self._reset_file()
 
     def emit(self, record: logging.LogRecord) -> None:
         message = self.format(record)
+        message_line_count = self._count_lines(f"{message}{self.terminator}")
+
+        if self._line_count + message_line_count > self.max_lines:
+            self._reset_file()
+
         super().emit(record)
-        self._line_count += self._count_lines(f"{message}{self.terminator}")
+        self._line_count += message_line_count
 
-        if self._line_count > self.max_lines:
-            self._truncate_to_last_lines()
-
-    def _truncate_to_last_lines(self) -> None:
+    def _reset_file(self) -> None:
         if self.stream:
             self.stream.flush()
             self.stream.close()
             self.stream = None
 
+        with open(
+            self.baseFilename,
+            "w",
+            encoding=self.encoding or "utf-8",
+        ) as file:
+            file.write("")
+
+        self._line_count = 0
+        self.stream = self._open()
+
+    def _read_existing_line_count(self) -> int:
         if not os.path.exists(self.baseFilename):
-            self._line_count = 0
-            self.stream = self._open()
-            return
+            return 0
 
         with open(
             self.baseFilename,
@@ -68,19 +90,7 @@ class LineLimitedFileHandler(logging.FileHandler):
             encoding=self.encoding or "utf-8",
             errors="ignore",
         ) as file:
-            lines = file.readlines()
-
-        if len(lines) > self.max_lines:
-            lines = lines[-self.max_lines:]
-            with open(
-                self.baseFilename,
-                "w",
-                encoding=self.encoding or "utf-8",
-            ) as file:
-                file.writelines(lines)
-
-        self._line_count = len(lines)
-        self.stream = self._open()
+            return sum(1 for _ in file)
 
     @staticmethod
     def _count_lines(message: str) -> int:
@@ -377,6 +387,14 @@ _loggers: Dict[str, BaseLogger] = {}
 _config: Optional[LogConfig] = None
 
 
+def _close_managed_handlers() -> None:
+    """Close and detach all managed logger handlers."""
+    for logger_wrapper in _loggers.values():
+        for handler in list(logger_wrapper.logger.handlers):
+            handler.close()
+            logger_wrapper.logger.removeHandler(handler)
+
+
 def _iter_console_handlers():
     """Yield console-only handlers from managed loggers."""
     seen = set()
@@ -491,10 +509,18 @@ def get_performance_logger() -> PerformanceLogger:
     return _loggers["performance"]
 
 
-def initialize_logging(log_dir: str = "logs", level: str = "INFO", enable_console: bool = True) -> bool:
+def initialize_logging(
+    log_dir: str = "logs",
+    level: str = "INFO",
+    enable_console: bool = True,
+    clear_existing: bool = True,
+) -> bool:
     """Initialize the managed logging system."""
     try:
         config = LogConfig(log_dir=log_dir, level=level, enable_console=enable_console)
+        _close_managed_handlers()
+        if clear_existing:
+            clear_log_files(config.log_dir)
         set_config(config)
         _loggers.clear()
         get_system_logger().startup("UnifiedLoggingSystem", "v3.0")
@@ -508,11 +534,7 @@ def shutdown_logging() -> None:
     """Shutdown all managed loggers and close handlers."""
     try:
         get_system_logger().shutdown("UnifiedLoggingSystem", "normal shutdown")
-
-        for logger in _loggers.values():
-            for handler in logger.logger.handlers:
-                handler.close()
-
+        _close_managed_handlers()
         _loggers.clear()
     except Exception as exc:
         print(f"Failed to shutdown logging: {exc}")
