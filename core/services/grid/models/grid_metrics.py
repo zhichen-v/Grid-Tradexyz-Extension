@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
 from decimal import Decimal
 from datetime import datetime, timedelta
 
@@ -75,6 +75,7 @@ class GridStatistics:
     monitoring_mode: str = "WebSocket"      # 订单监控方式：WebSocket 或 REST轮询
     # 持仓数据来源：WebSocket缓存 / PositionTracker / REST API
     position_data_source: str = "PositionTracker"
+    liquidation_price: Optional[Decimal] = None
 
     # 本金保护模式状态
     capital_protection_enabled: bool = False  # 是否启用本金保护

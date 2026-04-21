@@ -442,7 +442,8 @@ class GridTerminalUI:
             else "Flat"
         )
 
-        position_value = abs(stats.current_position) * stats.average_cost
+        mark_price = stats.current_price if stats.current_price > 0 else stats.average_cost
+        position_value = abs(stats.current_position) * mark_price
         self._append_field(
             content,
             "Position",
@@ -457,31 +458,64 @@ class GridTerminalUI:
             value_style="bold cyan",
         )
 
-        liquidation_price, distance_percent, risk_level = self._calculate_liquidation_price(
-            stats
-        )
-        if risk_level == "N/A":
-            risk_text = "N/A"
+        exchange_liquidation_price = getattr(stats, "liquidation_price", None)
+        risk_label = "Liquidation risk"
+        if stats.current_position == 0:
+            risk_text = "No live position"
             risk_style = "cyan"
-        elif liquidation_price is None:
-            risk_text = "Safe inside current grid range"
-            risk_style = "bold green"
-        else:
+        elif exchange_liquidation_price is not None and exchange_liquidation_price > 0:
+            risk_reference_price = (
+                stats.current_price if stats.current_price > 0 else stats.average_cost
+            )
+            if risk_reference_price > 0:
+                distance_percent = float(
+                    (exchange_liquidation_price - risk_reference_price)
+                    / risk_reference_price
+                    * 100
+                )
+            else:
+                distance_percent = 0.0
             direction = "DOWN" if stats.current_position > 0 else "UP"
-            if risk_level == "safe":
+            if abs(distance_percent) > 20:
                 risk_prefix = "OK"
                 risk_style = "bold green"
-            elif risk_level == "warning":
+            elif abs(distance_percent) > 10:
                 risk_prefix = "WARN"
                 risk_style = "bold yellow"
             else:
                 risk_prefix = "HIGH"
                 risk_style = "bold red"
             risk_text = (
-                f"{risk_prefix} ${liquidation_price:,.2f} "
+                f"{risk_prefix} ${exchange_liquidation_price:,.2f} "
                 f"({direction} {abs(distance_percent):.1f}%)"
             )
-        self._append_field(content, "Liquidation risk", risk_text, value_style=risk_style)
+        else:
+            risk_label = "Liquidation risk (est.)"
+            liquidation_price, distance_percent, risk_level = self._calculate_liquidation_price(
+                stats
+            )
+            if risk_level == "N/A":
+                risk_text = "Unavailable"
+                risk_style = "cyan"
+            elif liquidation_price is None:
+                risk_text = "Safe inside current grid range"
+                risk_style = "bold green"
+            else:
+                direction = "DOWN" if stats.current_position > 0 else "UP"
+                if risk_level == "safe":
+                    risk_prefix = "OK"
+                    risk_style = "bold green"
+                elif risk_level == "warning":
+                    risk_prefix = "WARN"
+                    risk_style = "bold yellow"
+                else:
+                    risk_prefix = "HIGH"
+                    risk_style = "bold red"
+                risk_text = (
+                    f"{risk_prefix} ${liquidation_price:,.2f} "
+                    f"({direction} {abs(distance_percent):.1f}%)"
+                )
+        self._append_field(content, risk_label, risk_text, value_style=risk_style)
 
         return Panel(content, title="Position Information", border_style="yellow")
 

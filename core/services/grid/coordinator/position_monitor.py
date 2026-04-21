@@ -69,6 +69,7 @@ class PositionMonitor:
         # 持仓缓存（用于变化检测）
         self._last_position_size = Decimal('0')
         self._last_position_price = Decimal('0')
+        self._last_liquidation_price: Optional[Decimal] = None
 
         # 🔥 现货模式：初始余额基准（用于计算持仓）
         self._initial_base_balance: Optional[Decimal] = None  # 启动时的基础货币总余额
@@ -140,6 +141,7 @@ class PositionMonitor:
 
             # 🔥 区分现货和合约的持仓查询方式
             is_spot_mode = self._is_spot_mode()
+            liquidation_price: Optional[Decimal] = None
 
             if is_spot_mode:
                 # 现货模式：通过余额查询
@@ -162,6 +164,12 @@ class PositionMonitor:
                     position_qty = position.size if position.side.value.lower() == 'long' else - \
                         position.size
                     entry_price = position.entry_price
+                    liquidation_price = (
+                        position.liquidation_price
+                        if getattr(position, "liquidation_price", None)
+                        and getattr(position, "liquidation_price", None) > 0
+                        else None
+                    )
 
             # 统一处理持仓数据
             if position_qty == 0:
@@ -182,6 +190,7 @@ class PositionMonitor:
                         )
                     self._last_position_size = Decimal('0')
                     self._last_position_price = Decimal('0')
+                    self._last_liquidation_price = None
 
                     # 更新剥头皮管理器
                     if self.coordinator.scalping_manager and self.coordinator.scalping_manager.is_active():
@@ -248,6 +257,7 @@ class PositionMonitor:
             # 更新缓存
             self._last_position_size = position_qty
             self._last_position_price = entry_price
+            self._last_liquidation_price = liquidation_price
 
             # 🆕 REST查询成功
             self._rest_failure_count = 0
@@ -433,6 +443,10 @@ class PositionMonitor:
     def is_rest_available(self) -> bool:
         """REST API是否可用"""
         return self._rest_is_available
+
+    def get_last_liquidation_price(self) -> Optional[Decimal]:
+        """Return the latest liquidation price from REST position sync."""
+        return self._last_liquidation_price
 
     def get_position_data_source(self) -> str:
         """获取当前持仓数据来源"""

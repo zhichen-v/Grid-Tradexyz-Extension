@@ -1011,6 +1011,24 @@ class GridCoordinator:
 
         # 获取统计数据（本地追踪器）
         stats = self.tracker.get_statistics()
+        tracker_position = stats.current_position
+        tracker_average_cost = stats.average_cost
+        state_position = getattr(self.state, "current_position", Decimal("0"))
+        state_average_cost = getattr(self.state, "average_cost", Decimal("0"))
+
+        def has_meaningful_position(position: Decimal, average_cost: Decimal) -> bool:
+            return position != 0 or average_cost > 0
+
+        selected_position = tracker_position
+        selected_average_cost = tracker_average_cost
+        if has_meaningful_position(tracker_position, tracker_average_cost):
+            stats.position_data_source = "PositionTracker"
+        elif has_meaningful_position(state_position, state_average_cost):
+            selected_position = state_position
+            selected_average_cost = state_average_cost
+            stats.position_data_source = "State snapshot"
+        else:
+            stats.position_data_source = "REST API"
 
         # 🔥 优先使用WebSocket缓存的真实持仓数据（但需要检查WebSocket是否可用）
         # 注意：只有在WebSocket缓存有效且WebSocket监控正常时才使用缓存
@@ -1019,41 +1037,54 @@ class GridCoordinator:
             ws_position = position_data['size']
             ws_entry_price = position_data['entry_price']
             has_cache = position_data.get('has_cache', False)
+            ws_has_meaningful_position = has_meaningful_position(ws_position, ws_entry_price)
+            local_has_meaningful_position = has_meaningful_position(
+                selected_position, selected_average_cost
+            )
 
             # 🔥 关键修复：只有在WebSocket启用且缓存有效时才使用WebSocket缓存
             # 如果WebSocket已失效（切换到REST备用模式），则使用PositionTracker数据
             if has_cache and self._position_ws_enabled:
-                stats.current_position = ws_position
-                stats.average_cost = ws_entry_price
-                stats.position_data_source = "WebSocket缓存"  # 🔥 标记数据来源
+                if ws_has_meaningful_position or not local_has_meaningful_position:
+                    selected_position = ws_position
+                    selected_average_cost = ws_entry_price
+                    stats.position_data_source = "WebSocket cache"
 
-                # 重新计算未实现盈亏（使用WebSocket的真实持仓）
-                if ws_position != 0 and current_price > 0:
-                    stats.unrealized_profit = ws_position * \
-                        (current_price - ws_entry_price)
+                    self.logger.debug(
+                        f"Using websocket position cache: size={ws_position}, entry=${ws_entry_price}"
+                    )
                 else:
-                    stats.unrealized_profit = Decimal('0')
-
-                self.logger.debug(
-                    f"Using websocket position cache: size={ws_position}, entry=${ws_entry_price}"
-                )
+                    self.logger.debug(
+                        "Ignoring empty websocket position cache because tracker/state "
+                        f"already has size={selected_position}, entry=${selected_average_cost}"
+                    )
             else:
                 # WebSocket失效或缓存无效，使用PositionTracker的数据
-                # 判断PositionTracker的数据来源
                 if self._position_ws_enabled:
-                    stats.position_data_source = "WebSocket回调"  # 🔥 通过WebSocket回调同步到Tracker
-                else:
-                    stats.position_data_source = "REST API备用"  # 🔥 通过REST API备用模式同步到Tracker
+                    if stats.position_data_source == "PositionTracker":
+                        stats.position_data_source = "WebSocket callback -> PositionTracker"
+                elif stats.position_data_source == "PositionTracker":
+                    stats.position_data_source = "REST API fallback -> PositionTracker"
 
                 self.logger.debug(
-                    f"Using position tracker data: size={stats.current_position}, "
-                    f"entry=${stats.average_cost}, source={stats.position_data_source} "
+                    f"Using local position snapshot: size={selected_position}, "
+                    f"entry=${selected_average_cost}, source={stats.position_data_source} "
                     f"(ws_enabled={self._position_ws_enabled}, cache={has_cache})"
                 )
         except Exception as e:
-            # 如果获取WebSocket数据失败，使用本地追踪器的数据
-            stats.position_data_source = "PositionTracker"  # 🔥 降级到Tracker
-            self.logger.debug(f"Failed to read websocket position; using local tracker data: {e}")
+            self.logger.debug(
+                f"Failed to read websocket position; using local position snapshot: {e}"
+            )
+
+        stats.current_position = selected_position
+        stats.average_cost = selected_average_cost
+        if selected_position != 0 and selected_average_cost > 0 and current_price > 0:
+            stats.unrealized_profit = selected_position * (current_price - selected_average_cost)
+        else:
+            stats.unrealized_profit = Decimal('0')
+
+        if hasattr(self.position_monitor, "get_last_liquidation_price"):
+            stats.liquidation_price = self.position_monitor.get_last_liquidation_price()
 
         # 🔥 添加监控方式信息
         stats.monitoring_mode = self.engine.get_monitoring_mode()
