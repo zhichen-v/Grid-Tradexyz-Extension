@@ -1,7 +1,7 @@
 """
 持仓监控模块
 
-🔥 重大修改：完全使用REST API进行持仓同步（不再依赖WebSocket）
+ 重大修改：完全使用REST API进行持仓同步（不再依赖WebSocket）
 原因：Backpack WebSocket持仓流不推送订单成交导致的变化，导致缓存过期
 """
 
@@ -61,7 +61,7 @@ class PositionMonitor:
         self._position_change_alert_threshold: float = 100  # 持仓变化告警阈值（%）
         self._position_max_multiplier: int = 10             # 最大持仓倍数
 
-        # 🔥 初始化阶段配置（避免首次启动和重置时的误报）
+        #  初始化阶段配置（避免首次启动和重置时的误报）
         self._initial_phase: bool = True                    # 是否处于初始化阶段
         self._initial_phase_duration: int = 60              # 初始化阶段持续时间（秒）
         self._initial_phase_start_time: float = 0          # 初始化阶段开始时间
@@ -71,7 +71,7 @@ class PositionMonitor:
         self._last_position_price = Decimal('0')
         self._last_liquidation_price: Optional[Decimal] = None
 
-        # 🔥 现货模式：初始余额基准（用于计算持仓）
+        #  现货模式：初始余额基准（用于计算持仓）
         self._initial_base_balance: Optional[Decimal] = None  # 启动时的基础货币总余额
 
         # 事件触发查询去重
@@ -89,28 +89,28 @@ class PositionMonitor:
 
         self._running = True
 
-        # 🔥 进入初始化阶段（避免首次启动时的持仓变化误报）
+        #  进入初始化阶段（避免首次启动时的持仓变化误报）
         self._initial_phase = True
         self._initial_phase_start_time = time.time()
         self.logger.info(
-            f"🔄 进入初始化阶段: 持续{self._initial_phase_duration}秒, "
+            f" 进入初始化阶段: 持续{self._initial_phase_duration}秒, "
             f"期间不检测持仓变化异常"
         )
 
         # 🆕 用REST API同步初始持仓
         try:
-            self.logger.info("📊 正在同步初始持仓数据（REST API）...")
+            self.logger.info(" 正在同步初始持仓数据（REST API）...")
             await self._query_and_update_position(is_initial=True)
-            self.logger.info("✅ 初始持仓同步完成（REST）")
+            self.logger.info(" 初始持仓同步完成（REST）")
         except Exception as rest_error:
-            self.logger.error(f"❌ REST API初始持仓同步失败: {rest_error}")
+            self.logger.error(f" REST API初始持仓同步失败: {rest_error}")
             self._rest_failure_count += 1
             # 初始同步失败也记录，但不阻止启动
 
         # 启动REST定时查询循环
         self._monitor_task = asyncio.create_task(
             self._rest_position_query_loop())
-        self.logger.info("✅ 持仓监控已启动（纯REST API，1秒高频查询，适应剧烈波动）")
+        self.logger.info(" 持仓监控已启动（纯REST API，1秒高频查询，适应剧烈波动）")
 
     async def stop_monitoring(self):
         """停止持仓监控"""
@@ -122,7 +122,7 @@ class PositionMonitor:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
-            self.logger.info("✅ 持仓监控已停止")
+            self.logger.info(" 持仓监控已停止")
 
     async def _query_and_update_position(self, is_initial: bool = False, is_event_triggered: bool = False) -> bool:
         """
@@ -139,7 +139,7 @@ class PositionMonitor:
             current_time = time.time()
             self._rest_last_query_time = current_time
 
-            # 🔥 区分现货和合约的持仓查询方式
+            #  区分现货和合约的持仓查询方式
             is_spot_mode = self._is_spot_mode()
             liquidation_price: Optional[Decimal] = None
 
@@ -158,7 +158,7 @@ class PositionMonitor:
                     entry_price = Decimal('0')
                 else:
                     position = positions[0]
-                    # 🔥 统一使用传统规则（系统内部表示）
+                    #  统一使用传统规则（系统内部表示）
                     # LONG(多头) = 正数, SHORT(空头) = 负数
                     # Lighter适配器已经在get_positions中完成了方向转换
                     position_qty = position.size if position.side.value.lower() == 'long' else - \
@@ -176,8 +176,8 @@ class PositionMonitor:
                 # 无持仓
                 if is_initial or self._last_position_size != Decimal('0'):
                     mode_str = "现货" if is_spot_mode else "合约"
-                    self.logger.info(f"📊 REST查询({mode_str}): 当前无持仓")
-                    # 🔥 持仓数据的唯一来源：REST API查询结果
+                    self.logger.info(f" REST查询({mode_str}): 当前无持仓")
+                    #  持仓数据的唯一来源：REST API查询结果
                     # tracker不再通过WebSocket订单成交事件更新持仓
                     self.tracker.sync_initial_position(
                         position=Decimal('0'),
@@ -208,7 +208,7 @@ class PositionMonitor:
 
                 # 🆕 恢复订单操作（如果之前被暂停）
                 if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
-                    self.logger.info("✅ REST API恢复正常，解除订单暂停")
+                    self.logger.info(" REST API恢复正常，解除订单暂停")
                     self.coordinator.is_paused = False
 
                 return True
@@ -218,7 +218,7 @@ class PositionMonitor:
             if not is_initial:
                 await self._check_position_anomaly(position_qty)
 
-            # 🔥 更新持仓追踪器（持仓数据的唯一来源）
+            #  更新持仓追踪器（持仓数据的唯一来源）
             # 所有持仓数据都来自REST API，不再使用WebSocket成交事件更新
             self.tracker.sync_initial_position(
                 position=position_qty,
@@ -250,11 +250,11 @@ class PositionMonitor:
 
             if is_initial:
                 self.logger.info(
-                    f"✅ 初始持仓({mode_str}): {side_str} {abs(position_qty)} @ ${entry_price}"
+                    f" 初始持仓({mode_str}): {side_str} {abs(position_qty)} @ ${entry_price}"
                 )
             elif position_changed:
                 self.logger.info(
-                    f"📡 REST同步({mode_str}): 持仓变化 {self._last_position_size} → {position_qty}, "
+                    f" REST同步({mode_str}): 持仓变化 {self._last_position_size} → {position_qty}, "
                     f"成本=${entry_price:.2f}"
                 )
 
@@ -270,7 +270,7 @@ class PositionMonitor:
 
             # 🆕 恢复订单操作（如果之前被暂停）
             if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
-                self.logger.info("✅ REST API恢复正常，解除订单暂停")
+                self.logger.info(" REST API恢复正常，解除订单暂停")
                 self.coordinator.is_paused = False
 
             return True
@@ -278,7 +278,7 @@ class PositionMonitor:
         except asyncio.TimeoutError:
             self._rest_failure_count += 1
             self.logger.error(
-                f"❌ REST查询超时（>{self._rest_timeout}秒）"
+                f" REST查询超时（>{self._rest_timeout}秒）"
                 f"[失败次数: {self._rest_failure_count}/{self._rest_max_failures}]"
             )
             await self._handle_rest_failure()
@@ -287,7 +287,7 @@ class PositionMonitor:
         except Exception as e:
             self._rest_failure_count += 1
             self.logger.error(
-                f"❌ REST查询失败: {e} "
+                f" REST查询失败: {e} "
                 f"[失败次数: {self._rest_failure_count}/{self._rest_max_failures}]"
             )
             await self._handle_rest_failure()
@@ -300,7 +300,7 @@ class PositionMonitor:
         Args:
             new_position: 新的持仓数量
         """
-        # 🔥 初始化阶段：跳过持仓变化异常检测
+        #  初始化阶段：跳过持仓变化异常检测
         if self._initial_phase:
             current_time = time.time()
             elapsed_time = current_time - self._initial_phase_start_time
@@ -309,17 +309,17 @@ class PositionMonitor:
             if elapsed_time >= self._initial_phase_duration:
                 self._initial_phase = False
                 self.logger.info(
-                    f"✅ 初始化阶段结束（{elapsed_time:.1f}秒）, 持仓变化异常检测已启用"
+                    f" 初始化阶段结束（{elapsed_time:.1f}秒）, 持仓变化异常检测已启用"
                 )
             else:
                 # 仍在初始化阶段，跳过检测
                 self.logger.debug(
-                    f"🔄 初始化阶段: 持仓变化 {self._last_position_size} → {new_position}, "
+                    f" 初始化阶段: 持仓变化 {self._last_position_size} → {new_position}, "
                     f"剩余{self._initial_phase_duration - elapsed_time:.0f}秒 (不检测异常)"
                 )
                 return
 
-        # 🔥 持仓归零逻辑：小于1个基础网格数量的持仓视为0
+        #  持仓归零逻辑：小于1个基础网格数量的持仓视为0
         # 这样可以避免微小的精度误差导致的异常告警
         order_amount = self.config.order_amount
 
@@ -330,13 +330,13 @@ class PositionMonitor:
         if abs(self._last_position_size) < order_amount:
             normalized_last_position = Decimal('0')
             self.logger.debug(
-                f"🔍 持仓归零: 上次持仓 {self._last_position_size} < {order_amount}, 视为0"
+                f" 持仓归零: 上次持仓 {self._last_position_size} < {order_amount}, 视为0"
             )
 
         if abs(new_position) < order_amount:
             normalized_new_position = Decimal('0')
             self.logger.debug(
-                f"🔍 持仓归零: 当前持仓 {new_position} < {order_amount}, 视为0"
+                f" 持仓归零: 当前持仓 {new_position} < {order_amount}, 视为0"
             )
 
         if normalized_last_position == Decimal('0'):
@@ -356,13 +356,13 @@ class PositionMonitor:
             # 显示归零后的持仓，以及原始持仓
             if normalized_last_position != self._last_position_size or normalized_new_position != new_position:
                 self.logger.warning(
-                    f"⚠️ 持仓变化异常告警: {normalized_last_position} → {normalized_new_position} "
+                    f"️ 持仓变化异常告警: {normalized_last_position} → {normalized_new_position} "
                     f"(原始: {self._last_position_size} → {new_position}), "
                     f"变化率={change_percentage:.1f}% (阈值={self._position_change_alert_threshold}%)"
                 )
             else:
                 self.logger.warning(
-                    f"⚠️ 持仓变化异常告警: {self._last_position_size} → {new_position}, "
+                    f"️ 持仓变化异常告警: {self._last_position_size} → {new_position}, "
                     f"变化率={change_percentage:.1f}% (阈值={self._position_change_alert_threshold}%)"
                 )
 
@@ -371,7 +371,7 @@ class PositionMonitor:
             normalized_last_position) * self._position_max_multiplier
         if abs(normalized_new_position) > expected_max_position and expected_max_position > 0:
             self.logger.critical(
-                f"🚨 持仓异常！紧急停止交易！\n"
+                f" 持仓异常！紧急停止交易！\n"
                 f"   上次持仓: {normalized_last_position} (原始: {self._last_position_size})\n"
                 f"   当前持仓: {normalized_new_position} (原始: {new_position})\n"
                 f"   超出预期: {self._position_max_multiplier}倍\n"
@@ -389,7 +389,7 @@ class PositionMonitor:
         if self._rest_failure_count >= self._rest_max_failures:
             if not hasattr(self.coordinator, 'is_paused') or not self.coordinator.is_paused:
                 self.logger.error(
-                    f"🚫 REST连续失败{self._rest_failure_count}次，暂停所有订单操作！\n"
+                    f" REST连续失败{self._rest_failure_count}次，暂停所有订单操作！\n"
                     f"   将持续尝试重连，成功后自动恢复..."
                 )
                 self.coordinator.is_paused = True
@@ -397,7 +397,7 @@ class PositionMonitor:
     async def _rest_position_query_loop(self):
         """REST定时查询循环（核心监控循环）"""
         self.logger.info(
-            f"🔄 REST持仓查询循环已启动: 间隔={self._rest_query_interval}秒"
+            f" REST持仓查询循环已启动: 间隔={self._rest_query_interval}秒"
         )
 
         while self._running:
@@ -408,20 +408,20 @@ class PositionMonitor:
                 success = await self._query_and_update_position(is_initial=False, is_event_triggered=False)
 
                 if success:
-                    self.logger.debug(f"✅ 定时REST查询成功")
+                    self.logger.debug(f" 定时REST查询成功")
                 else:
-                    self.logger.warning(f"⚠️ 定时REST查询失败")
+                    self.logger.warning(f"️ 定时REST查询失败")
 
             except asyncio.CancelledError:
-                self.logger.info("🔄 REST查询循环已取消")
+                self.logger.info(" REST查询循环已取消")
                 break
             except Exception as e:
-                self.logger.error(f"❌ REST查询循环错误: {e}")
+                self.logger.error(f" REST查询循环错误: {e}")
                 import traceback
                 self.logger.error(traceback.format_exc())
                 await asyncio.sleep(10)
 
-        self.logger.info("🔄 REST查询循环已退出")
+        self.logger.info(" REST查询循环已退出")
 
     async def trigger_event_query(self, event_name: str = "unknown"):
         """
@@ -440,7 +440,7 @@ class PositionMonitor:
             return
 
         self._last_event_query_time = current_time
-        self.logger.info(f"🔔 事件触发持仓查询: {event_name}")
+        self.logger.info(f" 事件触发持仓查询: {event_name}")
 
         await self._query_and_update_position(is_initial=False, is_event_triggered=True)
 
@@ -459,15 +459,15 @@ class PositionMonitor:
     def _is_spot_mode(self) -> bool:
         """判断是否是现货模式"""
         try:
-            # 🔥 修复导入路径：4个点，不是5个点
+            #  修复导入路径：4个点，不是5个点
             from ....adapters.exchanges.interface import ExchangeType
             if hasattr(self.engine, 'exchange') and hasattr(self.engine.exchange, 'config'):
                 is_spot = self.engine.exchange.config.exchange_type == ExchangeType.SPOT
                 self.logger.debug(
-                    f"🔍 现货模式判断: {is_spot} (exchange_type={self.engine.exchange.config.exchange_type})")
+                    f" 现货模式判断: {is_spot} (exchange_type={self.engine.exchange.config.exchange_type})")
                 return is_spot
         except Exception as e:
-            self.logger.error(f"❌ 判断现货模式失败: {e}")
+            self.logger.error(f" 判断现货模式失败: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
         return False
@@ -495,7 +495,7 @@ class PositionMonitor:
                         total_balance = balance.total  # 总余额
                         break
 
-            # 🔥 现货持仓计算逻辑：
+            #  现货持仓计算逻辑：
             # 1. 首次查询：如果总余额 >= 预留，说明预留充足，将总余额作为基准，持仓从0开始
             # 2. 后续查询：持仓 = 当前总余额 - 初始余额基准
             if self._initial_base_balance is None:
@@ -504,13 +504,13 @@ class PositionMonitor:
 
                 # 检查是否有预留管理器
                 if self.coordinator.reserve_manager:
-                    # 🔥 使用预留基数（reserve_amount），而不是当前剩余（get_current_reserve）
+                    #  使用预留基数（reserve_amount），而不是当前剩余（get_current_reserve）
                     # 启动时判断账户余额是否 >= 预留基数
                     reserve_amount = self.coordinator.reserve_manager.reserve_amount
                     if total_balance >= reserve_amount:
                         # 余额充足，说明账户已有预留，持仓从0开始
                         self.logger.info(
-                            f"✅ 现货启动检查: 账户余额={total_balance} >= 预留={reserve_amount}, "
+                            f" 现货启动检查: 账户余额={total_balance} >= 预留={reserve_amount}, "
                             f"持仓从0开始计算"
                         )
                         trading_balance = Decimal('0')
@@ -518,7 +518,7 @@ class PositionMonitor:
                         # 余额不足（不应该发生，因为启动检查会拦截）
                         trading_balance = total_balance - reserve_amount
                         self.logger.warning(
-                            f"⚠️ 现货启动检查: 账户余额={total_balance} < 预留={reserve_amount}, "
+                            f"️ 现货启动检查: 账户余额={total_balance} < 预留={reserve_amount}, "
                             f"持仓={trading_balance}（异常状态）"
                         )
                 else:
@@ -528,7 +528,7 @@ class PositionMonitor:
                 # 后续查询：持仓 = 当前余额 - 初始余额基准
                 trading_balance = total_balance - self._initial_base_balance
                 self.logger.debug(
-                    f"📊 现货持仓: 当前余额={total_balance}, "
+                    f" 现货持仓: 当前余额={total_balance}, "
                     f"初始基准={self._initial_base_balance}, 持仓={trading_balance}"
                 )
 
@@ -536,7 +536,7 @@ class PositionMonitor:
             if trading_balance <= 0:
                 return Decimal('0'), Decimal('0')
 
-            # 🔥 计算平均成本：使用tracker记录的成交均价
+            #  计算平均成本：使用tracker记录的成交均价
             # 如果tracker有数据，使用其平均成本；否则使用当前价格
             current_tracker_cost = self.tracker.get_average_cost()
             if current_tracker_cost > 0:
@@ -549,13 +549,13 @@ class PositionMonitor:
                     entry_price = Decimal('0')
 
             self.logger.debug(
-                f"📊 现货持仓: {trading_balance} {base_currency} @ ${entry_price}"
+                f" 现货持仓: {trading_balance} {base_currency} @ ${entry_price}"
             )
 
             return trading_balance, entry_price
 
         except Exception as e:
-            self.logger.error(f"❌ 查询现货持仓失败: {e}")
+            self.logger.error(f" 查询现货持仓失败: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             return Decimal('0'), Decimal('0')
@@ -572,7 +572,7 @@ class PositionMonitor:
             elapsed_time = time.time() - self._initial_phase_start_time
             self._initial_phase = False
             self.logger.info(
-                f"✅ 手动结束初始化阶段（已运行{elapsed_time:.1f}秒）, "
+                f" 手动结束初始化阶段（已运行{elapsed_time:.1f}秒）, "
                 f"持仓变化异常检测已启用"
             )
         else:
@@ -595,10 +595,10 @@ class PositionMonitor:
         self._initial_phase = True
         self._initial_phase_start_time = time.time()
 
-        # 🔥 重置现货初始余额基准，使持仓从0重新计算
+        #  重置现货初始余额基准，使持仓从0重新计算
         self._initial_base_balance = None
 
         self.logger.info(
-            f"🔄 重新进入初始化阶段: 持续{self._initial_phase_duration}秒, "
+            f" 重新进入初始化阶段: 持续{self._initial_phase_duration}秒, "
             f"期间不检测持仓变化异常"
         )

@@ -1,35 +1,35 @@
 """
-订单验证工具模块
+Order verification utilities.
 
-提供订单取消验证、订单存在验证等通用工具方法
+Provides reusable helpers for validating order cancellation, order existence,
+and other exchange-side order state checks.
 """
 
 import asyncio
-from typing import List, Optional, Callable
-from decimal import Decimal
+from typing import Callable
 
 from ....logging import get_logger
-from ..models import GridOrder, GridOrderSide, GridOrderStatus
+from ..models import GridOrderSide
 
 
 class OrderVerificationUtils:
     """
-    订单验证工具类
+    Reusable order-verification helper methods.
 
-    职责：
-    1. 验证订单是否被取消
-    2. 验证订单是否已挂出
-    3. 批量订单取消并验证
-    4. 提供可复用的验证逻辑
+    Responsibilities:
+    1. Verify that orders have been canceled.
+    2. Verify that orders exist on the exchange.
+    3. Support batch order-cancel validation.
+    4. Provide reusable exchange verification logic.
     """
 
     def __init__(self, exchange, symbol: str):
         """
-        初始化验证工具
+        Initialize the verification utilities.
 
         Args:
-            exchange: 交易所适配器
-            symbol: 交易对符号
+            exchange: Exchange adapter.
+            symbol: Trading symbol.
         """
         self.logger = get_logger(__name__)
         self.exchange = exchange
@@ -37,55 +37,53 @@ class OrderVerificationUtils:
 
     async def verify_no_orders_by_filter(
         self,
-        order_filter: Callable[[GridOrder], bool],
+        order_filter: Callable,
         filter_description: str,
         max_retries: int = 3
     ) -> bool:
         """
-        验证满足条件的订单已全部不存在（通用方法）
+        Verify that no exchange open orders match the given filter.
 
         Args:
-            order_filter: 订单过滤函数，返回True表示需要验证的订单
-            filter_description: 过滤条件描述（用于日志）
-            max_retries: 最大重试次数
+            order_filter: Filter callback. Orders returning `True` are treated
+                as orders that should no longer exist.
+            filter_description: Human-readable description used in logs.
+            max_retries: Maximum verification attempts.
 
         Returns:
-            True: 满足条件的订单已全部不存在
-            False: 仍有满足条件的订单存在
+            True if no matching orders remain, otherwise False.
         """
         for retry in range(max_retries):
             try:
-                # 从交易所获取当前挂单
                 exchange_orders = await self.exchange.get_open_orders(
                     symbol=self.symbol
                 )
 
-                # 过滤出需要验证的订单
                 filtered_orders = [
                     order for order in exchange_orders
                     if order_filter(order)
                 ]
 
                 if len(filtered_orders) == 0:
-                    self.logger.info(f"✅ 验证通过: 交易所确认无{filter_description}")
-                    return True
-                else:
-                    self.logger.warning(
-                        f"⚠️ 验证失败 (尝试{retry+1}/{max_retries}): "
-                        f"交易所仍有{len(filtered_orders)}个{filter_description}"
+                    self.logger.info(
+                        f"Verification passed: exchange confirms no {filter_description}"
                     )
-                    for order in filtered_orders:
-                        self.logger.warning(
-                            f"   残留订单: {order.id}, "
-                            f"价格=${order.price}"
-                        )
+                    return True
 
-                    # 如果不是最后一次重试，等待后再验证
-                    if retry < max_retries - 1:
-                        await asyncio.sleep(0.5)
+                self.logger.warning(
+                    f"Verification failed (attempt {retry + 1}/{max_retries}): "
+                    f"exchange still has {len(filtered_orders)} {filter_description}"
+                )
+                for order in filtered_orders:
+                    self.logger.warning(
+                        f"   Remaining order: {order.id}, price=${order.price}"
+                    )
+
+                if retry < max_retries - 1:
+                    await asyncio.sleep(0.5)
 
             except Exception as e:
-                self.logger.error(f"验证{filter_description}失败: {e}")
+                self.logger.error(f"Failed to verify {filter_description}: {e}")
                 if retry < max_retries - 1:
                     await asyncio.sleep(0.5)
 
@@ -93,71 +91,70 @@ class OrderVerificationUtils:
 
     async def verify_no_sell_orders(self, max_retries: int = 3) -> bool:
         """
-        验证没有卖单（做多网格剥头皮模式）
+        Verify that no sell orders remain.
+
+        Useful for long-grid scalping flows that should only keep buy orders.
 
         Args:
-            max_retries: 最大重试次数
+            max_retries: Maximum verification attempts.
 
         Returns:
-            True: 确认没有卖单
-            False: 仍有卖单
+            True if no sell orders remain, otherwise False.
         """
         return await self.verify_no_orders_by_filter(
             order_filter=lambda order: order.side == GridOrderSide.SELL,
-            filter_description="卖单",
+            filter_description="sell orders",
             max_retries=max_retries
         )
 
     async def verify_no_buy_orders(self, max_retries: int = 3) -> bool:
         """
-        验证没有买单（做空网格剥头皮模式）
+        Verify that no buy orders remain.
+
+        Useful for short-grid scalping flows that should only keep sell orders.
 
         Args:
-            max_retries: 最大重试次数
+            max_retries: Maximum verification attempts.
 
         Returns:
-            True: 确认没有买单
-            False: 仍有买单
+            True if no buy orders remain, otherwise False.
         """
         return await self.verify_no_orders_by_filter(
             order_filter=lambda order: order.side == GridOrderSide.BUY,
-            filter_description="买单",
+            filter_description="buy orders",
             max_retries=max_retries
         )
 
     async def verify_all_orders_cancelled(self, max_retries: int = 3) -> bool:
         """
-        验证所有订单已取消
+        Verify that all exchange open orders have been canceled.
 
         Args:
-            max_retries: 最大重试次数
+            max_retries: Maximum verification attempts.
 
         Returns:
-            True: 所有订单已取消
-            False: 仍有未取消的订单
+            True if no open orders remain, otherwise False.
         """
         for retry in range(max_retries):
             try:
-                # 从交易所获取当前挂单
                 exchange_orders = await self.exchange.get_open_orders(
                     symbol=self.symbol
                 )
 
                 if len(exchange_orders) == 0:
-                    self.logger.info(f"✅ 验证通过: 交易所确认无挂单")
+                    self.logger.info("Verification passed: exchange confirms no open orders")
                     return True
-                else:
-                    self.logger.warning(
-                        f"⚠️ 验证失败 (尝试{retry+1}/{max_retries}): "
-                        f"交易所仍有{len(exchange_orders)}个挂单"
-                    )
 
-                    # 如果不是最后一次重试，等待后再验证
-                    if retry < max_retries - 1:
-                        await asyncio.sleep(0.5)
+                self.logger.warning(
+                    f"Verification failed (attempt {retry + 1}/{max_retries}): "
+                    f"exchange still has {len(exchange_orders)} open orders"
+                )
+
+                if retry < max_retries - 1:
+                    await asyncio.sleep(0.5)
 
             except Exception as e:
-                self.logger.error(f"验证订单取消失败: {e}")
+                self.logger.error(f"Failed to verify order cancellation: {e}")
                 if retry < max_retries - 1:
                     await asyncio.sleep(0.5)
 
@@ -169,47 +166,44 @@ class OrderVerificationUtils:
         max_retries: int = 3
     ) -> bool:
         """
-        验证订单已在交易所挂出
+        Verify that an expected order exists on the exchange.
 
         Args:
-            expected_order_id: 预期的订单ID
-            max_retries: 最大重试次数
+            expected_order_id: Expected order ID.
+            max_retries: Maximum verification attempts.
 
         Returns:
-            True: 订单已挂出
-            False: 订单未挂出
+            True if the order is found, otherwise False.
         """
         for retry in range(max_retries):
             try:
-                # 从交易所获取当前挂单
                 exchange_orders = await self.exchange.get_open_orders(
                     symbol=self.symbol
                 )
 
-                # 查找订单
                 found = False
                 for order in exchange_orders:
                     if order.id == expected_order_id:
                         found = True
                         self.logger.info(
-                            f"✅ 验证通过: 订单已挂出 "
+                            f"Verification passed: order exists "
                             f"{order.side.value} {order.amount}@${order.price}"
                         )
                         break
 
                 if found:
                     return True
-                else:
-                    self.logger.warning(
-                        f"⚠️ 验证失败 (尝试{retry+1}/{max_retries}): "
-                        f"交易所未找到订单 {expected_order_id}"
-                    )
 
-                    if retry < max_retries - 1:
-                        await asyncio.sleep(0.5)
+                self.logger.warning(
+                    f"Verification failed (attempt {retry + 1}/{max_retries}): "
+                    f"exchange did not return order {expected_order_id}"
+                )
+
+                if retry < max_retries - 1:
+                    await asyncio.sleep(0.5)
 
             except Exception as e:
-                self.logger.error(f"验证订单存在失败: {e}")
+                self.logger.error(f"Failed to verify order existence: {e}")
                 if retry < max_retries - 1:
                     await asyncio.sleep(0.5)
 
@@ -217,14 +211,14 @@ class OrderVerificationUtils:
 
     async def get_open_orders_count(self) -> int:
         """
-        获取当前未成交订单数量
+        Return the current number of open orders.
 
         Returns:
-            未成交订单数量（如果失败返回-1）
+            Open order count, or `-1` on failure.
         """
         try:
             open_orders = await self.exchange.get_open_orders(self.symbol)
             return len(open_orders)
         except Exception as e:
-            self.logger.error(f"获取未成交订单数量失败: {e}")
+            self.logger.error(f"Failed to get open order count: {e}")
             return -1

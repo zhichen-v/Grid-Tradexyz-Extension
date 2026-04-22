@@ -1,7 +1,8 @@
 """
-网格协调器模块
+Grid coordinator package exports.
 
-包含网格协调器及其所有子模块
+This package exposes the grid coordinator and its supporting coordinator-layer
+helpers.
 """
 
 from .grid_coordinator import GridCoordinator
@@ -13,11 +14,11 @@ from .balance_monitor import BalanceMonitor
 from .scalping_operations import ScalpingOperations
 
 __all__ = [
-    'GridCoordinator',
-    'OrderVerificationUtils',
-    'OrderOperations',
-    'GridResetManager',
-    'PositionMonitor',
-    'BalanceMonitor',
-    'ScalpingOperations',
+    "GridCoordinator",
+    "OrderVerificationUtils",
+    "OrderOperations",
+    "GridResetManager",
+    "PositionMonitor",
+    "BalanceMonitor",
+    "ScalpingOperations",
 ]

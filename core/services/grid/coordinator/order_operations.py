@@ -62,7 +62,7 @@ class OrderOperations:
 
         if self.coordinator.is_emergency_stopped:
             self.logger.error(
-                f"🚨 系统紧急停止中，禁止{operation_name}操作！"
+                f" 系统紧急停止中，禁止{operation_name}操作！"
             )
             return True
 
@@ -98,14 +98,14 @@ class OrderOperations:
             True: 所有订单已取消
             False: 仍有订单无法取消
         """
-        self.logger.info("📋 取消所有订单并验证...")
+        self.logger.info(" 取消所有订单并验证...")
 
         # 1. 首次批量取消
         try:
             cancelled_count = await self.engine.cancel_all_orders()
-            self.logger.info(f"✅ 批量取消API返回: {cancelled_count} 个订单")
+            self.logger.info(f" 批量取消API返回: {cancelled_count} 个订单")
         except Exception as e:
-            self.logger.error(f"❌ 批量取消订单失败: {e}")
+            self.logger.error(f" 批量取消订单失败: {e}")
 
         # 2. 验证循环（带重试）
         cancel_verified = False
@@ -122,21 +122,21 @@ class OrderOperations:
 
             if open_count == 0:
                 # 验证成功
-                self.logger.info(f"✅ 订单取消验证通过: 当前未成交订单 {open_count} 个")
+                self.logger.info(f" 订单取消验证通过: 当前未成交订单 {open_count} 个")
                 cancel_verified = True
                 break
             elif open_count < 0:
                 # 获取订单失败
-                self.logger.error("❌ 无法获取未成交订单数量，跳过验证")
+                self.logger.error(" 无法获取未成交订单数量，跳过验证")
                 break
             else:
                 # 验证失败
                 if retry < max_retries - 1:
                     # 还有重试机会，尝试再次取消
                     self.logger.warning(
-                        f"⚠️ 第 {retry + 1} 次验证失败: 仍有 {open_count} 个未成交订单"
+                        f"️ 第 {retry + 1} 次验证失败: 仍有 {open_count} 个未成交订单"
                     )
-                    self.logger.info(f"🔄 尝试再次取消这些订单...")
+                    self.logger.info(f" 尝试再次取消这些订单...")
 
                     # 再次调用取消订单
                     try:
@@ -147,11 +147,11 @@ class OrderOperations:
                 else:
                     # 已达到最大重试次数
                     self.logger.error(
-                        f"❌ 订单取消验证最终失败！已重试 {max_retries} 次，仍有 {open_count} 个未成交订单"
+                        f" 订单取消验证最终失败！已重试 {max_retries} 次，仍有 {open_count} 个未成交订单"
                     )
                     self.logger.error(f"预期: 0 个订单, 实际: {open_count} 个订单")
-                    self.logger.error("⚠️ 操作已暂停，不会继续后续步骤，避免超出订单限制")
-                    self.logger.error("💡 建议: 请手动检查交易所订单")
+                    self.logger.error("️ 操作已暂停，不会继续后续步骤，避免超出订单限制")
+                    self.logger.error(" 建议: 请手动检查交易所订单")
 
         return cancel_verified
 
@@ -182,7 +182,7 @@ class OrderOperations:
         """
         for attempt in range(max_attempts):
             self.logger.info(
-                f"🔄 取消{filter_description}尝试 {attempt+1}/{max_attempts}..."
+                f" 取消{filter_description}尝试 {attempt+1}/{max_attempts}..."
             )
 
             # 1. 收集需要取消的订单（从本地状态）
@@ -192,7 +192,7 @@ class OrderOperations:
                     orders_to_cancel_list.append(order)
 
             if len(orders_to_cancel_list) == 0:
-                self.logger.info(f"📋 本地状态显示无{filter_description}，验证交易所...")
+                self.logger.info(f" 本地状态显示无{filter_description}，验证交易所...")
                 # 即使本地无订单，也要验证交易所
                 if await self.verifier.verify_no_orders_by_filter(
                     order_filter, filter_description
@@ -200,7 +200,7 @@ class OrderOperations:
                     return True
                 else:
                     # 交易所还有订单，但本地状态没有，需要同步
-                    self.logger.warning("⚠️ 本地状态与交易所不同步，从交易所获取...")
+                    self.logger.warning("️ 本地状态与交易所不同步，从交易所获取...")
                     try:
                         exchange_orders = await self.engine.exchange.get_open_orders(
                             symbol=self.config.symbol
@@ -214,7 +214,7 @@ class OrderOperations:
                         continue
 
             self.logger.info(
-                f"📋 准备取消 {len(orders_to_cancel_list)} 个{filter_description}")
+                f" 准备取消 {len(orders_to_cancel_list)} 个{filter_description}")
 
             # 2. 批量取消订单（并发，提高速度）
             cancelled_count = 0
@@ -273,28 +273,28 @@ class OrderOperations:
                     await asyncio.sleep(0.1)
 
             self.logger.info(
-                f"✅ 批量取消完成: 成功={cancelled_count}, 失败={failed_count}"
+                f" 批量取消完成: 成功={cancelled_count}, 失败={failed_count}"
             )
 
             # 3. 等待一小段时间，让交易所处理取消请求
             await asyncio.sleep(0.3)
 
-            # 4. 🔥 关键：从交易所验证是否还有满足条件的订单
+            # 4.  关键：从交易所验证是否还有满足条件的订单
             if await self.verifier.verify_no_orders_by_filter(
                 order_filter, filter_description
             ):
                 self.logger.info(
-                    f"✅ 所有{filter_description}已成功取消（尝试{attempt+1}次）")
+                    f" 所有{filter_description}已成功取消（尝试{attempt+1}次）")
                 return True
             else:
                 self.logger.warning(
-                    f"⚠️ 交易所仍有{filter_description}残留，准备第{attempt+2}次尝试..."
+                    f"️ 交易所仍有{filter_description}残留，准备第{attempt+2}次尝试..."
                 )
                 # 继续下一次循环
 
         # 达到最大尝试次数，仍有订单
         self.logger.error(
-            f"❌ 取消{filter_description}失败: 已尝试{max_attempts}次，交易所仍有残留"
+            f" 取消{filter_description}失败: 已尝试{max_attempts}次，交易所仍有残留"
         )
         return False
 
@@ -335,12 +335,12 @@ class OrderOperations:
     async def place_order_with_verification(
         self,
         order: GridOrder,
-        max_attempts: int = 2  # 🔥 只重试1次（总共2次尝试）
+        max_attempts: int = 2  #  只重试1次（总共2次尝试）
     ) -> Optional[GridOrder]:
         """
         挂单并验证（新方案：提交→最终验证→重试）
 
-        🔥 核心改进：
+         核心改进：
         1. 提交订单后，无论API成功还是失败，都执行最终验证
         2. 最终验证：从交易所查询订单是否真实存在
         3. 只有最终验证确认不存在，才重试
@@ -367,7 +367,7 @@ class OrderOperations:
 
         for attempt in range(max_attempts):
             self.logger.info(
-                f"🔄 挂单尝试 {attempt+1}/{max_attempts}..."
+                f" 挂单尝试 {attempt+1}/{max_attempts}..."
             )
 
             # ==================== 步骤1: 提交订单 ====================
@@ -382,7 +382,7 @@ class OrderOperations:
                 returned_order = placed_order
 
                 self.logger.info(
-                    f"📤 挂单API调用成功: {placed_order.order_id} "
+                    f" 挂单API调用成功: {placed_order.order_id} "
                     f"{placed_order.side.value} {placed_order.amount} @ ${placed_order.price}"
                 )
 
@@ -391,15 +391,15 @@ class OrderOperations:
                 api_error_msg = str(e)
 
                 self.logger.warning(
-                    f"❌ 挂单API调用失败: {e}\n"
-                    f"   ⚠️ 注意：订单可能已提交但返回失败\n"
+                    f" 挂单API调用失败: {e}\n"
+                    f"   ️ 注意：订单可能已提交但返回失败\n"
                     f"   将执行最终验证确认订单是否真实存在"
                 )
 
             # ==================== 步骤2: 最终验证 ====================
-            # 🔥 关键：无论API成功还是失败，都执行最终验证
+            #  关键：无论API成功还是失败，都执行最终验证
 
-            self.logger.info("🔍 执行最终验证：从交易所查询订单...")
+            self.logger.info(" 执行最终验证：从交易所查询订单...")
             await asyncio.sleep(1.0)  # 等待订单状态稳定
 
             verified_order = await self._final_verification(
@@ -412,12 +412,12 @@ class OrderOperations:
                 # 验证通过：订单确实存在
                 if api_success:
                     self.logger.info(
-                        f"✅ 挂单成功: API成功 + 最终验证通过\n"
+                        f" 挂单成功: API成功 + 最终验证通过\n"
                         f"   订单ID: {verified_order.id}"
                     )
                 else:
                     self.logger.warning(
-                        f"⚠️ 挂单成功（特殊情况）: API失败 + 最终验证通过\n"
+                        f"️ 挂单成功（特殊情况）: API失败 + 最终验证通过\n"
                         f"   订单ID: {verified_order.id}\n"
                         f"   API错误: {api_error_msg}\n"
                         f"   说明：订单已提交但API返回失败"
@@ -443,7 +443,7 @@ class OrderOperations:
                 # 验证失败：订单确实不存在
                 if api_success:
                     self.logger.error(
-                        f"🚨 挂单失败（异常情况）: API成功 + 最终验证失败\n"
+                        f" 挂单失败（异常情况）: API成功 + 最终验证失败\n"
                         f"   API返回订单ID: {returned_order.order_id if returned_order else 'None'}\n"
                         f"   但交易所查询不到该订单\n"
                         f"   可能原因：临时ID、订单被立即取消、API数据错误"
@@ -453,7 +453,7 @@ class OrderOperations:
                         self.state.remove_order(returned_order.order_id)
                 else:
                     self.logger.error(
-                        f"❌ 挂单失败: API失败 + 最终验证失败\n"
+                        f" 挂单失败: API失败 + 最终验证失败\n"
                         f"   API错误: {api_error_msg}\n"
                         f"   交易所也没有该订单"
                     )
@@ -462,9 +462,9 @@ class OrderOperations:
                 if attempt < max_attempts - 1:
                     self.logger.info(
                         f"⏳ 等待5秒后重试 {attempt+2}/{max_attempts}...")
-                    await asyncio.sleep(5.0)  # 🔥 重试间隔5秒
+                    await asyncio.sleep(5.0)  #  重试间隔5秒
                 else:
-                    self.logger.error(f"❌ 挂单最终失败: 已尝试{max_attempts}次")
+                    self.logger.error(f" 挂单最终失败: 已尝试{max_attempts}次")
                     return None
 
         return None
@@ -495,7 +495,7 @@ class OrderOperations:
                 symbol=self.config.symbol
             )
         except Exception as e:
-            self.logger.error(f"❌ 获取开放订单失败: {e}")
+            self.logger.error(f" 获取开放订单失败: {e}")
             return None
 
         # 阶段1: 如果有返回的订单ID，先精确匹配
@@ -503,19 +503,19 @@ class OrderOperations:
             for order in open_orders:
                 if order.id == returned_order_id:
                     self.logger.info(
-                        f"✅ 阶段1验证通过: 找到订单ID {returned_order_id}"
+                        f" 阶段1验证通过: 找到订单ID {returned_order_id}"
                     )
                     return order
 
             self.logger.warning(
-                f"⚠️ 阶段1验证失败: 订单ID {returned_order_id} 不存在"
+                f"️ 阶段1验证失败: 订单ID {returned_order_id} 不存在"
             )
 
         # 阶段2: 根据订单特征模糊匹配（防止ID丢失或API未返回ID）
         for order in open_orders:
             if self._is_matching_order(order, expected_order):
                 self.logger.info(
-                    f"✅ 阶段2验证通过: 找到匹配订单 {order.id}\n"
+                    f" 阶段2验证通过: 找到匹配订单 {order.id}\n"
                     f"   价格: ${order.price} (期望: ${expected_order.price})\n"
                     f"   数量: {order.amount} (期望: {expected_order.amount})\n"
                     f"   方向: {order.side.value} (期望: {expected_order.side.value})"
@@ -524,7 +524,7 @@ class OrderOperations:
 
         # 两个阶段都失败
         self.logger.error(
-            f"❌ 最终验证失败: 未找到匹配订单\n"
+            f" 最终验证失败: 未找到匹配订单\n"
             f"   期望订单: {expected_order.side.value} "
             f"{expected_order.amount} @ ${expected_order.price}"
         )

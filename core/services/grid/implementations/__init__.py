@@ -1,7 +1,8 @@
 """
-网格交易系统实现层
+Grid trading implementation exports.
 
-包含各个接口的具体实现
+This package exposes the concrete strategy, engine, and position tracker
+implementations used by the grid runtime.
 """
 
 from .grid_strategy_impl import GridStrategyImpl
@@ -9,8 +10,7 @@ from .grid_engine_impl import GridEngineImpl
 from .position_tracker_impl import PositionTrackerImpl
 
 __all__ = [
-    'GridStrategyImpl',
-    'GridEngineImpl',
-    'PositionTrackerImpl',
+    "GridStrategyImpl",
+    "GridEngineImpl",
+    "PositionTrackerImpl",
 ]
-

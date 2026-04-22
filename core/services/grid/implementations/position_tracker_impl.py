@@ -1,7 +1,8 @@
 """
-持仓跟踪器实现
+Position tracker implementation.
 
-跟踪网格系统的持仓、盈亏、交易历史等
+Tracks grid position state, realized/unrealized PnL, trade history, and the
+summary statistics shown by the runtime UI.
 """
 
 from typing import Dict, List, Deque, Optional
@@ -19,52 +20,52 @@ from ..models import (
 
 class PositionTrackerImpl(IPositionTracker):
     """
-    持仓跟踪器实现
+    Position tracker implementation.
 
-    功能：
-    1. 跟踪当前持仓和成本
-    2. 计算已实现和未实现盈亏
-    3. 记录交易历史
-    4. 生成统计数据
+    Responsibilities:
+    1. Track current position and average cost.
+    2. Calculate realized and unrealized PnL.
+    3. Store trade history.
+    4. Produce summary statistics.
     """
 
     def __init__(self, config: GridConfig, grid_state: GridState):
         """
-        初始化持仓跟踪器
+        Initialize the position tracker.
 
         Args:
-            config: 网格配置
-            grid_state: 网格状态
+            config: Grid configuration.
+            grid_state: Shared grid state.
         """
         self.logger = get_logger(__name__)
         self.config = config
         self.state = grid_state
 
-        # 持仓信息
-        self.current_position = Decimal('0')      # 当前持仓数量
-        self.position_cost = Decimal('0')         # 持仓总成本
-        self.average_cost = Decimal('0')          # 平均成本
+        # Position state
+        self.current_position = Decimal('0')
+        self.position_cost = Decimal('0')
+        self.average_cost = Decimal('0')
 
-        # 盈亏统计
-        self.realized_pnl = Decimal('0')          # 已实现盈亏
-        self.total_fees = Decimal('0')            # 总手续费
+        # PnL state
+        self.realized_pnl = Decimal('0')
+        self.total_fees = Decimal('0')
 
-        # 交易历史（最近1000条）
+        # Filled-trade history
         self.trade_history: Deque[Dict] = deque(maxlen=1000)
         self._filled_order_registry: Dict[str, Dict[str, object]] = {}
 
-        # 统计信息
+        # Statistics
         self.buy_count = 0
         self.sell_count = 0
         self.completed_cycles = 0
         self._completed_profit_cycle_count = 0
         self._completed_cycle_profit_total = Decimal('0')
 
-        # 资金信息（需要从交易所获取）
+        # Balances
         self.available_balance = Decimal('0')
         self.frozen_balance = Decimal('0')
 
-        # 时间信息
+        # Runtime timestamps
         self.start_time = datetime.now()
         self.last_trade_time = datetime.now()
 
@@ -72,24 +73,28 @@ class PositionTrackerImpl(IPositionTracker):
 
     def record_filled_order(self, order: GridOrder):
         """
-        🔥 记录订单成交（仅用于交易历史和统计，不更新持仓）
+        Record a filled order into trade history and PnL statistics.
 
-        修改说明：
-        - 持仓数据：完全来自 position_monitor 的REST查询（sync_initial_position方法）
-        - 交易历史：仍然通过此方法记录，用于终端UI显示"最近成交"
-        - 统计数据：买入/卖出次数、已实现盈亏、手续费（仅供显示）
+        Design notes:
+        - Position size is not updated here. The authoritative position comes
+          from `position_monitor` / REST sync.
+        - Trade history is tracked locally so the UI can show recent fills and
+          completed cycles.
+        - Statistics here focus on fill history, realized PnL, and fees.
 
-        不再做的事：
-        ❌ 不再更新 current_position（持仓由REST同步）
-        ❌ 不再更新 average_cost（成本由REST同步）
-        ❌ 不再更新 position_cost（由REST同步时计算）
+        This method intentionally does not update:
+        - `current_position`
+        - `average_cost`
+        - `position_cost`
 
-        仅用于显示：
-        ✅ realized_pnl（已实现盈亏统计）
-        ✅ total_fees（手续费统计）
+        Those fields are synchronized from exchange-backed position snapshots.
+
+        This method does update:
+        - `realized_pnl`
+        - `total_fees`
 
         Args:
-            order: 成交订单
+            order: Filled order.
         """
         if not order.is_filled():
             self.logger.warning(
@@ -100,12 +105,12 @@ class PositionTrackerImpl(IPositionTracker):
         filled_price = order.filled_price or order.price
         filled_amount = order.filled_amount or order.amount
 
-        # 用于记录交易历史的盈亏
+        # Profit is derived from the paired parent fill when available.
         profit = None
         cycle_profit = None
         parent_fill = self._get_parent_fill(order)
 
-        # 🔥 统计计数和盈亏计算（仅用于显示）
+        # Realized PnL is recognized when the fill closes a previously opened leg.
         if order.is_buy_order():
             self.buy_count += 1
             if parent_fill and parent_fill['side'] == 'sell':
@@ -123,8 +128,7 @@ class PositionTrackerImpl(IPositionTracker):
         else:
             self.sell_count += 1
 
-            # 📊 计算已实现盈亏（仅用于统计显示，不影响业务逻辑）
-            # 使用REST同步的average_cost来计算
+            # Prefer parent-fill pairing, then fall back to synced average cost.
             if parent_fill and parent_fill['side'] == 'buy':
                 profit = (filled_price - parent_fill['price']) * filled_amount
                 cycle_profit = profit
@@ -135,7 +139,7 @@ class PositionTrackerImpl(IPositionTracker):
                     f"parent_price={parent_fill['price']}, profit={profit}"
                 )
             elif self.current_position > 0 and self.average_cost > 0:
-                # 做多网格的卖出，计算盈亏
+                # Long-side sell realization.
                 sell_cost = self.average_cost * filled_amount
                 sell_value = filled_price * filled_amount
                 profit = sell_value - sell_cost
@@ -146,27 +150,26 @@ class PositionTrackerImpl(IPositionTracker):
                     f"avg_cost={self.average_cost}, pnl={profit}"
                 )
             elif self.current_position < 0 and self.average_cost > 0:
-                # 做空网格的卖出（建仓），暂不计算盈亏
+                # Short-side sell fill extends the short leg and does not
+                # realize PnL by itself in this tracker path.
                 self.logger.debug(
                     f"Recorded short-side sell fill: {filled_amount}@{filled_price}"
                 )
 
         self.completed_cycles = min(self.buy_count, self.sell_count)
 
-        # 📊 计算手续费（仅用于统计显示）
+        # Always track exchange fees from the fill notional.
         fee = filled_price * filled_amount * self.config.fee_rate
         self.total_fees += fee
 
-        # 更新完成循环次数
+        # Only completed reverse-profit fills contribute to avg cycle profit.
         if cycle_profit is not None:
             self._completed_profit_cycle_count += 1
             self._completed_cycle_profit_total += cycle_profit
 
-        # 🔥 记录交易历史（用于终端UI显示）
         self._store_filled_order(order, filled_price, filled_amount)
         self._record_trade(order, filled_price, filled_amount, profit)
 
-        # 更新最后交易时间
         self.last_trade_time = datetime.now()
 
         self.logger.info(
@@ -177,13 +180,13 @@ class PositionTrackerImpl(IPositionTracker):
 
     def _record_trade(self, order: GridOrder, price: Decimal, amount: Decimal, profit: Decimal = None):
         """
-        记录交易到历史
+        Append one trade record to recent history.
 
         Args:
-            order: 订单
-            price: 成交价格
-            amount: 成交数量
-            profit: 利润（卖单才有）
+            order: Grid order.
+            price: Filled price.
+            amount: Filled amount.
+            profit: Realized profit for this fill, when applicable.
         """
         trade_record = {
             'time': order.filled_at or datetime.now(),
@@ -201,7 +204,7 @@ class PositionTrackerImpl(IPositionTracker):
         self.trade_history.append(trade_record)
 
     def _get_parent_fill(self, order: GridOrder) -> Optional[Dict[str, object]]:
-        """?瑕?嗉恥?D????蝏恣嚗?"""
+        """Return the stored parent fill, if this order was created from one."""
         if not order.parent_order_id:
             return None
 
@@ -215,7 +218,7 @@ class PositionTrackerImpl(IPositionTracker):
         return parent_fill
 
     def _store_filled_order(self, order: GridOrder, price: Decimal, amount: Decimal):
-        """璉瘚?漱霈Ｗ?蝏恣嚗??霈Ｗ?蝏恣銝箏?"""
+        """Store a filled order so reverse fills can pair against it later."""
         self._filled_order_registry[order.order_id] = {
             'side': order.side.value,
             'price': price,
@@ -225,90 +228,82 @@ class PositionTrackerImpl(IPositionTracker):
 
     def get_current_position(self) -> Decimal:
         """
-        获取当前持仓
+        Return the current position size.
 
         Returns:
-            持仓数量（正数=多头，负数=空头）
+            Signed position size. Positive is long, negative is short.
         """
         return self.current_position
 
     def get_average_cost(self) -> Decimal:
         """
-        获取平均持仓成本
+        Return the average position cost.
 
         Returns:
-            平均成本
+            Average cost.
         """
         return self.average_cost
 
     def calculate_unrealized_pnl(self, current_price: Decimal) -> Decimal:
         """
-        计算未实现盈亏
+        Calculate unrealized PnL.
 
         Args:
-            current_price: 当前价格
+            current_price: Current market price.
 
         Returns:
-            未实现盈亏
+            Unrealized PnL.
         """
         if self.current_position == 0:
             return Decimal('0')
 
-        # 未实现盈亏 = (当前价格 - 平均成本) * 持仓数量
-        unrealized_pnl = (current_price - self.average_cost) * \
-            self.current_position
+        # Unrealized PnL = (current price - average cost) * position.
+        unrealized_pnl = (current_price - self.average_cost) * self.current_position
 
         return unrealized_pnl
 
     def get_realized_pnl(self) -> Decimal:
         """
-        获取已实现盈亏
+        Return realized PnL.
 
         Returns:
-            已实现盈亏
+            Realized PnL.
         """
         return self.realized_pnl
 
     def get_total_pnl(self, current_price: Decimal) -> Decimal:
         """
-        获取总盈亏（已实现+未实现）
+        Return total PnL.
 
         Args:
-            current_price: 当前价格
+            current_price: Current market price.
 
         Returns:
-            总盈亏
+            Realized plus unrealized PnL.
         """
         unrealized = self.calculate_unrealized_pnl(current_price)
         return self.realized_pnl + unrealized
 
     def get_statistics(self) -> GridStatistics:
         """
-        获取统计数据
+        Build tracker statistics.
 
         Returns:
-            网格统计数据
+            Grid statistics snapshot.
         """
-        # 获取当前价格
         current_price = self.state.current_price or self.config.get_first_order_price()
 
-        # 计算未实现盈亏
         unrealized_pnl = self.calculate_unrealized_pnl(current_price)
         total_pnl = self.realized_pnl + unrealized_pnl
         net_profit = total_pnl - self.total_fees
 
-        # 计算收益率
-        initial_capital = self.config.order_amount * \
-            self.config.grid_count * current_price
-        profit_rate = (net_profit / initial_capital *
-                       100) if initial_capital > 0 else Decimal('0')
+        initial_capital = self.config.order_amount * self.config.grid_count * current_price
+        profit_rate = (net_profit / initial_capital * 100) if initial_capital > 0 else Decimal('0')
 
-        # 计算资金利用率
         total_balance = self.available_balance + self.frozen_balance
         capital_utilization = (
             self.frozen_balance / total_balance * 100) if total_balance > 0 else 0.0
 
-        # 运行时长
         running_time = datetime.now() - self.start_time
 
         statistics = GridStatistics(
@@ -332,9 +327,9 @@ class PositionTrackerImpl(IPositionTracker):
             net_profit=net_profit,
             profit_rate=profit_rate,
             grid_utilization=self.state.get_grid_utilization(),
-            spot_balance=self.available_balance,  # 本地追踪器计算的余额映射为现货余额
-            collateral_balance=Decimal('0'),  # 本地追踪器不计算抵押品
-            order_locked_balance=self.frozen_balance,  # 订单冻结资金
+            spot_balance=self.available_balance,  # Reused as the available balance field.
+            collateral_balance=Decimal('0'),  # This tracker does not maintain collateral snapshots.
+            order_locked_balance=self.frozen_balance,  # Balance locked by open orders.
             total_balance=total_balance,
             capital_utilization=capital_utilization,
             running_time=running_time,
@@ -351,86 +346,72 @@ class PositionTrackerImpl(IPositionTracker):
 
     def get_metrics(self) -> GridMetrics:
         """
-        获取性能指标
+        Build higher-level performance metrics.
 
         Returns:
-            网格性能指标
+            Grid metrics snapshot.
         """
         metrics = GridMetrics()
 
-        # 获取当前价格
         current_price = self.state.current_price or self.config.get_first_order_price()
 
-        # 计算总利润
         metrics.total_profit = self.get_total_pnl(current_price)
 
-        # 计算收益率
-        initial_capital = self.config.order_amount * \
-            self.config.grid_count * current_price
+        initial_capital = self.config.order_amount * self.config.grid_count * current_price
         if initial_capital > 0:
-            metrics.profit_rate = (
-                metrics.total_profit / initial_capital) * 100
+            metrics.profit_rate = (metrics.total_profit / initial_capital) * 100
 
-        # 交易统计
         metrics.total_trades = self.buy_count + self.sell_count
-        metrics.win_trades = self.completed_cycles  # 完整循环都算盈利
-        metrics.loss_trades = 0  # 网格交易通常不会亏损（除非单边行情）
+        metrics.win_trades = self.completed_cycles  # Completed cycles count as successful round trips.
+        metrics.loss_trades = 0  # Grid cycles are not classified into separate loss trades here.
 
         if metrics.total_trades > 0:
-            metrics.win_rate = (metrics.win_trades /
-                                (metrics.total_trades / 2)) * 100  # 一买一卖算一次
+            metrics.win_rate = (metrics.win_trades / (metrics.total_trades / 2)) * 100
 
-        # 计算日均收益
         running_days = (datetime.now() - self.start_time).days
         if running_days > 0:
-            metrics.daily_profit = metrics.total_profit / \
-                Decimal(str(running_days))
+            metrics.daily_profit = metrics.total_profit / Decimal(str(running_days))
             metrics.running_days = running_days
 
-        # 计算平均每笔收益
         if self._completed_profit_cycle_count > 0:
             metrics.avg_profit_per_trade = self._completed_cycle_profit_total / \
                 Decimal(str(self._completed_profit_cycle_count))
 
-        # 手续费统计
         metrics.total_fees = self.total_fees
         if metrics.total_profit != 0:
-            metrics.fee_rate = (
-                self.total_fees / abs(metrics.total_profit)) * 100
+            metrics.fee_rate = (self.total_fees / abs(metrics.total_profit)) * 100
 
-        # 持仓统计
-        metrics.max_position = abs(self.current_position)  # 简化处理
+        metrics.max_position = abs(self.current_position)  # Current peak snapshot only.
         metrics.avg_position = abs(self.current_position)
 
         return metrics
 
     def get_trade_history(self, limit: int = 10) -> List[Dict]:
         """
-        获取交易历史
+        Return recent trade history.
 
         Args:
-            limit: 返回记录数
+            limit: Maximum number of trade records.
 
         Returns:
-            交易记录列表
+            Trade history records.
         """
-        # 返回最新的N条记录
         history_list = list(self.trade_history)
         return history_list[-limit:] if len(history_list) > limit else history_list
 
     def update_balance(self, available: Decimal, frozen: Decimal):
         """
-        更新资金信息
+        Update local balance snapshots.
 
         Args:
-            available: 可用资金
-            frozen: 冻结资金
+            available: Available balance.
+            frozen: Locked balance.
         """
         self.available_balance = available
         self.frozen_balance = frozen
 
     def reset(self):
-        """重置跟踪器"""
+        """Reset the tracker state."""
         self.current_position = Decimal('0')
         self.position_cost = Decimal('0')
         self.average_cost = Decimal('0')
@@ -450,36 +431,35 @@ class PositionTrackerImpl(IPositionTracker):
 
     def sync_initial_position(self, position: Decimal, entry_price: Decimal):
         """
-        🔥 同步持仓（持仓数据的唯一来源）
+        Sync the initial exchange-backed position into the tracker.
 
-        从REST API查询的交易所实际持仓同步到tracker。
-        这是更新tracker持仓的唯一方法，不再通过WebSocket订单成交事件更新。
+        The position monitor uses a REST snapshot to seed tracker state so the
+        runtime starts from the real live position instead of assuming flat.
 
-        数据流：
-        1. position_monitor每秒通过REST API查询交易所持仓
-        2. 调用此方法将结果同步到tracker
-        3. 所有模块从tracker读取持仓数据
+        High-level flow:
+        1. `position_monitor` fetches the live position from REST.
+        2. The result is synchronized into the tracker.
+        3. Subsequent UI and statistics read from the tracker snapshot.
 
-        优点：
-        - 持仓数据100%准确（来自交易所）
-        - 避免WebSocket和REST两个数据源冲突
-        - 消除竞态条件
+        Guarantees:
+        - Position state comes from exchange data, not guessed fills.
+        - Prevents websocket/REST startup drift.
+        - Avoids false early exposure reporting.
 
         Args:
-            position: 持仓数量（正数=多仓，负数=空仓）
-            entry_price: 平均入场价格
+            position: Signed position size.
+            entry_price: Average entry price.
         """
         old_position = self.current_position
         self.current_position = position
         self.average_cost = entry_price
 
-        # 计算持仓总成本
         if position != 0:
             self.position_cost = abs(position) * entry_price
         else:
             self.position_cost = Decimal('0')
 
-        # 只在首次同步或持仓变化时输出info，其他时候用debug（避免终端刷屏）
+        # Log at INFO only when the synced position actually changed.
         if old_position != position:
             self.logger.info(
                 f"Initial position synced: {old_position} -> {position}, "

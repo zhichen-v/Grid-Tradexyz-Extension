@@ -1,10 +1,11 @@
 """
-网格策略实现
+Grid strategy implementation.
 
-实现网格策略的核心逻辑：
-- 做多网格（Long Grid）
-- 做空网格（Short Grid）
-- 统一的反向挂单机制
+This module builds the initial grid order layout and calculates reverse orders
+for:
+- long grid mode
+- short grid mode
+- follow and martingale variants
 """
 
 from typing import List, Tuple
@@ -21,13 +22,13 @@ from ..models import (
 
 class GridStrategyImpl(IGridStrategy):
     """
-    网格策略实现
+    Grid strategy implementation.
 
-    核心原则：
-    1. 做多和做空网格本质相同，只是初始化方向不同
-    2. 任何订单成交后立即挂反向订单
-    3. 买单成交 → 向上移动一格挂卖单
-    4. 卖单成交 → 向下移动一格挂买单
+    Core behavior:
+    1. Build the initial grid order set from the configured price range.
+    2. Calculate reverse orders after fills.
+    3. A filled buy order places a sell order above the fill.
+    4. A filled sell order places a buy order below the fill.
     """
 
     def __init__(self):
@@ -37,49 +38,49 @@ class GridStrategyImpl(IGridStrategy):
 
     def initialize(self, config: GridConfig, current_price: Decimal = None) -> List[GridOrder]:
         """
-        初始化网格 - 一次性生成所有网格订单
+        Initialize the strategy and build the initial order set.
 
-        做多网格：为每个网格价格挂买单（仅低于当前市价的格子）
-        做空网格：为每个网格价格挂卖单（仅高于当前市价的格子）
+        In long grid mode, only buy orders below the current price are placed.
+        In short grid mode, only sell orders above the current price are placed.
 
         Args:
-            config: 网格配置
-            current_price: 当前市价（用于过滤会变成 taker 的订单）
+            config: Grid configuration.
+            current_price: Current market price. When set, orders that would
+                cross the market are skipped to avoid taker execution.
 
         Returns:
-            所有网格的初始订单列表
+            Initial grid orders.
         """
         self.config = config
         self.current_price = current_price
         self.grid_prices = self._calculate_grid_prices()
 
-        # 🔥 价格移动网格：价格区间在运行时动态设置
+        # In follow mode the range is dynamic, so log the grid shape only.
         if config.is_follow_mode():
             self.logger.info(
-                f"初始化{config.grid_type.value}网格: "
-                f"区间[动态跟随], "
-                f"间隔{config.grid_interval}, {config.grid_count}个网格"
+                f"Initialized {config.grid_type.value}: "
+                f"dynamic range, interval={config.grid_interval}, "
+                f"grids={config.grid_count}"
             )
         else:
             self.logger.info(
-                f"初始化{config.grid_type.value}网格: "
-                f"区间[{config.lower_price}, {config.upper_price}], "
-                f"间隔{config.grid_interval}, {config.grid_count}个网格"
+                f"Initialized {config.grid_type.value}: "
+                f"range=[{config.lower_price}, {config.upper_price}], "
+                f"interval={config.grid_interval}, grids={config.grid_count}"
             )
 
-        # 为所有网格创建初始订单
         all_orders = self._create_all_initial_orders()
 
-        self.logger.info(f"生成{len(all_orders)}个初始订单，准备批量挂单")
+        self.logger.info(f"Built {len(all_orders)} initial grid orders")
 
         return all_orders
 
     def _calculate_grid_prices(self) -> List[Decimal]:
         """
-        计算所有网格价格
+        Calculate all configured grid prices.
 
         Returns:
-            价格列表（按网格ID排序）
+            Price list ordered by grid ID.
         """
         prices = []
         for grid_id in range(1, self.config.grid_count + 1):
@@ -90,28 +91,29 @@ class GridStrategyImpl(IGridStrategy):
 
     def _create_all_initial_orders(self) -> List[GridOrder]:
         """
-        创建所有网格的初始订单
+        Create all initial grid orders.
 
-        做多网格：为每个网格价格创建买单
-        做空网格：为每个网格价格创建卖单
+        In long grid mode, initial orders are buys.
+        In short grid mode, initial orders are sells.
 
         Returns:
-            所有网格的初始订单列表
+            Initial grid orders.
         """
         all_orders = []
         skipped_count = 0
 
         if self.config.grid_type in [GridType.LONG, GridType.MARTINGALE_LONG, GridType.FOLLOW_LONG]:
-            # 做多网格：为低于当前市价的网格挂买单
+            # In long mode, place only buy orders below the live price.
             for grid_id in range(1, self.config.grid_count + 1):
                 price = self.config.get_grid_price(grid_id)
 
-                # 🔥 过滤：买单价格必须低于当前市价，否则会变成 taker
+                # Skip orders that would cross the market and execute as takers.
                 if self.current_price is not None and price >= self.current_price:
                     skipped_count += 1
                     self.logger.debug(
-                        f"跳过 Grid {grid_id} 买单@{price}：高于当前市价 {self.current_price}，"
-                        f"待价格上涨后由反手机制挂出"
+                        f"Skip Grid {grid_id} buy @{price}: "
+                        f"current_price={self.current_price}, "
+                        f"would cross the market and act as taker"
                     )
                     continue
 
@@ -130,27 +132,31 @@ class GridStrategyImpl(IGridStrategy):
 
             if all_orders:
                 self.logger.info(
-                    f"做多网格：生成{len(all_orders)}个买单，"
-                    f"价格范围 ${all_orders[0].price:,.2f} - ${all_orders[-1].price:,.2f}"
-                    + (f"（跳过{skipped_count}个高于市价的格子）" if skipped_count > 0 else "")
+                    f"Long grid created {len(all_orders)} initial buy orders, "
+                    f"price range ${all_orders[0].price:,.2f} - ${all_orders[-1].price:,.2f}"
+                    + (
+                        f", skipped {skipped_count} market-crossing levels"
+                        if skipped_count > 0 else ""
+                    )
                 )
             else:
                 self.logger.info(
-                    f"做多网格：当前市价 ${self.current_price:,.2f} 低于所有网格价格，"
-                    f"暂无可挂买单（共跳过{skipped_count}个格子）"
+                    f"Long grid created no initial orders below current price "
+                    f"${self.current_price:,.2f}; skipped {skipped_count} levels"
                 )
 
         else:  # SHORT, MARTINGALE_SHORT, FOLLOW_SHORT
-            # 做空网格：为高于当前市价的网格挂卖单
+            # In short mode, place only sell orders above the live price.
             for grid_id in range(1, self.config.grid_count + 1):
                 price = self.config.get_grid_price(grid_id)
 
-                # 🔥 过滤：卖单价格必须高于当前市价，否则会变成 taker
+                # Skip orders that would cross the market and execute as takers.
                 if self.current_price is not None and price <= self.current_price:
                     skipped_count += 1
                     self.logger.debug(
-                        f"跳过 Grid {grid_id} 卖单@{price}：低于当前市价 {self.current_price}，"
-                        f"待价格下跌后由反手机制挂出"
+                        f"Skip Grid {grid_id} sell @{price}: "
+                        f"current_price={self.current_price}, "
+                        f"would cross the market and act as taker"
                     )
                     continue
 
@@ -169,14 +175,17 @@ class GridStrategyImpl(IGridStrategy):
 
             if all_orders:
                 self.logger.info(
-                    f"做空网格：生成{len(all_orders)}个卖单，"
-                    f"价格范围 ${all_orders[0].price:,.2f} - ${all_orders[-1].price:,.2f}"
-                    + (f"（跳过{skipped_count}个低于市价的格子）" if skipped_count > 0 else "")
+                    f"Short grid created {len(all_orders)} initial sell orders, "
+                    f"price range ${all_orders[0].price:,.2f} - ${all_orders[-1].price:,.2f}"
+                    + (
+                        f", skipped {skipped_count} market-crossing levels"
+                        if skipped_count > 0 else ""
+                    )
                 )
             else:
                 self.logger.info(
-                    f"做空网格：当前市价 ${self.current_price:,.2f} 高于所有网格价格，"
-                    f"暂无可挂卖单（共跳过{skipped_count}个格子）"
+                    f"Short grid created no initial orders above current price "
+                    f"${self.current_price:,.2f}; skipped {skipped_count} levels"
                 )
 
         return all_orders
@@ -188,43 +197,46 @@ class GridStrategyImpl(IGridStrategy):
         distance: int = 1
     ) -> Tuple[GridOrderSide, Decimal, int]:
         """
-        计算反向订单参数
+        Calculate the reverse order parameters.
 
-        核心逻辑：
-        - 买单成交 → 向上移动N格挂卖单
-        - 卖单成交 → 向下移动N格挂买单
+        Rules:
+        - A filled buy order places a sell order N grids above.
+        - A filled sell order places a buy order N grids below.
 
         Args:
-            filled_order: 已成交订单
-            grid_interval: 网格间隔
-            distance: 反手挂单的格子距离（默认1格）
+            filled_order: Filled order.
+            grid_interval: Grid interval.
+            distance: Reverse-order grid distance. Default is 1.
 
         Returns:
-            (订单方向, 价格, 网格ID)
+            (side, price, grid_id)
         """
         if filled_order.is_buy_order():
-            # 买单成交 → 挂卖单
+            # Buy fill -> place sell above.
             new_side = GridOrderSide.SELL
-            # 🔥 关键修复：使用【下单价格】而非【成交价格】计算反手价格
-            # 这样可以保证网格间距的一致性，避免市价成交导致间距错乱
+            # Use the configured order price as the base grid anchor so the
+            # reverse order stays aligned to the intended grid layout.
             new_price = filled_order.price + (grid_interval * distance)
-            # 网格ID保持不变或向上移动（取决于具体实现）
+            # Keep the same logical grid id so state remains paired to the fill.
             new_grid_id = filled_order.grid_id
 
             self.logger.debug(
-                f"买单成交 (下单价@{filled_order.price}, 成交价@{filled_order.filled_price}), "
-                f"挂卖单@{new_price} (向上移动{distance}格，距离{grid_interval * distance})"
+                f"Buy fill (order_price={filled_order.price}, "
+                f"filled_price={filled_order.filled_price}), "
+                f"reverse sell -> {new_price} "
+                f"(distance={distance}, delta={grid_interval * distance})"
             )
         else:
-            # 卖单成交 → 挂买单
+            # Sell fill -> place buy below.
             new_side = GridOrderSide.BUY
-            # 🔥 关键修复：使用【下单价格】而非【成交价格】计算反手价格
             new_price = filled_order.price - (grid_interval * distance)
             new_grid_id = filled_order.grid_id
 
             self.logger.debug(
-                f"卖单成交 (下单价@{filled_order.price}, 成交价@{filled_order.filled_price}), "
-                f"挂买单@{new_price} (向下移动{distance}格，距离{grid_interval * distance})"
+                f"Sell fill (order_price={filled_order.price}, "
+                f"filled_price={filled_order.filled_price}), "
+                f"reverse buy -> {new_price} "
+                f"(distance={distance}, delta={grid_interval * distance})"
             )
 
         return (new_side, new_price, new_grid_id)
@@ -236,53 +248,53 @@ class GridStrategyImpl(IGridStrategy):
         distance: int = 1
     ) -> List[Tuple[GridOrderSide, Decimal, int, Decimal]]:
         """
-        批量计算反向订单参数
+        Calculate reverse orders for a batch of fills.
 
-        用于处理多个订单同时成交的情况
+        Each filled order produces one reverse order entry.
 
         Args:
-            filled_orders: 已成交订单列表
-            grid_interval: 网格间隔
-            distance: 反手挂单的格子距离（默认1格）
+            filled_orders: Filled orders.
+            grid_interval: Grid interval.
+            distance: Reverse-order grid distance. Default is 1.
 
         Returns:
-            [(订单方向, 价格, 网格ID, 数量), ...]
+            [(side, price, grid_id, amount), ...]
         """
         reverse_orders = []
 
         for order in filled_orders:
             side, price, grid_id = self.calculate_reverse_order(
                 order, grid_interval, distance)
-            # 数量与成交订单保持一致
+            # Reuse the actual filled amount when available.
             amount = order.filled_amount or order.amount
             reverse_orders.append((side, price, grid_id, amount))
 
         self.logger.info(
-            f"批量成交: {len(filled_orders)}个订单, "
-            f"准备挂{len(reverse_orders)}个反向订单（距离{distance}格）"
+            f"Processed {len(filled_orders)} fills into "
+            f"{len(reverse_orders)} reverse orders with distance={distance}"
         )
 
         return reverse_orders
 
     def get_grid_prices(self) -> List[Decimal]:
-        """获取所有网格价格"""
+        """Return all configured grid prices."""
         return self.grid_prices.copy()
 
     def validate_price_range(self, current_price: Decimal) -> bool:
         """
-        验证当前价格是否在网格区间内
+        Validate whether the current price is inside the configured range.
 
         Args:
-            current_price: 当前价格
+            current_price: Current market price.
 
         Returns:
-            是否在区间内
+            Whether the price is in range.
         """
         in_range = self.config.is_price_in_range(current_price)
 
         if not in_range:
             self.logger.warning(
-                f"价格{current_price}超出网格区间"
+                f"Current price {current_price} is outside grid range "
                 f"[{self.config.lower_price}, {self.config.upper_price}]"
             )
 
@@ -290,13 +302,13 @@ class GridStrategyImpl(IGridStrategy):
 
     def get_grid_id_by_price(self, price: Decimal) -> int:
         """
-        根据价格获取网格ID
+        Map a price to its grid ID.
 
         Args:
-            price: 价格
+            price: Price.
 
         Returns:
-            网格ID
+            Grid ID.
         """
         return self.config.get_grid_index_by_price(price)
 

@@ -44,15 +44,15 @@ class BalanceMonitor:
         self._order_locked_balance: Decimal = Decimal('0')  # 订单冻结余额
         self._last_balance_update: Optional[datetime] = None
 
-        # 💰 初始本金（独立维护，无论是否启用本金保护都记录）
+        #  初始本金（独立维护，无论是否启用本金保护都记录）
         self._initial_capital: Decimal = Decimal('0')  # 启动时的初始账户权益
 
-        # 🔥 现货模式专用：记录初始持仓和USDC
+        #  现货模式专用：记录初始持仓和USDC
         self._initial_spot_position: Decimal = Decimal('0')  # 初始现货持仓数量
         self._initial_spot_usdc: Decimal = Decimal('0')  # 初始USDC余额
-        self._initial_capital_with_btc_calculated: bool = False  # 🔥 标记初始本金是否已包含BTC价值
+        self._initial_capital_with_btc_calculated: bool = False  #  标记初始本金是否已包含BTC价值
 
-        # 🔥 现货模式专用：缓存基础货币（如BTC/UBTC）的总余额
+        #  现货模式专用：缓存基础货币（如BTC/UBTC）的总余额
         self._base_currency_total_balance: Decimal = Decimal(
             '0')  # 基础货币总余额（包括预留）
 
@@ -73,7 +73,7 @@ class BalanceMonitor:
 
         # 启动监控循环
         self._monitor_task = asyncio.create_task(self._balance_monitor_loop())
-        self.logger.info(f"✅ 账户余额轮询已启动（间隔{self._update_interval}秒）")
+        self.logger.info(f" 账户余额轮询已启动（间隔{self._update_interval}秒）")
 
     async def stop_monitoring(self):
         """停止余额监控"""
@@ -85,21 +85,21 @@ class BalanceMonitor:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
-            self.logger.info("✅ 余额监控已停止")
+            self.logger.info(" 余额监控已停止")
 
     async def _balance_monitor_loop(self):
         """余额监控循环"""
-        self.logger.info("💰 账户余额监控循环已启动")
+        self.logger.info(" 账户余额监控循环已启动")
 
         while self._running:
             try:
                 await asyncio.sleep(self._update_interval)
                 await self.update_balance()
             except asyncio.CancelledError:
-                self.logger.info("💰 余额监控循环被取消")
+                self.logger.info(" 余额监控循环被取消")
                 break
             except Exception as e:
-                self.logger.error(f"❌ 余额更新失败: {e}")
+                self.logger.error(f" 余额更新失败: {e}")
                 await asyncio.sleep(self._update_interval)
 
     async def update_balance(self):
@@ -111,8 +111,8 @@ class BalanceMonitor:
         - collateral_balance: netEquity（账户总净资产，用于盈亏计算）
         - order_locked_balance: netEquityLocked（订单冻结的净资产）
 
-        🔥 重要：盈亏计算使用 netEquity（总净资产），包含可用+冻结的所有资产
-        🔥 不能用 netEquityAvailable，因为它不包含订单冻结资金，会导致盈亏计算错误
+         重要：盈亏计算使用 netEquity（总净资产），包含可用+冻结的所有资产
+         不能用 netEquityAvailable，因为它不包含订单冻结资金，会导致盈亏计算错误
         """
         try:
             # 调用交易所API获取所有余额
@@ -129,7 +129,7 @@ class BalanceMonitor:
                 # 从 raw_data 中提取详细的余额信息
                 raw_data = usdc_balance.raw_data
 
-                # 🔥 支持多交易所：Backpack vs Hyperliquid vs Lighter
+                #  支持多交易所：Backpack vs Hyperliquid vs Lighter
                 exchange_name = self.config.exchange.lower() if hasattr(
                     self.config, 'exchange') else 'backpack'
 
@@ -156,7 +156,7 @@ class BalanceMonitor:
                     self._order_locked_balance = usdc_balance.used  # 订单冻结资产
 
                     self.logger.debug(
-                        f"📊 Lighter余额: 可用={self._spot_balance}, "
+                        f" Lighter余额: 可用={self._spot_balance}, "
                         f"总额={self._collateral_balance}, 冻结={self._order_locked_balance}"
                     )
                 else:
@@ -166,13 +166,13 @@ class BalanceMonitor:
                     self._spot_balance = self._safe_decimal(
                         raw_data.get('availableQuantity', '0'))
                     self._collateral_balance = self._safe_decimal(
-                        raw_data.get('_account_netEquity', '0'))  # 🔥 使用总净资产（正确）
+                        raw_data.get('_account_netEquity', '0'))  #  使用总净资产（正确）
                     self._order_locked_balance = self._safe_decimal(
-                        raw_data.get('_account_netEquityLocked', '0'))  # 🔥 订单冻结资产
+                        raw_data.get('_account_netEquityLocked', '0'))  #  订单冻结资产
 
                 self._last_balance_update = datetime.now()
 
-                # 🔥 现货模式：同时查询并缓存基础货币（如UBTC）的总余额
+                #  现货模式：同时查询并缓存基础货币（如UBTC）的总余额
                 if self._is_spot_mode():
                     symbol_parts = self.config.symbol.split('/')
                     if len(symbol_parts) >= 1:
@@ -182,7 +182,7 @@ class BalanceMonitor:
                             if balance.currency == base_currency:
                                 self._base_currency_total_balance = balance.total
                                 self.logger.debug(
-                                    f"📊 缓存{base_currency}总余额: {self._base_currency_total_balance}"
+                                    f" 缓存{base_currency}总余额: {self._base_currency_total_balance}"
                                 )
                                 break
 
@@ -200,51 +200,51 @@ class BalanceMonitor:
                             # 触发止盈
                             self.coordinator.take_profit_manager.activate(
                                 current_equity)
-                            # 🔥 使用新模块执行止盈重置
+                            #  使用新模块执行止盈重置
                             await self.coordinator.reset_manager.execute_take_profit_reset()
 
                 # 只在首次或有显著变化时输出info，其他用debug
                 if self._last_balance_update is None:
                     self.logger.info(
-                        f"💰 初始余额: 现货=${self._spot_balance:,.2f}, "
+                        f" 初始余额: 现货=${self._spot_balance:,.2f}, "
                         f"抵押品=${self._collateral_balance:,.2f}, "
                         f"订单冻结=${self._order_locked_balance:,.2f}"
                     )
                 else:
                     self.logger.debug(
-                        f"💰 余额查询: 现货=${self._spot_balance:,.2f}, "
+                        f" 余额查询: 现货=${self._spot_balance:,.2f}, "
                         f"抵押品=${self._collateral_balance:,.2f}, "
                         f"订单冻结=${self._order_locked_balance:,.2f}"
                     )
             else:
                 all_currencies = [b.currency for b in balances]
                 self.logger.warning(
-                    f"⚠️ 未找到USDC余额，所有币种: {', '.join(all_currencies) if all_currencies else '(空)'}"
+                    f"️ 未找到USDC余额，所有币种: {', '.join(all_currencies) if all_currencies else '(空)'}"
                 )
 
         except Exception as e:
-            self.logger.error(f"❌ 获取账户余额失败: {e}")
+            self.logger.error(f" 获取账户余额失败: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
 
     def _initialize_managers_capital(self):
         """初始化各个管理器的本金（首次获取时）"""
-        # 💰 首先记录BalanceMonitor自己的初始本金（无论是否启用本金保护）
+        #  首先记录BalanceMonitor自己的初始本金（无论是否启用本金保护）
         if (self._initial_capital == Decimal('0') or not self._initial_capital_with_btc_calculated) and self._collateral_balance > 0:
-            # 🔥 区分现货和合约模式
+            #  区分现货和合约模式
             if self._is_spot_mode():
-                # 🔥 现货模式：初始本金 = 初始USDC + 初始BTC总价值（包括预留）
+                #  现货模式：初始本金 = 初始USDC + 初始BTC总价值（包括预留）
                 # 重要：这里要统计所有BTC，不减去预留
                 initial_btc_total = self._get_base_currency_total_balance()  # 获取BTC总余额
                 initial_price = self._get_current_price()
 
-                # 🔥 如果价格为0，说明系统刚启动，价格还没有更新，暂时只计算USDC
+                #  如果价格为0，说明系统刚启动，价格还没有更新，暂时只计算USDC
                 # 等待下一次余额更新时再补充BTC价值
                 if initial_price <= 0:
                     # 只在首次遇到价格为0时输出警告
                     if self._initial_capital == Decimal('0'):
                         self.logger.warning(
-                            f"⚠️ 当前价格为0或无效，暂时只使用USDC作为初始本金: ${self._collateral_balance:,.3f} USDC"
+                            f"️ 当前价格为0或无效，暂时只使用USDC作为初始本金: ${self._collateral_balance:,.3f} USDC"
                         )
                         self.logger.warning(
                             f"   BTC总量: {initial_btc_total}, 等待价格更新后将重新计算初始本金"
@@ -266,19 +266,19 @@ class BalanceMonitor:
                     self._initial_capital_with_btc_calculated = True  # 标记已完整计算
 
                     self.logger.info(
-                        f"💰 现货初始本金已记录: ${self._initial_capital:,.3f} USDC "
+                        f" 现货初始本金已记录: ${self._initial_capital:,.3f} USDC "
                         f"(USDC: ${self._initial_spot_usdc:,.3f} + "
                         f"BTC总价值: ${initial_btc_value:,.3f}, BTC总量: {initial_btc_total})"
                     )
 
-                    # 🔥 同步更新剥头皮管理器的本金（包含BTC价值）
+                    #  同步更新剥头皮管理器的本金（包含BTC价值）
                     if self.coordinator.scalping_manager:
                         old_capital = self.coordinator.scalping_manager.get_initial_capital()
                         if old_capital < self._initial_capital:
                             self.coordinator.scalping_manager.initialize_capital(
                                 self._initial_capital, is_reinit=True)
                             self.logger.info(
-                                f"💰 剥头皮管理器本金已同步更新: "
+                                f" 剥头皮管理器本金已同步更新: "
                                 f"${old_capital:,.2f} → ${self._initial_capital:,.2f}"
                             )
             else:
@@ -286,7 +286,7 @@ class BalanceMonitor:
                 self._initial_capital = self._collateral_balance
                 self._initial_capital_with_btc_calculated = True  # 合约模式不需要BTC计算
                 self.logger.info(
-                    f"💰 初始本金已记录: ${self._initial_capital:,.3f} USDC")
+                    f" 初始本金已记录: ${self._initial_capital:,.3f} USDC")
 
         self.coordinator.ensure_symbol_isolated_capital(
             current_price=self._get_current_price()
@@ -305,14 +305,14 @@ class BalanceMonitor:
         """
         获取当前余额
 
-        🔥 重要：现货模式时，collateral_balance 需要通过属性获取
+         重要：现货模式时，collateral_balance 需要通过属性获取
         因为属性会自动加上持仓价值（USDC + BTC价值）
         """
         return {
             'spot_balance': self._spot_balance,
-            'collateral_balance': self.collateral_balance,  # 🔥 使用属性，不是私有变量
+            'collateral_balance': self.collateral_balance,  #  使用属性，不是私有变量
             'order_locked_balance': self._order_locked_balance,
-            'total_balance': self._spot_balance + self.collateral_balance + self._order_locked_balance,  # 🔥 使用属性
+            'total_balance': self._spot_balance + self.collateral_balance + self._order_locked_balance,  #  使用属性
             'last_update': self._last_balance_update
         }
 
@@ -326,11 +326,11 @@ class BalanceMonitor:
         """
         抵押品余额（当前权益）
 
-        🔥 现货模式：返回实时权益 = 当前USDC + 当前BTC总价值（包括预留）
-        🔥 合约模式：返回账户权益（保持原逻辑）
+         现货模式：返回实时权益 = 当前USDC + 当前BTC总价值（包括预留）
+         合约模式：返回账户权益（保持原逻辑）
         """
         if self._is_spot_mode():
-            # 🔥 现货模式：实时计算权益（统计所有BTC，包括预留）
+            #  现货模式：实时计算权益（统计所有BTC，包括预留）
             current_btc_total = self._get_base_currency_total_balance()  # 获取BTC总余额
             current_price = self._get_current_price()
             btc_total_value = abs(current_btc_total) * current_price  # BTC总价值
@@ -372,7 +372,7 @@ class BalanceMonitor:
         """
         获取当前价格
 
-        🔥 优先从state获取，如果为空则主动查询引擎
+         优先从state获取，如果为空则主动查询引擎
         """
         try:
             # 优先从state获取（缓存的价格）
@@ -399,7 +399,7 @@ class BalanceMonitor:
         """
         获取基础货币的总余额（包括预留和交易持仓）
 
-        🔥 重要：这个方法返回账户中所有的基础货币（如BTC/UBTC），
+         重要：这个方法返回账户中所有的基础货币（如BTC/UBTC），
         从缓存中读取，不减去预留，不减去订单冻结，用于计算初始本金和当前权益
 
         Returns:
