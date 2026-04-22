@@ -1080,15 +1080,23 @@ class GridEngineImpl(IGridEngine):
             filled_price,
             fill_amount,
         )
+        self.logger.info(
+            f"{source} user fill candidate: "
+            f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, "
+            f"price={filled_price}, amount={fill_amount}, event_key={event_key}, "
+            f"payload={self._summarize_tradexyz_fill_item(item)}"
+        )
         if not self._record_tradexyz_fill_entry(
             tracking,
             event_key,
             fill_amount,
             filled_price,
         ):
-            self.logger.debug(
+            self.logger.info(
                 f"Skipping duplicate TradeXYZ user fill: "
-                f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, event={event_key}"
+                f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, "
+                f"event={event_key}, cumulative={tracking.get('cumulative_filled')}, "
+                f"payload={self._summarize_tradexyz_fill_item(item)}"
             )
             return True
 
@@ -1112,6 +1120,12 @@ class GridEngineImpl(IGridEngine):
         tracking["cumulative_filled"] = str(cumulative_filled)
         tracking["remaining_amount"] = str(max(order_amount - cumulative_filled, Decimal("0")))
         tracking["last_fill_price"] = str(filled_price)
+        self.logger.info(
+            f"{source} user fill ledger updated: "
+            f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}, "
+            f"incremental={fill_amount}, cumulative={cumulative_filled}, "
+            f"remaining={tracking['remaining_amount']}, event_key={event_key}"
+        )
 
         if order_amount > 0 and (order_amount - cumulative_filled) > tolerance:
             self.logger.info(
@@ -1505,6 +1519,39 @@ class GridEngineImpl(IGridEngine):
             f"{grid_order.order_id}:{event_time}:{side}:{start_position}:{direction}:{fee}:"
             f"{normalized_price}:{normalized_amount}"
         )
+
+    def _summarize_tradexyz_fill_item(self, item: Dict[str, Any]) -> str:
+        """Return a compact diagnostic summary for one TradeXYZ fill payload."""
+        interesting_keys = (
+            "oid",
+            "tid",
+            "fillId",
+            "fill_id",
+            "tradeId",
+            "hash",
+            "txHash",
+            "time",
+            "timestamp",
+            "side",
+            "dir",
+            "direction",
+            "startPosition",
+            "start_pos",
+            "fee",
+            "commission",
+            "px",
+            "avgPx",
+            "price",
+            "sz",
+            "filledSz",
+            "filled",
+        )
+        parts = [
+            f"{key}={item.get(key)}"
+            for key in interesting_keys
+            if key in item and item.get(key) not in (None, "")
+        ]
+        return ", ".join(parts) if parts else "no-interesting-fields"
 
     def _string_or_none(self, value: Any) -> Optional[str]:
         """Normalize a value into a non-empty string key."""

@@ -187,10 +187,10 @@ class GridState:
         
         self.last_update_at = datetime.now()
     
-    def mark_order_filled(self, order_id: str, filled_price: Decimal, filled_amount: Decimal):
+    def mark_order_filled(self, order_id: str, filled_price: Decimal, filled_amount: Decimal) -> bool:
         """标记订单已成交"""
         if order_id not in self.active_orders:
-            return
+            return False
         
         order = self.active_orders[order_id]
         order.mark_filled(filled_price, filled_amount)
@@ -300,6 +300,7 @@ class GridState:
         self.current_position = position
         self.average_cost = average_cost
         self.last_update_at = datetime.now()
+        return True
 
     def __repr__(self) -> str:
         return (

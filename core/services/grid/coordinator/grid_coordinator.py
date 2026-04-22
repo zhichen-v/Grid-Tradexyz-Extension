@@ -363,7 +363,8 @@ class GridCoordinator:
                 self.logger.info(
                     f"Skipping duplicate fill handling: Grid {filled_order.grid_id} "
                     f"{filled_order.side.value}@{filled_order.price} "
-                    f"(last handled {elapsed:.1f}s ago)"
+                    f"(last handled {elapsed:.1f}s ago, fill_key={fill_key}, "
+                    f"reverse_order_id={filled_order.reverse_order_id})"
                 )
                 return
             self._recent_fills[fill_key] = current_time
@@ -372,7 +373,9 @@ class GridCoordinator:
             self.logger.info(
                 f"Order filled: {filled_order.side.value} "
                 f"{filled_order.filled_amount}@{filled_order.filled_price} "
-                f"(Grid {filled_order.grid_id})"
+                f"(Grid {filled_order.grid_id}, order_id={filled_order.order_id}, "
+                f"fill_key={fill_key}, parent_order_id={filled_order.parent_order_id}, "
+                f"reverse_order_id={filled_order.reverse_order_id})"
             )
 
             #  触发持仓查询（订单成交后立即查询持仓，带5秒去重）
@@ -392,11 +395,15 @@ class GridCoordinator:
                     del self._grid_level_locks[grid_id_check]
 
             # 1. 更新状态
-            self.state.mark_order_filled(
-                filled_order.order_id,
-                filled_order.filled_price,
-                filled_order.filled_amount or filled_order.amount
-            )
+            state_updated = self._mark_state_order_filled_with_fallback(filled_order)
+            if not state_updated:
+                self.logger.info(
+                    f"Skipping already-processed or untracked fill: "
+                    f"order_id={filled_order.order_id}, grid_id={filled_order.grid_id}, "
+                    f"side={filled_order.side.value}, price={filled_order.price}, "
+                    f"state_active_orders={len(self.state.active_orders)}"
+                )
+                return
 
             #  2. 记录交易历史（不影响持仓，只用于统计和显示）
             # 持仓数据完全来自 position_monitor 的REST查询
@@ -1882,6 +1889,64 @@ class GridCoordinator:
             False - scalping mode disables all reverse orders
         """
         return False  # Scalping mode disables all reverse orders
+
+    def _mark_state_order_filled_with_fallback(self, filled_order: GridOrder) -> bool:
+        """Mark one filled order in shared state, even if the tracked key drifted."""
+        filled_amount = filled_order.filled_amount or filled_order.amount
+        if self.state.mark_order_filled(
+            filled_order.order_id,
+            filled_order.filled_price,
+            filled_amount,
+        ):
+            self.logger.info(
+                f"State fill matched by direct order id: "
+                f"order_id={filled_order.order_id}, grid_id={filled_order.grid_id}, "
+                f"side={filled_order.side.value}, price={filled_order.price}"
+            )
+            return True
+
+        matches = [
+            order
+            for order in self.state.active_orders.values()
+            if getattr(order, "status", None) == GridOrderStatus.PENDING
+            and order.grid_id == filled_order.grid_id
+            and order.side == filled_order.side
+            and order.price == filled_order.price
+        ]
+        if not matches:
+            self.logger.warning(
+                f"State fill reconciliation found no pending match: "
+                f"order_id={filled_order.order_id}, grid_id={filled_order.grid_id}, "
+                f"side={filled_order.side.value}, price={filled_order.price}, "
+                f"state_active_orders={len(self.state.active_orders)}"
+            )
+            return False
+
+        fallback_order = sorted(
+            matches,
+            key=lambda order: (
+                getattr(order, "created_at", None) or datetime.min,
+                order.order_id,
+            ),
+        )[0]
+        self.logger.warning(
+            f"State order id mismatch during fill reconciliation: "
+            f"filled_order_id={filled_order.order_id}, fallback_order_id={fallback_order.order_id}, "
+            f"grid_id={filled_order.grid_id}, side={filled_order.side.value}, "
+            f"price={filled_order.price}, matching_orders={len(matches)}"
+        )
+        matched = self.state.mark_order_filled(
+            fallback_order.order_id,
+            filled_order.filled_price,
+            filled_amount,
+        )
+        self.logger.info(
+            f"State fallback fill result: matched={matched}, "
+            f"filled_order_id={filled_order.order_id}, fallback_order_id={fallback_order.order_id}, "
+            f"grid_id={filled_order.grid_id}, side={filled_order.side.value}, "
+            f"price={filled_order.price}"
+        )
+        return matched
 
     def _sync_orders_from_engine(self):
         """
