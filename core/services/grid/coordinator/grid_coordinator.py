@@ -11,7 +11,7 @@ behaviors during sync and verification.
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from decimal import Decimal
 from datetime import datetime
 
