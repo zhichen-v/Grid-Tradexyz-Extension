@@ -402,7 +402,6 @@ class OrderHealthChecker:
             for order in exchange_orders
             if getattr(order, "price", None) is not None
         }
-        existing_keys.update(self._get_local_open_order_price_keys())
         existing_grid_ids = {
             grid_id
             for order in exchange_orders
