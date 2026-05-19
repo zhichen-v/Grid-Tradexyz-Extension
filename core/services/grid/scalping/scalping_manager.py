@@ -60,6 +60,13 @@ class ScalpingManager:
         """是否处于剥头皮模式"""
         return self._is_scalping_active
 
+    def _is_long_grid(self) -> bool:
+        return self.config.grid_type in [
+            GridType.LONG,
+            GridType.FOLLOW_LONG,
+            GridType.MARTINGALE_LONG,
+        ]
+
     def should_trigger(self, current_price: Decimal, current_grid_index: int) -> bool:
         """
         判断是否应该触发剥头皮模式
@@ -88,7 +95,7 @@ class ScalpingManager:
             return False  # 未启用剥头皮
 
         # 🔥 做多网格：Grid 1 = 最低价，价格跌到低位时触发（Grid ID <= trigger_grid）
-        if self.config.grid_type in [GridType.LONG, GridType.FOLLOW_LONG, GridType.MARTINGALE_LONG]:
+        if self._is_long_grid():
             should_trigger = current_grid_index <= self._trigger_grid
             if should_trigger:
                 self.logger.warning(
@@ -132,7 +139,7 @@ class ScalpingManager:
             return False  # 不在剥头皮模式中
 
         # 🔥 做多网格：Grid 1 = 最低价，价格反弹回高位时退出（Grid ID > trigger_grid）
-        if self.config.grid_type in [GridType.LONG, GridType.FOLLOW_LONG, GridType.MARTINGALE_LONG]:
+        if self._is_long_grid():
             should_exit = current_grid_index > self._trigger_grid
             if should_exit:
                 self.logger.info(
@@ -225,6 +232,22 @@ class ScalpingManager:
             return None
 
         # 🔥 新算法：基于已实现盈亏计算回本价格
+        is_long_grid = self._is_long_grid()
+
+        if is_long_grid and self._current_position <= 0:
+            self.logger.warning(
+                f"Skip scalping take-profit calculation: long-grid position "
+                f"must be positive, got {self._current_position}"
+            )
+            return None
+
+        if not is_long_grid and self._current_position >= 0:
+            self.logger.warning(
+                f"Skip scalping take-profit calculation: short-grid position "
+                f"must be negative, got {self._current_position}"
+            )
+            return None
+
         realized_pnl = self._current_equity - self._initial_capital
         position_abs = abs(self._current_position)
 
@@ -252,7 +275,7 @@ class ScalpingManager:
             return None
 
         # 🔥 做多网格：Grid 1 = 最低价
-        if self.config.grid_type in [GridType.LONG, GridType.FOLLOW_LONG, GridType.MARTINGALE_LONG]:
+        if self._is_long_grid():
             # 回本价格 = 当前价格 + 需要上涨的幅度
             breakeven_price = current_price + required_price_move
             order_side = GridOrderSide.SELL  # 卖出平仓
@@ -288,19 +311,21 @@ class ScalpingManager:
                 breakeven_price, direction="conservative")
 
             # 🔥 检查回本网格是否超出范围
-            if breakeven_grid < 1:
+            if breakeven_grid > self.config.grid_count:
                 # 回本价格超出网格范围（低于最低网格），使用最低网格作为止盈价格
                 self.logger.warning(
                     f"⚠️ 回本价格 ${breakeven_price:,.2f} (Grid {breakeven_grid}) 超出网格范围 "
-                    f"(最低Grid 1)，止盈价格将使用最低网格"
+                    f"(最低Grid {self.config.grid_count})，止盈价格将使用最低网格"
                 )
-                self._take_profit_grid_index = 1
+                self._take_profit_grid_index = self.config.grid_count
             else:
-                # 止盈网格 = 回本网格 - 止盈网格数（不低于第1格）
+                # 止盈网格 = 回本网格 + 止盈网格数（不超过最低网格）
+                # Short grids descend as the index increases, so a buy TP must
+                # move to a larger grid index than breakeven.
                 take_profit_grids = self.config.scalping_take_profit_grids
-                self._take_profit_grid_index = max(
-                    1,
-                    breakeven_grid - take_profit_grids
+                self._take_profit_grid_index = min(
+                    self.config.grid_count,
+                    breakeven_grid + take_profit_grids
                 )
 
         # 从网格配置中获取精确的止盈价格
@@ -308,6 +333,38 @@ class ScalpingManager:
             self._take_profit_grid_index)
 
         # 创建止盈订单
+        if order_side == GridOrderSide.BUY and take_profit_price >= current_price:
+            take_profit_grids = max(1, self.config.scalping_take_profit_grids)
+            current_grid = self.config.find_nearest_grid_index(
+                current_price,
+                direction="conservative",
+            )
+            adjusted_grid = min(
+                self.config.grid_count,
+                max(self._take_profit_grid_index, current_grid + take_profit_grids),
+            )
+            adjusted_price = self.config.get_grid_price(adjusted_grid)
+
+            if adjusted_price >= current_price:
+                adjusted_grid = min(self.config.grid_count, current_grid + 1)
+                adjusted_price = self.config.get_grid_price(adjusted_grid)
+
+            if adjusted_price >= current_price:
+                self.logger.warning(
+                    f"Skip short-grid scalping TP because no passive buy price "
+                    f"is available below current price ${current_price:.2f}: "
+                    f"calculated ${take_profit_price:.2f}, adjusted ${adjusted_price:.2f}"
+                )
+                return None
+
+            self.logger.warning(
+                f"Adjusted short-grid scalping TP below market to avoid an "
+                f"immediate buy fill: ${take_profit_price:.2f} -> "
+                f"${adjusted_price:.2f} (Grid {adjusted_grid})"
+            )
+            self._take_profit_grid_index = adjusted_grid
+            take_profit_price = adjusted_price
+
         self._take_profit_order = GridOrder(
             order_id=f"scalping_tp_{self._take_profit_grid_index}",
             grid_id=self._take_profit_grid_index,
@@ -393,7 +450,7 @@ class ScalpingManager:
             "buy" 或 "sell"
         """
         # 做多网格：取消所有卖单
-        if self.config.grid_type in [GridType.LONG, GridType.FOLLOW_LONG, GridType.MARTINGALE_LONG]:
+        if self._is_long_grid():
             return "sell"
         # 做空网格：取消所有买单
         else:

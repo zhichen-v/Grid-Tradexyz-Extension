@@ -437,6 +437,25 @@ class ScalpingOperations:
                 self.logger.info(" tracker显示无持仓，无需挂止盈订单")
                 return True
 
+            is_long_grid = self.config.grid_type in [
+                GridType.LONG,
+                GridType.FOLLOW_LONG,
+                GridType.MARTINGALE_LONG,
+            ]
+            if is_long_grid and tracker_position <= 0:
+                self.logger.error(
+                    f"Skip scalping take-profit placement: long-grid position "
+                    f"must be positive, got {tracker_position}"
+                )
+                return False
+
+            if not is_long_grid and tracker_position >= 0:
+                self.logger.error(
+                    f"Skip scalping take-profit placement: short-grid position "
+                    f"must be negative, got {tracker_position}"
+                )
+                return False
+
             self.logger.info(
                 f" 持仓验证（tracker）: {tracker_position} @ ${tracker_cost:,.2f}"
             )
@@ -592,6 +611,15 @@ class ScalpingOperations:
                 self.logger.warning(
                     f"️ 止盈订单挂出失败，准备第{attempt+2}次尝试..."
                 )
+                await asyncio.sleep(1.0)
+                latest_position = self.tracker.get_current_position()
+                if latest_position != tracker_position:
+                    self.logger.warning(
+                        f"Stop scalping TP retry after ambiguous placement: "
+                        f"position changed from {tracker_position} to {latest_position}. "
+                        f"The order may have filled before open-order verification."
+                    )
+                    return True
 
         # 达到最大尝试次数，挂单仍失败
         self.logger.error(
