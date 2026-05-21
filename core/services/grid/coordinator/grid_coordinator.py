@@ -90,6 +90,7 @@ class GridCoordinator:
         self._running = False
         self._paused = False
         self._resetting = False  # Reset-in-progress flag used by protection and scalping flows.
+        self._emergency_stop_requested = False
 
         #  Transaction deduplication mechanism: Prevents the same transaction from being processed repeatedly by multiple detection mechanisms.
         # key = 'grid_id:side:price', value = timestamp
@@ -684,12 +685,15 @@ class GridCoordinator:
             f"Error count ({self._error_count}/{self._max_errors}): {error}"
         )
 
-        # 如果错误次数过多，暂停系统
+        # Repeated order-handling failures leave fills unmanaged, so stop and cancel live orders.
         if self._error_count >= self._max_errors:
+            if self._emergency_stop_requested:
+                return
+            self._emergency_stop_requested = True
             self.logger.error(
-                f"Error threshold exceeded ({self._max_errors}); pausing system"
+                f"Error threshold exceeded ({self._max_errors}); stopping system and cancelling open orders"
             )
-            asyncio.create_task(self.pause())
+            asyncio.create_task(self.stop())
 
     async def _cleanup_before_start(self):
         """
@@ -858,6 +862,9 @@ class GridCoordinator:
             return
 
         # 🆕 启动前清理旧订单和持仓
+        self._paused = False
+        self._emergency_stop_requested = False
+
         await self._cleanup_before_start()
 
         await self.initialize()

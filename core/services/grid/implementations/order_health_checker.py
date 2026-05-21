@@ -67,10 +67,13 @@ class OrderHealthChecker:
 
         try:
             self._restored_missing_orders_in_sync = 0
+            repair_block_reason = self._get_health_repair_suspend_reason()
             exchange_orders, positions = await self._fetch_orders_and_positions()
 
-            unresolved_orders = await self._sync_orders_into_engine(exchange_orders)
-            repair_block_reason = self._get_health_repair_suspend_reason()
+            unresolved_orders = await self._sync_orders_into_engine(
+                exchange_orders,
+                allow_restore=repair_block_reason is None,
+            )
             if repair_block_reason:
                 consistency_deferred = True
                 self.logger.info(
@@ -173,10 +176,42 @@ class OrderHealthChecker:
         getter = getattr(self.engine, "get_health_repair_suspend_reason", None)
         if callable(getter):
             try:
-                return getter()
+                reason = getter()
+                if reason:
+                    return reason
             except Exception:
-                return None
-        return getattr(self.engine, "_health_repairs_suspended_reason", None)
+                pass
+
+        reason = getattr(self.engine, "_health_repairs_suspended_reason", None)
+        if reason:
+            return reason
+
+        if getattr(self.engine, "_shutting_down", False):
+            return "engine shutdown in progress"
+        if not getattr(self.engine, "_running", True):
+            return "engine not running"
+
+        coordinator = getattr(self.engine, "coordinator", None)
+        if coordinator is None:
+            return None
+
+        if not getattr(coordinator, "_running", True):
+            return "coordinator stopped"
+        if getattr(coordinator, "_paused", False):
+            return "coordinator paused"
+        public_pause_state = getattr(coordinator, "is_paused", False)
+        if isinstance(public_pause_state, bool) and public_pause_state:
+            return "coordinator order operations paused"
+        if callable(public_pause_state):
+            try:
+                if public_pause_state():
+                    return "coordinator order operations paused"
+            except Exception:
+                pass
+        if getattr(coordinator, "_resetting", False) or getattr(coordinator, "_is_resetting", False):
+            return "coordinator reset in progress"
+
+        return None
 
     async def _fetch_orders_and_positions(self) -> Tuple[List[OrderData], List[PositionData]]:
         """Fetch open orders and positions from the exchange."""
@@ -196,7 +231,11 @@ class OrderHealthChecker:
 
         return orders, positions
 
-    async def _sync_orders_into_engine(self, exchange_orders: List[OrderData]) -> int:
+    async def _sync_orders_into_engine(
+        self,
+        exchange_orders: List[OrderData],
+        allow_restore: bool = True,
+    ) -> int:
         """Sync remote open orders into the engine pending-order cache."""
         exchange_order_ids = {order.id for order in exchange_orders if getattr(order, "id", None)}
         filled_orders: List[GridOrder] = []
@@ -229,7 +268,7 @@ class OrderHealthChecker:
                     self.config.symbol,
                 )
             except Exception:
-                if await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
+                if allow_restore and await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
                     continue
                 unresolved_orders += 1
                 unresolved_price_keys.add(self._order_price_key(grid_order))
@@ -287,7 +326,7 @@ class OrderHealthChecker:
                 grid_order.mark_cancelled()
                 self._clear_pending_order_refs(grid_order, alias_keys)
             else:
-                if await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
+                if allow_restore and await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
                     continue
                 unresolved_orders += 1
                 unresolved_price_keys.add(self._order_price_key(grid_order))

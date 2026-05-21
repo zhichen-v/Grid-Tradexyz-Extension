@@ -11,6 +11,10 @@
 
 ### Fixed
 
+#### 2026-05-21
+
+- Fixed paused/error-threshold grid recovery so health checks no longer cancel, restore, or place missing orders while the coordinator is paused, stopped, or resetting, and repeated fill-handling errors now stop the runtime and cancel open orders instead of leaving live orders unmanaged.
+
 #### 2026-05-19
 
 - Fixed short-grid scalping take-profit placement so aggregate buy TP orders are forced below the current market instead of becoming immediately marketable, blocked short-grid scalping from placing buy TP orders after the tracked position is no longer short, and stopped ambiguous TP retries once position sync shows the prior order likely filled.
@@ -124,6 +128,8 @@
 
 - 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile run_grid_trading.py core\services\grid\models\grid_config.py core\services\grid\models\grid_metrics.py core\services\grid\coordinator\grid_coordinator.py core\services\grid\coordinator\grid_reset_manager.py core\services\grid\terminal_ui.py`
 - 2026-05-21: Parsed all `config/grid/*.yaml` files with PyYAML and ran local stop-loss assertions for long and short trigger directions using `config/grid/example.yaml`.
+- 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile core\services\grid\implementations\order_health_checker.py core\services\grid\coordinator\grid_coordinator.py`
+- 2026-05-21: Local assertion script covering paused/stopped/reset health-repair suspension and confirming missing-order restore is not attempted while repair is blocked.
 
 - 2026-05-19: `.\.venv\Scripts\python.exe -m py_compile core\services\grid\scalping\scalping_manager.py core\services\grid\coordinator\scalping_operations.py`
 - 2026-05-19: Local assertion script covering the TSLA short-grid scalping scenario where `current_price=414.64`, position `-0.6`, and prior realized profit previously produced a marketable buy TP above the market.
