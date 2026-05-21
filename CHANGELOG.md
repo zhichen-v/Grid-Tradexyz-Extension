@@ -13,6 +13,7 @@
 
 #### 2026-05-21
 
+- Fixed TradeXYZ XYZ symbol routing so configured assets such as `MU` and `MU-USD` are recognized as XYZ markets instead of falling through to ccxt/Hyperliquid ticker calls, and grid startup now fails fast when exchange connection setup returns unsuccessful.
 - Fixed paused/error-threshold grid recovery so health checks no longer cancel, restore, or place missing orders while the coordinator is paused, stopped, or resetting, and repeated fill-handling errors now stop the runtime and cancel open orders instead of leaving live orders unmanaged.
 
 #### 2026-05-19
@@ -128,6 +129,8 @@
 
 - 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile run_grid_trading.py core\services\grid\models\grid_config.py core\services\grid\models\grid_metrics.py core\services\grid\coordinator\grid_coordinator.py core\services\grid\coordinator\grid_reset_manager.py core\services\grid\terminal_ui.py`
 - 2026-05-21: Parsed all `config/grid/*.yaml` files with PyYAML and ran local stop-loss assertions for long and short trigger directions using `config/grid/example.yaml`.
+- 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile core\adapters\exchanges\adapters\tradexyz_base.py core\adapters\exchanges\adapters\tradexyz.py core\services\grid\implementations\grid_engine_impl.py`
+- 2026-05-21: Local assertion script covering TradeXYZ `MU`, `MU-USD`, `MU/USD:PERP`, and `xyz:MU` routing to XYZ while keeping crypto symbols on the non-XYZ path; confirmed public `allMids` contains `xyz:MU` and `TradeXYZRest.get_ticker("MU-USD")` returns through the XYZ path.
 - 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile core\services\grid\implementations\order_health_checker.py core\services\grid\coordinator\grid_coordinator.py`
 - 2026-05-21: Local assertion script covering paused/stopped/reset health-repair suspension and confirming missing-order restore is not attempted while repair is blocked.
 

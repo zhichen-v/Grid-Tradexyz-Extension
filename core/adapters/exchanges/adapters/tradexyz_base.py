@@ -6,7 +6,7 @@ through the `dex="xyz"` namespace and use `xyz:`-prefixed coin identifiers.
 """
 
 from pathlib import Path
-from typing import List
+from typing import List, Set
 
 import yaml
 
@@ -18,6 +18,7 @@ class TradeXYZBase(HyperliquidBase):
 
     XYZ_DEX = "xyz"
     XYZ_COIN_PREFIX = "xyz:"
+    XYZ_QUOTE_SUFFIXES = {"USD", "USDC", "USDT", "PERP"}
 
     XYZ_ASSET_CLASSES = {
         "us_stocks": [
@@ -29,6 +30,7 @@ class TradeXYZBase(HyperliquidBase):
             "NVDA",
             "TSLA",
             "AMD",
+            "MU",
             "PLTR",
             "COIN",
             "MSTR",
@@ -109,35 +111,85 @@ class TradeXYZBase(HyperliquidBase):
                 self.logger.error(f"Failed to load TradeXYZ config: {exc}")
 
     def is_xyz_symbol(self, symbol: str) -> bool:
-        if symbol.startswith(self.XYZ_COIN_PREFIX):
+        normalized_symbol = self._normalize_symbol_text(symbol)
+        if not normalized_symbol:
+            return False
+
+        if normalized_symbol.startswith(self.XYZ_COIN_PREFIX.upper()):
             return True
 
-        base_symbol = self._extract_base_symbol(symbol)
-        for assets in self.XYZ_ASSET_CLASSES.values():
-            if base_symbol in assets:
-                return True
-        return False
+        xyz_assets = self._get_xyz_asset_set()
+        base_symbol = self._extract_base_symbol(normalized_symbol)
+        return normalized_symbol in xyz_assets or base_symbol in xyz_assets
 
     def to_xyz_coin(self, symbol: str) -> str:
-        if symbol.startswith(self.XYZ_COIN_PREFIX):
-            return symbol
+        normalized_symbol = self._normalize_symbol_text(symbol)
+        if normalized_symbol.startswith(self.XYZ_COIN_PREFIX.upper()):
+            return f"{self.XYZ_COIN_PREFIX}{normalized_symbol.split(':', 1)[1]}"
 
-        base = self._extract_base_symbol(symbol)
+        base = self._extract_base_symbol(normalized_symbol)
         return f"{self.XYZ_COIN_PREFIX}{base}"
 
     def from_xyz_coin(self, xyz_coin: str) -> str:
-        if xyz_coin.startswith(self.XYZ_COIN_PREFIX):
-            return xyz_coin[len(self.XYZ_COIN_PREFIX) :]
-        return xyz_coin
+        normalized_coin = self._normalize_symbol_text(xyz_coin)
+        if normalized_coin.startswith(self.XYZ_COIN_PREFIX.upper()):
+            return normalized_coin[len(self.XYZ_COIN_PREFIX) :]
+        return normalized_coin
 
     def _extract_base_symbol(self, symbol: str) -> str:
-        if symbol.startswith(self.XYZ_COIN_PREFIX):
+        symbol = self._normalize_symbol_text(symbol)
+
+        if symbol.startswith(self.XYZ_COIN_PREFIX.upper()):
             symbol = symbol[len(self.XYZ_COIN_PREFIX) :]
 
+        if ":" in symbol:
+            symbol = symbol.split(":", 1)[0]
+
         if "/" in symbol:
-            symbol = symbol.split("/")[0]
+            symbol = symbol.split("/", 1)[0]
+        elif "-" in symbol:
+            parts = symbol.split("-")
+            while len(parts) > 1 and parts[-1] in self.XYZ_QUOTE_SUFFIXES:
+                parts.pop()
+            symbol = "-".join(parts)
 
         return symbol.upper()
+
+    @staticmethod
+    def _normalize_symbol_text(symbol: str) -> str:
+        return str(symbol or "").strip().upper()
+
+    def _get_xyz_asset_set(self) -> Set[str]:
+        assets: Set[str] = set()
+        self._add_xyz_assets(assets, self.get_xyz_asset_list())
+        return assets
+
+    def _get_configured_xyz_assets(self) -> List[str]:
+        if not isinstance(self.xyz_config, dict):
+            return []
+
+        tradexyz_config = self.xyz_config.get("tradexyz", {})
+        if not isinstance(tradexyz_config, dict):
+            return []
+
+        symbols_config = tradexyz_config.get("symbols", {})
+        if not isinstance(symbols_config, dict):
+            return []
+
+        xyz_symbols = symbols_config.get("xyz", [])
+        if not isinstance(xyz_symbols, list):
+            return []
+
+        return [str(symbol) for symbol in xyz_symbols if symbol]
+
+    def _add_xyz_assets(self, asset_set: Set[str], assets: List[str]) -> None:
+        for asset in assets:
+            normalized_asset = self._normalize_symbol_text(asset)
+            if not normalized_asset:
+                continue
+
+            asset_set.add(normalized_asset)
+            asset_set.add(self._extract_base_symbol(normalized_asset))
 
     def to_tradexyz_symbol(self, symbol: str) -> str:
         if self.is_xyz_symbol(symbol):
@@ -151,11 +203,13 @@ class TradeXYZBase(HyperliquidBase):
         return super().map_symbol(symbol)
 
     def reverse_map_symbol(self, exchange_symbol: str) -> str:
-        if exchange_symbol.startswith(self.XYZ_COIN_PREFIX):
+        normalized_symbol = self._normalize_symbol_text(exchange_symbol)
+
+        if normalized_symbol.startswith(self.XYZ_COIN_PREFIX.upper()):
             return self.from_xyz_coin(exchange_symbol)
 
-        if exchange_symbol.endswith("/USD:PERP"):
-            base_symbol = exchange_symbol.split("/")[0]
+        if normalized_symbol.endswith("/USD:PERP"):
+            base_symbol = normalized_symbol.split("/")[0]
             if self.is_xyz_symbol(base_symbol):
                 return base_symbol
 
@@ -163,8 +217,18 @@ class TradeXYZBase(HyperliquidBase):
 
     def get_xyz_asset_list(self) -> List[str]:
         all_assets: List[str] = []
-        for assets in self.XYZ_ASSET_CLASSES.values():
-            all_assets.extend(assets)
+        seen: Set[str] = set()
+
+        for assets in list(self.XYZ_ASSET_CLASSES.values()) + [
+            self._get_configured_xyz_assets()
+        ]:
+            for asset in assets:
+                normalized_asset = self._normalize_symbol_text(asset)
+                if not normalized_asset or normalized_asset in seen:
+                    continue
+                all_assets.append(normalized_asset)
+                seen.add(normalized_asset)
+
         return all_assets
 
     def get_supported_xyz_symbols(self) -> List[str]:

@@ -74,7 +74,11 @@ class GridEngineImpl(IGridEngine):
         self._last_ws_check_time = 0.0
 
         if not self.exchange.is_connected():
-            await self.exchange.connect()
+            connected = await self.exchange.connect()
+            if not connected or not self.exchange.is_connected():
+                raise ConnectionError(
+                    f"Failed to connect to exchange: {config.exchange}"
+                )
             self.logger.info(f"Connected to exchange: {config.exchange}")
 
         try:
