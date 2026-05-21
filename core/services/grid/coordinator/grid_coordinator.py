@@ -114,6 +114,9 @@ class GridCoordinator:
         self._price_escape_trigger_count = 0  # 价格朝有利方向脱离触发次数
         self._take_profit_trigger_count = 0  # 止盈模式触发次数
         self._capital_protection_trigger_count = 0  # 本金保护模式触发次数
+        self._stop_loss_trigger_count = 0
+        self._stop_loss_triggered = False
+        self._stop_loss_monitor_task: Optional[asyncio.Task] = None
 
         #  价格移动网格专用
         self._price_escape_start_time: Optional[float] = None  # 价格脱离开始时间
@@ -199,6 +202,13 @@ class GridCoordinator:
             # 获取当前市价（所有模式都需要，用于过滤 taker 订单）
             current_price = await self.engine.get_current_price()
             self.logger.info(f"Current market price: ${current_price:,.2f}")
+
+            if self.config.check_stop_loss(current_price):
+                raise ValueError(
+                    f"Startup price ${current_price:,.4f} already breaches "
+                    f"stop_loss_price ${self.config.stop_loss_price:,.4f}; "
+                    "refusing to place grid orders"
+                )
 
             #  价格移动网格：根据当前价格设置价格区间
             if self.config.is_follow_mode():
@@ -947,6 +957,15 @@ class GridCoordinator:
             asyncio.create_task(self._price_escape_monitor())
             self.logger.info("Price escape monitor started")
 
+        if self.config.is_stop_loss_enabled():
+            self._stop_loss_triggered = False
+            self._stop_loss_monitor_task = asyncio.create_task(
+                self._stop_loss_monitor()
+            )
+            self.logger.info(
+                f"Stop-loss monitor started at ${self.config.stop_loss_price:,.4f}"
+            )
+
         #  启动余额轮询监控（使用新模块 BalanceMonitor）
         await self.balance_monitor.start_monitoring()
 
@@ -975,6 +994,21 @@ class GridCoordinator:
         #  停止余额监控（使用新模块）
         if hasattr(self.engine, 'begin_shutdown'):
             self.engine.begin_shutdown()
+
+        current_task = asyncio.current_task()
+        if (
+            self._stop_loss_monitor_task
+            and self._stop_loss_monitor_task is not current_task
+            and not self._stop_loss_monitor_task.done()
+        ):
+            self._stop_loss_monitor_task.cancel()
+            try:
+                await self._stop_loss_monitor_task
+            except asyncio.CancelledError:
+                pass
+        if self._stop_loss_monitor_task is not current_task:
+            self._stop_loss_monitor_task = None
+
         await self.balance_monitor.stop_monitoring()
 
         #  停止持仓同步监控（使用新模块）
@@ -1145,6 +1179,12 @@ class GridCoordinator:
             stats.price_lock_enabled = True
             stats.price_lock_active = self.price_lock_manager.is_locked()
             stats.price_lock_threshold = self.config.price_lock_threshold
+
+        if self.config.is_stop_loss_enabled():
+            stats.stop_loss_enabled = True
+            stats.stop_loss_triggered = self._stop_loss_triggered
+            stats.stop_loss_price = self.config.stop_loss_price
+            stats.stop_loss_trigger_count = self._stop_loss_trigger_count
 
         # 🆕 触发次数统计（仅标记）
         stats.scalping_trigger_count = self._scalping_trigger_count
@@ -1358,6 +1398,41 @@ class GridCoordinator:
         )
 
     # ==================== 价格移动网格专用方法 ====================
+
+    async def _stop_loss_monitor(self):
+        """Monitor current price and execute a configured stop loss once."""
+        self.logger.info("Stop-loss monitor loop started")
+
+        while self._running:
+            try:
+                if self._stop_loss_triggered:
+                    await asyncio.sleep(self.config.stop_loss_check_interval)
+                    continue
+
+                if self._resetting or self._is_resetting:
+                    await asyncio.sleep(self.config.stop_loss_check_interval)
+                    continue
+
+                current_price = await self.engine.get_current_price()
+                if self.config.check_stop_loss(current_price):
+                    self._stop_loss_triggered = True
+                    self.logger.warning(
+                        f"Stop loss condition met: current=${current_price:,.4f}, "
+                        f"threshold=${self.config.stop_loss_price:,.4f}"
+                    )
+                    await self.reset_manager.execute_stop_loss_shutdown(current_price)
+                    break
+
+                await asyncio.sleep(self.config.stop_loss_check_interval)
+
+            except asyncio.CancelledError:
+                self.logger.info("Stop-loss monitor stopped")
+                break
+            except Exception as e:
+                self.logger.error(f"Stop-loss monitor error: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                await asyncio.sleep(max(1, self.config.stop_loss_check_interval))
 
     async def _price_escape_monitor(self):
         """

@@ -149,6 +149,104 @@ class GridResetManager:
             self.coordinator._resetting = False
             self.logger.info(" 系统锁定已释放")
 
+    async def execute_stop_loss_shutdown(self, current_price: Decimal) -> bool:
+        """Cancel open orders, close the live position, and stop the grid runtime."""
+        if self.coordinator._is_resetting or self.coordinator._resetting:
+            self.logger.warning("Stop loss shutdown skipped because a reset is already in progress")
+            return False
+
+        self.coordinator._is_resetting = True
+        self.coordinator._resetting = True
+        self.coordinator.is_emergency_stopped = True
+
+        close_success = True
+        try:
+            stop_price = self.config.stop_loss_price
+            self.logger.warning(
+                f"Stop loss triggered: current=${current_price:,.4f}, "
+                f"threshold=${stop_price:,.4f}; canceling orders and closing position"
+            )
+
+            cancel_verified = await self.order_ops.cancel_all_orders_with_verification(
+                max_retries=3,
+                retry_delay=1.5,
+                first_delay=0.8
+            )
+            if not cancel_verified:
+                self.logger.error(
+                    "Stop loss order cancellation was not fully verified; "
+                    "continuing shutdown and position close attempt"
+                )
+
+            current_position = await self._resolve_live_position_for_close()
+            if current_position != 0:
+                close_side = GridOrderSide.SELL if current_position > 0 else GridOrderSide.BUY
+                self.logger.warning(
+                    f"Stop loss closing position: {close_side.value} {abs(current_position)}"
+                )
+                try:
+                    await self.engine.place_market_order(
+                        side=close_side,
+                        amount=abs(current_position)
+                    )
+                    self.logger.warning("Stop loss market close submitted")
+                except Exception as exc:
+                    close_success = False
+                    self.logger.error(f"Stop loss market close failed: {exc}")
+            else:
+                self.logger.info("Stop loss found no open position to close")
+
+            self.state.active_orders.clear()
+            self.state.pending_buy_orders = 0
+            self.state.pending_sell_orders = 0
+            self.tracker.reset()
+            self.coordinator._stop_loss_trigger_count += 1
+
+            await self.coordinator.stop()
+            return close_success
+        except Exception as exc:
+            close_success = False
+            self.logger.error(f"Stop loss shutdown failed: {exc}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
+        finally:
+            self.coordinator._is_resetting = False
+            self.coordinator._resetting = False
+
+    async def _resolve_live_position_for_close(self) -> Decimal:
+        """Prefer the exchange position, then fall back to tracker/state snapshots."""
+        try:
+            positions = await self.engine.exchange.get_positions(symbols=[self.config.symbol])
+        except TypeError:
+            positions = await self.engine.exchange.get_positions([self.config.symbol])
+        except Exception as exc:
+            self.logger.warning(f"Failed to query exchange position for stop loss: {exc}")
+            positions = []
+
+        if positions:
+            position = positions[0]
+            position_size = Decimal(str(position.size or Decimal('0')))
+            side = getattr(position, "side", "")
+            side_value = str(getattr(side, "value", side)).lower()
+            if side_value == "short" and position_size > 0:
+                position_size = -position_size
+            if position_size != 0:
+                return position_size
+
+        try:
+            tracker_position = self.tracker.get_current_position()
+            if tracker_position != 0:
+                return tracker_position
+        except Exception as exc:
+            self.logger.warning(f"Failed to read tracker position for stop loss: {exc}")
+
+        state_position = getattr(self.state, "current_position", Decimal('0'))
+        try:
+            return Decimal(str(state_position or Decimal('0')))
+        except Exception:
+            return Decimal('0')
+
     async def execute_price_follow_reset(
         self,
         current_price: Decimal,

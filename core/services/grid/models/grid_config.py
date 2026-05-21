@@ -103,6 +103,9 @@ class GridConfig:
     price_lock_enabled: bool = False                 # 是否启用价格锁定模式
     # 价格锁定阈值（做多：价格>=阈值时锁定；做空：价格<=阈值时锁定）
     price_lock_threshold: Optional[Decimal] = None
+    stop_loss_enabled: bool = False                  # Price-based stop loss switch.
+    stop_loss_price: Optional[Decimal] = None        # Long: trigger at/below; short: trigger at/above.
+    stop_loss_check_interval: int = 1                # Stop-loss monitor interval in seconds.
     price_lock_start_at_threshold: bool = False      # 启动时使用阈值作为起点（仅价格移动网格+价格超出阈值时生效）
     # 说明：仅对价格移动网格（FOLLOW模式）生效
     # - 做多：如果当前价格 > 阈值，则以阈值为网格上限启动
@@ -152,6 +155,12 @@ class GridConfig:
 
     def _validate(self):
         """验证配置参数"""
+        if self.stop_loss_enabled:
+            if self.stop_loss_price is None or self.stop_loss_price <= 0:
+                raise ValueError("stop_loss_price must be greater than 0 when stop_loss_enabled is true")
+            if self.stop_loss_check_interval <= 0:
+                raise ValueError("stop_loss_check_interval must be greater than 0")
+
         # 价格移动网格的价格区间在运行时动态设置，跳过验证
         if self.is_follow_mode():
             if self.follow_grid_count is None or self.follow_grid_count <= 0:
@@ -588,6 +597,23 @@ class GridConfig:
     def is_capital_protection_enabled(self) -> bool:
         """判断是否启用本金保护模式"""
         return self.capital_protection_enabled
+
+    def is_stop_loss_enabled(self) -> bool:
+        """Return whether price-based stop loss is enabled."""
+        return self.stop_loss_enabled
+
+    def check_stop_loss(self, current_price: Decimal) -> bool:
+        """Return whether current price has crossed the configured stop-loss level."""
+        if not self.stop_loss_enabled or self.stop_loss_price is None:
+            return False
+
+        if self.grid_type in [GridType.LONG, GridType.FOLLOW_LONG, GridType.MARTINGALE_LONG]:
+            return current_price <= self.stop_loss_price
+
+        if self.grid_type in [GridType.SHORT, GridType.FOLLOW_SHORT, GridType.MARTINGALE_SHORT]:
+            return current_price >= self.stop_loss_price
+
+        return False
 
     def __repr__(self) -> str:
         mode = "Martingale" if self.is_martingale_mode() else "Normal"

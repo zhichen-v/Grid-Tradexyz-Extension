@@ -2,6 +2,13 @@
 
 ## [Unreleased] - 2026-04-08
 
+### Added
+
+#### 2026-05-21
+
+- Added price-based grid stop loss settings: when enabled, long grids trigger at or below `stop_loss_price`, short grids trigger at or above it, then cancel open orders, market-close the current position, and stop the grid runtime.
+- Documented stop loss settings in `config/grid/README.md` and filled `config/grid/example.yaml` with a complete English TradeXYZ example.
+
 ### Fixed
 
 #### 2026-05-19
@@ -114,6 +121,9 @@
 - Strengthened health-check validation so success is no longer inferred from order-count parity alone.
 
 ### Validation
+
+- 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile run_grid_trading.py core\services\grid\models\grid_config.py core\services\grid\models\grid_metrics.py core\services\grid\coordinator\grid_coordinator.py core\services\grid\coordinator\grid_reset_manager.py core\services\grid\terminal_ui.py`
+- 2026-05-21: Parsed all `config/grid/*.yaml` files with PyYAML and ran local stop-loss assertions for long and short trigger directions using `config/grid/example.yaml`.
 
 - 2026-05-19: `.\.venv\Scripts\python.exe -m py_compile core\services\grid\scalping\scalping_manager.py core\services\grid\coordinator\scalping_operations.py`
 - 2026-05-19: Local assertion script covering the TSLA short-grid scalping scenario where `current_price=414.64`, position `-0.6`, and prior realized profit previously produced a marketable buy TP above the market.

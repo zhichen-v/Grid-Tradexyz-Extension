@@ -234,6 +234,16 @@ def create_grid_config(config_data: dict) -> GridConfig:
             "price_lock_start_at_threshold"
         ]
 
+    # Stop-loss settings.
+    if "stop_loss_enabled" in grid_config:
+        params["stop_loss_enabled"] = grid_config["stop_loss_enabled"]
+    if "stop_loss_price" in grid_config and grid_config["stop_loss_price"] is not None:
+        params["stop_loss_price"] = Decimal(str(grid_config["stop_loss_price"]))
+    if "stop_loss_check_interval" in grid_config:
+        params["stop_loss_check_interval"] = int(
+            grid_config["stop_loss_check_interval"]
+        )
+
     # Reverse-order settings.
     if "reverse_order_grid_distance" in grid_config:
         params["reverse_order_grid_distance"] = int(

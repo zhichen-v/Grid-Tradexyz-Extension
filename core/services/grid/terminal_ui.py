@@ -206,6 +206,15 @@ class GridTerminalUI:
             lock_style = "bold yellow" if stats.price_lock_active else "bold cyan"
             self._append_field(content, "Price lock", lock_text, value_style=lock_style)
 
+        if stats.stop_loss_enabled:
+            stop_text = (
+                f"Triggered | count {stats.stop_loss_trigger_count}"
+                if stats.stop_loss_triggered
+                else f"Armed | threshold ${stats.stop_loss_price:,.2f}"
+            )
+            stop_style = "bold red" if stats.stop_loss_triggered else "bold cyan"
+            self._append_field(content, "Stop loss", stop_text, value_style=stop_style)
+
         if stats.price_escape_active:
             direction_text = "DOWN" if stats.price_escape_direction == "down" else "UP"
             self._append_field(

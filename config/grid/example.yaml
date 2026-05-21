@@ -1,0 +1,66 @@
+grid_system:
+  # Exchange and instrument
+  exchange: "tradexyz"
+  symbol: "NVDA"
+
+  # Grid mode
+  # Supported values: long, short, follow_long, follow_short, martingale_long, martingale_short.
+  grid_type: "long"
+
+  # Fixed-range price band
+  lower_price: 180.0
+  upper_price: 190.0
+
+  # Order sizing
+  grid_interval: 0.5
+  order_amount: 0.1
+  quantity_precision: 1
+
+  # Optional martingale sizing.
+  # Keep this at 0.0 for fixed-size orders.
+  martingale_increment: 0.0
+
+  # Scalping mode.
+  # When enabled, the strategy switches to a consolidated take-profit order
+  # after price reaches the configured grid-depth trigger.
+  scalping_enabled: false
+  scalping_trigger_percent: 90
+  scalping_take_profit_grids: 2
+
+  # Capital protection.
+  # When enabled, the strategy waits for symbol-level equity recovery after
+  # the configured grid-depth trigger before resetting.
+  capital_protection_enabled: false
+  capital_protection_trigger_percent: 40
+
+  # Equity-based take profit.
+  # Example: 0.01 means 1% of the symbol-level initial capital.
+  take_profit_enabled: false
+  take_profit_percentage: 0.01
+
+  # Favorable-direction price lock.
+  # For long grids, price_lock_threshold is checked above the market.
+  # For short grids, price_lock_threshold is checked below the market.
+  price_lock_enabled: false
+  price_lock_threshold: 999999.0
+  price_lock_start_at_threshold: false
+
+  # Price-based stop loss.
+  # For long grids, the stop triggers when market price is at or below this price.
+  # For short grids, the stop triggers when market price is at or above this price.
+  # On trigger, the runtime cancels open orders, market-closes the current position,
+  # and stops the grid system.
+  stop_loss_enabled: true
+  stop_loss_price: 178.0
+  stop_loss_check_interval: 1
+
+  # Reverse order behavior.
+  # A value of 1 places reverse orders one grid interval away from the filled price.
+  reverse_order_grid_distance: 1
+
+  # Runtime health checks.
+  order_health_check_interval: 15
+
+  # Optional position health-check tolerance.
+  position_tolerance:
+    tolerance_multiplier: 0.25

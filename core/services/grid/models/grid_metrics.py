@@ -104,6 +104,12 @@ class GridStatistics:
     price_lock_active: bool = False            # 价格锁定是否已激活
     price_lock_threshold: Decimal = Decimal('0')  # 价格锁定阈值
 
+    # Stop-loss status
+    stop_loss_enabled: bool = False
+    stop_loss_triggered: bool = False
+    stop_loss_price: Decimal = Decimal('0')
+    stop_loss_trigger_count: int = 0
+
     # 🆕 触发次数统计（仅标记次数，无实质性功能）
     scalping_trigger_count: int = 0            # 剥头皮模式触发次数
     price_escape_trigger_count: int = 0        # 价格朝有利方向脱离触发次数

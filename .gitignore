@@ -33,5 +33,4 @@ CLAUDE.md
 README_old.md
 AGENTS.md
 
-config/grid/tradexyz_long.yaml
-config/grid/tradexyz_long_NVDA.yaml
+config/grid/trade_*.yaml

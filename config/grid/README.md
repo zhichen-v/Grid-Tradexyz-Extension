@@ -8,6 +8,7 @@
 
 | 檔案 | 交易所 | 類型 | 用途 |
 |------|--------|------|------|
+| `example.yaml` | TradeXYZ | `long` | 完整英文範例，包含 stop loss 設定 |
 | `backpack_capital_protection_long.yaml` | Backpack | `follow_long` | 做多跟隨網格，四道保護全開的完整範例 |
 | `backpack_capital_protection_short.yaml` | Backpack | `follow_short` | 做空跟隨網格，四道保護全開的完整範例 |
 | `tradexyz_long.yaml` | TradeXYZ | `long` | 固定區間做多範例 |
@@ -230,7 +231,7 @@ grid_system:
 
 ## 保護機制
 
-這套 grid 有四種額外保護／控制模式，可以單獨開啟。
+這套 grid 有五種額外保護／控制模式，可以單獨開啟。
 
 ### 1. Scalping 模式
 
@@ -313,6 +314,21 @@ trigger_grid = grid_count - int(grid_count * capital_protection_trigger_percent 
 - 做空：當價格 `<= threshold` 時觸發鎖定
 - `price_lock_start_at_threshold` 只在 `follow_long` / `follow_short` 生效
 
+### 5. Stop Loss 模式
+
+| 參數 | 實際預設值 | 說明 |
+|------|------------|------|
+| `stop_loss_enabled` | `false` | 是否啟用設定價格止損 |
+| `stop_loss_price` | 無 | 觸發止損的價格 |
+| `stop_loss_check_interval` | `1` | 檢查間隔，單位秒 |
+
+實際行為：
+
+- 做多網格：當市價 `<= stop_loss_price` 時觸發
+- 做空網格：當市價 `>= stop_loss_price` 時觸發
+- 觸發後會取消所有掛單、市價平掉目前持倉，然後停止 grid runtime
+- 若啟動時市價已經越過止損價，系統會拒絕掛出初始網格單
+
 ## 巢狀設定
 
 ### `spot_reserve`
@@ -373,9 +389,10 @@ grid_system:
   capital_protection_enabled: false
   take_profit_enabled: false
   price_lock_enabled: false
+  stop_loss_enabled: false
 ```
 
-### 範例 2：跟隨網格加四道保護
+### 範例 2：跟隨網格加保護模式
 
 ```yaml
 grid_system:
@@ -399,6 +416,9 @@ grid_system:
   price_lock_enabled: true
   price_lock_threshold: 50.0
   price_lock_start_at_threshold: false
+  stop_loss_enabled: true
+  stop_loss_price: 42.0
+  stop_loss_check_interval: 1
   reverse_order_grid_distance: 1
   order_health_check_interval: 300
 ```
@@ -426,10 +446,12 @@ grid_system:
 - `martingale_increment` 會快速放大持倉，請先用很小數值測試
 - `reverse_order_grid_distance` 調大會增加單筆目標利潤，也會降低成交速度
 - scalping 與 capital protection 的百分比，本質上都是轉成格位，不是直接拿價格百分比比較
+- 做多的 `stop_loss_price` 通常應放在目前價格與網格下方；做空則放在目前價格與網格上方
 
 ## 風險與注意事項
 
 - 修改 YAML 後需要重啟程式才會生效
+- stop loss 觸發後會停止策略；重新啟動前請先確認交易所掛單與持倉狀態
 - 請確認 `quantity_precision` 與交易所實際最小下單單位一致
 - 固定區間模式若 `upper_price - lower_price` 不能被 `grid_interval` 合理切分，實際 `grid_count` 會取整數
 - 部分舊範例檔仍可能留有歷史註解；若註解和公式不同，以程式公式為準
