@@ -16,7 +16,7 @@ grid_system:
   # 基础配置
   # ============================================================================
   exchange: "tradexyz"
-  symbol: "NVDA"                    # 🧪 美股测试（自动识别为 XYZ 市场，走 SDK 下单）
+  symbol: "MU"                    # 🧪 美股测试（自动识别为 XYZ 市场，走 SDK 下单）
   #                                 # 可替换为其他 XYZ 资产如 "TSLA"、"AAPL"、"GOOGL"
   #                                 # 或加密货币 "BTC"、"ETH"（走 ccxt 路径）
 
@@ -28,20 +28,20 @@ grid_system:
   # ============================================================================
   # 固定范围网格参数
   # ============================================================================
-  lower_price: 187.5                 # 🧪 网格下限价格
-  upper_price: 189.5                # 🧪 网格上限价格（高于市价的格子会自动跳过，不会变 taker）
+  lower_price: 700                # 🧪 网格下限价格
+  upper_price: 760                # 🧪 网格上限价格（高于市价的格子会自动跳过，不会变 taker）
   # 网格数量会根据 (upper_price - lower_price) / grid_interval 自动计算
 
   # ============================================================================
   # 通用网格参数
   # ============================================================================
-  grid_interval: 0.1               # 🧪 每格间隔 $0.1
-  order_amount: 0.1                 # 🧪 最小下单量（NVDA 约 $18，0.1 股 ≈ $18）
+  grid_interval: 0.8                # 🧪 每格间隔 $5.0（远大于正常值，避免成交）
+  order_amount: 0.1                 # 🧪 最小下单量（NVDA 约 $100，0.1 股 ≈ $10）
 
   # ----------------------------------------------------------------------------
   # 交易精度配置
   # ----------------------------------------------------------------------------
-  quantity_precision: 1              # NVDA 数量精度（XYZ 美股通常 1 位小数）
+  quantity_precision: 2              # NVDA 数量精度（XYZ 美股通常 1 位小数）
 
   # ============================================================================
   # 马丁模式（测试不需要，关闭）
@@ -54,12 +54,12 @@ grid_system:
 
   # 🎯 剥头皮模式
   scalping_enabled: false            # 🧪 测试关闭
-  scalping_trigger_percent: 90
+  scalping_trigger_percent: 50
   scalping_take_profit_grids: 2
 
   # 🛡️ 本金保护模式
   capital_protection_enabled: false   # 🧪 测试关闭
-  capital_protection_trigger_percent: 40
+  capital_protection_trigger_percent: 30
 
   # 💰 止盈模式
   take_profit_enabled: false          # 🧪 测试关闭
@@ -74,4 +74,4 @@ grid_system:
   reverse_order_grid_distance: 1
 
   # 🔍 订单健康检查间隔
-  order_health_check_interval: 10
+  order_health_check_interval: 60     # 🧪 缩短到 15 秒，方便测试时快速检查
