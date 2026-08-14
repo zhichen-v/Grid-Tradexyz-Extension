@@ -63,7 +63,7 @@ class LighterBase:
         False: "buy",   # is_ask=False -> buy
     }
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], signer_client: Any = None):
         """
         初始化Lighter基础类
 
@@ -99,15 +99,16 @@ class LighterBase:
         self._symbol_to_market_index: Dict[str, int] = {}
 
         # 初始化SignerClient（用于认证和签名）
-        self.signer_client = None
-        if self.api_key_private_key:
+        self.signer_client = signer_client
+        if self.signer_client is None and self.api_key_private_key:
             try:
                 from lighter import SignerClient
                 self.signer_client = SignerClient(
                     url=self.base_url,
-                    private_key=self.api_key_private_key,
                     account_index=self.account_index,
-                    api_key_index=self.api_key_index,
+                    api_private_keys={
+                        self.api_key_index: self.api_key_private_key
+                    },
                 )
                 logger.info("✅ SignerClient初始化成功")
             except Exception as e:
@@ -134,23 +135,27 @@ class LighterBase:
             symbol: 原始符号，如 "BTC-USD" 或 "BTCUSD"
 
         Returns:
-            标准化后的符号，如 "BTC-USD"
+            Lighter原生符号，如 "BTC"
         """
-        # Lighter使用 BTC-USD 格式
-        symbol = symbol.upper().replace("_", "-")
+        # Lighter API 的 perp symbol 是基础资产名称（例如 ETH、BTC、SOL）。
+        normalized = symbol.upper().replace("/", "-").replace("_", "-")
 
-        if "-" not in symbol and len(symbol) > 3:
-            # 尝试分割，如 BTCUSD -> BTC-USD
-            if symbol.endswith("USD"):
-                base = symbol[:-3]
-                quote = "USD"
-                symbol = f"{base}-{quote}"
-            elif symbol.endswith("USDT"):
-                base = symbol[:-4]
-                quote = "USDT"
-                symbol = f"{base}-{quote}"
+        # API discovery 返回的原生 symbol（例如 AUDUSD）优先，避免误拆。
+        if normalized in self._symbol_to_market_index:
+            return normalized
 
-        return symbol
+        parts = [part for part in normalized.replace(":", "-").split("-") if part]
+        if len(parts) > 1:
+            return parts[0]
+
+        # 兼容 BTCUSD / BTCUSDC / BTCUSDT；仅在 discovery 已确认基础资产时拆分。
+        for quote in ("USDT", "USDC", "USD"):
+            if normalized.endswith(quote):
+                base = normalized[:-len(quote)]
+                if base in self._symbol_to_market_index:
+                    return base
+
+        return normalized
 
     def get_market_index(self, symbol: str) -> Optional[int]:
         """
@@ -173,12 +178,13 @@ class LighterBase:
             markets: 市场信息列表
         """
         for market in markets:
-            market_index = market.get(
-                "market_index") or market.get("market_id")
+            market_index = market.get("market_index")
+            if market_index is None:
+                market_index = market.get("market_id")
             if market_index is not None:
                 self._markets_cache[market_index] = market
                 # 构建符号到索引的映射
-                symbol = market.get("symbol", "")
+                symbol = market.get("symbol", "").upper()
                 if symbol:
                     self._symbol_to_market_index[symbol] = market_index
 
@@ -244,7 +250,7 @@ class LighterBase:
             return default
 
     @staticmethod
-    def _parse_timestamp(timestamp: Any) -> Optional[int]:
+    def _parse_timestamp(timestamp: Any) -> Optional[datetime]:
         """
         解析时间戳
 
@@ -252,19 +258,27 @@ class LighterBase:
             timestamp: 时间戳（秒或毫秒）
 
         Returns:
-            毫秒级时间戳
+            datetime对象
         """
         if timestamp is None:
             return None
 
         try:
             ts = int(timestamp)
-            # 如果是秒级时间戳，转换为毫秒
+            # 如果是秒级时间戳，转换为毫秒。
             if ts < 10000000000:
                 ts = ts * 1000
-            return ts
-        except (ValueError, TypeError):
+            return datetime.fromtimestamp(ts / 1000)
+        except (ValueError, TypeError, OSError, OverflowError):
             return None
+
+    @staticmethod
+    def _leverage_from_initial_margin_fraction(value: Any) -> int:
+        """Convert Lighter's percentage IMF (for example 2.00) to leverage."""
+        margin_fraction = LighterBase._safe_decimal(value)
+        if margin_fraction <= 0:
+            return 1
+        return max(1, int(Decimal("100") / margin_fraction))
 
     def _parse_order_side(self, is_ask: bool) -> str:
         """

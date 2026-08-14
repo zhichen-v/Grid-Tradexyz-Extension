@@ -11,9 +11,9 @@ Lighter交易所适配器 - REST API模块
    - market_id=2: SOL
 
 2. 动态价格精度（关键特性）：
-   - 不同交易对使用不同的价格精度
+   - 不同交易对使用不同的价格与数量精度
    - 价格乘数公式: price_int = price_usd × (10 ** price_decimals)
-   - 数量使用1e5: base_amount = quantity × 100000 (实际测试确认)
+   - 数量乘数公式: base_amount = quantity × (10 ** size_decimals)
 
    示例：
    - ETH (2位小数): $4127.39 × 100 = 412739
@@ -37,13 +37,12 @@ import logging
 
 try:
     import lighter
-    from lighter import Configuration, ApiClient, SignerClient
+    from lighter import Configuration, ApiClient
     from lighter.api import AccountApi, OrderApi, TransactionApi, CandlestickApi, FundingApi
     LIGHTER_AVAILABLE = True
 except ImportError:
     LIGHTER_AVAILABLE = False
-    logging.warning(
-        "lighter SDK未安装。请执行: pip install git+https://github.com/elliottech/lighter-python.git")
+    logging.warning("lighter SDK未安装。请执行: uv pip install lighter-sdk==1.1.2")
 
 from .lighter_base import LighterBase
 from ..models import (
@@ -96,7 +95,6 @@ class LighterRest(LighterBase):
 
         # 初始化客户端
         self.api_client: Optional[ApiClient] = None
-        self.signer_client: Optional[SignerClient] = None
 
         # API实例
         self.account_api: Optional[AccountApi] = None
@@ -115,14 +113,8 @@ class LighterRest(LighterBase):
         # 这是关键修复！没有这个缓存会导致批量下单时触发429
         self._market_info_cache = {}  # {symbol: {info, timestamp}}
 
-        # 🔥 初始化WebSocket模块（用于订单成交监控）
-        try:
-            from .lighter_websocket import LighterWebSocket
-            self._websocket = LighterWebSocket(config)
-            logger.info("✅ Lighter WebSocket模块已初始化")
-        except Exception as e:
-            logger.warning(f"⚠️ Lighter WebSocket初始化失败: {e}")
-            self._websocket = None
+        # WebSocket由统一adapter持有，避免重复连接与SignerClient nonce状态。
+        self._websocket = None
 
         logger.info("Lighter REST客户端初始化完成")
 
@@ -148,15 +140,8 @@ class LighterRest(LighterBase):
             self.candlestick_api = CandlestickApi(self.api_client)
             self.funding_api = FundingApi(self.api_client)
 
-            # 如果配置了私钥，创建签名客户端
-            if self.api_key_private_key:
-                self.signer_client = SignerClient(
-                    url=self.base_url,
-                    private_key=self.api_key_private_key,
-                    account_index=self.account_index,
-                    api_key_index=self.api_key_index,
-                )
-
+            # SignerClient由LighterBase创建；这里只验证配置是否与账户匹配。
+            if self.signer_client:
                 # 检查客户端
                 err = self.signer_client.check_client()
                 if err is not None:
@@ -169,27 +154,6 @@ class LighterRest(LighterBase):
 
             # 加载市场信息
             await self._load_markets()
-
-            # 🔥 连接WebSocket（如果已初始化）
-            if self._websocket:
-                try:
-                    logger.info(
-                        f"🔗 准备连接WebSocket - markets数量: {len(self.markets)}, _markets_cache数量: {len(self._markets_cache)}")
-
-                    # 共享markets信息给WebSocket
-                    self._websocket.markets = self.markets
-                    self._websocket._markets_cache = getattr(
-                        self, '_markets_cache', {})
-
-                    await self._websocket.connect()
-                    logger.info("✅ Lighter WebSocket已连接")
-                except Exception as ws_err:
-                    logger.warning(
-                        f"⚠️ Lighter WebSocket连接失败: {ws_err}，将使用fallback方案")
-                    import traceback
-                    logger.debug(f"WebSocket错误详情:\n{traceback.format_exc()}")
-            else:
-                logger.warning("⚠️ WebSocket模块未初始化")
 
         except Exception as e:
             logger.error(f"Lighter REST客户端初始化失败: {e}")
@@ -238,15 +202,30 @@ class LighterRest(LighterBase):
         try:
             # 获取订单簿列表（包含市场信息）
             # ⚠️ 必须使用此API，它会返回所有市场包括market_id=0的ETH
-            response = await self.order_api.order_books()
+            response = await self.order_api.order_books(filter="perp")
 
             if hasattr(response, 'order_books'):
                 markets = []
+                self.markets.clear()
+                self._markets_cache.clear()
+                self._symbol_to_market_index.clear()
                 for order_book_info in response.order_books:
                     if hasattr(order_book_info, 'symbol') and hasattr(order_book_info, 'market_id'):
+                        if getattr(order_book_info, 'status', None) != 'active':
+                            continue
                         market_info = {
-                            "market_id": order_book_info.market_id,  # 使用API返回的真实 market_id
+                            "market_id": order_book_info.market_id,
                             "symbol": order_book_info.symbol,
+                            "market_type": getattr(order_book_info, 'market_type', 'perp'),
+                            "status": getattr(order_book_info, 'status', 'active'),
+                            "supported_price_decimals": getattr(
+                                order_book_info, 'supported_price_decimals', None),
+                            "supported_size_decimals": getattr(
+                                order_book_info, 'supported_size_decimals', None),
+                            "min_base_amount": getattr(
+                                order_book_info, 'min_base_amount', None),
+                            "min_quote_amount": getattr(
+                                order_book_info, 'min_quote_amount', None),
                         }
                         markets.append(market_info)
 
@@ -256,8 +235,12 @@ class LighterRest(LighterBase):
                 self.update_markets_cache(markets)
                 logger.info(f"加载了 {len(markets)} 个市场")
 
+                if not markets:
+                    raise RuntimeError("Lighter API未返回任何活跃的perp市场")
+
         except Exception as e:
             logger.error(f"加载市场信息失败: {e}")
+            raise
 
     async def get_exchange_info(self) -> ExchangeInfo:
         """
@@ -268,18 +251,24 @@ class LighterRest(LighterBase):
         """
         try:
             # 获取订单簿信息
-            response = await self.order_api.order_books()
+            response = await self.order_api.order_books(filter="perp")
 
             symbols = []
             if hasattr(response, 'order_books'):
                 for ob in response.order_books:
                     if hasattr(ob, 'symbol') and hasattr(ob, 'market_id'):
+                        if getattr(ob, 'status', None) != 'active':
+                            continue
                         symbols.append({
                             "symbol": ob.symbol,
-                            "market_id": ob.market_id,  # 使用 market_id 而不是 index
-                            "base_asset": ob.symbol.split('-')[0] if '-' in ob.symbol else "",
-                            "quote_asset": ob.symbol.split('-')[1] if '-' in ob.symbol else "USD",
+                            "market_id": ob.market_id,
+                            "base_asset": ob.symbol,
+                            "quote_asset": "USD",
                             "status": getattr(ob, 'status', 'trading'),
+                            "price_decimals": getattr(
+                                ob, 'supported_price_decimals', None),
+                            "size_decimals": getattr(
+                                ob, 'supported_size_decimals', None),
                         })
 
             # 创建 ExchangeInfo 对象
@@ -462,12 +451,19 @@ class LighterRest(LighterBase):
                         trade, 'size') else Decimal("0")
                     cost = price * amount
 
-                    # 解析成交方向
-                    is_ask = getattr(trade, 'is_ask', False)
-                    side = OrderSide.SELL if is_ask else OrderSide.BUY
+                    # is_maker_ask=true表示卖方是maker，因此taker方向为买。
+                    is_maker_ask = getattr(trade, 'is_maker_ask', False)
+                    side = OrderSide.BUY if is_maker_ask else OrderSide.SELL
+                    taker_order_id = (
+                        getattr(trade, 'bid_id', None)
+                        if is_maker_ask
+                        else getattr(trade, 'ask_id', None)
+                    )
 
                     trades.append(TradeData(
-                        id=str(getattr(trade, 'trade_id', '')),
+                        id=str(getattr(
+                            trade, 'trade_id_str',
+                            getattr(trade, 'trade_id', ''))),
                         symbol=symbol,
                         side=side,
                         amount=amount,
@@ -476,7 +472,10 @@ class LighterRest(LighterBase):
                         fee=None,
                         timestamp=self._parse_timestamp(
                             getattr(trade, 'timestamp', None)) or datetime.now(),
-                        order_id=str(getattr(trade, 'order_id', '')),
+                        order_id=(
+                            str(taker_order_id)
+                            if taker_order_id is not None else None
+                        ),
                         raw_data={'trade': trade}
                     ))
 
@@ -560,10 +559,10 @@ class LighterRest(LighterBase):
         try:
             # 🔥 修复：Lighter 需要使用专门的订单查询 API，而不是 account API
             # 生成认证令牌
-            import time
-            expiry_timestamp = int(time.time()) + 3600  # 1小时后过期
             auth_result = self.signer_client.create_auth_token_with_expiry(
-                expiry_timestamp)
+                deadline=3600,
+                api_key_index=self.api_key_index,
+            )
 
             # SDK 返回元组 (token, error)
             if isinstance(auth_result, tuple):
@@ -584,9 +583,10 @@ class LighterRest(LighterBase):
 
             # 使用 account_active_orders API（SDK 方法是异步的，直接 await）
             response = await self.order_api.account_active_orders(
+                authorization=auth_token,
                 account_index=self.account_index,
-                market_id=market_id if market_id is not None else 255,  # 255 = 所有市场
-                auth=auth_token
+                market_id=market_id,
+                market_type="perp",
             )
 
             orders = []
@@ -689,9 +689,9 @@ class LighterRest(LighterBase):
 
         try:
             # 生成认证令牌
-            import lighter
             auth_token, err = self.signer_client.create_auth_token_with_expiry(
-                lighter.SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY
+                deadline=3600,
+                api_key_index=self.api_key_index,
             )
             if err:
                 logger.error(f"生成认证令牌失败: {err}")
@@ -704,10 +704,11 @@ class LighterRest(LighterBase):
 
             # 获取历史订单
             response = await self.order_api.account_inactive_orders(
+                authorization=auth_token,
                 account_index=self.account_index,
                 limit=limit,
-                auth=auth_token,
-                market_id=market_id if market_id is not None else 255  # 255表示所有市场
+                market_id=market_id,
+                market_type="perp",
             )
 
             orders = []
@@ -786,8 +787,8 @@ class LighterRest(LighterBase):
                             realized_pnl=self._safe_decimal(
                                 getattr(position_info, 'realized_pnl', 0)),
                             percentage=None,  # 可以计算
-                            leverage=int(
-                                getattr(position_info, 'leverage', 1)),
+                            leverage=self._leverage_from_initial_margin_fraction(
+                                getattr(position_info, 'initial_margin_fraction', 0)),
                             margin_mode=MarginMode.CROSS if getattr(
                                 position_info, 'margin_mode', 0) == 0 else MarginMode.ISOLATED,
                             margin=self._safe_decimal(
@@ -818,12 +819,6 @@ class LighterRest(LighterBase):
                 "   请检查lighter_config.yaml中的api_key_private_key和account_index")
             return False
         return True
-
-    def _extract_price_decimals(self, market_details) -> int:
-        """从市场详情中提取价格精度"""
-        if hasattr(market_details, 'order_book_details') and market_details.order_book_details:
-            return market_details.order_book_details[0].price_decimals
-        return 1  # 默认值
 
     async def _get_market_info(self, symbol: str) -> Optional[Dict]:
         """
@@ -860,18 +855,28 @@ class LighterRest(LighterBase):
             # 获取市场详情，动态获取价格精度
             logger.debug(f"🔍 获取市场详情: market_id={market_index}")
             market_details = await self.order_api.order_book_details(market_id=market_index)
-            price_decimals = self._extract_price_decimals(market_details)
+            if not market_details.order_book_details:
+                raise RuntimeError(f"Lighter未返回市场详情: {symbol}")
 
-            logger.debug(f"✅ 获取价格精度成功: price_decimals={price_decimals}")
+            detail = market_details.order_book_details[0]
+            price_decimals = int(detail.supported_price_decimals)
+            size_decimals = int(detail.supported_size_decimals)
+
+            logger.debug(
+                f"✅ 获取市场精度成功: price_decimals={price_decimals}, "
+                f"size_decimals={size_decimals}")
 
             price_multiplier = Decimal(10 ** price_decimals)
+            size_multiplier = Decimal(10 ** size_decimals)
             logger.debug(
-                f"{symbol} 价格精度: {price_decimals}位小数, 乘数: {price_multiplier}")
+                f"{symbol} 价格乘数: {price_multiplier}, 数量乘数: {size_multiplier}")
 
             market_info = {
                 'market_index': market_index,
                 'price_decimals': price_decimals,
-                'price_multiplier': price_multiplier
+                'price_multiplier': price_multiplier,
+                'size_decimals': size_decimals,
+                'size_multiplier': size_multiplier,
             }
 
             # 🔥 缓存市场信息（关键！）
@@ -931,6 +936,17 @@ class LighterRest(LighterBase):
             logger.error(f"计算滑点保护价格失败: {e}")
             return None
 
+    @staticmethod
+    def _convert_base_amount(market_info: Dict, quantity: Decimal) -> int:
+        """Convert a decimal size without silently truncating unsupported precision."""
+        scaled_amount = quantity * market_info['size_multiplier']
+        if scaled_amount != scaled_amount.to_integral_value():
+            raise ValueError(
+                f"数量 {quantity} 超过市场允许的 "
+                f"{market_info['size_decimals']} 位小数精度"
+            )
+        return int(scaled_amount)
+
     def _convert_market_order_params(
         self,
         market_info: Dict,
@@ -950,8 +966,7 @@ class LighterRest(LighterBase):
         avg_execution_price_rounded = avg_execution_price.quantize(
             quantize_precision)
 
-        # 🔥 Lighter的数量单位是1e5而不是1e6（实际测试发现放大10倍问题）
-        base_amount_int = int(quantity * Decimal("100000"))
+        base_amount_int = self._convert_base_amount(market_info, quantity)
         avg_price_int = int(avg_execution_price_rounded *
                             market_info['price_multiplier'])
         is_ask = (side.lower() == "sell")
@@ -996,8 +1011,7 @@ class LighterRest(LighterBase):
 
         price_rounded = price.quantize(quantize_precision)
 
-        # 🔥 Lighter的数量单位是1e5而不是1e6（与市价单保持一致）
-        base_amount_int = int(quantity * Decimal("100000"))
+        base_amount_int = self._convert_base_amount(market_info, quantity)
         price_int = int(price_rounded * market_info['price_multiplier'])
         is_ask = (side.lower() == "sell")
 
@@ -1376,7 +1390,7 @@ class LighterRest(LighterBase):
         ⚠️  Lighter价格精度说明：
         - Lighter使用动态价格乘数，不同交易对精度不同
         - 价格乘数公式: price_int = price_usd × (10 ** price_decimals)
-        - 数量始终使用1e6: base_amount = quantity × 1000000
+        - 数量使用市场的size_decimals: base_amount = quantity × 10 ** size_decimals
 
         示例：
         - ETH (price_decimals=2): $4127.39 × 100 = 412739
@@ -1591,24 +1605,28 @@ class LighterRest(LighterBase):
         """解析订单类型"""
         type_mapping = {
             'market': OrderType.MARKET,
+            'liquidation': OrderType.MARKET,
             'limit': OrderType.LIMIT,
-            'stop-limit': OrderType.STOP_LIMIT,
-            'stop_limit': OrderType.STOP_LIMIT,
-            'stop-market': OrderType.STOP,
-            'stop_market': OrderType.STOP,
+            'stop-loss-limit': OrderType.STOP_LIMIT,
+            'take-profit-limit': OrderType.TAKE_PROFIT_LIMIT,
+            'stop-loss': OrderType.STOP,
+            'take-profit': OrderType.TAKE_PROFIT,
             'stop': OrderType.STOP,
         }
         return type_mapping.get(order_type_str.lower().replace('_', '-'), OrderType.LIMIT)
 
     def _parse_order_status(self, status_str: str) -> OrderStatus:
         """解析订单状态"""
+        normalized = status_str.lower()
+        if normalized.startswith('canceled') or normalized == 'cancelled':
+            return OrderStatus.CANCELED
+
         status_mapping = {
             'pending': OrderStatus.PENDING,
+            'in-progress': OrderStatus.OPEN,
             'open': OrderStatus.OPEN,
             'filled': OrderStatus.FILLED,
-            'canceled': OrderStatus.CANCELED,
-            'canceled-too-much-slippage': OrderStatus.CANCELED,
             'expired': OrderStatus.EXPIRED,
             'rejected': OrderStatus.REJECTED,
         }
-        return status_mapping.get(status_str.lower(), OrderStatus.UNKNOWN)
+        return status_mapping.get(normalized, OrderStatus.UNKNOWN)

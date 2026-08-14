@@ -20,7 +20,6 @@ from ..adapter import ExchangeAdapter
 from ..interface import ExchangeConfig
 from ..models import *
 from ..subscription_manager import create_subscription_manager, DataType
-from .lighter_base import LighterBase
 from .lighter_rest import LighterRest
 from .lighter_websocket import LighterWebSocket
 
@@ -33,9 +32,10 @@ class LighterAdapter(ExchangeAdapter):
 
         # 初始化各个模块
         config_dict = self._convert_config_to_dict(config)
-        self._base = LighterBase(config_dict)
         self._rest = LighterRest(config_dict)
-        self._websocket = LighterWebSocket(config_dict)
+        self._websocket = LighterWebSocket(
+            config_dict, signer_client=self._rest.signer_client)
+        self._base = self._rest
 
         # 共享数据缓存
         shared_position_cache = {}
@@ -149,9 +149,9 @@ class LighterAdapter(ExchangeAdapter):
                     self.logger.warning(f"⚠️ 无法从配置文件加载Lighter配置: {e}")
 
         # 添加可选配置
-        if hasattr(config, 'api_url'):
-            config_dict['api_url'] = config.api_url
-        if hasattr(config, 'ws_url'):
+        if getattr(config, 'base_url', None):
+            config_dict['api_url'] = config.base_url
+        if getattr(config, 'ws_url', None):
             config_dict['ws_url'] = config.ws_url
 
         return config_dict
@@ -739,7 +739,8 @@ class LighterAdapter(ExchangeAdapter):
             callback: 数据回调函数
         """
         normalized_symbol = self._normalize_symbol(symbol)
-        await self._websocket.subscribe_orderbook(normalized_symbol, callback)
+        await self._websocket.subscribe_orderbook(
+            normalized_symbol, callback=callback)
 
     async def subscribe_trades(self, symbol: str, callback: Optional[Callable] = None):
         """
@@ -864,12 +865,9 @@ class LighterAdapter(ExchangeAdapter):
         if not symbol:
             return symbol
 
-        # 先检查是否有自定义映射
-        if symbol in self._symbol_mapping:
-            return self._symbol_mapping[symbol]
-
-        # 使用base模块的标准化方法
-        return self._base.normalize_symbol(symbol)
+        # 自定义映射的目标也必须转换成 Lighter 当前使用的原生 symbol。
+        mapped_symbol = self._symbol_mapping.get(symbol, symbol)
+        return self._base.normalize_symbol(mapped_symbol)
 
     def get_supported_symbols(self) -> List[str]:
         """

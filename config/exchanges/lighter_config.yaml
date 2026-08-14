@@ -16,16 +16,16 @@ api_config:
   
   # API认证配置
   # 注意：这些信息需要在实际使用时配置
-  # API_KEY_PRIVATE_KEY: 从Lighter前端生成的API Key私钥（带0x前缀）
+  # API_KEY_PRIVATE_KEY: 从Lighter前端生成的API Key私钥
   # ACCOUNT_INDEX: 账户索引
   # API_KEY_INDEX: API Key索引
   auth:
-    api_key_private_key: "11111111111111111111111111111111111111111111111111111111111111111111111"  # 需要配置
-    account_index: 11111          # 账户索引 (十进制)
-    api_key_index: 11             # API Key索引
+    api_key_private_key: ""
+    account_index: 0              # 账户索引 (十进制)
+    api_key_index: 0              # API Key索引
   
   # SDK安装说明
-  sdk_install_command: "pip install git+https://github.com/elliottech/lighter-python.git"
+  sdk_install_command: "uv pip install lighter-sdk==1.1.2"
 
 # 订阅模式配置
 subscription_mode:
@@ -60,9 +60,9 @@ subscription_mode:
 # 符号映射配置
 symbol_mapping:
   # 内部符号 -> Lighter符号
-  "BTCUSD": "BTC-USD"
-  "ETHUSD": "ETH-USD"
-  "SOLUSD": "SOL-USD"
+  "BTCUSD": "BTC"
+  "ETHUSD": "ETH"
+  "SOLUSD": "SOL"
 
 # 速率限制配置
 rate_limits:
@@ -195,7 +195,7 @@ usage:
   setup_steps:
     - "1. 访问 https://app.lighter.xyz 注册账户"
     - "2. 在前端创建API Key，保存Private Key"
-    - "3. 安装Lighter SDK: pip install git+https://github.com/elliottech/lighter-python.git"
+    - "3. 安装Lighter SDK: uv pip install lighter-sdk==1.1.2"
     - "4. 配置本文件中的api_key_private_key、account_index和api_key_index"
     - "5. 在程序中使用LighterAdapter"
   

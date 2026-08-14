@@ -29,7 +29,7 @@ except ImportError:
 from .lighter_base import LighterBase
 from ..models import (
     TickerData, OrderBookData, TradeData, OrderData, PositionData,
-    OrderBookLevel, OrderStatus, OrderSide, OrderType
+    OrderBookLevel, OrderStatus, OrderSide, OrderType, PositionSide, MarginMode
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 class LighterWebSocket(LighterBase):
     """Lighter WebSocket客户端"""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], signer_client: Any = None):
         """
         初始化Lighter WebSocket客户端
 
@@ -48,16 +48,18 @@ class LighterWebSocket(LighterBase):
         if not LIGHTER_AVAILABLE:
             raise ImportError("lighter SDK未安装，无法使用Lighter WebSocket")
 
-        super().__init__(config)
+        super().__init__(config, signer_client=signer_client)
 
         # WebSocket客户端（SDK的WsClient，用于订阅account_all）
         self.ws_client: Optional[WsClient] = None
         self._ws_task: Optional[asyncio.Task] = None
+        self._stopping_sdk_ws = False
 
-        # 直接WebSocket连接（用于订阅account_all_orders和market_stats）
+        # 直接WebSocket连接（用于account_all_orders、market_stats和trade）
         self._direct_ws = None
         self._direct_ws_task: Optional[asyncio.Task] = None
         self._subscribed_market_stats: List[int] = []  # 订阅的market_stats市场
+        self._subscribed_trades: List[int] = []
 
         # 保存事件循环引用
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -146,15 +148,7 @@ class LighterWebSocket(LighterBase):
         try:
             self._connected = False
 
-            # 关闭SDK的WebSocket任务
-            if self._ws_task and not self._ws_task.done():
-                self._ws_task.cancel()
-                try:
-                    await self._ws_task
-                except asyncio.CancelledError:
-                    pass
-
-            self.ws_client = None
+            await self._stop_sdk_ws_client()
 
             # 关闭直接WebSocket连接
             if self._direct_ws_task and not self._direct_ws_task.done():
@@ -227,7 +221,12 @@ class LighterWebSocket(LighterBase):
         # 🔥 使用market_stats代替orderbook
         await self.subscribe_market_stats(market_index, symbol)
 
-    async def subscribe_orderbook(self, market_index_or_symbol, symbol: Optional[str] = None):
+    async def subscribe_orderbook(
+        self,
+        market_index_or_symbol,
+        symbol: Optional[str] = None,
+        callback: Optional[Callable] = None,
+    ):
         """
         订阅订单簿
 
@@ -235,6 +234,9 @@ class LighterWebSocket(LighterBase):
             market_index_or_symbol: 市场索引或交易对符号
             symbol: 交易对符号（如果第一个参数是市场索引）
         """
+        if callback:
+            self._orderbook_callbacks.append(callback)
+
         if isinstance(market_index_or_symbol, str):
             symbol = market_index_or_symbol
             market_index = self.get_market_index(symbol)
@@ -290,6 +292,7 @@ class LighterWebSocket(LighterBase):
             # 任务已在运行，发送新的订阅消息
             if self._direct_ws:
                 await self._send_market_stats_subscriptions()
+                await self._send_trade_subscriptions()
         else:
             # 启动新任务
             self._direct_ws_task = asyncio.create_task(
@@ -312,6 +315,21 @@ class LighterWebSocket(LighterBase):
             except Exception as e:
                 logger.error(f"发送market_stats订阅失败: {e}")
 
+    async def _send_trade_subscriptions(self):
+        """发送公开成交频道订阅消息。"""
+        if not self._direct_ws:
+            return
+
+        for market_index in self._subscribed_trades:
+            try:
+                await self._direct_ws.send(json.dumps({
+                    "type": "subscribe",
+                    "channel": f"trade/{market_index}",
+                }))
+                logger.info(f"📤 发送trade订阅: market_index={market_index}")
+            except Exception as e:
+                logger.error(f"发送trade订阅失败: {e}")
+
     async def subscribe_trades(self, symbol: str, callback: Optional[Callable] = None):
         """
         订阅成交数据
@@ -323,8 +341,14 @@ class LighterWebSocket(LighterBase):
         if callback:
             self._trade_callbacks.append(callback)
 
-        # Lighter的订单簿更新中包含成交信息
-        await self.subscribe_orderbook(symbol)
+        market_index = self.get_market_index(symbol)
+        if market_index is None:
+            logger.warning(f"未找到交易对 {symbol} 的市场索引")
+            return
+
+        if market_index not in self._subscribed_trades:
+            self._subscribed_trades.append(market_index)
+            await self._ensure_direct_ws_running()
 
     async def subscribe_account(self, account_index: Optional[int] = None):
         """
@@ -356,11 +380,8 @@ class LighterWebSocket(LighterBase):
         if callback:
             self._order_callbacks.append(callback)
 
-        # 🔥 启动直接订阅account_all_orders（包含挂单状态）
+        # account_all_orders包含完整订单状态；单笔trade不能推导整单FILLED。
         await self._subscribe_account_all_orders()
-
-        # 🔥 同时保持account_all订阅（用于成交推送）
-        await self.subscribe_account()
 
     async def subscribe_order_fills(self, callback: Callable) -> None:
         """
@@ -372,7 +393,7 @@ class LighterWebSocket(LighterBase):
         if callback:
             self._order_fill_callbacks.append(callback)
 
-        await self.subscribe_account()
+        await self._subscribe_account_all_orders()
 
     async def subscribe_positions(self, callback: Optional[Callable] = None):
         """
@@ -389,34 +410,45 @@ class LighterWebSocket(LighterBase):
     async def unsubscribe_ticker(self, symbol: str):
         """取消订阅ticker"""
         market_index = self.get_market_index(symbol)
-        if market_index and market_index in self._subscribed_markets:
-            self._subscribed_markets.remove(market_index)
-            await self._recreate_ws_client()
+        if market_index is not None and market_index in self._subscribed_market_stats:
+            self._subscribed_market_stats.remove(market_index)
+            await self._send_direct_unsubscribe(f"market_stats/{market_index}")
 
     async def unsubscribe_orderbook(self, symbol: str):
         """取消订阅订单簿"""
-        await self.unsubscribe_ticker(symbol)
+        market_index = self.get_market_index(symbol)
+        if market_index is not None and market_index in self._subscribed_markets:
+            self._subscribed_markets.remove(market_index)
+            await self._recreate_ws_client()
 
     async def unsubscribe_trades(self, symbol: str):
         """取消订阅成交"""
-        await self.unsubscribe_ticker(symbol)
+        market_index = self.get_market_index(symbol)
+        if market_index is not None and market_index in self._subscribed_trades:
+            self._subscribed_trades.remove(market_index)
+            await self._send_direct_unsubscribe(f"trade/{market_index}")
+
+    async def _send_direct_unsubscribe(self, channel: str):
+        if not self._direct_ws:
+            return
+        try:
+            await self._direct_ws.send(json.dumps({
+                "type": "unsubscribe",
+                "channel": channel,
+            }))
+        except Exception as e:
+            logger.warning(f"取消订阅 {channel} 失败: {e}")
 
     # ============= WebSocket客户端管理 =============
 
     async def _recreate_ws_client(self):
         """重新创建WebSocket客户端（当订阅变化时）"""
-        if not self._subscribed_markets and not self._subscribed_accounts:
-            logger.info("没有订阅，跳过创建WsClient")
-            return
-
         try:
-            # 先关闭旧的客户端
-            if self._ws_task and not self._ws_task.done():
-                self._ws_task.cancel()
-                try:
-                    await self._ws_task
-                except asyncio.CancelledError:
-                    pass
+            await self._stop_sdk_ws_client()
+
+            if not self._subscribed_markets and not self._subscribed_accounts:
+                logger.info("没有订阅，已关闭WsClient")
+                return
 
             # 创建新的WsClient
             # 🔥 从ws_url中提取host（去掉协议和路径）
@@ -447,6 +479,33 @@ class LighterWebSocket(LighterBase):
         except Exception as e:
             logger.error(f"创建WebSocket客户端失败: {e}")
 
+    async def _stop_sdk_ws_client(self):
+        """Close the sync SDK socket before awaiting its executor task."""
+        client = self.ws_client
+        task = self._ws_task
+        self._stopping_sdk_ws = True
+        try:
+            connection = getattr(client, "ws", None) if client else None
+            if connection is not None:
+                try:
+                    await asyncio.to_thread(connection.close)
+                except Exception as e:
+                    logger.warning(f"关闭SDK WebSocket连接失败: {e}")
+
+            if task and not task.done():
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except asyncio.TimeoutError:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+        finally:
+            self._ws_task = None
+            self.ws_client = None
+            self._stopping_sdk_ws = False
+
     async def _run_ws_client(self):
         """在异步任务中运行同步的WsClient"""
         try:
@@ -457,8 +516,8 @@ class LighterWebSocket(LighterBase):
             logger.info("WebSocket任务已取消")
         except Exception as e:
             logger.error(f"❌ WebSocket运行出错: {e}", exc_info=True)
-            # 尝试重连
-            asyncio.create_task(self.reconnect())
+            if self._connected and not self._stopping_sdk_ws:
+                asyncio.create_task(self.reconnect())
 
     # ============= 消息处理 =============
 
@@ -501,10 +560,8 @@ class LighterWebSocket(LighterBase):
         """
         账户数据更新回调
 
-        根据Lighter WebSocket文档，account数据包含:
-        - orders: {market_index: [Order]} - 订单列表
-        - trades: {market_index: [Trade]} - 成交列表
-        - positions: {market_index: Position} - 持仓数据
+        SDK 1.1.2的account_all数据包含trades、positions与assets等账户资料。
+        订单更新来自独立的account_all_orders频道。
 
         Args:
             account_id: 账户ID
@@ -517,67 +574,20 @@ class LighterWebSocket(LighterBase):
             logger.debug(
                 f"📥 收到账户更新: account_id={account_id}, keys={list(account.keys())}")
 
-            # 🔥 解析订单数据（根据Lighter WebSocket文档）
-            if "orders" in account and account["orders"]:
-                orders_data = account["orders"]
-
-                # orders是字典: {market_index: [Order]}
-                if isinstance(orders_data, dict):
-                    for market_index, order_list in orders_data.items():
-                        if isinstance(order_list, list):
-                            for order_info in order_list:
-                                logger.debug(f"🔍 订单完整数据: {order_info}")
-
-                                order = self._parse_order_from_ws(order_info)
-                                if order:
-                                    logger.debug(
-                                        f"📝 订单更新: id={order.id}, "
-                                        f"状态={order.status}, 价格={order.price}, "
-                                        f"数量={order.amount}, 已成交={order.filled}")
-
-                                    # 触发通用订单回调
-                                    if self._order_callbacks:
-                                        self._trigger_order_callbacks(order)
-
-                                    # 如果是FILLED状态，触发订单成交回调
-                                    if self._order_fill_callbacks and order.status == OrderStatus.FILLED:
-                                        logger.info(
-                                            f"✅ 订单成交: id={order.id}, "
-                                            f"成交价={order.average}, 成交量={order.filled}")
-                                        self._trigger_order_fill_callbacks(
-                                            order)
-
-            # 🔥 解析成交数据（Trade列表，Lighter通过这个推送订单成交）
+            # account_all只包含成交与持仓等账户资料；订单状态由
+            # account_all_orders频道处理，避免把单笔成交误判为整单FILLED。
             if "trades" in account and account["trades"]:
                 trades_data = account["trades"]
                 if isinstance(trades_data, dict):
                     for market_index, trade_list in trades_data.items():
                         if isinstance(trade_list, list):
-                            logger.info(
-                                f"📊 市场{market_index}收到{len(trade_list)}个成交记录")
-
-                            # 🔥 遍历每个trade，解析为OrderData并触发回调
                             for trade_info in trade_list:
-                                logger.info(
-                                    f"🔍 收到成交数据keys: {list(trade_info.keys())}")
-                                logger.debug(f"🔍 成交完整数据: {trade_info}")
-
-                                # 解析trade为OrderData
-                                order = self._parse_trade_as_order(trade_info)
-                                if order:
-                                    logger.info(
-                                        f"💰 订单成交: id={order.id}, "
-                                        f"价格={order.average}, 数量={order.filled}, "
-                                        f"方向={order.side.value}")
-
-                                    # 触发订单回调
-                                    if self._order_callbacks:
-                                        self._trigger_order_callbacks(order)
-
-                                    # 触发订单成交回调
-                                    if self._order_fill_callbacks:
-                                        self._trigger_order_fill_callbacks(
-                                            order)
+                                normalized_trade = dict(trade_info)
+                                normalized_trade.setdefault(
+                                    "market_id", int(market_index))
+                                trade = self._parse_trade_data(normalized_trade)
+                                if trade:
+                                    self._trigger_trade_callbacks(trade)
 
             # 解析持仓更新
             if "positions" in account and self._position_callbacks:
@@ -683,8 +693,8 @@ class LighterWebSocket(LighterBase):
         ⚠️ 根据Lighter官方Go结构文档，实际字段名是缩写形式：
         - "i":  OrderIndex (int64) - 订单ID
         - "u":  ClientOrderIndex (int64) - 客户端订单ID  
-        - "is": InitialBaseAmount (int64) - 初始数量（单位1e5）
-        - "rs": RemainingBaseAmount (int64) - 剩余数量（单位1e5）
+        - "is": InitialBaseAmount (int64) - 初始数量（动态size_decimals）
+        - "rs": RemainingBaseAmount (int64) - 剩余数量（动态size_decimals）
         - "p":  Price (uint32) - 价格（需要除以price_multiplier）
         - "ia": IsAsk (uint8) - 是否卖单 (0=buy, 1=sell)
         - "st": Status (uint8) - 状态码 (0=Failed, 1=Pending, 2=Executed, 3=Pending-Final)
@@ -707,17 +717,29 @@ class LighterWebSocket(LighterBase):
             # TODO: 需要确认market_index的实际字段名
             market_index = order_info.get("m")
             symbol = self._get_symbol_from_market_index(
-                market_index) if market_index else "UNKNOWN"
+                market_index) if market_index is not None else "UNKNOWN"
 
-            # 🔥 解析数量（使用缩写字段，数量单位是1e5）
+            market_info = self._markets_cache.get(market_index, {})
+            size_decimals = market_info.get(
+                "size_decimals", market_info.get("supported_size_decimals"))
+            price_decimals = market_info.get(
+                "price_decimals", market_info.get("supported_price_decimals"))
+            if size_decimals is None or price_decimals is None:
+                logger.warning(f"⚠️ 市场 {market_index} 缺少价格或数量精度")
+                return None
+
+            size_multiplier = Decimal(10) ** int(size_decimals)
+            price_multiplier = Decimal(10) ** int(price_decimals)
+
+            # 解析动态精度的整数数量。
             initial_amount_raw = order_info.get("is", 0)  # InitialBaseAmount
             remaining_amount_raw = order_info.get(
                 "rs", 0)  # RemainingBaseAmount
 
             initial_amount = self._safe_decimal(
-                initial_amount_raw) / Decimal("100000")
+                initial_amount_raw) / size_multiplier
             remaining_amount = self._safe_decimal(
-                remaining_amount_raw) / Decimal("100000")
+                remaining_amount_raw) / size_multiplier
             filled_amount = initial_amount - remaining_amount
 
             # 暂时无法从Order结构直接获取filled_quote，设置为0
@@ -726,8 +748,7 @@ class LighterWebSocket(LighterBase):
             # 计算成交均价（如果有成交且有价格）
             average_price = None
             price_raw = order_info.get("p", 0)  # Price (uint32)
-            # 根据市场的price_multiplier调整，这里假设是10
-            price = self._safe_decimal(price_raw) / Decimal("10")
+            price = self._safe_decimal(price_raw) / price_multiplier
             if filled_amount > 0 and price > 0:
                 average_price = price  # 近似使用订单价格
 
@@ -901,6 +922,49 @@ class LighterWebSocket(LighterBase):
             logger.error(f"解析交易数据失败: {e}", exc_info=True)
             return None
 
+    def _parse_trade_data(self, trade_info: Dict[str, Any]) -> Optional[TradeData]:
+        """Parse the current Lighter Trade schema into the shared model."""
+        try:
+            market_id = trade_info.get("market_id")
+            if market_id is None:
+                return None
+
+            price = self._safe_decimal(trade_info.get("price"))
+            amount = self._safe_decimal(trade_info.get("size"))
+            usd_amount = trade_info.get("usd_amount")
+            cost = (
+                self._safe_decimal(usd_amount)
+                if usd_amount is not None else price * amount
+            )
+            is_maker_ask = bool(trade_info.get("is_maker_ask", False))
+            taker_order_id = (
+                trade_info.get("bid_id")
+                if is_maker_ask else trade_info.get("ask_id")
+            )
+
+            return TradeData(
+                id=str(trade_info.get(
+                    "trade_id_str", trade_info.get("trade_id", ""))),
+                symbol=self._get_symbol_from_market_index(int(market_id)),
+                side=OrderSide.BUY if is_maker_ask else OrderSide.SELL,
+                amount=amount,
+                price=price,
+                cost=cost,
+                fee=None,
+                timestamp=(
+                    self._parse_timestamp(trade_info.get("timestamp"))
+                    or datetime.now()
+                ),
+                order_id=(
+                    str(taker_order_id)
+                    if taker_order_id is not None else None
+                ),
+                raw_data=trade_info,
+            )
+        except Exception as e:
+            logger.error(f"解析成交数据失败: {e}", exc_info=True)
+            return None
+
     def _parse_positions(self, positions_data: Dict[str, Any]) -> List[PositionData]:
         """解析持仓列表"""
         positions = []
@@ -914,20 +978,41 @@ class LighterWebSocket(LighterBase):
                 if position_size == 0:
                     continue
 
+                liquidation_raw = position_info.get("liquidation_price")
+                liquidation_price = (
+                    None
+                    if liquidation_raw in (None, "", "0", "0.0")
+                    else self._safe_decimal(liquidation_raw)
+                )
+
                 positions.append(PositionData(
                     symbol=symbol,
-                    side="long" if position_size > 0 else "short",
+                    side=(
+                        PositionSide.LONG
+                        if position_size > 0 else PositionSide.SHORT
+                    ),
                     size=abs(position_size),
                     entry_price=self._safe_decimal(
                         position_info.get("avg_entry_price", 0)),
+                    mark_price=None,
+                    current_price=None,
                     unrealized_pnl=self._safe_decimal(
                         position_info.get("unrealized_pnl", 0)),
                     realized_pnl=self._safe_decimal(
                         position_info.get("realized_pnl", 0)),
-                    liquidation_price=self._safe_decimal(
-                        position_info.get("liquidation_price")),
-                    leverage=Decimal("1"),
-                    exchange="lighter"
+                    percentage=None,
+                    leverage=self._leverage_from_initial_margin_fraction(
+                        position_info.get("initial_margin_fraction", 0)),
+                    margin_mode=(
+                        MarginMode.CROSS
+                        if position_info.get("margin_mode", 0) == 0
+                        else MarginMode.ISOLATED
+                    ),
+                    margin=self._safe_decimal(
+                        position_info.get("allocated_margin", 0)),
+                    liquidation_price=liquidation_price,
+                    timestamp=datetime.now(),
+                    raw_data=position_info,
                 ))
             except Exception as e:
                 logger.error(f"解析持仓失败: {e}")
@@ -1095,25 +1180,24 @@ class LighterWebSocket(LighterBase):
         retry_count = 0
 
         # 🔥 外层循环：确保任务永不退出
-        while self.is_running:
+        while self._connected:
             try:
-                # 检查SignerClient是否可用
-                if not self.signer_client:
-                    logger.error("❌ SignerClient未初始化，无法订阅订单")
-                    await asyncio.sleep(10)
-                    continue
-
-                # 🔥 生成auth token（有效期1小时）
-                # create_auth_token_with_expiry需要过期时间戳（秒级），不是相对秒数
-                import time
-                expiry_timestamp = int(time.time()) + 3600  # 当前时间+1小时
-
-                result = self.signer_client.create_auth_token_with_expiry(
-                    expiry_timestamp)
-                # 返回的是元组 (token, None)
-                auth_token = result[0] if isinstance(result, tuple) else result
-
-                logger.info(f"✅ 生成认证token (过期时间: {expiry_timestamp})")
+                # market_stats是公开频道；只有账户订单订阅需要认证token。
+                auth_token = None
+                if self.signer_client:
+                    auth_token, auth_error = (
+                        self.signer_client.create_auth_token_with_expiry(
+                            deadline=3600,
+                            api_key_index=self.api_key_index,
+                        )
+                    )
+                    if auth_error:
+                        logger.warning(f"⚠️ 生成认证token失败: {auth_error}")
+                        auth_token = None
+                    else:
+                        logger.info("✅ 已生成1小时有效的认证token")
+                elif self.account_index:
+                    logger.warning("⚠️ SignerClient未初始化，跳过账户订单订阅")
 
                 # 连接WebSocket
                 ws_url = self.ws_url
@@ -1129,7 +1213,7 @@ class LighterWebSocket(LighterBase):
 
                     # 发送订阅消息
                     # 1️⃣ 订阅account_all_orders（需要认证）
-                    if self.account_index:
+                    if self.signer_client and auth_token:
                         subscribe_msg = {
                             "type": "subscribe",
                             "channel": f"account_all_orders/{self.account_index}",
@@ -1141,6 +1225,9 @@ class LighterWebSocket(LighterBase):
 
                     # 2️⃣ 订阅market_stats（无需认证）
                     await self._send_market_stats_subscriptions()
+
+                    # 3️⃣ 订阅公开成交（无需认证）
+                    await self._send_trade_subscriptions()
 
                     # 重置重连计数（连接成功）
                     retry_count = 0
@@ -1236,6 +1323,20 @@ class LighterWebSocket(LighterBase):
             elif msg_type in ("subscribed/market_stats", "update/market_stats") and "market_stats" in data:
                 await self._handle_market_stats_update(data["market_stats"])
 
+            # subscribed/trade包含历史快照；只把增量推送给实时回调。
+            elif msg_type == "update/trade":
+                trade_rows = data.get("trades", []) + data.get(
+                    "liquidation_trades", [])
+                for trade_info in trade_rows:
+                    trade = self._parse_trade_data(trade_info)
+                    if not trade:
+                        continue
+                    for callback in self._trade_callbacks:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(trade)
+                        else:
+                            callback(trade)
+
         except Exception as e:
             logger.error(f"❌ 处理直接WebSocket消息失败: {e}", exc_info=True)
 
@@ -1275,9 +1376,9 @@ class LighterWebSocket(LighterBase):
                 timestamp=datetime.now(),  # ✅ 必需字段，使用datetime对象
                 last=last_price,  # ✅ 最新成交价
                 bid=self._safe_decimal(market_stats.get(
-                    "mark_price", last_price)),  # 使用mark_price作为bid近似值
+                    "best_bid_price", last_price)),
                 ask=self._safe_decimal(market_stats.get(
-                    "index_price", last_price)),  # 使用index_price作为ask近似值
+                    "best_ask_price", last_price)),
                 volume=self._safe_decimal(
                     market_stats.get("daily_base_token_volume", 0)),  # 24小时成交量
                 high=self._safe_decimal(
@@ -1300,6 +1401,34 @@ class LighterWebSocket(LighterBase):
 
         except Exception as e:
             logger.error(f"❌ 处理market_stats更新失败: {e}", exc_info=True)
+
+    @staticmethod
+    def _parse_direct_order_type(value: Any) -> OrderType:
+        normalized = str(value or "limit").lower().replace("_", "-")
+        return {
+            "market": OrderType.MARKET,
+            "liquidation": OrderType.MARKET,
+            "limit": OrderType.LIMIT,
+            "stop-loss": OrderType.STOP,
+            "stop-loss-limit": OrderType.STOP_LIMIT,
+            "take-profit": OrderType.TAKE_PROFIT,
+            "take-profit-limit": OrderType.TAKE_PROFIT_LIMIT,
+        }.get(normalized, OrderType.LIMIT)
+
+    @staticmethod
+    def _parse_direct_order_status(value: Any) -> OrderStatus:
+        normalized = str(value or "unknown").lower()
+        if normalized.startswith("canceled") or normalized == "cancelled":
+            return OrderStatus.CANCELED
+        return {
+            "pending": OrderStatus.PENDING,
+            "in-progress": OrderStatus.OPEN,
+            "open": OrderStatus.OPEN,
+            "filled": OrderStatus.FILLED,
+            "expired": OrderStatus.EXPIRED,
+            "rejected": OrderStatus.REJECTED,
+            "failed": OrderStatus.REJECTED,
+        }.get(normalized, OrderStatus.UNKNOWN)
 
     def _parse_order_from_direct_ws(self, order_info: Dict[str, Any]) -> Optional[OrderData]:
         """
@@ -1350,16 +1479,8 @@ class LighterWebSocket(LighterBase):
             is_ask = order_info.get("is_ask", False)
             side = OrderSide.SELL if is_ask else OrderSide.BUY
 
-            # 状态
-            status_str = order_info.get("status", "unknown").lower()
-            if status_str == "filled":
-                status = OrderStatus.FILLED
-            elif status_str == "canceled" or status_str == "cancelled":
-                status = OrderStatus.CANCELED
-            elif status_str == "open":
-                status = OrderStatus.OPEN
-            else:
-                status = OrderStatus.OPEN  # 默认为OPEN
+            status = self._parse_direct_order_status(
+                order_info.get("status"))
 
             # 创建OrderData
             return OrderData(
@@ -1367,7 +1488,7 @@ class LighterWebSocket(LighterBase):
                 client_id=str(order_info.get("client_order_index", "")),
                 symbol=symbol,
                 side=side,
-                type=OrderType.LIMIT,
+                type=self._parse_direct_order_type(order_info.get("type")),
                 amount=initial_amount,
                 price=price,
                 filled=filled_amount,
