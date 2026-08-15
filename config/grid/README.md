@@ -27,7 +27,37 @@ uv run python run_grid_trading.py config/grid/<設定檔>.yaml --debug
 測試後若要清空 TradeXYZ 掛單與持倉：
 
 ```bash
-uv run python test_tradexyz_cancel_orders.py
+uv run python -m tests.test_tradexyz_cancel_orders
+```
+
+### Lighter 與 Robinhood instance
+
+Lighter 的網格策略參數一樣放在 `config/grid/*.yaml`，例如：
+
+```yaml
+grid_system:
+  exchange: "lighter"
+  symbol: "PLTR"
+  grid_type: "long"
+  lower_price: 170
+  upper_price: 180
+  grid_interval: 0.5
+  order_amount: 0.1
+```
+
+上述價格區間僅供展示；實際啟動前請按當時市價調整。`order_amount` 也必須同時
+滿足該市場的最小 base 與 quote amount。
+
+連線 instance 與憑證則放在 `config/exchanges/lighter_config.yaml`；可先複製
+`lighter_config_example.yaml`。Robinhood 使用 `network: "robinhood"`，原 Lighter
+主網使用 `network: "mainnet"`。兩者的 account index、API key、餘額、掛單與持倉
+彼此獨立，不可共用。
+
+公開行情 smoke test（不使用憑證、不會下單）：
+
+```bash
+uv run python -m tests.test_lighter_public --network mainnet
+uv run python -m tests.test_lighter_public --network robinhood
 ```
 
 ## YAML 基本結構

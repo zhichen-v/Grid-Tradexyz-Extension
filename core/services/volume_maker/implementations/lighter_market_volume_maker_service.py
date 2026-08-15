@@ -860,28 +860,28 @@ class LighterMarketVolumeMakerService(IVolumeMakerService):
         try:
             balance = await self.execution_adapter.get_account_balance()
 
-            # 查找USDC或USD余额
-            usdc_balance = None
+            # Robinhood Lighter uses USDG; other instances use USDC.
+            collateral_balance = None
             for bal in balance:
-                if bal.currency.upper() in ['USDC', 'USD', 'USDT']:
-                    usdc_balance = bal.free
+                if bal.currency.upper() in ['USDC', 'USDG', 'USD', 'USDT']:
+                    collateral_balance = bal.free
                     self._balance_currency = bal.currency.upper()  # 🔥 更新币种
                     break
 
-            if usdc_balance is None:
-                self.logger.warning("⚠️ 未找到USDC余额")
+            if collateral_balance is None:
+                self.logger.warning("⚠️ 未找到穩定幣抵押品餘額")
                 return True  # 继续运行
 
             # 🔥 更新最新余额（用于UI显示）
-            self._latest_balance = usdc_balance
+            self._latest_balance = collateral_balance
 
-            if self.config.min_balance is not None and usdc_balance < Decimal(str(self.config.min_balance)):
+            if self.config.min_balance is not None and collateral_balance < Decimal(str(self.config.min_balance)):
                 self.logger.error(
-                    f"❌ Lighter余额不足 - 当前: {usdc_balance}, 要求: {self.config.min_balance}")
+                    f"❌ Lighter余额不足 - 当前: {collateral_balance}, 要求: {self.config.min_balance}")
                 return False
 
             self.logger.info(
-                f"✅ Lighter余额检查通过 - {self._balance_currency}: {usdc_balance}")
+                f"✅ Lighter余额检查通过 - {self._balance_currency}: {collateral_balance}")
             return True
 
         except Exception as e:

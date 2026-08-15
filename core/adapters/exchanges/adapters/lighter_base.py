@@ -71,26 +71,37 @@ class LighterBase:
             config: 配置字典，包含API密钥、URL等信息
         """
         self.config = config
-        self.testnet = config.get("testnet", False)
+        configured_network = config.get("network")
+        legacy_testnet = config.get("testnet", False)
 
         # API 配置
         self.api_key_private_key = config.get("api_key_private_key", "")
         self.account_index = config.get("account_index", 0)
         self.api_key_index = config.get("api_key_index", 0)
 
-        # URL配置
-        self.base_url = self.TESTNET_URL if self.testnet else self.MAINNET_URL
-        self.ws_url = self.TESTNET_WS_URL if self.testnet else self.MAINNET_WS_URL
+        # Prefer the official SDK profiles while keeping the legacy testnet
+        # boolean as a backwards-compatible profile selector.
+        from lighter.endpoint_profiles import get_endpoint_profile
+
+        profile_name = configured_network or (
+            "testnet" if legacy_testnet else "mainnet"
+        )
+        endpoint_profile = get_endpoint_profile(str(profile_name).strip().lower())
+        self.network = endpoint_profile.name
+        self.testnet = endpoint_profile.name.endswith("testnet")
+        self.chain_id = endpoint_profile.chain_id
+        self.base_url = endpoint_profile.api_url
+        self.ws_url = endpoint_profile.ws_url
 
         # 覆盖URL（如果配置中提供）
-        if "api_url" in config:
+        if config.get("api_url"):
             self.base_url = config["api_url"]
-        if "ws_url" in config:
+        if config.get("ws_url"):
             self.ws_url = config["ws_url"]
 
-        # 🔥 确保ws_url不为None
+        # Keep REST and WS on the selected instance when an override is blank.
         if not self.ws_url:
-            default_ws = self.TESTNET_WS_URL if self.testnet else self.MAINNET_WS_URL
+            default_ws = endpoint_profile.ws_url
             logger.warning(f"⚠️ ws_url为空，使用默认值: {default_ws}")
             self.ws_url = default_ws
 
@@ -109,13 +120,16 @@ class LighterBase:
                     api_private_keys={
                         self.api_key_index: self.api_key_private_key
                     },
+                    chain_id=self.chain_id,
                 )
                 logger.info("✅ SignerClient初始化成功")
             except Exception as e:
                 logger.warning(f"⚠️ SignerClient初始化失败: {e}")
 
         logger.info(
-            f"Lighter基础配置初始化完成 - URL: {self.base_url}, 测试网: {self.testnet}")
+            f"Lighter基础配置初始化完成 - network: {self.network}, "
+            f"URL: {self.base_url}, 测试网: {self.testnet}"
+        )
 
     def get_base_url(self) -> str:
         """获取REST API基础URL"""

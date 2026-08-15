@@ -12,7 +12,7 @@ TradeXYZ 掛單清理工具
   - .env 檔案中含有 HL_AGENT_KEY / HL_WALLET_ADDRESS
 
 執行:
-    uv run python test_tradexyz_cancel_orders.py
+    uv run python -m tests.test_tradexyz_cancel_orders
 """
 
 import os

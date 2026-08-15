@@ -118,16 +118,16 @@ class BalanceMonitor:
             # 调用交易所API获取所有余额
             balances = await self.engine.exchange.get_balances()
 
-            # 查找USDC余额
-            usdc_balance = None
+            # Lighter Robinhood uses USDG; other supported perp venues use USDC.
+            collateral_balance = None
             for balance in balances:
-                if balance.currency.upper() == 'USDC':
-                    usdc_balance = balance
+                if balance.currency.upper() in {'USDC', 'USDG'}:
+                    collateral_balance = balance
                     break
 
-            if usdc_balance:
+            if collateral_balance:
                 # 从 raw_data 中提取详细的余额信息
-                raw_data = usdc_balance.raw_data
+                raw_data = collateral_balance.raw_data
 
                 #  支持多交易所：Backpack vs Hyperliquid vs Lighter
                 exchange_name = self.config.exchange.lower() if hasattr(
@@ -150,10 +150,9 @@ class BalanceMonitor:
                         raw_data.get('used', '0'))  # 订单冻结资产
                 elif exchange_name == 'lighter':
                     # Lighter格式：BalanceData 直接包含 free, used, total
-                    # Lighter是合约交易所，只有USDC保证金
-                    self._spot_balance = usdc_balance.free  # 可用余额
-                    self._collateral_balance = usdc_balance.total  # 总余额（包含冻结）
-                    self._order_locked_balance = usdc_balance.used  # 订单冻结资产
+                    self._spot_balance = collateral_balance.free  # 可用余额
+                    self._collateral_balance = collateral_balance.total  # 总余额（包含冻结）
+                    self._order_locked_balance = collateral_balance.used  # 订单冻结资产
 
                     self.logger.debug(
                         f" Lighter余额: 可用={self._spot_balance}, "
@@ -219,7 +218,7 @@ class BalanceMonitor:
             else:
                 all_currencies = [b.currency for b in balances]
                 self.logger.warning(
-                    f"️ 未找到USDC余额，所有币种: {', '.join(all_currencies) if all_currencies else '(空)'}"
+                    f"️ 未找到USDC/USDG余额，所有币种: {', '.join(all_currencies) if all_currencies else '(空)'}"
                 )
 
         except Exception as e:
@@ -286,7 +285,7 @@ class BalanceMonitor:
                 self._initial_capital = self._collateral_balance
                 self._initial_capital_with_btc_calculated = True  # 合约模式不需要BTC计算
                 self.logger.info(
-                    f" 初始本金已记录: ${self._initial_capital:,.3f} USDC")
+                    f" 初始本金已记录: ${self._initial_capital:,.3f}（抵押品）")
 
         self.coordinator.ensure_symbol_isolated_capital(
             current_price=self._get_current_price()

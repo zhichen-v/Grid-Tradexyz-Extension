@@ -119,16 +119,22 @@ class LighterAdapter(ExchangeAdapter):
         Returns:
             配置字典
         """
+        extra_params = getattr(config, 'extra_params', {})
+
         # 先尝试从ExchangeConfig获取
         config_dict = {
             "testnet": getattr(config, 'testnet', False),
+            "network": extra_params.get('network'),
             "api_key_private_key": getattr(config, 'api_key_private_key', ''),
             "account_index": getattr(config, 'account_index', 0),
             "api_key_index": getattr(config, 'api_key_index', 0),
         }
 
         # 如果api_key_private_key为空，从配置文件加载
-        if not config_dict.get('api_key_private_key'):
+        if (
+            not config_dict.get('api_key_private_key')
+            and extra_params.get('load_credentials_from_file', True)
+        ):
             try:
                 lighter_config = self._load_lighter_config()
                 api_config = lighter_config.get('api_config', {})
@@ -141,6 +147,9 @@ class LighterAdapter(ExchangeAdapter):
                 config_dict['api_key_index'] = auth_config.get(
                     'api_key_index', 0)
                 config_dict['testnet'] = api_config.get('testnet', False)
+                config_dict['network'] = (
+                    config_dict.get('network') or api_config.get('network')
+                )
 
                 if self.logger:
                     self.logger.info("✅ 从lighter_config.yaml加载API配置")

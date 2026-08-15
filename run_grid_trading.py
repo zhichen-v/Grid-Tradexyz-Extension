@@ -492,8 +492,12 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
             lighter_config_path = Path("config/exchanges/lighter_config.yaml")
             if lighter_config_path.exists():
                 with open(lighter_config_path, "r", encoding="utf-8") as file:
-                    lighter_config_data = yaml.safe_load(file)
+                    lighter_config_data = yaml.safe_load(file) or {}
                 api_config = lighter_config_data.get("api_config", {})
+                lighter_network = str(
+                    api_config.get("network")
+                    or ("testnet" if api_config.get("testnet", False) else "mainnet")
+                ).strip().lower()
 
                 exchange_config = ExchangeConfig(
                     exchange_id="lighter",
@@ -504,9 +508,11 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                     testnet=api_config.get("testnet", False),
                     enable_websocket=True,
                     enable_auto_reconnect=True,
+                    extra_params={"network": lighter_network},
                 )
                 print(
-                    "   - Lighter config loaded successfully (adapter will read API credentials automatically)"
+                    "   - Lighter config loaded successfully "
+                    f"(network={lighter_network}; adapter will read API credentials automatically)"
                 )
             else:
                 print(f"   - Warning: Lighter config file not found: {lighter_config_path}")
@@ -519,6 +525,7 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                     testnet=False,
                     enable_websocket=True,
                     enable_auto_reconnect=True,
+                    extra_params={"network": "mainnet"},
                 )
         except Exception as exc:
             print(f"   - Warning: failed to load Lighter config: {exc}")
@@ -531,6 +538,7 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                 testnet=False,
                 enable_websocket=True,
                 enable_auto_reconnect=True,
+                extra_params={"network": "mainnet"},
             )
     else:
         display_name = "TradeXYZ" if exchange_name == "tradexyz" else exchange_name.capitalize()

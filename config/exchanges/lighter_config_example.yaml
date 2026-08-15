@@ -5,13 +5,11 @@ exchange_name: "Lighter"
 
 # API配置
 api_config:
-  # API端点
-  mainnet_url: "https://mainnet.zklighter.elliot.ai"
-  testnet_url: "https://testnet.zklighter.elliot.ai"
-  ws_mainnet_url: "wss://mainnet.zklighter.elliot.ai/stream"
-  ws_testnet_url: "wss://testnet.zklighter.elliot.ai/stream"
-  
-  # 默认使用主网
+  # Lighter instance（由 lighter-sdk 官方 endpoint profile 解析）
+  # 可选: mainnet, testnet, robinhood, robinhood_testnet
+  network: "mainnet"
+
+  # 舊版相容欄位；若省略 network，才會用此欄位選 mainnet/testnet
   testnet: false
   
   # API认证配置
@@ -202,7 +200,9 @@ usage:
   important_notes:
     - "Lighter使用zkRollup技术，交易需要签名"
     - "API Key私钥必须保密，不要提交到代码仓库"
-    - "测试时建议先使用testnet: true"
+    - "Robinhood與Lighter mainnet是獨立instance，account_index、API Key、餘額、掛單與持倉不可共用"
+    - "切換network後會重新發現market_index；不可沿用其他instance的市場索引"
+    - "測試時建議使用network: testnet或network: robinhood_testnet"
     - "市场索引(market_index)对应交易对，需要通过API获取"
 
 # 示例配置

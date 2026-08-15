@@ -1,16 +1,20 @@
 """Read-only Lighter adapter smoke test; no credentials or orders required."""
 
+import argparse
 import asyncio
 from decimal import Decimal
 from datetime import datetime
 from importlib.metadata import version
 from inspect import signature
 import threading
+from types import SimpleNamespace
 
 import lighter
+from lighter.endpoint_profiles import ENDPOINT_PROFILES, get_endpoint_profile
 
 from core.adapters.exchanges.factory import ExchangeFactory
 from core.adapters.exchanges.adapters.lighter import LighterAdapter
+from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
 from core.adapters.exchanges.interface import ExchangeConfig
 from core.adapters.exchanges.models import ExchangeType
@@ -19,12 +23,15 @@ from core.adapters.exchanges.models import ExchangeType
 async def check_client_lifecycle() -> None:
     created = 0
     closed = 0
+    signer_kwargs = None
     real_signer = lighter.SignerClient
+    robinhood_profile = get_endpoint_profile("robinhood")
 
     class FakeSigner:
         def __init__(self, **kwargs):
-            nonlocal created
+            nonlocal created, signer_kwargs
             created += 1
+            signer_kwargs = kwargs
 
         async def close(self):
             nonlocal closed
@@ -37,6 +44,9 @@ async def check_client_lifecycle() -> None:
         api_key="",
         api_secret="",
         testnet=False,
+        base_url="https://lighter-proxy.example",
+        ws_url="",
+        extra_params={"network": "robinhood"},
     )
     signed_config.api_key_private_key = "test-only"
     lighter.SignerClient = FakeSigner
@@ -44,10 +54,19 @@ async def check_client_lifecycle() -> None:
         signed_client = LighterAdapter(signed_config)
         assert signed_client._rest.signer_client is signed_client._websocket.signer_client
         assert signed_client._base is signed_client._rest
+        assert signer_kwargs["chain_id"] == robinhood_profile.chain_id
+        assert signer_kwargs["url"] == "https://lighter-proxy.example"
+        assert signed_client._websocket.ws_url == robinhood_profile.ws_url
         await signed_client.disconnect()
     finally:
         lighter.SignerClient = real_signer
     assert created == 1 and closed == 1
+
+    blank_override_client = LighterWebSocket({
+        "network": "robinhood",
+        "ws_url": "",
+    })
+    assert blank_override_client.ws_url == robinhood_profile.ws_url
 
     started = threading.Event()
     stopped = threading.Event()
@@ -83,12 +102,37 @@ async def check_client_lifecycle() -> None:
     assert order_fill_subscription_started
 
 
-async def main() -> None:
+async def check_collateral_currency() -> None:
+    class FakeAccountApi:
+        async def account(self, **kwargs):
+            return SimpleNamespace(accounts=[SimpleNamespace(
+                available_balance="90",
+                collateral="100",
+            )])
+
+    for network, expected_currency in (
+        ("mainnet", "USDC"),
+        ("robinhood", "USDG"),
+    ):
+        rest = LighterRest({"network": network})
+        rest.signer_client = object()
+        rest.account_api = FakeAccountApi()
+        balances = await rest.get_account_balance()
+        assert balances and balances[0].currency == expected_currency
+        assert balances[0].free == Decimal("90")
+        assert balances[0].used == Decimal("10")
+
+
+async def main(network: str = "mainnet", symbol: str | None = None) -> None:
     assert "api_private_keys" in signature(lighter.SignerClient).parameters
     assert "authorization" in signature(
         lighter.OrderApi.account_active_orders
     ).parameters
     await check_client_lifecycle()
+    await check_collateral_currency()
+
+    profile = get_endpoint_profile(network)
+    symbol = (symbol or "ETH").upper()
 
     config = ExchangeConfig(
         exchange_id="lighter",
@@ -96,22 +140,35 @@ async def main() -> None:
         exchange_type=ExchangeType.PERPETUAL,
         api_key="",
         api_secret="",
-        testnet=False,
+        testnet=profile.name.endswith("testnet"),
+        extra_params={
+            "network": profile.name,
+            "load_credentials_from_file": False,
+        },
     )
     client = ExchangeFactory().create_adapter("lighter", config)
 
     try:
+        assert client._rest.signer_client is None
+        assert client._rest.base_url == profile.api_url
+        assert client._websocket.ws_url == profile.ws_url
         assert await client.connect()
 
-        market_id = client._rest.get_market_index("ETH-USD")
-        assert market_id is not None
-        assert market_id == client._rest.get_market_index("ETH_USDC_PERP")
+        robinhood_ticker = None
+        if profile.name == "robinhood":
+            assert client._rest.get_market_index("PLTR") is not None
+            robinhood_ticker = await client.get_ticker("PLTR-USD")
+            assert robinhood_ticker and robinhood_ticker.last > 0
 
-        ticker = await client.get_ticker("ETH-USD")
+        market_id = client._rest.get_market_index(f"{symbol}-USD")
+        assert market_id is not None
+        assert market_id == client._rest.get_market_index(f"{symbol}_USDC_PERP")
+
+        ticker = await client.get_ticker(f"{symbol}-USD")
         assert ticker and ticker.last and ticker.last > 0
         assert ticker.bid and ticker.ask and ticker.bid <= ticker.ask
 
-        orderbook = await client.get_orderbook("ETH-USD", limit=3)
+        orderbook = await client.get_orderbook(f"{symbol}-USD", limit=3)
         assert orderbook and orderbook.bids and orderbook.asks
 
         ws_orderbook = None
@@ -122,15 +179,15 @@ async def main() -> None:
             ws_orderbook = update
             orderbook_update.set()
 
-        await client.subscribe_orderbook("ETH-USD", on_orderbook)
+        await client.subscribe_orderbook(f"{symbol}-USD", on_orderbook)
         await asyncio.wait_for(orderbook_update.wait(), timeout=15)
         assert ws_orderbook and ws_orderbook.bids and ws_orderbook.asks
 
-        recent_trades = await client.get_recent_trades("ETH-USD", limit=2)
+        recent_trades = await client.get_recent_trades(f"{symbol}-USD", limit=2)
         assert recent_trades and recent_trades[0].order_id
         assert isinstance(recent_trades[0].timestamp, datetime)
 
-        market_info = await client._rest._get_market_info("ETH")
+        market_info = await client._rest._get_market_info(symbol)
         assert market_info is not None
         limit_params = client._rest._convert_limit_order_params(
             market_info,
@@ -159,7 +216,7 @@ async def main() -> None:
             ws_ticker = update
             ws_update.set()
 
-        await client.subscribe_ticker("ETH-USD", on_ticker)
+        await client.subscribe_ticker(f"{symbol}-USD", on_ticker)
         await asyncio.wait_for(ws_update.wait(), timeout=15)
         assert ws_ticker and ws_ticker.last and ws_ticker.last > 0
         assert ws_ticker.bid and ws_ticker.ask and ws_ticker.bid <= ws_ticker.ask
@@ -172,7 +229,7 @@ async def main() -> None:
             ws_trade = update
             trade_update.set()
 
-        await client.subscribe_trades("ETH-USD", on_trade)
+        await client.subscribe_trades(f"{symbol}-USD", on_trade)
         await asyncio.wait_for(trade_update.wait(), timeout=15)
         assert ws_trade and ws_trade.price > 0 and ws_trade.amount > 0
         assert isinstance(ws_trade.timestamp, datetime)
@@ -208,16 +265,16 @@ async def main() -> None:
         })
         assert parsed_positions and parsed_positions[0].leverage == 50
 
-        await client._websocket.unsubscribe_ticker("ETH")
-        await client._websocket.unsubscribe_trades("ETH")
-        await client._websocket.unsubscribe_orderbook("ETH")
+        await client._websocket.unsubscribe_ticker(symbol)
+        await client._websocket.unsubscribe_trades(symbol)
+        await client._websocket.unsubscribe_orderbook(symbol)
         assert market_id not in client._websocket._subscribed_market_stats
         assert market_id not in client._websocket._subscribed_trades
         assert market_id not in client._websocket._subscribed_markets
 
         print(f"lighter-sdk={version('lighter-sdk')}")
         print(
-            f"ETH market_id={market_id} REST={ticker.last} "
+            f"network={profile.name} {symbol} market_id={market_id} REST={ticker.last} "
             f"WS={ws_ticker.last} bid={ws_ticker.bid} ask={ws_ticker.ask}"
         )
         print(
@@ -229,9 +286,19 @@ async def main() -> None:
             f"recent_trade={recent_trades[0].price} "
             f"ws_trade={ws_trade.price} side={ws_trade.side.value}"
         )
+        if robinhood_ticker:
+            print(f"Robinhood market check: PLTR={robinhood_ticker.last}")
     finally:
         await client.disconnect()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--network",
+        choices=sorted(ENDPOINT_PROFILES),
+        default="mainnet",
+    )
+    parser.add_argument("--symbol")
+    args = parser.parse_args()
+    asyncio.run(main(network=args.network, symbol=args.symbol))

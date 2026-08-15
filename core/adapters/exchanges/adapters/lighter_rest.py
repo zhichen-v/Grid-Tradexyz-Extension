@@ -509,7 +509,7 @@ class LighterRest(LighterBase):
                 # 获取第一个账户（通常就是查询的账户）
                 account = response.accounts[0]
 
-                # 获取可用余额和抵押品（USDC余额）
+                # 获取可用余额和抵押品
                 available_balance = self._safe_decimal(
                     getattr(account, 'available_balance', 0))
                 collateral = self._safe_decimal(
@@ -518,11 +518,15 @@ class LighterRest(LighterBase):
                 # 计算锁定余额（抵押品 - 可用余额）
                 locked = max(collateral - available_balance, Decimal("0"))
 
-                # USDC 余额（Lighter是合约交易所，只有USDC保证金）
+                collateral_currency = (
+                    "USDG"
+                    if self.network in {"robinhood", "robinhood_testnet"}
+                    else "USDC"
+                )
                 if collateral > 0:
                     from datetime import datetime
                     balances.append(BalanceData(
-                        currency="USDC",
+                        currency=collateral_currency,
                         free=available_balance,
                         used=locked,
                         total=collateral,

@@ -8,6 +8,7 @@
 # 交易所設定（含私鑰）
 config/exchanges/tradexyz_config.yaml
 config/exchanges/hyperliquid_config.yaml
+config/exchanges/lighter_config.yaml
 
 # Python
 __pycache__/

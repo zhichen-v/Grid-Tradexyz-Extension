@@ -14,7 +14,7 @@ environment, configure credentials, choose a grid config, and run the bot.
 - Grid coordinator, engine, tracker, and TUI: `core/services/grid/`
 - Exchange configs: `config/exchanges/`
 - Grid configs: `config/grid/`
-- Smoke scripts for TradeXYZ: `test_tradexyz_public.py`, `test_tradexyz_order.py`, `test_tradexyz_cancel_orders.py`
+- Smoke scripts for TradeXYZ under `tests/`: public data, order flow, and cleanup
 - Runtime logs: `logs/`
 
 ## 2. Prerequisites
@@ -285,19 +285,19 @@ Before placing real orders, use the smoke scripts to confirm connectivity and ad
 Public connectivity:
 
 ```bash
-uv run python test_tradexyz_public.py
+uv run python -m tests.test_tradexyz_public
 ```
 
 Order placement flow:
 
 ```bash
-uv run python test_tradexyz_order.py
+uv run python -m tests.test_tradexyz_order
 ```
 
 Cancel-order flow:
 
 ```bash
-uv run python test_tradexyz_cancel_orders.py
+uv run python -m tests.test_tradexyz_cancel_orders
 ```
 
 These scripts may hit real exchange endpoints. Do not run them with production credentials unless you understand the effect.
@@ -373,9 +373,11 @@ grid1.3/
 ├─ logs/
 ├─ run_grid_trading.py
 ├─ setup_agent_wallet.py
-├─ test_tradexyz_public.py
-├─ test_tradexyz_order.py
-└─ test_tradexyz_cancel_orders.py
+└─ tests/
+   ├─ test_lighter_public.py
+   ├─ test_tradexyz_public.py
+   ├─ test_tradexyz_order.py
+   └─ test_tradexyz_cancel_orders.py
 ```
 
 ## 15. Security Notes

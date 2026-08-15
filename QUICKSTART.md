@@ -80,19 +80,19 @@ Exit with `Ctrl+C` or `Q`.
 Public API:
 
 ```bash
-uv run python test_tradexyz_public.py
+uv run python -m tests.test_tradexyz_public
 ```
 
 Order placement:
 
 ```bash
-uv run python test_tradexyz_order.py
+uv run python -m tests.test_tradexyz_order
 ```
 
 Order cancel:
 
 ```bash
-uv run python test_tradexyz_cancel_orders.py
+uv run python -m tests.test_tradexyz_cancel_orders
 ```
 
 These scripts may hit live endpoints. Use caution.

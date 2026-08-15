@@ -13,7 +13,7 @@ TradeXYZ NVDA 掛單測試（使用 Agent Wallet）
   5. 取消訂單並確認
 
 執行:
-    uv run python test_tradexyz_order.py
+    uv run python -m tests.test_tradexyz_order
 """
 
 import os
