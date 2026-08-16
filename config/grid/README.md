@@ -221,7 +221,7 @@ grid_system:
 | `grid_interval` | 是 | 無 | 每格價格距離 |
 | `order_amount` | 是 | 無 | 每格的基礎下單數量 |
 | `quantity_precision` | 否 | `3` | 數量小數位數 |
-| `max_position` | 否 | `null` | 最大持倉限制 |
+| `max_position` | 否 | `null` | 保留欄位；目前不作跨程序／全帳戶硬性限制 |
 | `enable_notifications` | 否 | `false` | 是否啟用通知 |
 | `order_health_check_interval` | 否 | `600` | 健康檢查間隔，單位秒 |
 | `fee_rate` | 否 | `0.0001` | 手續費率，供損益估算使用 |
@@ -481,7 +481,7 @@ grid_system:
 ## 風險與注意事項
 
 - 修改 YAML 後需要重啟程式才會生效
-- stop loss 觸發後會停止策略；重新啟動前請先確認交易所掛單與持倉狀態
+- stop loss 觸發後會撤單、以 `reduce_only` 市價單平倉並回查至零倉位，再停止策略；若交易所查詢、撤單或平倉驗證失敗，策略會停止但保留本地狀態並要求人工檢查
 - 請確認 `quantity_precision` 與交易所實際最小下單單位一致
 - 固定區間模式若 `upper_price - lower_price` 不能被 `grid_interval` 合理切分，實際 `grid_count` 會取整數
 - 部分舊範例檔仍可能留有歷史註解；若註解和公式不同，以程式公式為準

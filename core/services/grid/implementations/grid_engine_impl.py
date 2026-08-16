@@ -48,6 +48,11 @@ class GridEngineImpl(IGridEngine):
 
         self._running = False
         self._shutting_down = False
+        self._placements_paused = False
+        self._placement_epoch = 0
+        self._inflight_placements = 0
+        self._placements_drained = asyncio.Event()
+        self._placements_drained.set()
         self._polling_task: Optional[asyncio.Task] = None
         self._ws_monitoring_enabled = False
         self._last_ws_check_time: float = 0.0
@@ -111,16 +116,22 @@ class GridEngineImpl(IGridEngine):
         self,
         order: GridOrder,
         batch_mode: bool = False,
+        allow_while_paused: bool = False,
     ) -> Optional[GridOrder]:
         """Place a single limit order and track it locally."""
-        try:
-            if self._shutting_down or not self._running:
-                self.logger.warning(
-                    f"Skip order placement while engine is stopping: "
-                    f"{order.side.value} {order.amount}@{order.price}"
-                )
-                return None
+        if (
+            self._shutting_down
+            or not self._running
+            or (self._placements_paused and not allow_while_paused)
+        ):
+            self.logger.warning(
+                f"Skip order placement while engine is stopping: "
+                f"{order.side.value} {order.amount}@{order.price}"
+            )
+            return None
 
+        self._begin_inflight_placement()
+        try:
             exchange_side = self._convert_order_side(order.side)
             create_kwargs = {
                 "symbol": self.config.symbol,
@@ -128,12 +139,18 @@ class GridEngineImpl(IGridEngine):
                 "order_type": OrderType.LIMIT,
                 "amount": order.amount,
                 "price": order.price,
-                "params": None,
+                "params": (
+                    {"time_in_force": "POST_ONLY"}
+                    if str(getattr(self.config, "exchange", "")).lower() == "lighter"
+                    else None
+                ),
             }
             if batch_mode and self._supports_batch_mode():
                 create_kwargs["batch_mode"] = True
 
             exchange_order = await self.exchange.create_order(**create_kwargs)
+            if exchange_order is None:
+                raise RuntimeError("Exchange rejected the order without an error response")
             order_id = self._string_or_none(
                 getattr(exchange_order, "id", None)
                 or getattr(exchange_order, "order_id", None)
@@ -164,9 +181,26 @@ class GridEngineImpl(IGridEngine):
             self.logger.error(f"Order placement failed: {exc}")
             order.mark_failed()
             raise
+        finally:
+            self._end_inflight_placement()
 
-    async def place_market_order(self, side: GridOrderSide, amount: Decimal) -> None:
+    async def place_market_order(
+        self,
+        side: GridOrderSide,
+        amount: Decimal,
+        reduce_only: bool = False,
+        reference_price: Optional[Decimal] = None,
+        allow_while_paused: bool = False,
+    ) -> None:
         """Place a market order, used mainly for position adjustment flows."""
+        if (
+            self._shutting_down
+            or not self._running
+            or (self._placements_paused and not allow_while_paused)
+        ):
+            raise RuntimeError("Cannot place a market order while engine is stopping")
+
+        self._begin_inflight_placement()
         try:
             exchange_side = self._convert_order_side(side)
             exchange_order = await self.exchange.create_order(
@@ -174,9 +208,11 @@ class GridEngineImpl(IGridEngine):
                 side=exchange_side,
                 order_type=OrderType.MARKET,
                 amount=amount,
-                price=None,
-                params=None,
+                price=reference_price,
+                params={"reduce_only": True} if reduce_only else None,
             )
+            if exchange_order is None:
+                raise RuntimeError("Exchange returned no market order")
             order_id = getattr(exchange_order, "id", None) or getattr(
                 exchange_order, "order_id", None
             )
@@ -186,14 +222,20 @@ class GridEngineImpl(IGridEngine):
         except Exception as exc:
             self.logger.error(f"Market order placement failed: {exc}")
             raise
+        finally:
+            self._end_inflight_placement()
 
     async def place_batch_orders(
         self,
         orders: List[GridOrder],
         max_retries: int = 2,
+        allow_while_paused: bool = False,
     ) -> List[GridOrder]:
         """Place orders in batches, with retries for failed items."""
         if not orders:
+            return []
+        if self._placements_paused and not allow_while_paused:
+            self.logger.warning("Skip batch placement while reset gate is active")
             return []
 
         total_orders = len(orders)
@@ -205,7 +247,7 @@ class GridEngineImpl(IGridEngine):
 
         for start in range(0, total_orders, batch_size):
             batch = orders[start:start + batch_size]
-            results = await self._execute_batch(batch)
+            results = await self._execute_batch(batch, allow_while_paused)
 
             for order, result in zip(batch, results):
                 if isinstance(result, GridOrder):
@@ -215,12 +257,23 @@ class GridEngineImpl(IGridEngine):
                 else:
                     failed_orders.append((order, str(result)))
 
+            if self._placements_paused and not allow_while_paused:
+                self.logger.warning(
+                    "Abort remaining batch placements because reset started"
+                )
+                return successful_orders
+
             if start + batch_size < total_orders:
                 await asyncio.sleep(0.5)
 
         for attempt in range(1, max_retries + 1):
             if not failed_orders:
                 break
+            if self._placements_paused and not allow_while_paused:
+                self.logger.warning(
+                    "Abort batch retries because reset gate is active"
+                )
+                return successful_orders
 
             self.logger.warning(
                 f"Retrying failed orders: attempt={attempt}, count={len(failed_orders)}"
@@ -229,7 +282,7 @@ class GridEngineImpl(IGridEngine):
 
             retry_orders = [order for order, _ in failed_orders]
             failed_orders = []
-            results = await self._execute_batch(retry_orders)
+            results = await self._execute_batch(retry_orders, allow_while_paused)
 
             for order, result in zip(retry_orders, results):
                 if isinstance(result, GridOrder):
@@ -285,27 +338,36 @@ class GridEngineImpl(IGridEngine):
 
     async def cancel_all_orders(self) -> int:
         """Cancel all open orders for the configured symbol."""
-        try:
-            if self.config is None:
-                return 0
-
-            for key in list(self._pending_orders.keys()):
-                self._expected_cancellations.add(key)
-
-            cancelled_orders = await self.exchange.cancel_all_orders(self.config.symbol)
-            cancelled_count = len(cancelled_orders) if cancelled_orders else len(
-                self.get_pending_orders()
-            )
-
-            for grid_order in self.get_pending_orders():
-                grid_order.mark_cancelled()
-
-            self._pending_orders.clear()
-            self.logger.info(f"All open orders cancelled: count={cancelled_count}")
-            return cancelled_count
-        except Exception as exc:
-            self.logger.error(f"Cancel-all failed: {exc}")
+        if self.config is None:
             return 0
+
+        # Shutdown first blocks new placements, then waits for any request that
+        # already crossed that gate to finish before taking the cancel snapshot.
+        await self._placements_drained.wait()
+
+        pending_orders = self.get_pending_orders()
+        expected_keys = set(self._pending_orders.keys())
+        self._expected_cancellations.update(expected_keys)
+
+        try:
+            cancelled_orders = await self.exchange.cancel_all_orders(self.config.symbol)
+            remaining_orders = await self.exchange.get_open_orders(self.config.symbol)
+            if remaining_orders:
+                raise RuntimeError(
+                    f"{len(remaining_orders)} orders remain open after cancel-all"
+                )
+        except Exception as exc:
+            self._expected_cancellations.difference_update(expected_keys)
+            self.logger.error(f"Cancel-all failed: {exc}")
+            raise
+
+        cancelled_count = len(cancelled_orders) if cancelled_orders else len(pending_orders)
+        for grid_order in pending_orders:
+            grid_order.mark_cancelled()
+
+        self._pending_orders.clear()
+        self.logger.info(f"All open orders cancelled: count={cancelled_count}")
+        return cancelled_count
 
     async def get_order_status(self, order_id: str) -> Optional[GridOrder]:
         """Fetch and apply the latest exchange status for a local order."""
@@ -411,6 +473,7 @@ class GridEngineImpl(IGridEngine):
     async def start(self):
         """Start background monitoring tasks."""
         self._shutting_down = False
+        self._placements_paused = False
         self._running = True
         self._start_smart_monitor()
         self._start_order_health_check()
@@ -422,8 +485,38 @@ class GridEngineImpl(IGridEngine):
             return
 
         self._shutting_down = True
+        self.pause_placements()
         self._running = False
         self.logger.info("Grid execution engine entered shutdown mode")
+
+    def pause_placements(self) -> None:
+        """Block new placement requests while allowing in-flight ones to finish."""
+        if not self._placements_paused:
+            self._placement_epoch += 1
+        self._placements_paused = True
+
+    def resume_placements(self) -> None:
+        """Re-open the reset placement gate for normal strategy work."""
+        if not self._shutting_down:
+            self._placements_paused = False
+
+    async def wait_for_inflight_placements(self) -> None:
+        """Wait until every request that crossed the placement gate has returned."""
+        await self._placements_drained.wait()
+
+    @property
+    def placement_epoch(self) -> int:
+        """Generation used to invalidate repair work captured before a reset."""
+        return self._placement_epoch
+
+    def _begin_inflight_placement(self) -> None:
+        self._inflight_placements += 1
+        self._placements_drained.clear()
+
+    def _end_inflight_placement(self) -> None:
+        self._inflight_placements -= 1
+        if self._inflight_placements == 0:
+            self._placements_drained.set()
 
     async def stop(self):
         """Stop background monitoring tasks."""
@@ -1619,18 +1712,31 @@ class GridEngineImpl(IGridEngine):
         if hasattr(state, "add_order"):
             state.add_order(new_order)
 
-    async def _execute_batch(self, orders: List[GridOrder]) -> List[Any]:
+    async def _execute_batch(
+        self,
+        orders: List[GridOrder],
+        allow_while_paused: bool = False,
+    ) -> List[Any]:
         """Execute one placement batch, serially when required by the exchange."""
         if self._supports_batch_mode():
             results = []
             for order in orders:
                 try:
-                    results.append(await self.place_order(order, batch_mode=True))
+                    results.append(
+                        await self.place_order(
+                            order,
+                            batch_mode=True,
+                            allow_while_paused=allow_while_paused,
+                        )
+                    )
                 except Exception as exc:
                     results.append(exc)
             return results
 
-        tasks = [self.place_order(order) for order in orders]
+        tasks = [
+            self.place_order(order, allow_while_paused=allow_while_paused)
+            for order in orders
+        ]
         return await asyncio.gather(*tasks, return_exceptions=True)
 
     def _supports_batch_mode(self) -> bool:

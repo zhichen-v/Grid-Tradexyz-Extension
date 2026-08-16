@@ -465,8 +465,22 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                         print(
                             f"   - Wallet address: {wallet_address[:10]}...{wallet_address[-6:]}"
                         )
+        except yaml.YAMLError:
+            if exchange_name == "lighter":
+                raise RuntimeError(
+                    "Invalid YAML in config/exchanges/lighter_config.yaml"
+                ) from None
+            print("   - Warning: exchange config contains invalid YAML")
         except Exception as exc:
-            print(f"   - Warning: failed to read exchange config file: {exc}")
+            if exchange_name == "lighter":
+                raise RuntimeError(
+                    "Failed to read Lighter config "
+                    f"({type(exc).__name__})"
+                ) from exc
+            print(
+                "   - Warning: failed to read exchange config file "
+                f"({type(exc).__name__})"
+            )
 
     # Print a warning if credentials are still missing.
     if not api_key or not api_secret:
@@ -527,19 +541,17 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                     enable_auto_reconnect=True,
                     extra_params={"network": "mainnet"},
                 )
+        except yaml.YAMLError:
+            # Parser exceptions include the offending source line, which may
+            # contain the API private key. Never echo them or fall back to mainnet.
+            raise RuntimeError(
+                "Invalid YAML in config/exchanges/lighter_config.yaml"
+            ) from None
         except Exception as exc:
-            print(f"   - Warning: failed to load Lighter config: {exc}")
-            exchange_config = ExchangeConfig(
-                exchange_id="lighter",
-                name="Lighter",
-                exchange_type=market_type,
-                api_key="",
-                api_secret="",
-                testnet=False,
-                enable_websocket=True,
-                enable_auto_reconnect=True,
-                extra_params={"network": "mainnet"},
-            )
+            raise RuntimeError(
+                "Failed to load Lighter config "
+                f"({type(exc).__name__})"
+            ) from exc
     else:
         display_name = "TradeXYZ" if exchange_name == "tradexyz" else exchange_name.capitalize()
         exchange_config = ExchangeConfig(
@@ -557,7 +569,13 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
     # Create and connect the adapter through the factory.
     factory = ExchangeFactory()
     adapter = factory.create_adapter(exchange_id=exchange_name, config=exchange_config)
-    await adapter.connect()
+    connected = await adapter.connect()
+    if not connected:
+        try:
+            await adapter.disconnect()
+        except Exception:
+            pass
+        raise RuntimeError(f"Failed to connect to exchange: {exchange_name}")
     return adapter
 
 
@@ -635,6 +653,7 @@ async def main(
     logger = get_system_logger()
     from core.adapters.exchanges.models import ExchangeType
 
+    runtime_error = None
     try:
         # 1. Load configuration.
         grid_config = create_grid_config(config_data)
@@ -804,32 +823,57 @@ async def main(
 
         await terminal_ui.run()
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # asyncio.run turns SIGINT into task cancellation. Handle it here so
+        # cleanup failures below can still produce a non-zero process exit.
         print("\n\nExit signal received, stopping the system...")
 
     except Exception as exc:
+        runtime_error = exc
         logger.error(f"System error: {exc}", exc_info=True)
         print(f"\nSystem error: {exc}")
 
     finally:
         print("\nCleaning up resources...")
-        try:
-            if "reserve_monitor" in locals() and reserve_monitor:
+        cleanup_errors = []
+
+        if "reserve_monitor" in locals() and reserve_monitor:
+            try:
                 await reserve_monitor.stop()
                 print("   - Reserve monitor stopped")
+            except Exception as exc:
+                cleanup_errors.append(f"reserve monitor: {exc}")
 
-            if "coordinator" in locals():
+        if "coordinator" in locals():
+            try:
                 await coordinator.stop()
                 print("   - Grid system stopped")
+            except Exception as exc:
+                cleanup_errors.append(f"grid stop: {exc}")
 
-            if "exchange_adapter" in locals():
+        if "exchange_adapter" in locals():
+            try:
                 await exchange_adapter.disconnect()
                 print("   - Exchange disconnected")
+            except Exception as exc:
+                cleanup_errors.append(f"exchange disconnect: {exc}")
 
+        if cleanup_errors:
+            print("\nCleanup completed with errors:")
+            for error in cleanup_errors:
+                print(f"   - {error}")
+        elif runtime_error is None:
             print("\nSystem exited safely")
+        else:
+            print("\nResources cleaned up after system failure")
 
-        except Exception as exc:
-            print(f"Cleanup error: {exc}")
+    if cleanup_errors:
+        cleanup_error = RuntimeError("; ".join(cleanup_errors))
+        if runtime_error is not None:
+            raise cleanup_error from runtime_error
+        raise cleanup_error
+    if runtime_error is not None:
+        raise runtime_error
 
 
 def parse_arguments() -> argparse.Namespace:

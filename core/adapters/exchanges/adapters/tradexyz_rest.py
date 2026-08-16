@@ -838,9 +838,15 @@ class TradeXYZRest(HyperliquidRest, TradeXYZBase):
 
         self._ensure_xyz_sdk()
 
-        xyz_coin = self.to_xyz_coin(symbol)
-
-        is_buy = side == OrderSide.BUY
+        xyz_coin = self.to_xyz_coin(symbol)
+
+        is_buy = side == OrderSide.BUY
+
+        reduce_only = bool(
+
+            (params or {}).get("reduce_only") or (params or {}).get("reduceOnly")
+
+        )
 
 
 
@@ -876,11 +882,13 @@ class TradeXYZRest(HyperliquidRest, TradeXYZBase):
 
                 sz=float(amount),
 
-                limit_px=limit_px,
-
-                order_type=sdk_order_type,
-
-            )
+                limit_px=limit_px,
+
+                order_type=sdk_order_type,
+
+                reduce_only=reduce_only,
+
+            )
 
         )
 
@@ -1878,13 +1886,13 @@ class TradeXYZRest(HyperliquidRest, TradeXYZBase):
 
         """获取 XYZ 市场持仓"""
 
-        if not self.config or not self.config.wallet_address:
-
-            if self.logger:
-
-                self.logger.warning("无法获取 XYZ 持仓: 未配置钱包地址")
-
-            return []
+        if not self.config or not self.config.wallet_address:
+
+            if self.logger:
+
+                self.logger.warning("无法获取 XYZ 持仓: 未配置钱包地址")
+
+            raise RuntimeError("无法获取 XYZ 持仓: 未配置钱包地址")
 
 
 
@@ -1978,13 +1986,13 @@ class TradeXYZRest(HyperliquidRest, TradeXYZBase):
 
 
 
-        except Exception as e:
-
-            if self.logger:
-
-                self.logger.error(f"获取 XYZ 持仓失败: {e}")
-
-            return []
+        except Exception as e:
+
+            if self.logger:
+
+                self.logger.error(f"获取 XYZ 持仓失败: {e}")
+
+            raise
 
 
 

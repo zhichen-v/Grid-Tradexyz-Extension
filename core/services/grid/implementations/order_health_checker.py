@@ -66,6 +66,11 @@ class OrderHealthChecker:
         consistency_deferred = False
 
         try:
+            self._health_cycle_placement_epoch = getattr(
+                self.engine,
+                "placement_epoch",
+                0,
+            )
             self._restored_missing_orders_in_sync = 0
             repair_block_reason = self._get_health_repair_suspend_reason()
             exchange_orders, positions = await self._fetch_orders_and_positions()
@@ -237,7 +242,15 @@ class OrderHealthChecker:
         allow_restore: bool = True,
     ) -> int:
         """Sync remote open orders into the engine pending-order cache."""
-        exchange_order_ids = {order.id for order in exchange_orders if getattr(order, "id", None)}
+        exchange_order_ids = {
+            str(alias)
+            for order in exchange_orders
+            for alias in (
+                getattr(order, "id", None),
+                getattr(order, "client_id", None),
+            )
+            if alias is not None and str(alias)
+        }
         filled_orders: List[GridOrder] = []
         unresolved_orders = 0
         unresolved_price_keys: set[Tuple[str, str]] = set()
@@ -342,7 +355,12 @@ class OrderHealthChecker:
 
         for ex_order in exchange_orders:
             order_id = getattr(ex_order, "id", None)
-            if not order_id or order_id in self.engine._pending_orders:
+            client_id = getattr(ex_order, "client_id", None)
+            order_id = str(order_id) if order_id is not None else None
+            client_id = str(client_id) if client_id is not None else None
+            if not order_id or order_id in self.engine._pending_orders or (
+                client_id and client_id in self.engine._pending_orders
+            ):
                 continue
             if self._was_recently_finalized_order(order_id):
                 continue
@@ -360,6 +378,8 @@ class OrderHealthChecker:
 
     async def _cleanup_duplicate_orders(self, exchange_orders: List[OrderData]) -> int:
         """Cancel duplicate orders that map to the same grid and side."""
+        if self._health_cycle_is_stale():
+            return 0
         duplicates = self._find_duplicate_orders(exchange_orders)
         if not duplicates:
             return 0
@@ -373,6 +393,8 @@ class OrderHealthChecker:
 
         cleaned = 0
         for order in duplicates:
+            if self._health_cycle_is_stale():
+                break
             order_id = getattr(order, "id", None)
             if not order_id:
                 continue
@@ -1794,6 +1816,10 @@ class OrderHealthChecker:
 
         current_price = await self.engine.get_current_price()
 
+        if target == 0:
+            side = PositionSide.LONG if actual > 0 else PositionSide.SHORT
+            return await self._close_position(side, abs(actual), current_price)
+
         # Flip side first when the position sign is wrong.
         if actual > 0 and target < 0:
             if not await self._close_position(PositionSide.LONG, abs(actual), current_price):
@@ -1823,7 +1849,13 @@ class OrderHealthChecker:
             return True
 
         close_side = ExchangeOrderSide.SELL if side == PositionSide.LONG else ExchangeOrderSide.BUY
-        return await self._submit_market_order(close_side, amount, current_price, "close_position")
+        return await self._submit_market_order(
+            close_side,
+            amount,
+            current_price,
+            "close_position",
+            reduce_only=True,
+        )
 
     async def _open_position(self, side: PositionSide, amount: Decimal, current_price: Decimal) -> bool:
         """Open additional exposure with a market order."""
@@ -1839,16 +1871,25 @@ class OrderHealthChecker:
         amount: Decimal,
         current_price: Decimal,
         reason: str,
+        reduce_only: bool = False,
     ) -> bool:
         """Submit a market order through the exchange adapter."""
+        if self._health_cycle_is_stale():
+            self.logger.info(
+                f"Skip stale health repair after reset: reason={reason}"
+            )
+            return False
         try:
-            await self.engine.exchange.create_order(
-                symbol=self.config.symbol,
-                side=side,
-                order_type=OrderType.MARKET,
+            grid_side = (
+                GridOrderSide.BUY
+                if side == ExchangeOrderSide.BUY
+                else GridOrderSide.SELL
+            )
+            await self.engine.place_market_order(
+                side=grid_side,
                 amount=amount,
-                price=current_price,
-                params=None,
+                reduce_only=reduce_only,
+                reference_price=current_price,
             )
             self.logger.info(
                 f"Submitted market order for health repair: reason={reason}, "
@@ -1866,6 +1907,8 @@ class OrderHealthChecker:
     async def _place_missing_orders(self, orders: List[GridOrder]) -> int:
         """Place missing grid orders back on the exchange."""
         if not orders:
+            return 0
+        if self._health_cycle_is_stale():
             return 0
 
         source_order_ids = {
@@ -1898,6 +1941,15 @@ class OrderHealthChecker:
                 f"side={order.side.value}, price={order.price}, amount={order.amount}"
             )
         return len(placed_orders)
+
+    def _health_cycle_is_stale(self) -> bool:
+        current_epoch = getattr(self.engine, "placement_epoch", 0)
+        expected_epoch = getattr(
+            self,
+            "_health_cycle_placement_epoch",
+            current_epoch,
+        )
+        return current_epoch != expected_epoch
 
     def _sync_placed_missing_order_to_state(
         self,

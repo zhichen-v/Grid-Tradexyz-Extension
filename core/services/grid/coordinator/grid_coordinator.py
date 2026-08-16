@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from decimal import Decimal
 from datetime import datetime
 
+from ....adapters.exchanges.models import OrderSide, OrderType, PositionSide
 from ....logging import get_logger
 from ..interfaces import IGridStrategy, IGridEngine, IPositionTracker
 from ..models import (
@@ -714,141 +715,99 @@ class GridCoordinator:
         self.logger.info("=" * 80)
 
         # 步骤1: 取消所有旧订单
-        try:
-            self.logger.info("Cleanup step 1: cancelling existing open orders")
+        self.logger.info("Cleanup step 1: cancelling existing open orders")
+        existing_orders = await self.engine.exchange.get_open_orders(
+            symbol=self.config.symbol
+        )
 
-            # 获取当前所有订单
-            existing_orders = await self.engine.exchange.get_open_orders(
+        if existing_orders:
+            self.logger.warning(
+                f"Detected {len(existing_orders)} existing orders; cancelling them now"
+            )
+            cancel_errors = []
+            for order in existing_orders:
+                try:
+                    await self.engine.exchange.cancel_order(
+                        order_id=order.id,
+                        symbol=self.config.symbol
+                    )
+                except Exception as exc:
+                    cancel_errors.append(f"{order.id}: {exc}")
+
+            await asyncio.sleep(2)
+            remaining_orders = await self.engine.exchange.get_open_orders(
                 symbol=self.config.symbol
             )
-
-            if len(existing_orders) > 0:
-                self.logger.warning(
-                    f"Detected {len(existing_orders)} existing orders; cancelling them now"
+            if cancel_errors or remaining_orders:
+                details = "; ".join(cancel_errors) or "none"
+                raise RuntimeError(
+                    "Pre-start order cleanup failed: "
+                    f"cancel_errors={details}, remaining={len(remaining_orders)}"
                 )
-
-                # 批量取消订单
-                cancel_count = 0
-                for order in existing_orders:
-                    try:
-                        await self.engine.exchange.cancel_order(
-                            order_id=order.id,
-                            symbol=self.config.symbol
-                        )
-                        cancel_count += 1
-                    except Exception as e:
-                        self.logger.warning(f"Failed to cancel order {order.id}: {e}")
-
-                self.logger.info(
-                    f"Cancelled {cancel_count}/{len(existing_orders)} existing orders"
-                )
-
-                # 等待取消生效
-                await asyncio.sleep(2)
-
-                # 验证是否清理成功
-                remaining_orders = await self.engine.exchange.get_open_orders(
-                    symbol=self.config.symbol
-                )
-                if len(remaining_orders) > 0:
-                    self.logger.warning(
-                        f"{len(remaining_orders)} orders remain open after cleanup"
-                    )
-                else:
-                    self.logger.info("All existing orders cleared")
-            else:
-                self.logger.info("No existing orders found; skipping order cleanup")
-
-        except Exception as e:
-            self.logger.error(f"Failed to clean existing orders: {e}")
-            import traceback
-            self.logger.error(traceback.format_exc())
+            self.logger.info("All existing orders cleared")
+        else:
+            self.logger.info("No existing orders found; skipping order cleanup")
 
         # 步骤2: 平掉所有持仓
-        try:
-            self.logger.info("Cleanup step 2: checking current position")
+        self.logger.info("Cleanup step 2: checking current position")
+        positions = await self.engine.exchange.get_positions(
+            symbols=[self.config.symbol]
+        )
 
-            # 获取当前持仓
-            positions = await self.engine.exchange.get_positions(
-                symbols=[self.config.symbol]
-            )
+        if positions:
+            position = positions[0]
+            position_size = abs(Decimal(str(position.size or Decimal('0'))))
 
-            if positions and len(positions) > 0:
-                position = positions[0]
-                position_size = position.size or Decimal('0')
-
-                if position_size != 0:
-                    self.logger.warning(
-                        f"Detected open position: {position_size} {self.config.symbol.split('_')[0]}, "
-                        f"entry=${position.entry_price}, "
-                        f"unrealized_pnl=${position.unrealized_pnl}"
-                    )
-
-                    # 计算平仓方向和数量
-                    close_side = 'Sell' if position_size > 0 else 'Buy'
-                    close_amount = abs(position_size)
-
-                    self.logger.warning(
-                        f"Closing existing position: {close_side} {close_amount} (market)"
-                    )
-
-                    # 使用市价单平仓（参考 order_health_checker.py 的实现）
-                    try:
-                        from ....adapters.exchanges.models import OrderSide, OrderType
-
-                        #  修复：获取当前市场价格（Hyperliquid市价单需要价格计算滑点）
-                        ticker = await self.engine.exchange.get_ticker(self.config.symbol)
-                        current_price = ticker.last
-
-                        # 确定平仓方向：平多仓=卖出，平空仓=买入
-                        order_side = OrderSide.SELL if close_side == 'Sell' else OrderSide.BUY
-
-                        # 调用交易所接口平仓（使用市价单）
-                        # 注意：
-                        # - Backpack: 不支持 reduceOnly，price=None即可
-                        # - Hyperliquid: 市价单需要price来计算滑点（默认5%）
-                        placed_order = await self.engine.exchange.create_order(
-                            symbol=self.config.symbol,
-                            side=order_side,
-                            order_type=OrderType.MARKET,
-                            amount=close_amount,
-                            price=current_price  # Hyperliquid需要价格计算滑点，Backpack会忽略
-                        )
-
-                        self.logger.info(f"Close-out order submitted: {placed_order.id}")
-
-                        # 等待平仓完成
-                        await asyncio.sleep(3)
-
-                        # 验证是否平仓成功
-                        new_positions = await self.engine.exchange.get_positions(
-                            symbols=[self.config.symbol]
-                        )
-                        if new_positions and len(new_positions) > 0:
-                            new_position_size = new_positions[0].size or Decimal(
-                                '0')
-                            if new_position_size == 0:
-                                self.logger.info("Position fully closed")
-                            else:
-                                self.logger.warning(
-                                    f"Position not fully closed; remaining={new_position_size}"
-                                )
-                        else:
-                            self.logger.info("Position fully closed")
-
-                    except Exception as e:
-                        self.logger.error(f"Failed to close position: {e}")
-                        import traceback
-                        self.logger.error(traceback.format_exc())
+            if position_size != 0:
+                if position.side == PositionSide.LONG:
+                    order_side = OrderSide.SELL
+                elif position.side == PositionSide.SHORT:
+                    order_side = OrderSide.BUY
                 else:
-                    self.logger.info("No open position; skipping close-out")
+                    raise RuntimeError(
+                        f"Unsupported position side for close-out: {position.side}"
+                    )
+
+                self.logger.warning(
+                    f"Detected open {position.side.value} position: "
+                    f"{position_size} {self.config.symbol.split('_')[0]}, "
+                    f"entry=${position.entry_price}, "
+                    f"unrealized_pnl=${position.unrealized_pnl}"
+                )
+
+                ticker = await self.engine.exchange.get_ticker(self.config.symbol)
+                placed_order = await self.engine.exchange.create_order(
+                    symbol=self.config.symbol,
+                    side=order_side,
+                    order_type=OrderType.MARKET,
+                    amount=position_size,
+                    price=ticker.last,
+                    params={"reduce_only": True},
+                )
+                if placed_order is None:
+                    raise RuntimeError("Exchange returned no close-out order")
+                self.logger.info(
+                    f"Close-out order submitted: "
+                    f"{getattr(placed_order, 'id', None) or getattr(placed_order, 'order_id', None)}"
+                )
+
+                await asyncio.sleep(3)
+                new_positions = await self.engine.exchange.get_positions(
+                    symbols=[self.config.symbol]
+                )
+                remaining_size = max(
+                    (abs(Decimal(str(item.size or Decimal('0')))) for item in new_positions),
+                    default=Decimal('0'),
+                )
+                if remaining_size != 0:
+                    raise RuntimeError(
+                        f"Position not fully closed; remaining={remaining_size}"
+                    )
+                self.logger.info("Position fully closed")
             else:
                 self.logger.info("No open position; skipping close-out")
-
-        except Exception as e:
-            self.logger.error(f"Position cleanup failed: {e}")
-            import traceback
-            self.logger.error(traceback.format_exc())
+        else:
+            self.logger.info("No open position; skipping close-out")
 
         self.logger.info("=" * 80)
         self.logger.info("Pre-start cleanup completed")
@@ -885,8 +844,15 @@ class GridCoordinator:
                 positions = await self.engine.exchange.get_positions(symbols=[self.config.symbol])
                 if positions and len(positions) > 0:
                     position = positions[0]
-                    real_size = position.size or Decimal('0')
+                    real_size = abs(position.size or Decimal('0'))
                     real_entry_price = position.entry_price or Decimal('0')
+
+                    if position.side == PositionSide.SHORT:
+                        real_size = -real_size
+                    elif position.side != PositionSide.LONG and real_size != 0:
+                        raise RuntimeError(
+                            f"Unsupported position side in startup snapshot: {position.side}"
+                        )
 
                     # 同步到WebSocket缓存
                     if hasattr(self.engine.exchange, '_position_cache'):
@@ -894,7 +860,7 @@ class GridCoordinator:
                             'size': real_size,
                             'entry_price': real_entry_price,
                             'unrealized_pnl': position.unrealized_pnl or Decimal('0'),
-                            'side': 'Long' if real_size > 0 else 'Short',
+                            'side': position.side.value,
                             'timestamp': datetime.now()
                         }
                         self.logger.info(
@@ -1016,22 +982,47 @@ class GridCoordinator:
         if self._stop_loss_monitor_task is not current_task:
             self._stop_loss_monitor_task = None
 
-        await self.balance_monitor.stop_monitoring()
+        shutdown_errors = []
+        try:
+            await self.balance_monitor.stop_monitoring()
+        except Exception as exc:
+            shutdown_errors.append(f"balance monitor: {exc}")
+            self.logger.error(f"Failed to stop balance monitor: {exc}")
 
         #  停止持仓同步监控（使用新模块）
-        await self.position_monitor.stop_monitoring()
+        try:
+            await self.position_monitor.stop_monitoring()
+        except Exception as exc:
+            shutdown_errors.append(f"position monitor: {exc}")
+            self.logger.error(f"Failed to stop position monitor: {exc}")
 
-        # 取消所有挂单
-        cancelled_count = await self.engine.cancel_all_orders()
-        self.logger.info(f"Cancelled {cancelled_count} open orders")
+        try:
+            # 取消所有挂单；保留持仓是原有的 Ctrl+C 语意
+            cancelled_count = await self.engine.cancel_all_orders()
+            self.logger.info(f"Cancelled {cancelled_count} open orders")
+        except Exception as exc:
+            shutdown_errors.append(f"order cancellation: {exc}")
+            self.logger.error(f"Failed to verify open-order cancellation: {exc}")
 
-        # 停止引擎
-        await self.engine.stop()
+        # 即使監控或撤單失敗，也必須停止背景任務和引擎。
+        try:
+            await self.engine.stop()
+        except Exception as exc:
+            shutdown_errors.append(f"engine stop: {exc}")
+            self.logger.error(f"Failed to stop grid engine: {exc}")
 
-        # 更新状态
-        self.state.stop()
+        try:
+            self.state.stop()
+        except Exception as exc:
+            shutdown_errors.append(f"state stop: {exc}")
+            self.logger.error(f"Failed to stop grid state: {exc}")
 
         self.logger.info("Grid system stopped")
+
+        if shutdown_errors:
+            raise RuntimeError(
+                "Grid stopped with cleanup errors: " + "; ".join(shutdown_errors)
+            )
 
     async def get_statistics(self) -> GridStatistics:
         """
@@ -1427,8 +1418,15 @@ class GridCoordinator:
                         f"Stop loss condition met: current=${current_price:,.4f}, "
                         f"threshold=${self.config.stop_loss_price:,.4f}"
                     )
-                    await self.reset_manager.execute_stop_loss_shutdown(current_price)
-                    break
+                    shutdown_complete = (
+                        await self.reset_manager.execute_stop_loss_shutdown(current_price)
+                    )
+                    if shutdown_complete or not self._running:
+                        break
+
+                    # A concurrent reset may have won the reset gate between the
+                    # price read and shutdown attempt. Re-arm the monitor afterward.
+                    self._stop_loss_triggered = False
 
                 await asyncio.sleep(self.config.stop_loss_check_interval)
 

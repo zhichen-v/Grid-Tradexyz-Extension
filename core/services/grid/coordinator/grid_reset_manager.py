@@ -9,6 +9,7 @@ from typing import Optional
 from decimal import Decimal
 from datetime import datetime
 
+from ....adapters.exchanges.models import PositionSide
 from ....logging import get_logger
 from ..models import GridOrder, GridOrderSide, GridOrderStatus
 from .order_operations import OrderOperations
@@ -49,11 +50,41 @@ class GridResetManager:
         # 创建订单操作实例
         self.order_ops = OrderOperations(engine, state, config, coordinator)
 
+    def _try_begin_reset(self) -> bool:
+        """Acquire the coordinator-wide reset gate without awaiting."""
+        if self.coordinator._is_resetting or self.coordinator._resetting:
+            return False
+        self.coordinator._is_resetting = True
+        self.coordinator._resetting = True
+        engine = getattr(self, "engine", None)
+        pause_placements = getattr(engine, "pause_placements", None)
+        if pause_placements:
+            pause_placements()
+        return True
+
+    def _end_reset(self) -> None:
+        self.coordinator._is_resetting = False
+        self.coordinator._resetting = False
+        engine = getattr(self, "engine", None)
+        resume_placements = getattr(engine, "resume_placements", None)
+        if resume_placements:
+            resume_placements()
+
+    async def _wait_for_inflight_placements(self) -> None:
+        wait_for_placements = getattr(
+            getattr(self, "engine", None),
+            "wait_for_inflight_placements",
+            None,
+        )
+        if wait_for_placements:
+            await wait_for_placements()
+
     async def execute_capital_protection_reset(self):
         """执行本金保护重置（平仓后重置并重新初始化本金）"""
+        if not self._try_begin_reset():
+            self.logger.warning("本金保护重置已跳过：另一個重置正在執行")
+            return
         try:
-            #  关键：设置重置标志，防止并发操作
-            self.coordinator._resetting = True
             self.logger.warning("️ 开始执行本金保护重置（锁定系统）...")
 
             # 执行通用重置工作流
@@ -96,14 +127,15 @@ class GridResetManager:
             self.logger.error(traceback.format_exc())
         finally:
             #  关键：无论成功或失败，都要释放重置锁
-            self.coordinator._resetting = False
+            self._end_reset()
             self.logger.info(" 系统锁定已释放")
 
     async def execute_take_profit_reset(self):
         """执行止盈重置（无论哪种网格都重置并重启）"""
+        if not self._try_begin_reset():
+            self.logger.warning("止盈重置已跳过：另一個重置正在執行")
+            return
         try:
-            #  关键：设置重置标志，防止并发操作
-            self.coordinator._resetting = True
             self.logger.warning(" 开始执行止盈重置（锁定系统）...")
 
             # 执行通用重置工作流
@@ -146,21 +178,20 @@ class GridResetManager:
             self.logger.error(traceback.format_exc())
         finally:
             #  关键：无论成功或失败，都要释放重置锁
-            self.coordinator._resetting = False
+            self._end_reset()
             self.logger.info(" 系统锁定已释放")
 
     async def execute_stop_loss_shutdown(self, current_price: Decimal) -> bool:
         """Cancel open orders, close the live position, and stop the grid runtime."""
-        if self.coordinator._is_resetting or self.coordinator._resetting:
+        if not self._try_begin_reset():
             self.logger.warning("Stop loss shutdown skipped because a reset is already in progress")
             return False
 
-        self.coordinator._is_resetting = True
-        self.coordinator._resetting = True
         self.coordinator.is_emergency_stopped = True
 
         close_success = True
         try:
+            await self._wait_for_inflight_placements()
             stop_price = self.config.stop_loss_price
             self.logger.warning(
                 f"Stop loss triggered: current=${current_price:,.4f}, "
@@ -173,6 +204,7 @@ class GridResetManager:
                 first_delay=0.8
             )
             if not cancel_verified:
+                close_success = False
                 self.logger.error(
                     "Stop loss order cancellation was not fully verified; "
                     "continuing shutdown and position close attempt"
@@ -187,65 +219,68 @@ class GridResetManager:
                 try:
                     await self.engine.place_market_order(
                         side=close_side,
-                        amount=abs(current_position)
+                        amount=abs(current_position),
+                        reduce_only=True,
+                        allow_while_paused=True,
                     )
                     self.logger.warning("Stop loss market close submitted")
+                    await asyncio.sleep(2)
+                    remaining_position = await self._resolve_live_position_for_close()
+                    if remaining_position != 0:
+                        close_success = False
+                        self.logger.error(
+                            "Stop loss position close was not verified; "
+                            f"remaining={remaining_position}"
+                        )
                 except Exception as exc:
                     close_success = False
                     self.logger.error(f"Stop loss market close failed: {exc}")
             else:
                 self.logger.info("Stop loss found no open position to close")
 
-            self.state.active_orders.clear()
-            self.state.pending_buy_orders = 0
-            self.state.pending_sell_orders = 0
-            self.tracker.reset()
-            self.coordinator._stop_loss_trigger_count += 1
+            if close_success:
+                self.state.active_orders.clear()
+                self.state.pending_buy_orders = 0
+                self.state.pending_sell_orders = 0
+                self.tracker.reset()
+                self.coordinator._stop_loss_trigger_count += 1
+            else:
+                self.logger.error(
+                    "Stop loss shutdown retained local order/position state because "
+                    "exchange cleanup was not fully verified"
+                )
 
-            await self.coordinator.stop()
-            return close_success
         except Exception as exc:
             close_success = False
             self.logger.error(f"Stop loss shutdown failed: {exc}")
             import traceback
             self.logger.error(traceback.format_exc())
-            return False
         finally:
-            self.coordinator._is_resetting = False
-            self.coordinator._resetting = False
+            try:
+                await self.coordinator.stop()
+            except Exception as exc:
+                close_success = False
+                self.logger.error(f"Stop loss runtime stop failed: {exc}")
+            self._end_reset()
+        return close_success
 
     async def _resolve_live_position_for_close(self) -> Decimal:
-        """Prefer the exchange position, then fall back to tracker/state snapshots."""
-        try:
-            positions = await self.engine.exchange.get_positions(symbols=[self.config.symbol])
-        except TypeError:
-            positions = await self.engine.exchange.get_positions([self.config.symbol])
-        except Exception as exc:
-            self.logger.warning(f"Failed to query exchange position for stop loss: {exc}")
-            positions = []
-
-        if positions:
-            position = positions[0]
-            position_size = Decimal(str(position.size or Decimal('0')))
-            side = getattr(position, "side", "")
-            side_value = str(getattr(side, "value", side)).lower()
-            if side_value == "short" and position_size > 0:
-                position_size = -position_size
-            if position_size != 0:
-                return position_size
-
-        try:
-            tracker_position = self.tracker.get_current_position()
-            if tracker_position != 0:
-                return tracker_position
-        except Exception as exc:
-            self.logger.warning(f"Failed to read tracker position for stop loss: {exc}")
-
-        state_position = getattr(self.state, "current_position", Decimal('0'))
-        try:
-            return Decimal(str(state_position or Decimal('0')))
-        except Exception:
+        """Return the signed live exchange position for the configured symbol."""
+        positions = await self.engine.exchange.get_positions(
+            symbols=[self.config.symbol]
+        )
+        if not positions:
             return Decimal('0')
+
+        position = positions[0]
+        position_size = abs(Decimal(str(position.size or Decimal('0'))))
+        if position_size == 0:
+            return Decimal('0')
+        if position.side == PositionSide.LONG:
+            return position_size
+        if position.side == PositionSide.SHORT:
+            return -position_size
+        raise RuntimeError(f"Unsupported position side: {position.side}")
 
     async def execute_price_follow_reset(
         self,
@@ -259,7 +294,7 @@ class GridResetManager:
             current_price: 当前价格
             direction: 脱离方向 ("up" 或 "down")
         """
-        if self.coordinator._is_resetting:
+        if self.coordinator._is_resetting or self.coordinator._resetting:
             self.logger.warning("网格正在重置中，跳过本次重置")
             return
 
@@ -277,9 +312,11 @@ class GridResetManager:
                 )
                 return
 
-        try:
-            self.coordinator._is_resetting = True
+        if not self._try_begin_reset():
+            self.logger.warning("网格正在重置中，跳过本次重置")
+            return
 
+        try:
             self.logger.info(
                 f" 开始重置网格: 当前价格=${current_price:,.2f}, 脱离方向={direction}"
             )
@@ -306,7 +343,7 @@ class GridResetManager:
                 update_price_range=True  # 价格移动网格需要更新价格区间
             )
 
-            if new_capital is not None or not should_close_position:
+            if new_capital is not None:
                 # 🆕 只有在有利方向脱离（平仓止盈）时才增加计数
                 if should_close_position:
                     self.coordinator._price_escape_trigger_count += 1
@@ -321,7 +358,7 @@ class GridResetManager:
             import traceback
             self.logger.error(traceback.format_exc())
         finally:
-            self.coordinator._is_resetting = False
+            self._end_reset()
 
     async def _generic_reset_workflow(
         self,
@@ -350,9 +387,10 @@ class GridResetManager:
             update_price_range: 是否需要更新价格区间（价格移动网格）
 
         Returns:
-            新本金（如果平仓），否则返回None
+            新本金；不需重算本金時成功回傳 0，失敗回傳 None
         """
         self.logger.info(f" 开始执行{reset_type}重置工作流...")
+        await self._wait_for_inflight_placements()
 
         # ======== 步骤1: 取消所有订单（带验证）========
         self.logger.info(" 步骤 1/7: 取消所有订单...")
@@ -370,7 +408,11 @@ class GridResetManager:
         new_capital = None
         if should_close_position:
             self.logger.info(" 步骤 2/7: 平仓...")
-            current_position = self.tracker.get_current_position()
+            try:
+                current_position = await self._resolve_live_position_for_close()
+            except Exception as exc:
+                self.logger.error(f" {reset_type}持仓查询失败: {exc}")
+                return None
             if current_position != 0:
                 self.logger.info(f" {reset_type}平仓: {current_position:+.4f}")
                 try:
@@ -378,17 +420,26 @@ class GridResetManager:
                     side = GridOrderSide.SELL if current_position > 0 else GridOrderSide.BUY
                     await self.engine.place_market_order(
                         side=side,
-                        amount=abs(current_position)
+                        amount=abs(current_position),
+                        reduce_only=True,
+                        allow_while_paused=True,
                     )
+                    await asyncio.sleep(2)
+                    remaining_position = await self._resolve_live_position_for_close()
+                    if remaining_position != 0:
+                        raise RuntimeError(
+                            f"position close not verified; remaining={remaining_position}"
+                        )
                     self.logger.info(f" {reset_type}平仓完成")
                 except Exception as e:
                     self.logger.error(f" {reset_type}平仓失败: {e}")
-                    # 即使平仓失败也继续重置流程
+                    return None
             else:
                 self.logger.info(" 步骤 2/7: 无持仓，跳过平仓")
 
             # 等待一小段时间，让平仓完成并余额更新
-            await asyncio.sleep(2)
+            if current_position == 0:
+                await asyncio.sleep(2)
 
             # 重新获取抵押品余额（平仓后的新本金）
             if should_reinit_capital:
@@ -461,7 +512,10 @@ class GridResetManager:
         self.logger.info(" 步骤 7/7: 生成并挂出新订单...")
         current_price = await self.engine.get_current_price()
         initial_orders = self.strategy.initialize(self.config, current_price)
-        placed_orders = await self.engine.place_batch_orders(initial_orders)
+        placed_orders = await self.engine.place_batch_orders(
+            initial_orders,
+            allow_while_paused=True,
+        )
 
         # 等待立即成交的订单完成
         await asyncio.sleep(2)
@@ -511,7 +565,7 @@ class GridResetManager:
             f" {reset_type}重置完成！成功挂出 {len(placed_orders)} 个订单"
         )
 
-        return new_capital
+        return new_capital if new_capital is not None else Decimal('0')
 
     async def _restart_grid_after_reset(self, new_capital: Optional[Decimal] = None):
         """

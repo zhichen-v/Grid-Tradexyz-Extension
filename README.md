@@ -276,7 +276,8 @@ What the startup flow does:
 5. Places the startup grid orders
 6. Starts the Rich terminal UI
 
-Exit safely with `Ctrl+C` or `Q`.
+Exit with `Ctrl+C` or `Q`. This cancels open orders and stops the runtime, but
+intentionally leaves any filled position open.
 
 ## 11. Smoke Checks
 
@@ -287,6 +288,26 @@ Public connectivity:
 ```bash
 uv run python -m tests.test_tradexyz_public
 ```
+
+Lighter Robinhood public connectivity (no credentials):
+
+```bash
+uv run python -m tests.test_lighter_public --network robinhood
+```
+
+Before a live Lighter Robinhood run, copy
+`config/exchanges/lighter_config_example.yaml` to the git-ignored
+`config/exchanges/lighter_config.yaml`, select `robinhood` or
+`robinhood_testnet`, fill its Lighter API credentials, and run:
+
+```bash
+uv run python lighter_preflight.py --symbol ETH --expected-wallet-address 0xYOUR_PUBLIC_ADDRESS
+```
+
+This authenticated preflight only reads the selected endpoint profile, account,
+USDG balance, market metadata, positions, and open orders. It never submits or
+cancels orders, and it never prints the API private key. The public wallet check
+is optional; it can also be set as `auth.expected_l1_address` in the local YAML.
 
 Order placement flow:
 

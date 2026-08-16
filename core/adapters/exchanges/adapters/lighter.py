@@ -128,6 +128,7 @@ class LighterAdapter(ExchangeAdapter):
             "api_key_private_key": getattr(config, 'api_key_private_key', ''),
             "account_index": getattr(config, 'account_index', 0),
             "api_key_index": getattr(config, 'api_key_index', 0),
+            "market_order_slippage": extra_params.get('market_order_slippage'),
         }
 
         # 如果api_key_private_key为空，从配置文件加载
@@ -150,6 +151,13 @@ class LighterAdapter(ExchangeAdapter):
                 config_dict['network'] = (
                     config_dict.get('network') or api_config.get('network')
                 )
+                market_order_config = (
+                    lighter_config.get('trading', {}).get('market_order', {})
+                )
+                if config_dict.get('market_order_slippage') is None:
+                    config_dict['market_order_slippage'] = market_order_config.get(
+                        'max_slippage', 0.01
+                    )
 
                 if self.logger:
                     self.logger.info("✅ 从lighter_config.yaml加载API配置")
@@ -179,9 +187,15 @@ class LighterAdapter(ExchangeAdapter):
             if self.logger:
                 self.logger.warning(f"Lighter配置文件未找到: {config_path}")
             return {'exchange_id': 'lighter'}
+        except yaml.YAMLError:
+            if self.logger:
+                self.logger.error(f"Lighter配置文件YAML格式无效: {config_path}")
+            return {'exchange_id': 'lighter'}
         except Exception as e:
             if self.logger:
-                self.logger.error(f"加载Lighter配置文件失败: {e}")
+                self.logger.error(
+                    f"加载Lighter配置文件失败: {type(e).__name__}"
+                )
             return {'exchange_id': 'lighter'}
 
     def _get_symbol_cache_service(self):
@@ -490,7 +504,12 @@ class LighterAdapter(ExchangeAdapter):
         # 🔥 重要修复：始终从REST API获取最新持仓数据，不使用缓存
         # 原因：缓存可能不同步，导致持仓数据不准确（特别是多笔成交累加的情况）
         # position_monitor依赖准确的持仓数据进行监控和异常检测
-        positions = await self._rest.get_positions(symbols)
+        normalized_symbols = (
+            [self._normalize_symbol(symbol) for symbol in symbols]
+            if symbols
+            else None
+        )
+        positions = await self._rest.get_positions(normalized_symbols)
 
         # 🔥 更新缓存，确保缓存与REST API同步
         # 清空旧缓存
@@ -660,27 +679,29 @@ class LighterAdapter(ExchangeAdapter):
         success = await self._rest.cancel_order(normalized_symbol, order_id)
 
         if success:
-            # 尝试获取订单信息
-            try:
-                order = await self.get_order(order_id, symbol)
-                return order
-            except:
-                # 如果获取失败，返回一个基本的OrderData对象
-                return OrderData(
-                    id=order_id,
-                    order_id=order_id,
-                    symbol=normalized_symbol,
-                    side=OrderSide.BUY,  # 占位符
-                    order_type=OrderType.LIMIT,  # 占位符
-                    amount=Decimal("0"),
-                    filled=Decimal("0"),
-                    remaining=Decimal("0"),
-                    status=OrderStatus.CANCELED,
-                    price=None,
-                    average_price=None,
-                    timestamp=datetime.now(),
-                    raw_data={}
-                )
+            # A successful cancel removes the order from active orders before
+            # inactive history is necessarily indexed.  Do not query it again;
+            # the caller verifies the final open-order set independently.
+            return OrderData(
+                id=order_id,
+                client_id=None,
+                symbol=normalized_symbol,
+                side=OrderSide.BUY,  # 占位符
+                type=OrderType.LIMIT,  # 占位符
+                amount=Decimal("0"),
+                price=None,
+                filled=Decimal("0"),
+                remaining=Decimal("0"),
+                cost=Decimal("0"),
+                average=None,
+                status=OrderStatus.CANCELED,
+                timestamp=datetime.now(),
+                updated=None,
+                fee=None,
+                trades=[],
+                params={},
+                raw_data={}
+            )
         else:
             raise Exception(f"Failed to cancel order {order_id}")
 
@@ -694,23 +715,12 @@ class LighterAdapter(ExchangeAdapter):
         Returns:
             被取消的订单列表
         """
-        try:
-            orders = await self.get_open_orders(symbol)
-
-            cancelled_orders = []
-            for order in orders:
-                try:
-                    # 注意：cancel_order现在接受 (order_id, symbol) 的顺序
-                    cancelled_order = await self.cancel_order(order.order_id, order.symbol)
-                    cancelled_orders.append(cancelled_order)
-                except Exception as e:
-                    self.logger.error(f"取消订单 {order.order_id} 失败: {e}")
-
-            return cancelled_orders
-
-        except Exception as e:
-            self.logger.error(f"取消所有订单失败: {e}")
-            return []
+        orders = await self.get_open_orders(symbol)
+        cancelled_orders = []
+        for order in orders:
+            cancelled_order = await self.cancel_order(order.id, order.symbol)
+            cancelled_orders.append(cancelled_order)
+        return cancelled_orders
 
     # ============= WebSocket订阅 =============
 

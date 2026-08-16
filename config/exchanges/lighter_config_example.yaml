@@ -16,11 +16,12 @@ api_config:
   # 注意：这些信息需要在实际使用时配置
   # API_KEY_PRIVATE_KEY: 从Lighter前端生成的API Key私钥
   # ACCOUNT_INDEX: 账户索引
-  # API_KEY_INDEX: API Key索引
+  # API_KEY_INDEX: 使用Lighter前端實際產生的索引（通常為4以上，請勿自行猜測）
   auth:
     api_key_private_key: ""
     account_index: 0              # 账户索引 (十进制)
-    api_key_index: 0              # API Key索引
+    api_key_index: 4              # 範例；請填入前端顯示的實際API Key索引
+    expected_l1_address: ""        # 可選：用來核對 account_index 所屬的公開 EVM 錢包地址
   
   # SDK安装说明
   sdk_install_command: "uv pip install lighter-sdk==1.1.2"
@@ -213,7 +214,7 @@ examples:
     auth:
       api_key_private_key: "0x..."
       account_index: 1
-      api_key_index: 0
+      api_key_index: 4
   
   # 测试网配置示例
   testnet:
@@ -221,4 +222,4 @@ examples:
     auth:
       api_key_private_key: "0x..."
       account_index: 65
-      api_key_index: 1
+      api_key_index: 4

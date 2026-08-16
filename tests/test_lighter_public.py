@@ -105,10 +105,13 @@ async def check_client_lifecycle() -> None:
 async def check_collateral_currency() -> None:
     class FakeAccountApi:
         async def account(self, **kwargs):
-            return SimpleNamespace(accounts=[SimpleNamespace(
-                available_balance="90",
-                collateral="100",
-            )])
+            return SimpleNamespace(
+                code=200,
+                accounts=[SimpleNamespace(
+                    available_balance="90",
+                    collateral="100",
+                )],
+            )
 
     for network, expected_currency in (
         ("mainnet", "USDC"),

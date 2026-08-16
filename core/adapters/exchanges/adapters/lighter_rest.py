@@ -30,7 +30,7 @@ Lighter交易所适配器 - REST API模块
 """
 
 from typing import Dict, Any, Optional, List
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime
 import asyncio
 import logging
@@ -117,6 +117,13 @@ class LighterRest(LighterBase):
         self._websocket = None
 
         logger.info("Lighter REST客户端初始化完成")
+
+    @staticmethod
+    def _require_success_response(response: Any, operation: str) -> None:
+        """Reject SDK/API response models that do not explicitly report success."""
+        code = getattr(response, 'code', None)
+        if code != 200:
+            raise RuntimeError(f"{operation} failed (code={code})")
 
     def is_connected(self) -> bool:
         """检查是否已连接"""
@@ -269,6 +276,10 @@ class LighterRest(LighterBase):
                                 ob, 'supported_price_decimals', None),
                             "size_decimals": getattr(
                                 ob, 'supported_size_decimals', None),
+                            "min_base_amount": getattr(
+                                ob, 'min_base_amount', None),
+                            "min_quote_amount": getattr(
+                                ob, 'min_quote_amount', None),
                         })
 
             # 创建 ExchangeInfo 对象
@@ -495,56 +506,57 @@ class LighterRest(LighterBase):
             BalanceData列表
         """
         if not self.signer_client:
-            logger.error("未配置SignerClient，无法获取账户信息")
-            return []
+            raise RuntimeError("未配置SignerClient，无法获取账户信息")
 
         try:
             # 获取账户信息
             response = await self.account_api.account(by="index", value=str(self.account_index))
+            self._require_success_response(response, "account balance query")
+
+            if not hasattr(response, 'accounts') or not response.accounts:
+                raise RuntimeError(
+                    f"account balance query returned no account_index={self.account_index}"
+                )
 
             balances = []
 
             # 解析 DetailedAccounts 结构
-            if hasattr(response, 'accounts') and response.accounts:
-                # 获取第一个账户（通常就是查询的账户）
-                account = response.accounts[0]
+            # 获取第一个账户（通常就是查询的账户）
+            account = response.accounts[0]
 
-                # 获取可用余额和抵押品
-                available_balance = self._safe_decimal(
-                    getattr(account, 'available_balance', 0))
-                collateral = self._safe_decimal(
-                    getattr(account, 'collateral', 0))
+            # 获取可用余额和抵押品
+            available_balance = self._safe_decimal(
+                getattr(account, 'available_balance', 0))
+            collateral = self._safe_decimal(
+                getattr(account, 'collateral', 0))
 
-                # 计算锁定余额（抵押品 - 可用余额）
-                locked = max(collateral - available_balance, Decimal("0"))
+            # 计算锁定余额（抵押品 - 可用余额）
+            locked = max(collateral - available_balance, Decimal("0"))
 
-                collateral_currency = (
-                    "USDG"
-                    if self.network in {"robinhood", "robinhood_testnet"}
-                    else "USDC"
-                )
-                if collateral > 0:
-                    from datetime import datetime
-                    balances.append(BalanceData(
-                        currency=collateral_currency,
-                        free=available_balance,
-                        used=locked,
-                        total=collateral,
-                        usd_value=collateral,
-                        timestamp=datetime.now(),
-                        raw_data={'account': account}
-                    ))
+            collateral_currency = (
+                "USDG"
+                if self.network in {"robinhood", "robinhood_testnet"}
+                else "USDC"
+            )
+            from datetime import datetime
+            balances.append(BalanceData(
+                currency=collateral_currency,
+                free=available_balance,
+                used=locked,
+                total=collateral,
+                usd_value=collateral,
+                timestamp=datetime.now(),
+                raw_data={'account': account}
+            ))
 
-                # 注意：Lighter是合约交易所，持仓不是余额
-                # 持仓应该通过 get_positions() 方法查询
+            # 注意：Lighter是合约交易所，持仓不是余额
+            # 持仓应该通过 get_positions() 方法查询
 
             return balances
 
         except Exception as e:
             logger.error(f"获取账户余额失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+            raise
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[OrderData]:
         """
@@ -557,8 +569,7 @@ class LighterRest(LighterBase):
             OrderData列表
         """
         if not self.signer_client:
-            logger.error("未配置SignerClient，无法获取订单信息")
-            return []
+            raise RuntimeError("未配置SignerClient，无法获取订单信息")
 
         try:
             # 🔥 修复：Lighter 需要使用专门的订单查询 API，而不是 account API
@@ -572,18 +583,18 @@ class LighterRest(LighterBase):
             if isinstance(auth_result, tuple):
                 auth_token, error = auth_result
                 if error:
-                    logger.error(f"生成认证令牌失败: {error}")
-                    return []
+                    raise RuntimeError(f"生成认证令牌失败: {error}")
             else:
                 auth_token = auth_result
+            if not auth_token:
+                raise RuntimeError("生成认证令牌失败: empty token")
 
             # 获取 market_id
             market_id = None
             if symbol:
                 market_id = self.get_market_index(symbol)
                 if market_id is None:
-                    logger.warning(f"未找到交易对 {symbol} 的市场索引")
-                    return []
+                    raise ValueError(f"未找到交易对 {symbol} 的市场索引")
 
             # 使用 account_active_orders API（SDK 方法是异步的，直接 await）
             response = await self.order_api.account_active_orders(
@@ -592,6 +603,10 @@ class LighterRest(LighterBase):
                 market_id=market_id,
                 market_type="perp",
             )
+            self._require_success_response(response, "active orders query")
+
+            if not hasattr(response, 'orders'):
+                raise RuntimeError("活跃订单 API 回应缺少 orders 字段")
 
             orders = []
 
@@ -615,7 +630,7 @@ class LighterRest(LighterBase):
 
         except Exception as e:
             logger.error(f"获取活跃订单失败: {e}")
-            return []
+            raise
 
     async def get_order(self, order_id: str, symbol: str) -> OrderData:
         """
@@ -636,41 +651,33 @@ class LighterRest(LighterBase):
             raise Exception("未配置SignerClient")
 
         try:
+            target_id = str(order_id)
+
+            def matches(order: OrderData) -> bool:
+                return target_id == str(order.id) or (
+                    order.client_id not in (None, '')
+                    and target_id == str(order.client_id)
+                )
+
             # 获取所有活跃订单
             open_orders = await self.get_open_orders(symbol)
 
             # 在活跃订单中查找
             for order in open_orders:
-                if order.id == order_id:
+                if matches(order):
                     logger.debug(f"找到订单: {order_id}, 状态={order.status.value}")
                     return order
 
-            # 如果在活跃订单中没找到，尝试从历史订单查找
-            # 注意：Lighter可能没有直接的单订单查询API
-            logger.warning(f"订单 {order_id} 不在活跃订单列表中，可能已成交或取消")
+            # 活跃订单中不存在时，只能由交易所的最终订单记录确认状态。
+            history = await self.get_order_history(symbol)
+            for order in history:
+                if matches(order):
+                    logger.debug(
+                        f"找到历史订单: {order_id}, 状态={order.status.value}"
+                    )
+                    return order
 
-            # 返回一个占位符OrderData，表示订单可能已完成
-            # 网格系统会根据订单不在open_orders中判断其已成交
-            return OrderData(
-                id=order_id,
-                client_id=None,
-                symbol=symbol,
-                side=OrderSide.BUY,  # 占位符
-                type=OrderType.LIMIT,  # 占位符
-                amount=Decimal("0"),
-                price=None,
-                filled=Decimal("0"),
-                remaining=Decimal("0"),
-                cost=Decimal("0"),
-                average=None,
-                status=OrderStatus.FILLED,  # 假设已成交
-                timestamp=datetime.now(),
-                updated=None,
-                fee=None,
-                trades=[],
-                params={},
-                raw_data={}
-            )
+            raise LookupError(f"Lighter order {order_id} not found for {symbol}")
 
         except Exception as e:
             logger.error(f"获取订单 {order_id} 失败: {e}")
@@ -688,23 +695,29 @@ class LighterRest(LighterBase):
             OrderData列表
         """
         if not self.signer_client:
-            logger.error("未配置SignerClient，无法获取订单历史")
-            return []
+            raise RuntimeError("未配置SignerClient，无法获取订单历史")
 
         try:
             # 生成认证令牌
-            auth_token, err = self.signer_client.create_auth_token_with_expiry(
+            auth_result = self.signer_client.create_auth_token_with_expiry(
                 deadline=3600,
                 api_key_index=self.api_key_index,
             )
-            if err:
-                logger.error(f"生成认证令牌失败: {err}")
-                return []
+            if isinstance(auth_result, tuple):
+                auth_token, error = auth_result
+                if error:
+                    raise RuntimeError(f"生成認證令牌失敗: {error}")
+            else:
+                auth_token = auth_result
+            if not auth_token:
+                raise RuntimeError("生成認證令牌失敗: empty token")
 
             # 获取市场ID（如果指定了symbol）
             market_id = None
             if symbol:
                 market_id = self.get_market_index(symbol)
+                if market_id is None:
+                    raise ValueError(f"未找到交易對 {symbol} 的市場索引")
 
             # 获取历史订单
             response = await self.order_api.account_inactive_orders(
@@ -714,6 +727,10 @@ class LighterRest(LighterBase):
                 market_id=market_id,
                 market_type="perp",
             )
+            self._require_success_response(response, "inactive orders query")
+
+            if not hasattr(response, 'orders'):
+                raise RuntimeError("歷史訂單 API 回應缺少 orders 欄位")
 
             orders = []
             if hasattr(response, 'orders') and response.orders:
@@ -727,9 +744,7 @@ class LighterRest(LighterBase):
 
         except Exception as e:
             logger.error(f"获取历史订单失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+            raise
 
     async def get_positions(self, symbols: Optional[List[str]] = None) -> List[PositionData]:
         """
@@ -742,66 +757,102 @@ class LighterRest(LighterBase):
             PositionData列表
         """
         if not self.signer_client:
-            logger.error("未配置SignerClient，无法获取持仓信息")
-            return []
+            raise RuntimeError("未配置SignerClient，无法获取持仓信息")
 
         try:
             # 获取账户信息（包含持仓）
             response = await self.account_api.account(by="index", value=str(self.account_index))
+            self._require_success_response(response, "positions query")
+
+            if not hasattr(response, 'accounts') or not response.accounts:
+                raise RuntimeError(
+                    f"持仓 API 未返回 account_index={self.account_index} 的账户"
+                )
 
             positions = []
             # 解析 DetailedAccounts 结构
-            if hasattr(response, 'accounts') and response.accounts:
-                account = response.accounts[0]
+            account = response.accounts[0]
 
-                if hasattr(account, 'positions') and account.positions:
+            if hasattr(account, 'positions') and account.positions:
+                for idx, position_info in enumerate(account.positions):
+                    symbol = position_info.symbol if hasattr(
+                        position_info, 'symbol') else ""
 
-                    for idx, position_info in enumerate(account.positions):
-                        symbol = position_info.symbol if hasattr(
-                            position_info, 'symbol') else ""
+                    # `position` is safety-critical: a malformed value must never
+                    # be interpreted as a flat account during startup/stop-loss.
+                    if not hasattr(position_info, 'position'):
+                        raise RuntimeError(
+                            f"Lighter position response is missing size for {symbol or idx}"
+                        )
+                    try:
+                        raw_position_size = Decimal(str(position_info.position))
+                    except (InvalidOperation, TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            f"Invalid Lighter position size for {symbol or idx}"
+                        ) from exc
+                    if not raw_position_size.is_finite():
+                        raise RuntimeError(
+                            f"Invalid Lighter position size for {symbol or idx}"
+                        )
 
-                        # 获取持仓数据
-                        position_raw = position_info.position if hasattr(
-                            position_info, 'position') else 0
+                    if raw_position_size == 0:
+                        continue
 
-                        position_size = self._safe_decimal(position_raw) if hasattr(
-                            position_info, 'position') else Decimal("0")
+                    # SDK 1.1.2 returns a positive `position` magnitude and keeps
+                    # direction in the separate `sign` field. Retain compatibility
+                    # with older signed-position responses when `sign` is absent.
+                    sign_raw = getattr(position_info, 'sign', None)
+                    if sign_raw is None:
+                        position_size = raw_position_size
+                    else:
+                        try:
+                            position_sign = int(sign_raw)
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                f"Invalid Lighter position sign for {symbol}: {sign_raw}"
+                            ) from exc
+                        if position_sign not in {-1, 1}:
+                            raise RuntimeError(
+                                f"Invalid Lighter position sign for {symbol}: {position_sign}"
+                            )
+                        if raw_position_size < 0:
+                            raise RuntimeError(
+                                f"Invalid negative Lighter position magnitude for {symbol or idx}"
+                            )
+                        position_size = raw_position_size * position_sign
 
-                        if position_size == 0:
-                            continue
+                    from datetime import datetime
+                    from ..models import PositionSide, MarginMode
 
-                        from datetime import datetime
-                        from ..models import PositionSide, MarginMode
+                    # 🔥 Lighter持仓方向定义（与传统CEX一致）
+                    # 正数 = 多头 (LONG) | 负数 = 空头 (SHORT)
+                    # ✅ 测试验证：BUY订单成交后，position返回正数，表示做多
+                    position_side = PositionSide.LONG if position_size > 0 else PositionSide.SHORT
 
-                        # 🔥 Lighter持仓方向定义（与传统CEX一致）
-                        # 正数 = 多头 (LONG) | 负数 = 空头 (SHORT)
-                        # ✅ 测试验证：BUY订单成交后，position返回正数，表示做多
-                        position_side = PositionSide.LONG if position_size > 0 else PositionSide.SHORT
-
-                        positions.append(PositionData(
-                            symbol=symbol,
-                            side=position_side,
-                            size=abs(position_size),
-                            entry_price=self._safe_decimal(
-                                getattr(position_info, 'avg_entry_price', 0)),
-                            mark_price=None,  # Lighter不提供标记价格
-                            current_price=None,  # 需要单独查询
-                            unrealized_pnl=self._safe_decimal(
-                                getattr(position_info, 'unrealized_pnl', 0)),
-                            realized_pnl=self._safe_decimal(
-                                getattr(position_info, 'realized_pnl', 0)),
-                            percentage=None,  # 可以计算
-                            leverage=self._leverage_from_initial_margin_fraction(
-                                getattr(position_info, 'initial_margin_fraction', 0)),
-                            margin_mode=MarginMode.CROSS if getattr(
-                                position_info, 'margin_mode', 0) == 0 else MarginMode.ISOLATED,
-                            margin=self._safe_decimal(
-                                getattr(position_info, 'allocated_margin', 0)),
-                            liquidation_price=self._safe_decimal(getattr(position_info, 'liquidation_price', 0)) if getattr(
-                                position_info, 'liquidation_price', '0') != '0' else None,
-                            timestamp=datetime.now(),
-                            raw_data={'position_info': position_info}
-                        ))
+                    positions.append(PositionData(
+                        symbol=symbol,
+                        side=position_side,
+                        size=abs(position_size),
+                        entry_price=self._safe_decimal(
+                            getattr(position_info, 'avg_entry_price', 0)),
+                        mark_price=None,  # Lighter不提供标记价格
+                        current_price=None,  # 需要单独查询
+                        unrealized_pnl=self._safe_decimal(
+                            getattr(position_info, 'unrealized_pnl', 0)),
+                        realized_pnl=self._safe_decimal(
+                            getattr(position_info, 'realized_pnl', 0)),
+                        percentage=None,  # 可以计算
+                        leverage=self._leverage_from_initial_margin_fraction(
+                            getattr(position_info, 'initial_margin_fraction', 0)),
+                        margin_mode=MarginMode.CROSS if getattr(
+                            position_info, 'margin_mode', 0) == 0 else MarginMode.ISOLATED,
+                        margin=self._safe_decimal(
+                            getattr(position_info, 'allocated_margin', 0)),
+                        liquidation_price=self._safe_decimal(getattr(position_info, 'liquidation_price', 0)) if getattr(
+                            position_info, 'liquidation_price', '0') != '0' else None,
+                        timestamp=datetime.now(),
+                        raw_data={'position_info': position_info}
+                    ))
 
             # 🔥 如果指定了symbols，只返回匹配的持仓
             if symbols:
@@ -811,7 +862,7 @@ class LighterRest(LighterBase):
 
         except Exception as e:
             logger.error(f"获取持仓信息失败: {e}")
-            return []
+            raise
 
     # ============= 交易功能 =============
 
@@ -875,12 +926,15 @@ class LighterRest(LighterBase):
             logger.debug(
                 f"{symbol} 价格乘数: {price_multiplier}, 数量乘数: {size_multiplier}")
 
+            cached_market = self._markets_cache.get(market_index, {})
             market_info = {
                 'market_index': market_index,
                 'price_decimals': price_decimals,
                 'price_multiplier': price_multiplier,
                 'size_decimals': size_decimals,
                 'size_multiplier': size_multiplier,
+                'min_base_amount': cached_market.get('min_base_amount'),
+                'min_quote_amount': cached_market.get('min_quote_amount'),
             }
 
             # 🔥 缓存市场信息（关键！）
@@ -896,6 +950,37 @@ class LighterRest(LighterBase):
             logger.error(f"获取市场信息失败: {e}")
             return None
 
+    @staticmethod
+    def _validate_order_minimums(
+        quantity: Decimal,
+        price: Optional[Decimal],
+        market_info: Dict,
+        enforce_market_minimums: bool = True,
+    ) -> None:
+        """Validate Lighter's base and quote minimums before signing an order."""
+        quantity = Decimal(str(quantity))
+        if quantity <= 0:
+            raise ValueError("Order quantity must be greater than 0")
+        if not enforce_market_minimums:
+            return
+
+        try:
+            min_base = Decimal(str(market_info.get('min_base_amount') or 0))
+            min_quote = Decimal(str(market_info.get('min_quote_amount') or 0))
+        except Exception as exc:
+            raise ValueError("Invalid Lighter market minimum metadata") from exc
+
+        if min_base > 0 and quantity < min_base:
+            raise ValueError(
+                f"Order quantity {quantity} is below min_base_amount {min_base}"
+            )
+        if price is not None and min_quote > 0:
+            notional = quantity * Decimal(str(price))
+            if notional < min_quote:
+                raise ValueError(
+                    f"Order notional {notional} is below min_quote_amount {min_quote}"
+                )
+
     async def _calculate_slippage_protection_price(
         self,
         symbol: str,
@@ -903,7 +988,7 @@ class LighterRest(LighterBase):
         provided_price: Optional[Decimal] = None
     ) -> Optional[Decimal]:
         """
-        计算市价单的滑点保护价格（万分之1 = 0.01%）
+        Calculate the market-order protection price from configured slippage.
 
         Args:
             symbol: 交易对符号
@@ -913,27 +998,36 @@ class LighterRest(LighterBase):
         Returns:
             滑点保护价格，或 None
         """
-        if provided_price:
-            return provided_price
-
         try:
-            orderbook = await self.get_orderbook(symbol)
-            if not orderbook or not orderbook.bids or not orderbook.asks:
-                logger.error(f"无法获取{symbol}的订单簿，市价单需要价格")
-                return None
-
             is_sell = (side.lower() == "sell")
-            if is_sell:
-                # 卖单：使用买1价格并减少万分之1
-                base_price = orderbook.bids[0].price
-                protection_price = base_price * Decimal("0.9999")
+            slippage = Decimal(str(
+                self.config.get('market_order_slippage')
+                if self.config.get('market_order_slippage') is not None
+                else '0.01'
+            ))
+            if slippage < 0 or slippage >= 1:
+                raise ValueError(
+                    "market_order_slippage must be between 0 (inclusive) and 1"
+                )
+
+            if provided_price:
+                base_price = Decimal(str(provided_price))
             else:
-                # 买单：使用卖1价格并增加万分之1
-                base_price = orderbook.asks[0].price
-                protection_price = base_price * Decimal("1.0001")
+                orderbook = await self.get_orderbook(symbol)
+                if not orderbook or not orderbook.bids or not orderbook.asks:
+                    logger.error(f"无法获取{symbol}的订单簿，市价单需要价格")
+                    return None
+                base_price = (
+                    orderbook.bids[0].price if is_sell else orderbook.asks[0].price
+                )
+
+            protection_price = base_price * (
+                Decimal('1') - slippage if is_sell else Decimal('1') + slippage
+            )
 
             logger.debug(
-                f"市价单滑点保护价格: {protection_price} (基准: {base_price}, 滑点: 0.01%)")
+                f"市价单滑点保护价格: {protection_price} "
+                f"(基准: {base_price}, 滑点: {slippage:.2%})")
             return protection_price
 
         except Exception as e:
@@ -967,14 +1061,15 @@ class LighterRest(LighterBase):
         else:
             quantize_precision = Decimal(10) ** (-price_decimals)
 
+        is_ask = (side.lower() == "sell")
         avg_execution_price_rounded = avg_execution_price.quantize(
-            quantize_precision)
+            quantize_precision,
+            rounding=ROUND_CEILING if is_ask else ROUND_FLOOR,
+        )
 
         base_amount_int = self._convert_base_amount(market_info, quantity)
         avg_price_int = int(avg_execution_price_rounded *
                             market_info['price_multiplier'])
-        is_ask = (side.lower() == "sell")
-
         logger.debug(f"  symbol参数中的market_index={market_info['market_index']}")
         logger.debug(
             f"  价格精度: {market_info['price_decimals']}位小数, 乘数: {market_info['price_multiplier']}")
@@ -1069,6 +1164,17 @@ class LighterRest(LighterBase):
         if not avg_execution_price:
             return None
 
+        try:
+            self._validate_order_minimums(
+                quantity,
+                avg_execution_price,
+                market_info,
+                enforce_market_minimums=not kwargs.get("reduce_only", False),
+            )
+        except ValueError as exc:
+            logger.error(f"订单低于Lighter市场最小限制: {exc}")
+            return None
+
         # 转换参数
         params = self._convert_market_order_params(
             market_info, quantity, avg_execution_price, side, **kwargs
@@ -1076,11 +1182,11 @@ class LighterRest(LighterBase):
 
         # 执行下单
         try:
-            tx, tx_hash, err = await self.signer_client.create_market_order(**params)
+            tx, response, err = await self.signer_client.create_market_order(**params)
 
             # 处理结果
             return await self._handle_order_result(
-                tx, tx_hash, err, symbol, side, "market",
+                tx, response, err, symbol, side, "market",
                 quantity, avg_execution_price, batch_mode=batch_mode,
                 skip_order_index_query=skip_order_index_query, **kwargs
             )
@@ -1117,7 +1223,7 @@ class LighterRest(LighterBase):
         # 执行下单
         try:
             import lighter
-            tx, tx_hash, err = await self.signer_client.create_order(**params)
+            tx, response, err = await self.signer_client.create_order(**params)
 
             # 🔥 处理结果（使用调整后的价格，与_convert_limit_order_params保持一致）
             price_decimals = market_info['price_decimals']
@@ -1129,7 +1235,7 @@ class LighterRest(LighterBase):
             price_rounded = price.quantize(quantize_precision)
 
             return await self._handle_order_result(
-                tx, tx_hash, err, symbol, side, "limit",
+                tx, response, err, symbol, side, "limit",
                 quantity, price_rounded, batch_mode=batch_mode,
                 skip_order_index_query=skip_order_index_query, **kwargs
             )
@@ -1140,7 +1246,7 @@ class LighterRest(LighterBase):
     async def _handle_order_result(
         self,
         tx,
-        tx_hash,
+        response,
         err,
         symbol: str,
         side: str,
@@ -1171,15 +1277,18 @@ class LighterRest(LighterBase):
                 logger.error(f"   限价单价格: {price}")
             return None
 
-        # 检查返回值
-        if not tx and not tx_hash:
-            logger.error(f"❌ Lighter下单失败: tx和tx_hash都为空（无错误信息）")
-            logger.error(f"   这可能是钱包未授权或gas不足")
+        try:
+            self._require_success_response(response, "order submission")
+        except RuntimeError as exc:
+            logger.error(f"❌ Lighter下单失败: {exc}")
+            return None
+
+        tx_hash_str = str(getattr(response, 'tx_hash', '') or '')
+        if not tx or not tx_hash_str:
+            logger.error("❌ Lighter下单失败: response缺少tx或tx_hash")
             return None
 
         # 🔥 提取transaction hash（这不是order_id！）
-        tx_hash_str = str(tx_hash.tx_hash) if tx_hash and hasattr(
-            tx_hash, 'tx_hash') else str(tx_hash)
         logger.info(f"✅ Lighter下单成功: tx_hash={tx_hash_str}")
 
         # 🔥 Lighter特殊处理：REST API无法立即查询到新下的订单
@@ -1279,7 +1388,7 @@ class LighterRest(LighterBase):
             fee=None,
             trades=[],
             params=kwargs,
-            raw_data={'tx': tx, 'tx_hash': tx_hash, 'tx_hash_str': tx_hash_str}
+            raw_data={'tx': tx, 'response': response, 'tx_hash_str': tx_hash_str}
         )
 
     async def _query_order_index(
@@ -1422,8 +1531,24 @@ class LighterRest(LighterBase):
             if not market_info:
                 return None
 
+            validation_price = price if order_type.lower() != "market" else None
+            try:
+                self._validate_order_minimums(
+                    quantity,
+                    validation_price,
+                    market_info,
+                    enforce_market_minimums=not kwargs.get("reduce_only", False),
+                )
+            except ValueError as exc:
+                logger.error(f"订单低于Lighter市场最小限制: {exc}")
+                return None
+
             # 3. 根据订单类型执行下单
             if order_type.lower() == "market":
+                # Market/IOC orders normally disappear from active orders before
+                # an order_index lookup can observe them. Position verification is
+                # the authoritative close check.
+                skip_order_index_query = True
                 return await self._execute_market_order(
                     symbol, side, quantity, price, market_info, batch_mode=batch_mode,
                     skip_order_index_query=skip_order_index_query, **kwargs
@@ -1477,13 +1602,22 @@ class LighterRest(LighterBase):
                 return False
 
             # 取消订单
-            tx, tx_hash, err = await self.signer_client.cancel_order(
+            tx, response, err = await self.signer_client.cancel_order(
                 market_index=market_index,
                 order_index=int(order_id),
             )
 
             if err:
                 logger.error(f"取消订单失败: {self.parse_error(err)}")
+                return False
+
+            try:
+                self._require_success_response(response, "order cancellation")
+            except RuntimeError as exc:
+                logger.error(f"取消订单失败: {exc}")
+                return False
+            if not tx or not getattr(response, 'tx_hash', None):
+                logger.error("取消订单失败: response缺少tx或tx_hash")
                 return False
 
             return True

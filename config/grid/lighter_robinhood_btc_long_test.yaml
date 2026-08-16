@@ -1,0 +1,27 @@
+grid_system:
+  exchange: "lighter"
+  symbol: "BTC"
+  grid_type: "long"
+
+  # 測試建立時 BTC 約 62,976 USDG；啟動前須重新確認市價仍高於 62,000。
+  lower_price: 62750.0
+  upper_price: 63500.0
+  grid_interval: 25.0
+
+  # Robinhood BTC: size step 0.00001、min base 0.00020、min quote 10 USDG。
+  order_amount: 0.00020
+  quantity_precision: 5
+
+  martingale_increment: 0.0
+  scalping_enabled: false
+  capital_protection_enabled: false
+  take_profit_enabled: false
+  price_lock_enabled: false
+
+  # 觸發後會停止掛單、撤單，並以 reduce-only 平掉 BTC 倉位。
+  stop_loss_enabled: false
+  stop_loss_price: 60500.0
+  stop_loss_check_interval: 1
+
+  reverse_order_grid_distance: 1
+  order_health_check_interval: 15

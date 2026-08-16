@@ -682,14 +682,14 @@ class GridTerminalUI:
         if not trades:
             table.add_row("--", "--", "--", "--", "--")
 
-        return Panel(table, title="Recent Trades (Last 5)", border_style="green")
+        return Panel(table, title="Confirmed Fills (Last 5)", border_style="green")
 
     def _format_display_time(self, trade_time: Optional[datetime]) -> str:
-        """Render recent-trade timestamps in UTC+8."""
+        """Render aware timestamps in UTC+8 and preserve local naive timestamps."""
         if not isinstance(trade_time, datetime):
             return "--"
         if trade_time.tzinfo is None:
-            trade_time = trade_time.replace(tzinfo=timezone.utc)
+            return trade_time.strftime("%H:%M:%S")
         return trade_time.astimezone(self.DISPLAY_TIMEZONE).strftime("%H:%M:%S")
 
     def create_orders_panel_display(self, stats: GridStatistics) -> Panel:
