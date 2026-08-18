@@ -102,6 +102,7 @@ grid_system:
 
 - `enable_notifications` 預設實際是 `false`
 - `order_health_check_interval` 預設實際是 `600`
+- `position_monitor_interval` 預設實際是 `10`，失敗時最長退避至 60 秒
 - `fee_rate` 預設實際是 `0.0001`
 
 另外要注意：
@@ -221,9 +222,10 @@ grid_system:
 | `grid_interval` | 是 | 無 | 每格價格距離 |
 | `order_amount` | 是 | 無 | 每格的基礎下單數量 |
 | `quantity_precision` | 否 | `3` | 數量小數位數 |
-| `max_position` | 否 | `null` | 保留欄位；目前不作跨程序／全帳戶硬性限制 |
+| `max_position` | 否 | `null` | 策略方向的持倉硬上限；計入目前持倉與未成交開倉單（僅限本程序／商品） |
 | `enable_notifications` | 否 | `false` | 是否啟用通知 |
 | `order_health_check_interval` | 否 | `600` | 健康檢查間隔，單位秒 |
+| `position_monitor_interval` | 否 | `10` | REST 持倉輪詢基礎間隔，至少 5 秒；失敗時指數退避至最長 60 秒 |
 | `fee_rate` | 否 | `0.0001` | 手續費率，供損益估算使用 |
 
 ### fixed range 專用欄位

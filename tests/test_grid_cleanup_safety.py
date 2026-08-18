@@ -74,6 +74,29 @@ class StartupCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         exchange.get_positions.assert_not_awaited()
 
+    async def test_nonterminal_cancel_ack_aborts_startup_cleanup(self):
+        order = SimpleNamespace(id="old-1")
+        pending_ack = SimpleNamespace(
+            status="pending",
+            params={"cancel_terminal": False},
+            raw_data={"cancel_terminal": False},
+        )
+        exchange = SimpleNamespace(
+            get_open_orders=AsyncMock(side_effect=[[order], []]),
+            cancel_order=AsyncMock(return_value=pending_ack),
+            get_positions=AsyncMock(return_value=[]),
+        )
+        coordinator = self.make_coordinator(exchange)
+
+        with patch(
+            "core.services.grid.coordinator.grid_coordinator.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not terminal"):
+                await coordinator._cleanup_before_start()
+
+        exchange.get_positions.assert_not_awaited()
+
     async def test_remaining_position_aborts_startup_cleanup(self):
         position = make_position(PositionSide.LONG)
         exchange = SimpleNamespace(
@@ -105,6 +128,7 @@ class ResetCloseTests(unittest.IsolatedAsyncioTestCase):
         coordinator = SimpleNamespace(
             _is_resetting=False,
             _resetting=False,
+            _grid_level_locks={},
             is_emergency_stopped=False,
             _stop_loss_trigger_count=0,
             stop=AsyncMock(),
@@ -202,6 +226,105 @@ class ResetCloseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("old", manager.state.active_orders)
         manager.tracker.reset.assert_not_called()
 
+    async def test_adverse_reset_preserves_live_position_for_max_position_filter(self):
+        current_position = Decimal("0.0008")
+
+        tracker = SimpleNamespace(
+            reset=MagicMock(),
+            sync_initial_position=MagicMock(),
+            get_current_position=MagicMock(return_value=current_position),
+            get_average_cost=MagicMock(return_value=Decimal("100")),
+        )
+        config = SimpleNamespace(
+            symbol="BTC",
+            grid_count=5,
+            max_position=Decimal("0.001"),
+            is_long=lambda: True,
+            is_short=lambda: False,
+            get_grid_price=lambda _index: Decimal("100"),
+        )
+        state = SimpleNamespace(
+            active_orders={"old": object()},
+            pending_buy_orders=1,
+            pending_sell_orders=0,
+            initialize_grid_levels=MagicMock(),
+            sync_position_snapshot=MagicMock(),
+            add_order=MagicMock(),
+        )
+        engine = SimpleNamespace(
+            exchange=SimpleNamespace(
+                get_positions=AsyncMock(
+                    return_value=[make_position(PositionSide.LONG, "0.0008")]
+                )
+            ),
+            get_current_price=AsyncMock(return_value=Decimal("100")),
+            get_pending_orders=MagicMock(return_value=[]),
+            place_batch_orders=AsyncMock(side_effect=lambda orders, **_kwargs: orders),
+        )
+        coordinator = GridCoordinator.__new__(GridCoordinator)
+        coordinator.logger = MagicMock()
+        coordinator.config = config
+        coordinator.tracker = tracker
+        coordinator.engine = engine
+        coordinator._grid_level_locks = {}
+        coordinator.scalping_manager = None
+        coordinator.capital_protection_manager = None
+        coordinator.take_profit_manager = None
+        coordinator.price_lock_manager = None
+        coordinator.position_monitor = SimpleNamespace(
+            restart_initial_phase=MagicMock()
+        )
+
+        manager = GridResetManager.__new__(GridResetManager)
+        manager.logger = MagicMock()
+        manager.config = config
+        manager.coordinator = coordinator
+        manager.state = state
+        manager.engine = engine
+        manager.tracker = tracker
+        manager.strategy = SimpleNamespace(
+            initialize=MagicMock(
+                return_value=[
+                    GridOrder(
+                        order_id=f"buy-{index}",
+                        grid_id=index,
+                        side=GridOrderSide.BUY,
+                        price=Decimal("100") - index,
+                        amount=Decimal("0.0002"),
+                        status=GridOrderStatus.PENDING,
+                        created_at=datetime.now(),
+                    )
+                    for index in range(5)
+                ]
+            )
+        )
+        manager.order_ops = SimpleNamespace(
+            cancel_all_orders_with_verification=AsyncMock(return_value=True)
+        )
+
+        with patch(
+            "core.services.grid.coordinator.grid_reset_manager.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await manager._generic_reset_workflow(
+                reset_type="adverse",
+                should_close_position=False,
+                should_reinit_capital=False,
+            )
+
+        self.assertEqual(result, Decimal("0"))
+        tracker.reset.assert_not_called()
+        tracker.sync_initial_position.assert_called_once_with(
+            position=current_position,
+            entry_price=Decimal("100"),
+        )
+        submitted_orders = engine.place_batch_orders.await_args.args[0]
+        self.assertEqual(len(submitted_orders), 1)
+        self.assertEqual(
+            sum((order.amount for order in submitted_orders), Decimal("0")),
+            Decimal("0.0002"),
+        )
+
 
 class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
     def make_engine(self, exchange) -> GridEngineImpl:
@@ -238,7 +361,7 @@ class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
 
         async def cancel_all_orders(symbol):
             events.append("cancelled")
-            return []
+            return [SimpleNamespace(id="late-1", client_id=None)]
 
         exchange = SimpleNamespace(
             create_order=AsyncMock(side_effect=create_order),
@@ -325,7 +448,9 @@ class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_success_clears_only_after_exchange_verification(self):
         exchange = SimpleNamespace(
-            cancel_all_orders=AsyncMock(return_value=[]),
+            cancel_all_orders=AsyncMock(
+                return_value=[SimpleNamespace(id="old-1", client_id=None)]
+            ),
             get_open_orders=AsyncMock(return_value=[]),
         )
         engine = self.make_engine(exchange)
@@ -384,9 +509,14 @@ class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
         )
         coordinator.state = SimpleNamespace(stop=MagicMock())
 
-        with self.assertRaisesRegex(RuntimeError, "order cancellation"):
-            await coordinator.stop()
+        with patch(
+            "core.services.grid.coordinator.grid_coordinator.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "order cancellation"):
+                await coordinator.stop()
 
+        self.assertEqual(coordinator.engine.cancel_all_orders.await_count, 5)
         coordinator.engine.stop.assert_awaited_once_with()
         coordinator.state.stop.assert_called_once_with()
 

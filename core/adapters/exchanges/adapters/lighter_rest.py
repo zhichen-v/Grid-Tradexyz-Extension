@@ -29,11 +29,13 @@ Lighter交易所适配器 - REST API模块
 这些设计是Lighter作为Layer 2 DEX的优化选择，与传统CEX不同！
 """
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime
 import asyncio
 import logging
+import threading
+import time
 
 try:
     import lighter
@@ -81,6 +83,9 @@ if not logger.handlers:
 class LighterRest(LighterBase):
     """Lighter REST API封装类"""
 
+    MUTATION_RECONCILIATION_ATTEMPTS = 2
+    MUTATION_RECONCILIATION_DELAY = 0.25
+
     def __init__(self, config: Dict[str, Any]):
         """
         初始化Lighter REST客户端
@@ -113,6 +118,18 @@ class LighterRest(LighterBase):
         # 这是关键修复！没有这个缓存会导致批量下单时触发429
         self._market_info_cache = {}  # {symbol: {info, timestamp}}
 
+        # All REST and signer traffic shares one cooldown so concurrent monitors
+        # cannot keep the account pinned behind a 429 response.
+        self._request_lock = asyncio.Lock()
+        self._next_request_at = 0.0
+        self._rate_limit_failures = 0
+        self._request_interval = 0.05
+        self._max_rate_limit_delay = 30.0
+        self._client_order_index_lock = threading.Lock()
+        self._last_client_order_index = 0
+        self._uncertain_cancellations = set()
+        self._unresolved_submissions = {}
+
         # WebSocket由统一adapter持有，避免重复连接与SignerClient nonce状态。
         self._websocket = None
 
@@ -125,9 +142,424 @@ class LighterRest(LighterBase):
         if code != 200:
             raise RuntimeError(f"{operation} failed (code={code})")
 
+    @staticmethod
+    def _is_rate_limited(value: Any) -> bool:
+        """Return whether an SDK result or exception represents HTTP 429."""
+        if isinstance(value, (tuple, list)):
+            return any(LighterRest._is_rate_limited(item) for item in value)
+        code = getattr(value, "code", None)
+        if code is None:
+            code = getattr(value, "status", None)
+        if str(code) == "429":
+            return True
+        text = str(value or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "too many requests",
+                "status code: 429",
+                "http 429",
+                "rate limited",
+            )
+        )
+
+    def _record_rate_limit(self, operation: str) -> float:
+        """Advance the shared exponential cooldown after a 429 response."""
+        self._rate_limit_failures += 1
+        delay = min(
+            2 ** (self._rate_limit_failures - 1),
+            self._max_rate_limit_delay,
+        )
+        now = asyncio.get_running_loop().time()
+        self._next_request_at = max(self._next_request_at, now + delay)
+        logger.warning(
+            f"Lighter rate limit reached during {operation}; "
+            f"shared cooldown={delay:.1f}s"
+        )
+        return delay
+
+    async def _call_api(
+        self,
+        operation: str,
+        request_factory: Callable[[], Any],
+        *,
+        retry_on_429: bool = True,
+    ) -> Any:
+        """Serialize API traffic and retry read-only requests once after a 429."""
+        if not hasattr(self, "_request_lock"):
+            self._request_lock = asyncio.Lock()
+            self._next_request_at = 0.0
+            self._rate_limit_failures = 0
+            self._request_interval = 0.05
+            self._max_rate_limit_delay = 30.0
+
+        max_attempts = 2 if retry_on_429 else 1
+        for attempt in range(max_attempts):
+            rate_limited = False
+            async with self._request_lock:
+                loop = asyncio.get_running_loop()
+                wait_for = self._next_request_at - loop.time()
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+
+                try:
+                    result = await request_factory()
+                except Exception as exc:
+                    if not self._is_rate_limited(exc):
+                        raise
+                    self._record_rate_limit(operation)
+                    rate_limited = True
+                else:
+                    if self._is_rate_limited(result):
+                        self._record_rate_limit(operation)
+                        rate_limited = True
+                    else:
+                        self._rate_limit_failures = 0
+                        self._next_request_at = max(
+                            self._next_request_at,
+                            loop.time() + self._request_interval,
+                        )
+                        return result
+
+            if not rate_limited:
+                break
+            if attempt + 1 >= max_attempts:
+                raise RuntimeError(f"{operation} rate limited (HTTP 429)")
+
+        raise RuntimeError(f"{operation} failed")
+
     def is_connected(self) -> bool:
         """检查是否已连接"""
         return self._connected
+
+    def _next_client_order_index(self) -> int:
+        """Return a process-unique, monotonically increasing Lighter client id."""
+        lock = getattr(self, "_client_order_index_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._client_order_index_lock = lock
+
+        with lock:
+            # Epoch milliseconds keep the sequence unique across process/host
+            # restarts; the local counter handles multiple orders in one ms.
+            now_ms = time.time_ns() // 1_000_000
+            value = max(
+                now_ms,
+                getattr(self, "_last_client_order_index", 0) + 1,
+            )
+            self._last_client_order_index = value
+            return value
+
+    @staticmethod
+    def _is_definitive_mutation_exception(exc: Exception) -> bool:
+        """Return whether an exception proves the mutation never crossed the API gate."""
+        # Once the signer call starts, ValueError/TypeError can come from response
+        # decoding after the request was accepted. Only an explicit HTTP 429 is
+        # safe to classify from the exception alone; response/err objects are
+        # handled separately by their callers.
+        return LighterRest._is_rate_limited(exc)
+
+    @staticmethod
+    def _order_matches_client_id(order: OrderData, client_order_id: int) -> bool:
+        target = str(client_order_id)
+        return str(getattr(order, "client_id", "") or "") == target or (
+            str(getattr(order, "id", "") or "") == target
+        )
+
+    def _register_unresolved_submission(
+        self,
+        client_order_id: int,
+        symbol: str,
+        order_type: str,
+        side: str,
+        amount: Decimal,
+        price: Decimal,
+    ) -> None:
+        registry = getattr(self, "_unresolved_submissions", None)
+        if registry is None:
+            registry = {}
+            self._unresolved_submissions = registry
+        registry[str(client_order_id)] = {
+            "client_order_id": str(client_order_id),
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": Decimal(str(amount)),
+            "price": Decimal(str(price)),
+            "time": datetime.now(),
+        }
+
+    def _clear_unresolved_submission(self, client_order_id: Any) -> None:
+        registry = getattr(self, "_unresolved_submissions", None)
+        if registry is not None:
+            registry.pop(str(client_order_id), None)
+
+    def _clear_resolved_submissions_from_orders(
+        self,
+        orders: List[OrderData],
+    ) -> None:
+        registry = getattr(self, "_unresolved_submissions", None)
+        if not registry:
+            return
+        for order in orders:
+            client_id = str(getattr(order, "client_id", "") or "")
+            order_id = str(getattr(order, "id", "") or "")
+            if client_id in registry:
+                registry.pop(client_id, None)
+            elif order_id in registry:
+                registry.pop(order_id, None)
+
+    def get_unresolved_submissions(self) -> List[Dict[str, Any]]:
+        """Return copies of mutation intents that remain unconfirmed."""
+        registry = getattr(self, "_unresolved_submissions", {})
+        return [dict(item) for item in registry.values()]
+
+    async def resolve_unresolved_submissions(self) -> List[OrderData]:
+        """Resolve registered intents using reads only and return exact matches."""
+        registry = list(getattr(self, "_unresolved_submissions", {}).values())
+        resolved: List[OrderData] = []
+        for item in registry:
+            order = await self._reconcile_order_submission(
+                item["symbol"],
+                int(item["client_order_id"]),
+            )
+            if order is not None:
+                resolved.append(order)
+        return resolved
+
+    async def _reconcile_order_submission(
+        self,
+        symbol: str,
+        client_order_id: int,
+    ) -> Optional[OrderData]:
+        """Look up one ambiguous submission without repeating the mutation."""
+        for attempt in range(self.MUTATION_RECONCILIATION_ATTEMPTS):
+            for source, fetch in (
+                ("open", self.get_open_orders),
+                ("history", self.get_order_history),
+            ):
+                try:
+                    orders = await fetch(symbol)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to reconcile ambiguous order submission: "
+                        f"client_order_id={client_order_id}, source={source}, error={exc}"
+                    )
+                    continue
+
+                for order in orders:
+                    if self._order_matches_client_id(order, client_order_id):
+                        self._clear_unresolved_submission(client_order_id)
+                        logger.warning(
+                            "Reconciled ambiguous order submission by client id: "
+                            f"client_order_id={client_order_id}, order_id={order.id}, "
+                            f"source={source}"
+                        )
+                        return order
+
+            if attempt + 1 < self.MUTATION_RECONCILIATION_ATTEMPTS:
+                await asyncio.sleep(self.MUTATION_RECONCILIATION_DELAY)
+        return None
+
+    def _build_uncertain_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: int,
+        reason: str,
+        **kwargs,
+    ) -> OrderData:
+        """Return a tracked placeholder so callers do not retry with a new id."""
+        client_id = str(client_order_id)
+        self._register_unresolved_submission(
+            client_order_id,
+            symbol,
+            order_type,
+            side,
+            quantity,
+            price,
+        )
+        params = dict(kwargs)
+        params["client_order_id"] = client_order_id
+        params["submission_uncertain"] = True
+        return OrderData(
+            id=client_id,
+            client_id=client_id,
+            symbol=symbol,
+            side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
+            type=OrderType.MARKET if order_type == "market" else OrderType.LIMIT,
+            amount=quantity,
+            price=price,
+            filled=Decimal("0"),
+            remaining=quantity,
+            cost=Decimal("0"),
+            average=None,
+            status=OrderStatus.PENDING,
+            timestamp=datetime.now(),
+            updated=None,
+            fee=None,
+            trades=[],
+            params=params,
+            raw_data={
+                "submission_uncertain": True,
+                "client_order_id": client_id,
+                "uncertainty_reason": reason,
+            },
+        )
+
+    async def _handle_ambiguous_order_submission(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        price: Decimal,
+        reason: str,
+        **kwargs,
+    ) -> OrderData:
+        client_order_id = kwargs["client_order_id"]
+        reconciled = await self._reconcile_order_submission(symbol, client_order_id)
+        if reconciled is not None:
+            return reconciled
+
+        logger.error(
+            "Order submission outcome remains uncertain; preserving client id without retry: "
+            f"client_order_id={client_order_id}, reason={reason}"
+        )
+        order_kwargs = dict(kwargs)
+        order_kwargs.pop("client_order_id", None)
+        return self._build_uncertain_order(
+            symbol,
+            side,
+            order_type,
+            quantity,
+            price,
+            client_order_id,
+            reason,
+            **order_kwargs,
+        )
+
+    async def _reconcile_cancellation(
+        self,
+        symbol: str,
+        order_id: str,
+    ) -> Optional[bool]:
+        """Resolve cancellation only from an exact active or terminal-history match."""
+        target = str(order_id)
+
+        def matches(order: OrderData) -> bool:
+            return target in {
+                str(getattr(order, "id", "") or ""),
+                str(getattr(order, "client_id", "") or ""),
+            }
+
+        for attempt in range(self.MUTATION_RECONCILIATION_ATTEMPTS):
+            try:
+                active_orders = await self.get_open_orders(symbol)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reconcile ambiguous cancellation: "
+                    f"order_id={order_id}, source=open, error={exc}"
+                )
+            else:
+                if any(matches(order) for order in active_orders):
+                    return False
+
+            try:
+                history = await self.get_order_history(symbol)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reconcile ambiguous cancellation: "
+                    f"order_id={order_id}, source=history, error={exc}"
+                )
+            else:
+                for order in history:
+                    if not matches(order):
+                        continue
+                    status = getattr(order, "status", None)
+                    status_value = getattr(status, "value", status)
+                    if str(status_value or "").lower() in {
+                        "canceled",
+                        "cancelled",
+                        "rejected",
+                        "expired",
+                    }:
+                        return True
+
+            if attempt + 1 < self.MUTATION_RECONCILIATION_ATTEMPTS:
+                await asyncio.sleep(self.MUTATION_RECONCILIATION_DELAY)
+        return None
+
+    async def _handle_ambiguous_cancellation(
+        self,
+        symbol: str,
+        order_id: str,
+        reason: str,
+    ) -> bool:
+        """Reconcile an uncertain cancel and prevent blind mutation retries."""
+        uncertain = getattr(self, "_uncertain_cancellations", None)
+        if uncertain is None:
+            uncertain = set()
+            self._uncertain_cancellations = uncertain
+        key = (symbol, str(order_id))
+        uncertain.add(key)
+
+        reconciled = await self._reconcile_cancellation(symbol, order_id)
+        if reconciled is True:
+            uncertain.discard(key)
+            logger.warning(
+                "Reconciled ambiguous cancellation as complete: "
+                f"order_id={order_id}, reason={reason}"
+            )
+            return True
+
+        logger.error(
+            "Cancellation outcome remains uncertain; signer mutation will not be repeated: "
+            f"order_id={order_id}, reason={reason}"
+        )
+        return False
+
+    @staticmethod
+    def _looks_like_client_order_index(order_id: str) -> bool:
+        """Identify the epoch-millisecond client ids allocated by this process."""
+        try:
+            return int(order_id) >= 1_000_000_000_000
+        except (TypeError, ValueError):
+            return False
+
+    async def _resolve_cancel_order_index(
+        self,
+        symbol: str,
+        logical_order_id: str,
+    ) -> Optional[str]:
+        """Resolve a temporary client id without ever sending it as an order index."""
+        if not self._looks_like_client_order_index(logical_order_id):
+            return logical_order_id
+
+        try:
+            orders = await self.get_open_orders(symbol)
+        except Exception as exc:
+            logger.error(
+                "Cannot resolve client_order_index before cancellation; fail closed: "
+                f"client_order_id={logical_order_id}, error={exc}"
+            )
+            return None
+
+        for order in orders:
+            if str(getattr(order, "client_id", "") or "") != logical_order_id:
+                continue
+            resolved = str(getattr(order, "id", "") or "")
+            if resolved and resolved != logical_order_id:
+                return resolved
+
+        logger.error(
+            "Client order intent has no cancellable order_index yet; fail closed: "
+            f"client_order_id={logical_order_id}"
+        )
+        return None
 
     async def connect(self):
         """连接（调用initialize）"""
@@ -209,7 +641,10 @@ class LighterRest(LighterBase):
         try:
             # 获取订单簿列表（包含市场信息）
             # ⚠️ 必须使用此API，它会返回所有市场包括market_id=0的ETH
-            response = await self.order_api.order_books(filter="perp")
+            response = await self._call_api(
+                "markets query",
+                lambda: self.order_api.order_books(filter="perp"),
+            )
 
             if hasattr(response, 'order_books'):
                 markets = []
@@ -258,7 +693,10 @@ class LighterRest(LighterBase):
         """
         try:
             # 获取订单簿信息
-            response = await self.order_api.order_books(filter="perp")
+            response = await self._call_api(
+                "exchange info query",
+                lambda: self.order_api.order_books(filter="perp"),
+            )
 
             symbols = []
             if hasattr(response, 'order_books'):
@@ -319,7 +757,10 @@ class LighterRest(LighterBase):
                 return None
 
             # 获取市场统计信息（包含价格信息）
-            response = await self.order_api.order_book_details(market_id=market_id)
+            response = await self._call_api(
+                "ticker query",
+                lambda: self.order_api.order_book_details(market_id=market_id),
+            )
 
             if not response or not hasattr(response, 'order_book_details') or not response.order_book_details:
                 return None
@@ -341,8 +782,13 @@ class LighterRest(LighterBase):
             bid_price = last_price
             ask_price = last_price
             try:
-                orderbook_response = await self.order_api.order_book_orders(
-                    market_id=market_id, limit=1)
+                orderbook_response = await self._call_api(
+                    "best price query",
+                    lambda: self.order_api.order_book_orders(
+                        market_id=market_id,
+                        limit=1,
+                    ),
+                )
                 if orderbook_response.bids:
                     bid_price = self._safe_decimal(
                         orderbook_response.bids[0].price)
@@ -385,7 +831,13 @@ class LighterRest(LighterBase):
                 return None
 
             # 使用 order_book_orders 获取订单簿深度
-            response = await self.order_api.order_book_orders(market_id=market_id, limit=limit)
+            response = await self._call_api(
+                "order book query",
+                lambda: self.order_api.order_book_orders(
+                    market_id=market_id,
+                    limit=limit,
+                ),
+            )
 
             if not response:
                 return None
@@ -451,7 +903,13 @@ class LighterRest(LighterBase):
                 return []
 
             # 获取最近成交
-            response = await self.order_api.recent_trades(market_id=market_id, limit=limit)
+            response = await self._call_api(
+                "recent trades query",
+                lambda: self.order_api.recent_trades(
+                    market_id=market_id,
+                    limit=limit,
+                ),
+            )
 
             trades = []
             if hasattr(response, 'trades') and response.trades:
@@ -510,7 +968,13 @@ class LighterRest(LighterBase):
 
         try:
             # 获取账户信息
-            response = await self.account_api.account(by="index", value=str(self.account_index))
+            response = await self._call_api(
+                "account balance query",
+                lambda: self.account_api.account(
+                    by="index",
+                    value=str(self.account_index),
+                ),
+            )
             self._require_success_response(response, "account balance query")
 
             if not hasattr(response, 'accounts') or not response.accounts:
@@ -597,11 +1061,14 @@ class LighterRest(LighterBase):
                     raise ValueError(f"未找到交易对 {symbol} 的市场索引")
 
             # 使用 account_active_orders API（SDK 方法是异步的，直接 await）
-            response = await self.order_api.account_active_orders(
-                authorization=auth_token,
-                account_index=self.account_index,
-                market_id=market_id,
-                market_type="perp",
+            response = await self._call_api(
+                "active orders query",
+                lambda: self.order_api.account_active_orders(
+                    authorization=auth_token,
+                    account_index=self.account_index,
+                    market_id=market_id,
+                    market_type="perp",
+                ),
             )
             self._require_success_response(response, "active orders query")
 
@@ -626,6 +1093,7 @@ class LighterRest(LighterBase):
             else:
                 logger.info(f"✅ REST API确认无活跃订单")
 
+            self._clear_resolved_submissions_from_orders(orders)
             return orders
 
         except Exception as e:
@@ -720,12 +1188,15 @@ class LighterRest(LighterBase):
                     raise ValueError(f"未找到交易對 {symbol} 的市場索引")
 
             # 获取历史订单
-            response = await self.order_api.account_inactive_orders(
-                authorization=auth_token,
-                account_index=self.account_index,
-                limit=limit,
-                market_id=market_id,
-                market_type="perp",
+            response = await self._call_api(
+                "inactive orders query",
+                lambda: self.order_api.account_inactive_orders(
+                    authorization=auth_token,
+                    account_index=self.account_index,
+                    limit=limit,
+                    market_id=market_id,
+                    market_type="perp",
+                ),
             )
             self._require_success_response(response, "inactive orders query")
 
@@ -740,6 +1211,7 @@ class LighterRest(LighterBase):
 
                     orders.append(self._parse_order(order_info, order_symbol))
 
+            self._clear_resolved_submissions_from_orders(orders)
             return orders
 
         except Exception as e:
@@ -761,7 +1233,13 @@ class LighterRest(LighterBase):
 
         try:
             # 获取账户信息（包含持仓）
-            response = await self.account_api.account(by="index", value=str(self.account_index))
+            response = await self._call_api(
+                "positions query",
+                lambda: self.account_api.account(
+                    by="index",
+                    value=str(self.account_index),
+                ),
+            )
             self._require_success_response(response, "positions query")
 
             if not hasattr(response, 'accounts') or not response.accounts:
@@ -909,7 +1387,12 @@ class LighterRest(LighterBase):
 
             # 获取市场详情，动态获取价格精度
             logger.debug(f"🔍 获取市场详情: market_id={market_index}")
-            market_details = await self.order_api.order_book_details(market_id=market_index)
+            market_details = await self._call_api(
+                "market details query",
+                lambda: self.order_api.order_book_details(
+                    market_id=market_index,
+                ),
+            )
             if not market_details.order_book_details:
                 raise RuntimeError(f"Lighter未返回市场详情: {symbol}")
 
@@ -1077,11 +1560,13 @@ class LighterRest(LighterBase):
             f"  avg_execution_price={avg_execution_price} -> 四舍五入后={avg_execution_price_rounded}, avg_price_int={avg_price_int}")
         logger.debug(
             f"  reduce_only={kwargs.get('reduce_only', False)}")
+        client_order_index = kwargs.get("client_order_id")
+        if client_order_index is None:
+            client_order_index = self._next_client_order_index()
 
         return {
             'market_index': market_info['market_index'],
-            'client_order_index': kwargs.get("client_order_id",
-                                             int(asyncio.get_event_loop().time() * 1000)),
+            'client_order_index': client_order_index,
             'base_amount': base_amount_int,
             'avg_execution_price': avg_price_int,
             'is_ask': is_ask,
@@ -1125,11 +1610,13 @@ class LighterRest(LighterBase):
             "GTT": lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
             "POST_ONLY": lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,
         }
+        client_order_index = kwargs.get("client_order_id")
+        if client_order_index is None:
+            client_order_index = self._next_client_order_index()
 
         return {
             'market_index': market_info['market_index'],
-            'client_order_index': kwargs.get("client_order_id",
-                                             int(asyncio.get_event_loop().time() * 1000)),
+            'client_order_index': client_order_index,
             'base_amount': base_amount_int,
             'price': price_int,
             'is_ask': is_ask,
@@ -1153,9 +1640,8 @@ class LighterRest(LighterBase):
     ) -> Optional[OrderData]:
         """执行市价单"""
         # 🔥 生成唯一的 client_order_id（确保整个流程使用同一个值）
-        if "client_order_id" not in kwargs:
-            kwargs["client_order_id"] = int(
-                asyncio.get_event_loop().time() * 1000)
+        if kwargs.get("client_order_id") is None:
+            kwargs["client_order_id"] = self._next_client_order_index()
 
         # 计算滑点保护价格
         avg_execution_price = await self._calculate_slippage_protection_price(
@@ -1182,7 +1668,11 @@ class LighterRest(LighterBase):
 
         # 执行下单
         try:
-            tx, response, err = await self.signer_client.create_market_order(**params)
+            tx, response, err = await self._call_api(
+                "market order submission",
+                lambda: self.signer_client.create_market_order(**params),
+                retry_on_429=False,
+            )
 
             # 处理结果
             return await self._handle_order_result(
@@ -1190,9 +1680,19 @@ class LighterRest(LighterBase):
                 quantity, avg_execution_price, batch_mode=batch_mode,
                 skip_order_index_query=skip_order_index_query, **kwargs
             )
-        except Exception as e:
-            logger.error(f"执行市价单失败: {e}")
-            return None
+        except Exception as exc:
+            if self._is_definitive_mutation_exception(exc):
+                logger.error(f"执行市价单失败: {exc}")
+                return None
+            return await self._handle_ambiguous_order_submission(
+                symbol,
+                side,
+                "market",
+                quantity,
+                avg_execution_price,
+                str(exc),
+                **kwargs,
+            )
 
     async def _execute_limit_order(
         self,
@@ -1211,37 +1711,50 @@ class LighterRest(LighterBase):
             return None
 
         # 🔥 生成唯一的 client_order_id（确保整个流程使用同一个值）
-        if "client_order_id" not in kwargs:
-            kwargs["client_order_id"] = int(
-                asyncio.get_event_loop().time() * 1000)
+        if kwargs.get("client_order_id") is None:
+            kwargs["client_order_id"] = self._next_client_order_index()
 
         # 转换参数
         params = self._convert_limit_order_params(
             market_info, quantity, price, side, **kwargs
         )
 
+        price_decimals = market_info['price_decimals']
+        quantize_precision = (
+            Decimal("1")
+            if price_decimals == 0
+            else Decimal(10) ** (-price_decimals)
+        )
+        price_rounded = price.quantize(quantize_precision)
+
         # 执行下单
         try:
             import lighter
-            tx, response, err = await self.signer_client.create_order(**params)
+            tx, response, err = await self._call_api(
+                "limit order submission",
+                lambda: self.signer_client.create_order(**params),
+                retry_on_429=False,
+            )
 
             # 🔥 处理结果（使用调整后的价格，与_convert_limit_order_params保持一致）
-            price_decimals = market_info['price_decimals']
-            if price_decimals == 0:
-                quantize_precision = Decimal("1")
-            else:
-                quantize_precision = Decimal(10) ** (-price_decimals)
-
-            price_rounded = price.quantize(quantize_precision)
-
             return await self._handle_order_result(
                 tx, response, err, symbol, side, "limit",
                 quantity, price_rounded, batch_mode=batch_mode,
                 skip_order_index_query=skip_order_index_query, **kwargs
             )
-        except Exception as e:
-            logger.error(f"执行限价单失败: {e}")
-            return None
+        except Exception as exc:
+            if self._is_definitive_mutation_exception(exc):
+                logger.error(f"执行限价单失败: {exc}")
+                return None
+            return await self._handle_ambiguous_order_submission(
+                symbol,
+                side,
+                "limit",
+                quantity,
+                price_rounded,
+                str(exc),
+                **kwargs,
+            )
 
     async def _handle_order_result(
         self,
@@ -1269,13 +1782,35 @@ class LighterRest(LighterBase):
         # 检查错误
         if err:
             error_msg = self.parse_error(err) if err else "未知错误"
-            logger.error(f"❌ Lighter下单失败: {error_msg}")
-            logger.error(f"   订单类型: {order_type}, 方向: {side}, 数量: {quantity}")
-            if order_type == "market":
-                logger.error(f"   市价单保护价格: {price}")
-            else:
-                logger.error(f"   限价单价格: {price}")
-            return None
+            mutation_error = err if isinstance(err, Exception) else RuntimeError(error_msg)
+            if self._is_definitive_mutation_exception(mutation_error):
+                logger.error(f"❌ Lighter下单失败: {error_msg}")
+                logger.error(f"   订单类型: {order_type}, 方向: {side}, 数量: {quantity}")
+                if order_type == "market":
+                    logger.error(f"   市价单保护价格: {price}")
+                else:
+                    logger.error(f"   限价单价格: {price}")
+                return None
+            return await self._handle_ambiguous_order_submission(
+                symbol,
+                side,
+                order_type,
+                quantity,
+                price,
+                error_msg,
+                **kwargs,
+            )
+
+        if response is None or getattr(response, "code", None) is None:
+            return await self._handle_ambiguous_order_submission(
+                symbol,
+                side,
+                order_type,
+                quantity,
+                price,
+                "submission response missing success code",
+                **kwargs,
+            )
 
         try:
             self._require_success_response(response, "order submission")
@@ -1285,8 +1820,15 @@ class LighterRest(LighterBase):
 
         tx_hash_str = str(getattr(response, 'tx_hash', '') or '')
         if not tx or not tx_hash_str:
-            logger.error("❌ Lighter下单失败: response缺少tx或tx_hash")
-            return None
+            return await self._handle_ambiguous_order_submission(
+                symbol,
+                side,
+                order_type,
+                quantity,
+                price,
+                "successful response missing tx or tx_hash",
+                **kwargs,
+            )
 
         # 🔥 提取transaction hash（这不是order_id！）
         logger.info(f"✅ Lighter下单成功: tx_hash={tx_hash_str}")
@@ -1322,11 +1864,13 @@ class LighterRest(LighterBase):
         # - 立即查询 order_index（确保反手单可靠性）
         # - 直接使用 order_index 作为唯一标识
         from datetime import datetime
+        client_order_id = kwargs.get("client_order_id")
+        if client_order_id is None:
+            raise RuntimeError("order submission lost its client_order_id")
 
         if batch_mode:
             # 批量模式：使用 client_order_id
-            client_order_id_str = str(kwargs.get("client_order_id", int(
-                asyncio.get_event_loop().time() * 1000)))
+            client_order_id_str = str(client_order_id)
             order_id = client_order_id_str
             logger.info(
                 f"📦 批量模式：使用 client_order_id={order_id}，"
@@ -1334,8 +1878,7 @@ class LighterRest(LighterBase):
             )
         elif skip_order_index_query:
             # 跳过查询模式：直接使用临时ID（Volume Maker 刷量程序）
-            client_order_id_str = str(kwargs.get("client_order_id", int(
-                asyncio.get_event_loop().time() * 1000)))
+            client_order_id_str = str(client_order_id)
             order_id = client_order_id_str
             logger.debug(
                 f"🔖 跳过查询模式：使用临时ID={order_id}，"
@@ -1350,6 +1893,7 @@ class LighterRest(LighterBase):
                 side=side,
                 price=price,
                 amount=quantity,
+                client_order_id=client_order_id,
                 max_retries=3
             )
 
@@ -1361,8 +1905,7 @@ class LighterRest(LighterBase):
                 )
             else:
                 # ⚠️ 查询失败，降级使用 client_order_id
-                client_order_id_str = str(kwargs.get("client_order_id", int(
-                    asyncio.get_event_loop().time() * 1000)))
+                client_order_id_str = str(client_order_id)
                 order_id = client_order_id_str
                 logger.warning(
                     f"⚠️ 降级使用 client_order_id: {order_id}，"
@@ -1370,9 +1913,8 @@ class LighterRest(LighterBase):
                 )
 
         return OrderData(
-            # 🔥 id 和 client_id 使用相同的值（order_index 或 client_order_id）
             id=order_id,
-            client_id=order_id,  # 统一标识，消除双键问题
+            client_id=str(client_order_id),
             symbol=symbol,
             side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
             type=OrderType.MARKET if order_type == "market" else OrderType.LIMIT,
@@ -1397,6 +1939,7 @@ class LighterRest(LighterBase):
         side: str,
         price: Decimal,
         amount: Decimal,
+        client_order_id: Optional[int] = None,
         max_retries: int = 3,
         retry_delay: float = 0.5
     ) -> Optional[str]:
@@ -1439,7 +1982,17 @@ class LighterRest(LighterBase):
                     )
                     continue
 
-                # 精确匹配：价格 + 数量
+                if client_order_id is not None:
+                    for order in open_orders:
+                        if self._order_matches_client_id(order, client_order_id):
+                            logger.info(
+                                f"✅ 查询到 order_index: {order.id} "
+                                f"(client_order_id={client_order_id})"
+                            )
+                            return order.id
+                    continue
+
+                # Legacy fallback when a caller has no client id.
                 for order in open_orders:
                     # 价格匹配（容差 0.01 USD）
                     price_match = abs(float(order.price) - float(price)) < 0.01
@@ -1578,6 +2131,20 @@ class LighterRest(LighterBase):
             logger.error("未配置SignerClient，无法取消订单")
             return False
 
+        logical_order_id = str(order_id)
+        uncertain = getattr(self, "_uncertain_cancellations", set())
+        uncertain_key = (symbol, logical_order_id)
+        if uncertain_key in uncertain:
+            reconciled = await self._reconcile_cancellation(symbol, logical_order_id)
+            if reconciled is True:
+                uncertain.discard(uncertain_key)
+                return True
+            logger.error(
+                "Skip repeated signer cancellation while prior outcome is uncertain: "
+                f"order_id={order_id}"
+            )
+            return False
+
         try:
             market_index = self.get_market_index(symbol)
             if market_index is None:
@@ -1585,7 +2152,7 @@ class LighterRest(LighterBase):
                 return False
 
             # 🔥 检查order_id是否为tx_hash（128字符十六进制）
-            if len(order_id) > 20:  # tx_hash通常是128字符，order_index是整数
+            if len(logical_order_id) > 20:  # tx_hash通常是128字符，order_index是整数
                 logger.warning(
                     f"⚠️ 订单ID似乎是tx_hash（长度{len(order_id)}），无法直接取消。"
                     f"需要等待WebSocket更新为真实的order_index"
@@ -1601,15 +2168,52 @@ class LighterRest(LighterBase):
                     logger.error(f"查询挂单失败: {e}")
                 return False
 
-            # 取消订单
-            tx, response, err = await self.signer_client.cancel_order(
-                market_index=market_index,
-                order_index=int(order_id),
+            mutation_order_id = await self._resolve_cancel_order_index(
+                symbol,
+                logical_order_id,
             )
+            if mutation_order_id is None:
+                return False
+            try:
+                mutation_order_index = int(mutation_order_id)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Cancellation order_index is not numeric; mutation was not sent: "
+                    f"order_id={mutation_order_id}"
+                )
+                return False
+
+            # 取消订单
+            try:
+                tx, response, err = await self._call_api(
+                    "order cancellation",
+                    lambda: self.signer_client.cancel_order(
+                        market_index=market_index,
+                        order_index=mutation_order_index,
+                    ),
+                    retry_on_429=False,
+                )
+            except Exception as exc:
+                if self._is_definitive_mutation_exception(exc):
+                    logger.error(f"取消订单失败 {symbol}/{order_id}: {exc}")
+                    return False
+                return await self._handle_ambiguous_cancellation(
+                    symbol,
+                    logical_order_id,
+                    str(exc),
+                )
 
             if err:
-                logger.error(f"取消订单失败: {self.parse_error(err)}")
+                error_msg = self.parse_error(err)
+                logger.error(f"取消订单失败: {error_msg}")
                 return False
+
+            if response is None or getattr(response, "code", None) is None:
+                return await self._handle_ambiguous_cancellation(
+                    symbol,
+                    logical_order_id,
+                    "cancellation response missing success code",
+                )
 
             try:
                 self._require_success_response(response, "order cancellation")
@@ -1617,10 +2221,20 @@ class LighterRest(LighterBase):
                 logger.error(f"取消订单失败: {exc}")
                 return False
             if not tx or not getattr(response, 'tx_hash', None):
-                logger.error("取消订单失败: response缺少tx或tx_hash")
-                return False
+                return await self._handle_ambiguous_cancellation(
+                    symbol,
+                    logical_order_id,
+                    "successful cancellation response missing tx or tx_hash",
+                )
 
-            return True
+            # A successful signer response only acknowledges transaction
+            # submission. The order may still fill before the cancellation is
+            # sequenced, so retain the intent until an exact terminal read.
+            return await self._handle_ambiguous_cancellation(
+                symbol,
+                logical_order_id,
+                "cancellation transaction acknowledged without terminal proof",
+            )
 
         except Exception as e:
             logger.error(f"取消订单失败 {symbol}/{order_id}: {e}")
@@ -1688,9 +2302,20 @@ class LighterRest(LighterBase):
         order_index = getattr(order_info, 'order_index', None)
         order_id_str = getattr(order_info, 'order_id', None)
 
-        # 如果有order_index，使用它；否则使用order_id
-        final_order_id = order_id_str if order_id_str else (
-            str(order_index) if order_index is not None else '')
+        # Cancellation and websocket reconciliation use the numeric indexes.
+        # Fall back to the string ids only for older/incomplete API payloads.
+        final_order_id = (
+            str(order_index)
+            if order_index is not None
+            else str(order_id_str or '')
+        )
+        client_order_index = getattr(order_info, 'client_order_index', None)
+        client_order_id = getattr(order_info, 'client_order_id', None)
+        client_id = (
+            str(client_order_index)
+            if client_order_index is not None
+            else str(client_order_id or '')
+        )
 
         logger.debug(
             f"解析订单: order_index={order_index}, order_id={order_id_str}, final_id={final_order_id}")
@@ -1714,7 +2339,7 @@ class LighterRest(LighterBase):
         return OrderData(
             # ✅ 使用真正的order_id（order_index的字符串形式）
             id=final_order_id,
-            client_id=str(getattr(order_info, 'client_order_id', '')),
+            client_id=client_id,
             symbol=symbol,
             side=self._parse_order_side(getattr(order_info, 'is_ask', False)),
             type=self._parse_order_type(getattr(order_info, 'type', 'limit')),

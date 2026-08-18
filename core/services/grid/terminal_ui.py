@@ -860,6 +860,11 @@ class GridTerminalUI:
                 loop_started = False
                 try:
                     while self._running:
+                        if self._coordinator_is_stopped():
+                            self.logger.warning(
+                                "Coordinator stopped; leaving the terminal UI loop"
+                            )
+                            break
                         try:
                             if not loop_started:
                                 self.logger.info("First main-loop iteration started...")
@@ -892,6 +897,13 @@ class GridTerminalUI:
                     self._running = False
         finally:
             restore_console_log_level(console_log_state)
+
+    def _coordinator_is_stopped(self) -> bool:
+        """Return whether the strategy stopped itself while the UI was active."""
+        checker = getattr(self.coordinator, "is_stopped", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(checker)
 
     def stop(self) -> None:
         """Stop the terminal UI."""

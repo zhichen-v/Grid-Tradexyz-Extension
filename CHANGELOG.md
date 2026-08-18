@@ -11,6 +11,14 @@
 
 ### Fixed
 
+#### 2026-08-18
+
+- Hardened the Lighter grid lifecycle after the BTC incident: unexpected cancellations now use bounded backoff/circuit breaking, all REST traffic shares 429 throttling, direct order WebSocket subscriptions recover after reconnect, and opening maker orders are separated from GTT/reduce-only closing orders.
+- Preserved the partial-fill invariant end to end: partial executions only update cumulative progress, continuations retain their carried fill, and exactly one full logical-size reverse order is created only after the logical order is completely filled; sub-minimum continuations and position repairs now fail closed instead of looping every health interval.
+- Made Lighter mutations ambiguity-safe with process-unique client order indexes, exact client/order history reconciliation, no blind mutation retries, and terminal-status-aware cancellation so response loss cannot silently create duplicates or turn a fill into a cancellation.
+- Made health, startup, pause, reset, and shutdown reconciliation fail closed: snapshot failures no longer look like empty exchange state, startup batches require live-order proof, fills are deferred across recoverable pauses, follow-grid resets retain real exposure, and `max_position` includes pending/reserved opening risk.
+- Added verified emergency cleanup: fatal errors close the placement gate immediately, cancel-all requires per-order terminal proof, shutdown-time fills remain accounted for, and any unresolved order or unsafe cleanup remains visible instead of being reported as a safe stop.
+
 #### 2026-05-21
 
 - Fixed TradeXYZ XYZ symbol routing so configured assets such as `MU` and `MU-USD` are recognized as XYZ markets instead of falling through to ccxt/Hyperliquid ticker calls, and grid startup now fails fast when exchange connection setup returns unsuccessful.
@@ -126,6 +134,8 @@
 - Strengthened health-check validation so success is no longer inferred from order-count parity alone.
 
 ### Validation
+
+- 2026-08-18: Local `unittest` discovery passed all 179 tests, including Lighter partial-fill, mutation ambiguity, cancellation recovery, 429 backoff, WebSocket reconnect, max-position, pause/startup, reset, and shutdown race regressions; `compileall` and diff checks were also run before deployment.
 
 - 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile run_grid_trading.py core\services\grid\models\grid_config.py core\services\grid\models\grid_metrics.py core\services\grid\coordinator\grid_coordinator.py core\services\grid\coordinator\grid_reset_manager.py core\services\grid\terminal_ui.py`
 - 2026-05-21: Parsed all `config/grid/*.yaml` files with PyYAML and ran local stop-loss assertions for long and short trigger directions using `config/grid/example.yaml`.

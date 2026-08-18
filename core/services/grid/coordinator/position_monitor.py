@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import random
 import time
 from typing import Dict, Any, Optional
 from decimal import Decimal
@@ -46,9 +47,13 @@ class PositionMonitor:
         self.coordinator = coordinator
 
         # 🆕 REST查询配置
-        self._rest_query_interval: int = 1   # REST查询间隔（秒）- 适应剧烈波动
+        self._rest_query_interval: int = max(
+            5,
+            int(getattr(config, "position_monitor_interval", 10)),
+        )
         self._rest_query_debounce: int = 5   # 事件触发去重时间（秒）
         self._rest_timeout: int = 5          # REST查询超时（秒）
+        self._rest_max_backoff: int = 60
 
         # 🆕 REST失败保护配置
         self._rest_max_failures: int = 3     # 最大连续失败次数
@@ -56,6 +61,8 @@ class PositionMonitor:
         self._rest_last_success_time: float = 0  # 最后成功时间
         self._rest_last_query_time: float = 0    # 最后查询时间
         self._rest_is_available: bool = True     # REST API可用性
+        self._rest_next_query_time: float = 0
+        self._rest_pause_owned: bool = False
 
         # 🆕 持仓异常保护配置
         self._position_change_alert_threshold: float = 100  # 持仓变化告警阈值（%）
@@ -80,6 +87,8 @@ class PositionMonitor:
         # 监控任务
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
+        self._query_lock = asyncio.Lock()
+        self._event_query_tasks: set[asyncio.Task] = set()
 
     async def start_monitoring(self):
         """启动持仓监控（纯REST API）"""
@@ -100,8 +109,12 @@ class PositionMonitor:
         # 🆕 用REST API同步初始持仓
         try:
             self.logger.info(" 正在同步初始持仓数据（REST API）...")
-            await self._query_and_update_position(is_initial=True)
-            self.logger.info(" 初始持仓同步完成（REST）")
+            async with self._query_lock:
+                success = await self._query_and_update_position(is_initial=True)
+            if success:
+                self.logger.info(" 初始持仓同步完成（REST）")
+            else:
+                self.logger.error(" REST API初始持仓同步失败；监控将按退避策略重试")
         except Exception as rest_error:
             self.logger.error(f" REST API初始持仓同步失败: {rest_error}")
             self._rest_failure_count += 1
@@ -110,19 +123,36 @@ class PositionMonitor:
         # 启动REST定时查询循环
         self._monitor_task = asyncio.create_task(
             self._rest_position_query_loop())
-        self.logger.info(" 持仓监控已启动（纯REST API，1秒高频查询，适应剧烈波动）")
+        self.logger.info(
+            f" 持仓监控已启动（纯REST API，基础间隔={self._rest_query_interval}秒）"
+        )
 
     async def stop_monitoring(self):
         """停止持仓监控"""
         self._running = False
+        current_task = asyncio.current_task()
+        tasks = []
+        if self._monitor_task and self._monitor_task is not current_task:
+            tasks.append(self._monitor_task)
+        tasks.extend(
+            task
+            for task in getattr(self, "_event_query_tasks", set())
+            if task is not current_task
+        )
 
-        if self._monitor_task:
-            self._monitor_task.cancel()
-            try:
-                await self._monitor_task
-            except asyncio.CancelledError:
-                pass
-            self.logger.info(" 持仓监控已停止")
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._monitor_task = None
+        self._event_query_tasks = {
+            task
+            for task in getattr(self, "_event_query_tasks", set())
+            if task is current_task and not task.done()
+        }
+        self.logger.info(" 持仓监控已停止")
 
     async def _query_and_update_position(self, is_initial: bool = False, is_event_triggered: bool = False) -> bool:
         """
@@ -201,15 +231,7 @@ class PositionMonitor:
                             symbol_snapshot["current_equity"],
                         )
 
-                # 🆕 REST查询成功
-                self._rest_failure_count = 0
-                self._rest_last_success_time = current_time
-                self._rest_is_available = True
-
-                # 🆕 恢复订单操作（如果之前被暂停）
-                if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
-                    self.logger.info(" REST API恢复正常，解除订单暂停")
-                    self.coordinator.is_paused = False
+                self._record_rest_success(current_time)
 
                 return True
 
@@ -263,15 +285,7 @@ class PositionMonitor:
             self._last_position_price = entry_price
             self._last_liquidation_price = liquidation_price
 
-            # 🆕 REST查询成功
-            self._rest_failure_count = 0
-            self._rest_last_success_time = current_time
-            self._rest_is_available = True
-
-            # 🆕 恢复订单操作（如果之前被暂停）
-            if hasattr(self.coordinator, 'is_paused') and self.coordinator.is_paused:
-                self.logger.info(" REST API恢复正常，解除订单暂停")
-                self.coordinator.is_paused = False
+            self._record_rest_success(current_time)
 
             return True
 
@@ -370,6 +384,11 @@ class PositionMonitor:
         expected_max_position = abs(
             normalized_last_position) * self._position_max_multiplier
         if abs(normalized_new_position) > expected_max_position and expected_max_position > 0:
+            fatal_reason = (
+                "Position anomaly exceeded the emergency threshold: "
+                f"previous={normalized_last_position}, current={normalized_new_position}, "
+                f"limit_multiplier={self._position_max_multiplier}"
+            )
             self.logger.critical(
                 f" 持仓异常！紧急停止交易！\n"
                 f"   上次持仓: {normalized_last_position} (原始: {self._last_position_size})\n"
@@ -377,22 +396,84 @@ class PositionMonitor:
                 f"   超出预期: {self._position_max_multiplier}倍\n"
                 f"   需要人工确认后才能恢复！"
             )
-            # 🆕 触发紧急停止
             self.coordinator.is_emergency_stopped = True
-            self.coordinator.is_paused = True
+            self.coordinator._request_fatal_stop(fatal_reason)
 
     async def _handle_rest_failure(self):
         """处理REST查询失败"""
         self._rest_is_available = False
+        backoff = min(
+            self._rest_max_backoff,
+            self._rest_query_interval * (2 ** self._rest_failure_count),
+        )
+        jitter = random.uniform(0, min(5.0, backoff * 0.2))
+        retry_delay = min(self._rest_max_backoff, backoff + jitter)
+        self._rest_next_query_time = time.time() + retry_delay
+        self.logger.warning(
+            f" REST查询进入退避: {retry_delay:.1f}秒后重试 "
+            f"(连续失败={self._rest_failure_count})"
+        )
 
         # 连续失败达到阈值：暂停订单操作
         if self._rest_failure_count >= self._rest_max_failures:
-            if not hasattr(self.coordinator, 'is_paused') or not self.coordinator.is_paused:
+            if not self._rest_pause_owned:
                 self.logger.error(
                     f" REST连续失败{self._rest_failure_count}次，暂停所有订单操作！\n"
                     f"   将持续尝试重连，成功后自动恢复..."
                 )
+            self._rest_pause_owned = True
+            refresh_pause = getattr(
+                self.coordinator,
+                "_refresh_recoverable_pause_state",
+                None,
+            )
+            if callable(refresh_pause):
+                refresh_pause()
+            else:
                 self.coordinator.is_paused = True
+
+    def _record_rest_success(self, current_time: float) -> None:
+        """Reset backoff and release only a pause created by this monitor."""
+        reconcile_reservations = getattr(
+            self.engine,
+            "reconcile_market_open_reservations",
+            None,
+        )
+        if callable(reconcile_reservations):
+            reconcile_reservations(self.tracker.get_current_position())
+        self._rest_failure_count = 0
+        self._rest_last_success_time = current_time
+        self._rest_is_available = True
+        self._rest_next_query_time = float(current_time) + self._rest_query_interval
+
+        if not self._rest_pause_owned:
+            return
+
+        self._rest_pause_owned = False
+        if (
+            getattr(self.coordinator, "_running", False)
+            and not getattr(self.coordinator, "is_emergency_stopped", False)
+        ):
+            self.logger.info(" REST API恢复正常，解除REST故障造成的订单暂停")
+            refresh_pause = getattr(
+                self.coordinator,
+                "_refresh_recoverable_pause_state",
+                None,
+            )
+            still_paused = (
+                bool(refresh_pause())
+                if callable(refresh_pause)
+                else False
+            )
+            if not callable(refresh_pause):
+                self.coordinator.is_paused = False
+            schedule_deferred_fills = getattr(
+                self.coordinator,
+                "schedule_deferred_fill_drain",
+                None,
+            )
+            if not still_paused and callable(schedule_deferred_fills):
+                schedule_deferred_fills()
 
     async def _rest_position_query_loop(self):
         """REST定时查询循环（核心监控循环）"""
@@ -402,10 +483,26 @@ class PositionMonitor:
 
         while self._running:
             try:
-                await asyncio.sleep(self._rest_query_interval)
+                next_query_time = self._rest_next_query_time or (
+                    time.time() + self._rest_query_interval
+                )
+                await asyncio.sleep(max(0, next_query_time - time.time()))
+
+                if not self._running:
+                    break
+                if time.time() < self._rest_next_query_time:
+                    continue
 
                 # 定时查询
-                success = await self._query_and_update_position(is_initial=False, is_event_triggered=False)
+                async with self._query_lock:
+                    if not self._running:
+                        break
+                    if time.time() < self._rest_next_query_time:
+                        continue
+                    success = await self._query_and_update_position(
+                        is_initial=False,
+                        is_event_triggered=False,
+                    )
 
                 if success:
                     self.logger.debug(f" 定时REST查询成功")
@@ -430,19 +527,52 @@ class PositionMonitor:
         Args:
             event_name: 事件名称（用于日志）
         """
-        current_time = time.time()
+        current_task = asyncio.current_task()
+        if not hasattr(self, "_event_query_tasks"):
+            self._event_query_tasks = set()
+        if current_task is not None:
+            self._event_query_tasks.add(current_task)
 
-        # 去重：5秒内只查询一次
-        if current_time - self._last_event_query_time < self._rest_query_debounce:
-            self.logger.debug(
-                f"⏭️ 跳过事件查询（{event_name}）：去重时间未到"
-            )
-            return
+        try:
+            if not getattr(self, "_running", False):
+                return
+            if not hasattr(self, "_query_lock"):
+                self._query_lock = asyncio.Lock()
 
-        self._last_event_query_time = current_time
-        self.logger.info(f" 事件触发持仓查询: {event_name}")
+            async with self._query_lock:
+                if not self._running:
+                    return
+                current_time = time.time()
 
-        await self._query_and_update_position(is_initial=False, is_event_triggered=True)
+                if (
+                    not self._rest_is_available
+                    and current_time < self._rest_next_query_time
+                ):
+                    self.logger.debug(
+                        f"⏭️ 跳过事件查询（{event_name}）：REST退避中"
+                    )
+                    return
+
+                # 去重：5秒内只查询一次；在锁内重查以阻止并发成交突发。
+                if current_time - max(
+                    self._last_event_query_time,
+                    self._rest_last_query_time,
+                ) < self._rest_query_debounce:
+                    self.logger.debug(
+                        f"⏭️ 跳过事件查询（{event_name}）：去重时间未到"
+                    )
+                    return
+
+                self._last_event_query_time = current_time
+                self.logger.info(f" 事件触发持仓查询: {event_name}")
+
+                await self._query_and_update_position(
+                    is_initial=False,
+                    is_event_triggered=True,
+                )
+        finally:
+            if current_task is not None:
+                self._event_query_tasks.discard(current_task)
 
     def is_rest_available(self) -> bool:
         """REST API是否可用"""

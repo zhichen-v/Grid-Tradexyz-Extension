@@ -33,6 +33,7 @@ class GridEngineImpl(IGridEngine):
         self._order_callbacks: List[Callable] = []
         self._pending_orders: Dict[str, GridOrder] = {}
         self._expected_cancellations: set[str] = set()
+        self._uncertain_cancel_order_ids: set[str] = set()
 
         self._current_price: Optional[Decimal] = None
         self._last_ticker_price: Optional[Decimal] = None
@@ -48,7 +49,9 @@ class GridEngineImpl(IGridEngine):
 
         self._running = False
         self._shutting_down = False
+        self._shutdown_fill_incident: Optional[str] = None
         self._placements_paused = False
+        self._placement_lock = asyncio.Lock()
         self._placement_epoch = 0
         self._inflight_placements = 0
         self._placements_drained = asyncio.Event()
@@ -67,6 +70,17 @@ class GridEngineImpl(IGridEngine):
         self._health_repairs_suspended_reason: Optional[str] = None
         self._recently_finalized_order_ids: Dict[str, float] = {}
         self._finalized_order_cache_seconds: float = 300.0
+        self._restore_tasks: Dict[str, asyncio.Task] = {}
+        self._restore_state: Dict[str, Dict[str, float]] = {}
+        self._restore_max_attempts: int = 3
+        self._restore_base_delay: float = 2.0
+        self._restore_attempt_window: float = 60.0
+        self._restore_circuit_seconds: float = 300.0
+        self._reserved_market_open_amount = Decimal("0")
+        self._reserved_market_position: Optional[Decimal] = None
+        self._uncertain_market_submissions: Dict[str, Dict[str, Any]] = {}
+        self._resolved_submission_client_ids: set[str] = set()
+        self._unmanaged_partial_carries: Dict[str, Dict[str, Any]] = {}
 
         exchange_id = getattr(exchange_adapter.config, "exchange_id", "unknown")
         self.logger.info(f"Grid execution engine initialized for {exchange_id}")
@@ -118,11 +132,31 @@ class GridEngineImpl(IGridEngine):
         batch_mode: bool = False,
         allow_while_paused: bool = False,
     ) -> Optional[GridOrder]:
+        """Serialize the exposure check through pending-order registration."""
+        if self._requires_exposure_lock(order.side):
+            async with self._get_placement_lock():
+                return await self._place_order_unlocked(
+                    order,
+                    batch_mode=batch_mode,
+                    allow_while_paused=allow_while_paused,
+                )
+        return await self._place_order_unlocked(
+            order,
+            batch_mode=batch_mode,
+            allow_while_paused=allow_while_paused,
+        )
+
+    async def _place_order_unlocked(
+        self,
+        order: GridOrder,
+        batch_mode: bool = False,
+        allow_while_paused: bool = False,
+    ) -> Optional[GridOrder]:
         """Place a single limit order and track it locally."""
         if (
             self._shutting_down
             or not self._running
-            or (self._placements_paused and not allow_while_paused)
+            or self._placement_is_paused(allow_while_paused)
         ):
             self.logger.warning(
                 f"Skip order placement while engine is stopping: "
@@ -130,20 +164,53 @@ class GridEngineImpl(IGridEngine):
             )
             return None
 
+        position_gate = getattr(
+            getattr(self, "coordinator", None),
+            "can_place_order_within_max_position",
+            None,
+        )
+        if position_gate and not position_gate(
+            order.side,
+            order.amount,
+            additional_open_amount=getattr(
+                self,
+                "_reserved_market_open_amount",
+                Decimal("0"),
+            ),
+        ):
+            self.logger.warning(
+                "Skip order placement because max_position would be exceeded: "
+                f"{order.side.value} {order.amount}@{order.price}"
+            )
+            return None
+
         self._begin_inflight_placement()
         try:
             exchange_side = self._convert_order_side(order.side)
+            exchange_name = str(getattr(self.config, "exchange", "")).lower()
+            is_lighter = exchange_name == "lighter"
+            is_reverse_order = bool(order.parent_order_id)
+            is_closing_order = is_lighter and self._is_reverse_side(order.side)
+            order_params = None
+            if is_lighter:
+                order_params = {
+                    "time_in_force": (
+                        "GTT"
+                        if is_reverse_order or is_closing_order
+                        else "POST_ONLY"
+                    )
+                }
+                if order_params["time_in_force"] == "GTT":
+                    order_params["skip_order_index_query"] = True
+                if is_closing_order:
+                    order_params["reduce_only"] = True
             create_kwargs = {
                 "symbol": self.config.symbol,
                 "side": exchange_side,
                 "order_type": OrderType.LIMIT,
                 "amount": order.amount,
                 "price": order.price,
-                "params": (
-                    {"time_in_force": "POST_ONLY"}
-                    if str(getattr(self.config, "exchange", "")).lower() == "lighter"
-                    else None
-                ),
+                "params": order_params,
             }
             if batch_mode and self._supports_batch_mode():
                 create_kwargs["batch_mode"] = True
@@ -172,6 +239,26 @@ class GridEngineImpl(IGridEngine):
             )
             self._register_pending_order(order, order_id, client_id)
 
+            exchange_status = self._exchange_order_status(exchange_order)
+            if exchange_status in {"canceled", "cancelled", "rejected", "expired"}:
+                self._clear_pending_order_refs(order_id, client_id)
+                reason = (
+                    "Exchange returned a terminal placement failure: "
+                    f"grid_id={order.grid_id}, order_id={order_id}, status={exchange_status}"
+                )
+                self._fail_closed_submission(reason, order)
+                raise RuntimeError(reason)
+
+            if self._is_submission_uncertain(order):
+                self._quarantine_uncertain_grid_submission(order)
+            elif exchange_status == "filled":
+                self._schedule_deferred_fill_finalization(
+                    order,
+                    exchange_order,
+                    order_id,
+                    client_id,
+                )
+
             self.logger.info(
                 f"Order placed: {order.side.value} {order.amount}@{order.price} "
                 f"(Grid {order.grid_id}, OrderID: {order.order_id})"
@@ -192,13 +279,60 @@ class GridEngineImpl(IGridEngine):
         reference_price: Optional[Decimal] = None,
         allow_while_paused: bool = False,
     ) -> None:
+        """Serialize market orders with limit-order exposure checks."""
+        if not reduce_only and self._requires_exposure_lock(side):
+            async with self._get_placement_lock():
+                await self._place_market_order_unlocked(
+                    side,
+                    amount,
+                    reduce_only=reduce_only,
+                    reference_price=reference_price,
+                    allow_while_paused=allow_while_paused,
+                )
+                return
+        await self._place_market_order_unlocked(
+            side,
+            amount,
+            reduce_only=reduce_only,
+            reference_price=reference_price,
+            allow_while_paused=allow_while_paused,
+        )
+
+    async def _place_market_order_unlocked(
+        self,
+        side: GridOrderSide,
+        amount: Decimal,
+        reduce_only: bool = False,
+        reference_price: Optional[Decimal] = None,
+        allow_while_paused: bool = False,
+    ) -> None:
         """Place a market order, used mainly for position adjustment flows."""
         if (
             self._shutting_down
             or not self._running
-            or (self._placements_paused and not allow_while_paused)
+            or self._placement_is_paused(allow_while_paused)
         ):
             raise RuntimeError("Cannot place a market order while engine is stopping")
+
+        position_gate = getattr(
+            getattr(self, "coordinator", None),
+            "can_place_order_within_max_position",
+            None,
+        )
+        if (
+            not reduce_only
+            and position_gate
+            and not position_gate(
+                side,
+                amount,
+                additional_open_amount=getattr(
+                    self,
+                    "_reserved_market_open_amount",
+                    Decimal("0"),
+                ),
+            )
+        ):
+            raise RuntimeError("Market order would exceed max_position")
 
         self._begin_inflight_placement()
         try:
@@ -213,9 +347,25 @@ class GridEngineImpl(IGridEngine):
             )
             if exchange_order is None:
                 raise RuntimeError("Exchange returned no market order")
+            if not reduce_only and self._is_opening_side(side):
+                self._reserve_market_open_amount(amount)
             order_id = getattr(exchange_order, "id", None) or getattr(
                 exchange_order, "order_id", None
             )
+            if self._exchange_submission_is_uncertain(exchange_order):
+                self._record_uncertain_market_submission(
+                    exchange_order,
+                    side,
+                    amount,
+                    reduce_only,
+                )
+                reason = (
+                    "Market order submission outcome is uncertain; position/client-id "
+                    f"verification is required: side={side.value}, amount={amount}, "
+                    f"reduce_only={reduce_only}, client_id={order_id}"
+                )
+                self._fail_closed_submission(reason)
+                raise RuntimeError(reason)
             self.logger.info(
                 f"Market order placed: {side.value} {amount}, OrderID: {order_id}"
             )
@@ -316,23 +466,66 @@ class GridEngineImpl(IGridEngine):
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel one order and mark it as expected in the local cache."""
+        expected_keys: set[str] = set()
         try:
             cache_key, grid_order = self._find_cached_order(order_id)
             if grid_order:
-                for key in self._pending_keys_for_order(grid_order):
-                    self._expected_cancellations.add(key)
+                expected_keys.update(self._pending_keys_for_order(grid_order))
             else:
-                self._expected_cancellations.add(order_id)
+                expected_keys.add(order_id)
+            self._expected_cancellations.update(expected_keys)
 
-            await self.exchange.cancel_order(order_id, self.config.symbol)
+            cancel_result = await self.exchange.cancel_order(order_id, self.config.symbol)
+            if not cancel_result:
+                if self._cancel_outcome_is_uncertain(order_id):
+                    self._uncertain_cancel_order_ids.update(expected_keys)
+                    self.logger.critical(
+                        "Order cancellation outcome remains uncertain; retaining local "
+                        f"state until an exact terminal update: order_id={order_id}"
+                    )
+                else:
+                    self._expected_cancellations.difference_update(expected_keys)
+                    self.logger.error(
+                        f"Order cancellation was rejected: order_id={order_id}"
+                    )
+                return False
+
+            if self._is_nonterminal_cancel_ack(cancel_result):
+                self._uncertain_cancel_order_ids.update(expected_keys)
+                self.logger.warning(
+                    "Cancellation was acknowledged but is not terminal; retaining local "
+                    f"state until exact history or WebSocket proof: order_id={order_id}"
+                )
+                return False
 
             if grid_order:
-                grid_order.mark_cancelled()
-                self._clear_pending_order_refs(cache_key, order_id)
+                aliases = self._pending_keys_for_order(grid_order)
+                if self._claim_order_finalization(
+                    *aliases,
+                    cache_key,
+                    order_id,
+                    grid_order.order_id,
+                ):
+                    self._clear_restore_state(grid_order)
+                    grid_order.mark_cancelled()
+                    self._remove_order_from_coordinator_state(grid_order)
+                self._clear_pending_order_refs(*aliases, cache_key, order_id)
+                self._consume_expected_cancellation(*aliases, cache_key, order_id)
+            else:
+                self._note_finalized_order(order_id)
+                self._expected_cancellations.discard(order_id)
 
             self.logger.info(f"Order cancelled successfully: {order_id}")
             return True
         except Exception as exc:
+            if self._cancel_outcome_is_uncertain(order_id):
+                self._uncertain_cancel_order_ids.update(expected_keys)
+                self.logger.critical(
+                    "Order cancellation response was lost; retaining local state until "
+                    f"an exact terminal update: order_id={order_id}, error={exc}"
+                )
+                return False
+            self._expected_cancellations.difference_update(expected_keys)
             self.logger.error(f"Order cancel failed for {order_id}: {exc}")
             return False
 
@@ -356,16 +549,73 @@ class GridEngineImpl(IGridEngine):
                 raise RuntimeError(
                     f"{len(remaining_orders)} orders remain open after cancel-all"
                 )
+            resolved_active, resolved_filled = (
+                await self._resolve_unresolved_submissions_read_only()
+            )
+            if resolved_active:
+                raise RuntimeError(
+                    "Previously uncertain submissions resolved as active after the "
+                    f"cancel snapshot: {', '.join(resolved_active)}"
+                )
+            if resolved_filled:
+                self._shutdown_fill_incident = (
+                    "Previously uncertain submissions resolved as filled: "
+                    + ", ".join(resolved_filled)
+                )
+                raise RuntimeError(
+                    self._shutdown_fill_incident
+                )
+            unresolved_cancels, filled_cancels = (
+                await self._resolve_uncertain_cancellations_read_only()
+            )
+            if filled_cancels:
+                self._shutdown_fill_incident = (
+                    "Previously uncertain cancellations resolved as filled: "
+                    + ", ".join(filled_cancels)
+                )
+                raise RuntimeError(
+                    self._shutdown_fill_incident
+                )
+            if unresolved_cancels:
+                raise RuntimeError(
+                    "Cancel-all cannot be verified while cancellations remain uncertain: "
+                    + ", ".join(unresolved_cancels)
+                )
+            unresolved_submissions = self._unresolved_submission_descriptions()
+            if unresolved_submissions:
+                raise RuntimeError(
+                    "Cancel-all cannot be verified while submissions remain uncertain: "
+                    + ", ".join(unresolved_submissions)
+                )
+            unresolved_pending, filled_pending = (
+                await self._reconcile_shutdown_pending_orders(
+                    pending_orders,
+                    cancelled_orders,
+                )
+            )
+            if filled_pending:
+                self._shutdown_fill_incident = (
+                    "Orders filled during shutdown instead of being cancelled: "
+                    + ", ".join(filled_pending)
+                )
+                raise RuntimeError(
+                    self._shutdown_fill_incident
+                )
+            if unresolved_pending:
+                raise RuntimeError(
+                    "Cancel-all lacks exact terminal proof for local orders: "
+                    + ", ".join(unresolved_pending)
+                )
+            if getattr(self, "_shutdown_fill_incident", None):
+                raise RuntimeError(self._shutdown_fill_incident)
         except Exception as exc:
             self._expected_cancellations.difference_update(expected_keys)
             self.logger.error(f"Cancel-all failed: {exc}")
             raise
 
         cancelled_count = len(cancelled_orders) if cancelled_orders else len(pending_orders)
-        for grid_order in pending_orders:
-            grid_order.mark_cancelled()
-
         self._pending_orders.clear()
+        self._expected_cancellations.difference_update(expected_keys)
         self.logger.info(f"All open orders cancelled: count={cancelled_count}")
         return cancelled_count
 
@@ -473,7 +723,9 @@ class GridEngineImpl(IGridEngine):
     async def start(self):
         """Start background monitoring tasks."""
         self._shutting_down = False
+        self._shutdown_fill_incident = None
         self._placements_paused = False
+        self._unmanaged_partial_carries = {}
         self._running = True
         self._start_smart_monitor()
         self._start_order_health_check()
@@ -500,6 +752,83 @@ class GridEngineImpl(IGridEngine):
         if not self._shutting_down:
             self._placements_paused = False
 
+    def _placement_is_paused(self, allow_while_paused: bool) -> bool:
+        """Return whether normal strategy placement is currently paused."""
+        if allow_while_paused:
+            return False
+        if self._placements_paused:
+            return True
+
+        coordinator = getattr(self, "coordinator", None)
+        if coordinator is None:
+            return False
+        if getattr(coordinator, "_paused", False):
+            return True
+        public_state = getattr(coordinator, "is_paused", False)
+        if isinstance(public_state, bool):
+            return public_state
+        if callable(public_state):
+            try:
+                return bool(public_state())
+            except Exception:
+                return False
+        return False
+
+    def _get_placement_lock(self) -> asyncio.Lock:
+        """Return the shared placement lock, including lightweight test engines."""
+        lock = getattr(self, "_placement_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._placement_lock = lock
+        return lock
+
+    def _requires_exposure_lock(self, side: GridOrderSide) -> bool:
+        """Serialize only capped opening exposure; preserve normal batch concurrency."""
+        coordinator = getattr(self, "coordinator", None)
+        config = getattr(coordinator, "config", None) or getattr(self, "config", None)
+        return (
+            getattr(config, "max_position", None) is not None
+            and self._is_opening_side(side)
+        )
+
+    def _is_opening_side(self, side: GridOrderSide) -> bool:
+        """Return whether this side increases configured strategy exposure."""
+        base_side = self._base_side_for_grid_type()
+        return base_side is not None and side == base_side
+
+    def _reserve_market_open_amount(self, amount: Decimal) -> None:
+        """Hold submitted market exposure until a later REST position snapshot confirms it."""
+        reserved_amount = getattr(self, "_reserved_market_open_amount", Decimal("0"))
+        if reserved_amount <= 0:
+            tracker = getattr(getattr(self, "coordinator", None), "tracker", None)
+            current = (
+                Decimal(str(tracker.get_current_position()))
+                if tracker and hasattr(tracker, "get_current_position")
+                else Decimal("0")
+            )
+            sign = Decimal("1") if self._base_side_for_grid_type() == GridOrderSide.BUY else Decimal("-1")
+            self._reserved_market_position = sign * current
+        self._reserved_market_open_amount = reserved_amount + Decimal(str(amount))
+
+    def reconcile_market_open_reservations(self, current_position: Decimal) -> None:
+        """Release market exposure reservations reflected by a REST position snapshot."""
+        current_position = Decimal(str(current_position))
+        if (
+            getattr(self, "_reserved_market_open_amount", Decimal("0")) > 0
+            and getattr(self, "_reserved_market_position", None) is not None
+        ):
+            sign = Decimal("1") if self._base_side_for_grid_type() == GridOrderSide.BUY else Decimal("-1")
+            directional_position = sign * current_position
+            reflected = max(directional_position - self._reserved_market_position, Decimal("0"))
+            self._reserved_market_open_amount = max(
+                self._reserved_market_open_amount - reflected,
+                Decimal("0"),
+            )
+            self._reserved_market_position = (
+                directional_position if self._reserved_market_open_amount > 0 else None
+            )
+        self._reconcile_uncertain_market_positions(current_position)
+
     async def wait_for_inflight_placements(self) -> None:
         """Wait until every request that crossed the placement gate has returned."""
         await self._placements_drained.wait()
@@ -522,7 +851,11 @@ class GridEngineImpl(IGridEngine):
         """Stop background monitoring tasks."""
         self._running = False
 
-        tasks = [self._health_check_task, self._polling_task]
+        tasks = [
+            self._health_check_task,
+            self._polling_task,
+            *self._restore_tasks.values(),
+        ]
         for task in tasks:
             if task and not task.done():
                 task.cancel()
@@ -533,6 +866,8 @@ class GridEngineImpl(IGridEngine):
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        self._restore_tasks.clear()
 
         self.logger.info("Grid execution engine stopped")
 
@@ -623,6 +958,15 @@ class GridEngineImpl(IGridEngine):
         """Check the real websocket client state, not only adapter heartbeat state."""
         ws_client = self._get_websocket_client()
         if ws_client is not None:
+            get_status = getattr(ws_client, "get_connection_status", None)
+            if callable(get_status):
+                try:
+                    status = get_status()
+                    if isinstance(status, dict) and "healthy" in status:
+                        return bool(status["healthy"])
+                except Exception:
+                    pass
+
             is_connected = getattr(ws_client, "is_connected", None)
             if callable(is_connected):
                 try:
@@ -848,6 +1192,7 @@ class GridEngineImpl(IGridEngine):
                 return
 
             exchange_keys = set()
+            exchange_orders_by_key: Dict[str, ExchangeOrderData] = {}
             for exchange_order in exchange_orders:
                 order_id = self._string_or_none(getattr(exchange_order, "id", None))
                 client_id = self._string_or_none(
@@ -855,8 +1200,62 @@ class GridEngineImpl(IGridEngine):
                 )
                 if order_id:
                     exchange_keys.add(order_id)
+                    exchange_orders_by_key[order_id] = exchange_order
                 if client_id:
                     exchange_keys.add(client_id)
+                    exchange_orders_by_key[client_id] = exchange_order
+
+            history_by_key: Dict[str, ExchangeOrderData] = {}
+            history_is_complete = True
+            needs_history = bool(
+                getattr(self, "_uncertain_market_submissions", {})
+            )
+            seen_pending_objects = set()
+            for pending_order in self._pending_orders.values():
+                object_id = id(pending_order)
+                if object_id in seen_pending_objects:
+                    continue
+                seen_pending_objects.add(object_id)
+                aliases = self._pending_keys_for_order(pending_order)
+                if any(alias in exchange_keys for alias in aliases):
+                    continue
+                if any(
+                    alias in self._expected_cancellations for alias in aliases
+                ) and not self._is_uncertain_cancel(*aliases):
+                    continue
+                order_age = (
+                    max(0.0, time.time() - pending_order.created_at.timestamp())
+                    if pending_order.created_at
+                    else self._exchange_sync_grace_period
+                )
+                if order_age >= self._exchange_sync_grace_period:
+                    needs_history = True
+                    break
+
+            if needs_history:
+                get_order_history = getattr(self.exchange, "get_order_history", None)
+                if callable(get_order_history):
+                    history_orders = await get_order_history(
+                        self.config.symbol,
+                        limit=100,
+                    )
+                    history_orders = list(history_orders or [])
+                    history_is_complete = len(history_orders) < 100
+                    for history_order in history_orders:
+                        for alias in (
+                            getattr(history_order, "id", None),
+                            getattr(history_order, "client_id", None),
+                        ):
+                            normalized = self._string_or_none(alias)
+                            if normalized:
+                                history_by_key[normalized] = history_order
+                else:
+                    history_is_complete = False
+
+            self._reconcile_uncertain_market_submissions(
+                exchange_orders_by_key,
+                history_by_key,
+            )
 
             removed_count = 0
             added_count = 0
@@ -870,15 +1269,45 @@ class GridEngineImpl(IGridEngine):
                 processed_objects.add(object_id)
 
                 aliases = self._pending_keys_for_order(grid_order)
+                if self._is_submission_uncertain(grid_order):
+                    self._quarantine_uncertain_grid_submission(grid_order)
                 if any(alias in exchange_keys for alias in aliases):
+                    matched_order = next(
+                        (
+                            exchange_orders_by_key[alias]
+                            for alias in aliases
+                            if alias in exchange_orders_by_key
+                        ),
+                        None,
+                    )
+                    if matched_order is not None:
+                        if self._is_submission_uncertain(grid_order):
+                            self._adopt_reconciled_grid_submission(
+                                grid_order,
+                                matched_order,
+                            )
+                        self._record_exchange_order_progress(
+                            grid_order,
+                            matched_order,
+                        )
                     continue
 
                 if any(alias in self._expected_cancellations for alias in aliases):
-                    grid_order.mark_cancelled()
-                    self._clear_pending_order_refs(*aliases)
-                    self._consume_expected_cancellation(*aliases)
-                    removed_count += 1
-                    continue
+                    if not self._is_uncertain_cancel(*aliases):
+                        if not self._claim_order_finalization(
+                            *aliases,
+                            grid_order.order_id,
+                        ):
+                            self._clear_pending_order_refs(*aliases)
+                            self._consume_expected_cancellation(*aliases)
+                            removed_count += 1
+                            continue
+                        self._clear_restore_state(grid_order)
+                        grid_order.mark_cancelled()
+                        self._clear_pending_order_refs(*aliases)
+                        self._consume_expected_cancellation(*aliases)
+                        removed_count += 1
+                        continue
 
                 order_age = (
                     max(0.0, time.time() - grid_order.created_at.timestamp())
@@ -888,13 +1317,27 @@ class GridEngineImpl(IGridEngine):
                 if order_age < self._exchange_sync_grace_period:
                     continue
 
-                lookup_id = grid_order.order_id or cache_key
-                try:
-                    exchange_order = await self.exchange.get_order(
-                        lookup_id,
-                        self.config.symbol,
-                    )
-                except Exception:
+                exchange_order = next(
+                    (
+                        history_by_key[alias]
+                        for alias in aliases
+                        if alias in history_by_key
+                    ),
+                    None,
+                )
+                if exchange_order is None:
+                    if not history_is_complete:
+                        self.logger.debug(
+                            "Order absent from a limited history snapshot; deferring: "
+                            f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}"
+                        )
+                        continue
+                    if self._is_submission_uncertain(grid_order):
+                        self.logger.critical(
+                            "Uncertain submission remains absent from read snapshots; "
+                            "retaining the original client id without restore: "
+                            f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}"
+                        )
                     continue
 
                 status = (
@@ -902,6 +1345,14 @@ class GridEngineImpl(IGridEngine):
                     if getattr(exchange_order, "status", None)
                     else "unknown"
                 )
+                if status in {"open", "pending", "new"} and self._is_submission_uncertain(
+                    grid_order
+                ):
+                    self._adopt_reconciled_grid_submission(
+                        grid_order,
+                        exchange_order,
+                    )
+                self._record_exchange_order_progress(grid_order, exchange_order)
                 if self._is_user_fill_snapshot(exchange_order):
                     handled, finalized = await self._handle_tradexyz_user_fill_snapshot(
                         grid_order,
@@ -915,20 +1366,46 @@ class GridEngineImpl(IGridEngine):
                         continue
 
                 if status == "filled":
+                    self._consume_expected_cancellation(*aliases)
                     filled_price = exchange_order.average or exchange_order.price or grid_order.price
                     filled_amount = self._get_finalized_fill_amount(
                         grid_order,
                         exchange_order.filled or grid_order.amount,
                     )
-                    self._note_finalized_order(*aliases)
+                    if not self._claim_order_finalization(
+                        *aliases,
+                        getattr(exchange_order, "id", None),
+                        getattr(exchange_order, "client_id", None),
+                        grid_order.order_id,
+                    ):
+                        self._clear_pending_order_refs(*aliases)
+                        continue
+                    self._clear_uncertain_cancellation_markers(
+                        {
+                            normalized
+                            for key in (
+                                *aliases,
+                                getattr(exchange_order, "id", None),
+                                getattr(exchange_order, "client_id", None),
+                                grid_order.order_id,
+                            )
+                            if (normalized := self._string_or_none(key))
+                        }
+                    )
+                    self._clear_restore_state(grid_order)
                     grid_order.mark_filled(filled_price, filled_amount)
                     self._clear_pending_order_refs(*aliases)
                     filled_in_sync.append(grid_order)
                     removed_count += 1
                 elif status in {"canceled", "cancelled", "rejected", "expired"}:
-                    self._note_finalized_order(*aliases)
-                    grid_order.mark_cancelled()
-                    self._clear_pending_order_refs(*aliases)
+                    await self._finalize_cancellation(
+                        grid_order,
+                        "REST terminal cancellation received",
+                        *aliases,
+                        getattr(exchange_order, "id", None),
+                        getattr(exchange_order, "client_id", None),
+                        grid_order.order_id,
+                    )
                     removed_count += 1
 
             for grid_order in filled_in_sync:
@@ -1040,9 +1517,14 @@ class GridEngineImpl(IGridEngine):
         if not grid_order:
             return
 
+        self._record_exchange_order_progress(grid_order, update_data)
+
         if status in {"FILLED", "CLOSED"}:
             filled_price = update_data.average or update_data.price or grid_order.price
-            filled_amount = update_data.filled or grid_order.amount
+            filled_amount = self._get_finalized_fill_amount(
+                grid_order,
+                update_data.filled or grid_order.amount,
+            )
             await self._finalize_fill(
                 grid_order,
                 filled_price,
@@ -1401,7 +1883,21 @@ class GridEngineImpl(IGridEngine):
         *keys: Optional[str],
     ):
         """Mark an order as filled, remove it from cache, and trigger callbacks."""
-        self._note_finalized_order(*keys, grid_order.order_id)
+        if not self._claim_order_finalization(*keys, grid_order.order_id):
+            self.logger.info(
+                "Skip duplicate terminal fill: "
+                f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}"
+            )
+            return
+        self._clear_uncertain_cancellation_markers(
+            {
+                normalized
+                for key in (*keys, grid_order.order_id)
+                if (normalized := self._string_or_none(key))
+            }
+        )
+        self._consume_expected_cancellation(*keys, grid_order.order_id)
+        self._clear_restore_state(grid_order)
         grid_order.mark_filled(filled_price, filled_amount)
         self._clear_pending_order_refs(*keys)
         self.logger.info(
@@ -1418,12 +1914,37 @@ class GridEngineImpl(IGridEngine):
         *keys: Optional[str],
     ):
         """Remove a cancelled order and restore it when the cancel was unexpected."""
-        self._note_finalized_order(*keys, grid_order.order_id)
+        submission_was_uncertain = self._is_submission_uncertain(grid_order)
+        if not self._claim_order_finalization(*keys, grid_order.order_id):
+            self.logger.info(
+                "Skip duplicate terminal cancellation: "
+                f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}"
+            )
+            return
+        self._clear_uncertain_cancellation_markers(
+            {
+                normalized
+                for key in (*keys, grid_order.order_id)
+                if (normalized := self._string_or_none(key))
+            }
+        )
+        grid_order.mark_cancelled()
+        self._remove_order_from_coordinator_state(grid_order)
         self._clear_pending_order_refs(*keys)
         if self._consume_expected_cancellation(*keys):
+            self._clear_restore_state(grid_order)
             self.logger.info(
                 f"Expected cancellation confirmed: "
                 f"grid_id={grid_order.grid_id}, order_id={grid_order.order_id}"
+            )
+            return
+
+        if submission_was_uncertain:
+            self._clear_restore_state(grid_order)
+            self._fail_closed_submission(
+                "Uncertain order submission reached a terminal failure without being "
+                f"restored: grid_id={grid_order.grid_id}, order_id={grid_order.order_id}",
+                grid_order,
             )
             return
 
@@ -1568,6 +2089,22 @@ class GridEngineImpl(IGridEngine):
             if normalized:
                 self._recently_finalized_order_ids[normalized] = now
 
+    def _claim_order_finalization(self, *keys: Optional[str]) -> bool:
+        """Atomically claim one terminal order transition across REST and WebSocket paths."""
+        self._prune_recently_finalized_orders()
+        normalized_keys = {
+            normalized
+            for key in keys
+            if (normalized := self._string_or_none(key))
+        }
+        if any(key in self._recently_finalized_order_ids for key in normalized_keys):
+            return False
+
+        now = time.time()
+        for key in normalized_keys:
+            self._recently_finalized_order_ids[key] = now
+        return True
+
     def _was_recently_finalized_order(self, key: Optional[str]) -> bool:
         """Return whether an order id was finalized recently enough to ignore stale open snapshots."""
         normalized = self._string_or_none(key)
@@ -1578,12 +2115,16 @@ class GridEngineImpl(IGridEngine):
 
     def _prune_recently_finalized_orders(self) -> None:
         """Drop old finalized-order ids from the stale-snapshot guard."""
-        if not self._recently_finalized_order_ids:
+        recently_finalized = getattr(self, "_recently_finalized_order_ids", None)
+        if recently_finalized is None:
+            recently_finalized = {}
+            self._recently_finalized_order_ids = recently_finalized
+        if not recently_finalized:
             return
-        cutoff = time.time() - self._finalized_order_cache_seconds
-        for key, seen_at in list(self._recently_finalized_order_ids.items()):
+        cutoff = time.time() - getattr(self, "_finalized_order_cache_seconds", 300.0)
+        for key, seen_at in list(recently_finalized.items()):
             if seen_at < cutoff:
-                del self._recently_finalized_order_ids[key]
+                del recently_finalized[key]
 
     def _pending_keys_for_order(self, grid_order: GridOrder) -> List[str]:
         """Return all cache keys that point to the provided GridOrder object."""
@@ -1623,10 +2164,13 @@ class GridEngineImpl(IGridEngine):
             candidate_keys.update(self._pending_keys_for_order(grid_order))
 
         consumed = False
+        uncertain_ids = getattr(self, "_uncertain_cancel_order_ids", None)
         for key in list(candidate_keys):
             if key in self._expected_cancellations:
                 self._expected_cancellations.remove(key)
                 consumed = True
+            if uncertain_ids is not None:
+                uncertain_ids.discard(key)
         return consumed
 
     async def _run_order_callbacks(self, grid_order: GridOrder) -> None:
@@ -1646,13 +2190,13 @@ class GridEngineImpl(IGridEngine):
         self,
         grid_order: GridOrder,
         order_id: str,
-    ) -> None:
-        """Re-place an unexpectedly cancelled order to keep the grid intact."""
+    ) -> bool:
+        """Schedule a bounded restore for an unexpectedly cancelled grid order."""
         if self._shutting_down or not self._running:
             self.logger.info(
                 f"Skip order restoration while engine is stopping: source_order_id={order_id}"
             )
-            return
+            return False
 
         remaining_amount = self._get_remaining_order_amount(grid_order)
         if remaining_amount <= self._get_order_fill_tolerance():
@@ -1661,39 +2205,273 @@ class GridEngineImpl(IGridEngine):
                 f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
                 f"price={grid_order.price}, source_order_id={order_id}"
             )
+            return False
+
+        if self._quarantine_subminimum_continuation_if_needed(
+            grid_order,
+            remaining_amount,
+        ):
+            return True
+
+        restore_key = self._restore_key(grid_order)
+        now = time.monotonic()
+        state = self._restore_state.setdefault(
+            restore_key,
+            {"attempts": 0.0, "last_attempt": 0.0, "circuit_until": 0.0},
+        )
+        if now >= state["circuit_until"] and (
+            now - state["last_attempt"] > self._restore_attempt_window
+        ):
+            state.update(attempts=0.0, circuit_until=0.0)
+
+        if now < state["circuit_until"]:
+            self.logger.error(
+                "Order restoration circuit is open: "
+                f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+                f"price={grid_order.price}, retry_after="
+                f"{state['circuit_until'] - now:.1f}s"
+            )
+            return False
+
+        active_task = self._restore_tasks.get(restore_key)
+        if active_task and not active_task.done():
+            self.logger.warning(
+                "Order restoration already scheduled: "
+                f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+                f"price={grid_order.price}"
+            )
+            return True
+
+        task = asyncio.create_task(
+            self._run_cancelled_order_restore(
+                grid_order,
+                order_id,
+                remaining_amount,
+                restore_key,
+            )
+        )
+        self._restore_tasks[restore_key] = task
+        return True
+
+    async def _run_cancelled_order_restore(
+        self,
+        grid_order: GridOrder,
+        order_id: str,
+        remaining_amount: Decimal,
+        restore_key: str,
+    ) -> None:
+        """Restore one logical order with backoff and a per-level circuit breaker."""
+        state = self._restore_state[restore_key]
+        try:
+            while state["attempts"] < self._restore_max_attempts:
+                if self._shutting_down or not self._running:
+                    return
+
+                if any(
+                    pending.grid_id == grid_order.grid_id
+                    and pending.side == grid_order.side
+                    and pending.price == grid_order.price
+                    for pending in self.get_pending_orders()
+                ):
+                    self.logger.info(
+                        "Skip order restoration because an equivalent order already exists: "
+                        f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+                        f"price={grid_order.price}"
+                    )
+                    return
+
+                attempts = int(state["attempts"])
+                if attempts:
+                    await asyncio.sleep(
+                        self._restore_base_delay * (2 ** (attempts - 1))
+                    )
+                    if self._shutting_down or not self._running:
+                        return
+
+                state["attempts"] = float(attempts + 1)
+                state["last_attempt"] = time.monotonic()
+                replacement_order = GridOrder(
+                    order_id="",
+                    grid_id=grid_order.grid_id,
+                    side=grid_order.side,
+                    price=grid_order.price,
+                    amount=remaining_amount,
+                    status=GridOrderStatus.PENDING,
+                    created_at=datetime.now(),
+                    parent_order_id=grid_order.parent_order_id,
+                    exchange_data=self._build_continuation_exchange_data(
+                        grid_order,
+                        remaining_amount,
+                        order_id,
+                    ),
+                )
+
+                try:
+                    placed_order = await self.place_order(replacement_order)
+                except Exception as exc:
+                    self.logger.error(
+                        "Failed to restore cancelled grid order: "
+                        f"grid_id={grid_order.grid_id}, source_order_id={order_id}, "
+                        f"attempt={attempts + 1}/{self._restore_max_attempts}, "
+                        f"error={exc}"
+                    )
+                    continue
+
+                if placed_order:
+                    self._replace_state_order(order_id, placed_order)
+                    self.logger.info(
+                        "Grid order restored after unexpected cancellation: "
+                        f"grid_id={placed_order.grid_id}, side={placed_order.side.value}, "
+                        f"amount={placed_order.amount}, price={placed_order.price}, "
+                        f"order_id={placed_order.order_id}, "
+                        f"attempt={attempts + 1}/{self._restore_max_attempts}"
+                    )
+                    return
+
+            state["circuit_until"] = time.monotonic() + self._restore_circuit_seconds
+            self.logger.error(
+                "Order restoration circuit opened after repeated failures: "
+                f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+                f"price={grid_order.price}, attempts={self._restore_max_attempts}, "
+                f"cooldown={self._restore_circuit_seconds:.0f}s"
+            )
+            if self._get_cumulative_fill_amount(grid_order) > 0:
+                self._quarantine_unmanaged_partial(
+                    grid_order,
+                    remaining_amount,
+                    "bounded continuation restore exhausted",
+                )
+            else:
+                self._clear_matching_grid_lock(grid_order)
+        finally:
+            current_task = asyncio.current_task()
+            if self._restore_tasks.get(restore_key) is current_task:
+                self._restore_tasks.pop(restore_key, None)
+
+    def _restore_key(self, grid_order: GridOrder) -> str:
+        """Return the stable identity shared by replacement orders for one level."""
+        return f"{grid_order.grid_id}:{grid_order.side.value}:{grid_order.price}"
+
+    def _clear_restore_state(self, grid_order: GridOrder) -> None:
+        """Clear retry history once the logical order reaches a terminal success."""
+        restore_key = self._restore_key(grid_order)
+        restore_tasks = getattr(self, "_restore_tasks", None)
+        if restore_tasks is None:
+            restore_tasks = {}
+            self._restore_tasks = restore_tasks
+        task = restore_tasks.pop(restore_key, None)
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        restore_state = getattr(self, "_restore_state", None)
+        if restore_state is not None:
+            restore_state.pop(restore_key, None)
+        unmanaged_carries = getattr(self, "_unmanaged_partial_carries", None)
+        if unmanaged_carries is not None:
+            unmanaged_carries.pop(restore_key, None)
+
+    def _remove_order_from_coordinator_state(self, grid_order: GridOrder) -> None:
+        """Remove the terminal source order without leaving pending state counts."""
+        coordinator = getattr(self, "coordinator", None)
+        state = getattr(coordinator, "state", None) if coordinator else None
+        active_orders = getattr(state, "active_orders", None) if state else None
+        if not isinstance(active_orders, dict):
             return
 
-        replacement_order = GridOrder(
-            order_id="",
-            grid_id=grid_order.grid_id,
-            side=grid_order.side,
-            price=grid_order.price,
-            amount=remaining_amount,
-            status=GridOrderStatus.PENDING,
-            created_at=datetime.now(),
-            parent_order_id=grid_order.parent_order_id,
-            exchange_data=self._build_continuation_exchange_data(
-                grid_order,
-                remaining_amount,
-                order_id,
-            ),
-        )
+        remove_keys = [
+            key
+            for key, state_order in active_orders.items()
+            if state_order is grid_order or str(key) == str(grid_order.order_id)
+        ]
+        for key in remove_keys:
+            stale_order = active_orders.pop(key)
+            if stale_order.side == GridOrderSide.BUY and getattr(state, "pending_buy_orders", 0) > 0:
+                state.pending_buy_orders -= 1
+            elif stale_order.side == GridOrderSide.SELL and getattr(state, "pending_sell_orders", 0) > 0:
+                state.pending_sell_orders -= 1
 
-        try:
-            placed_order = await self.place_order(replacement_order)
-            if placed_order:
-                self._replace_state_order(order_id, placed_order)
-                self.logger.info(
-                    "Grid order restored after unexpected cancellation: "
-                    f"grid_id={placed_order.grid_id}, side={placed_order.side.value}, "
-                    f"amount={placed_order.amount}, price={placed_order.price}, "
-                    f"order_id={placed_order.order_id}"
-                )
-        except Exception as exc:
-            self.logger.error(
-                "Failed to restore cancelled grid order: "
-                f"grid_id={grid_order.grid_id}, source_order_id={order_id}, error={exc}"
-            )
+    def _quarantine_subminimum_continuation_if_needed(
+        self,
+        grid_order: GridOrder,
+        remaining_amount: Decimal,
+    ) -> bool:
+        """Fail-stop an opening continuation that cannot satisfy exchange minimums."""
+        if (
+            not self._is_opening_side(grid_order.side)
+            or self._get_cumulative_fill_amount(grid_order) <= 0
+        ):
+            return False
+        checker = getattr(self, "_health_checker", None)
+        minimum_violation = getattr(checker, "_market_minimum_violation", None)
+        if not callable(minimum_violation):
+            return False
+        violation = minimum_violation(remaining_amount, grid_order.price)
+        if not violation:
+            return False
+        self._quarantine_unmanaged_partial(
+            grid_order,
+            remaining_amount,
+            f"continuation below exchange minimum ({violation})",
+        )
+        return True
+
+    def _quarantine_unmanaged_partial(
+        self,
+        grid_order: GridOrder,
+        remaining_amount: Decimal,
+        reason: str,
+    ) -> None:
+        """Retain partial exposure accounting and block this grid until restart."""
+        carry_amount = self._get_cumulative_fill_amount(grid_order)
+        restore_key = self._restore_key(grid_order)
+        unmanaged_carries = getattr(self, "_unmanaged_partial_carries", None)
+        if unmanaged_carries is None:
+            unmanaged_carries = {}
+            self._unmanaged_partial_carries = unmanaged_carries
+        unmanaged_carries[restore_key] = {
+            "grid_id": grid_order.grid_id,
+            "side": grid_order.side,
+            "price": grid_order.price,
+            "carry_amount": carry_amount,
+            "remaining_amount": Decimal(str(remaining_amount)),
+            "reason": reason,
+        }
+
+        coordinator = getattr(self, "coordinator", None)
+        locks = getattr(coordinator, "_grid_level_locks", None) if coordinator else None
+        if isinstance(locks, dict):
+            locks[grid_order.grid_id] = {
+                "tp_side": grid_order.side.value,
+                "tp_price": grid_order.price,
+                "tp_order_id": None,
+                "reason": "unmanaged_partial",
+            }
+
+        fatal_reason = (
+            "Partial fill continuation cannot be placed safely: "
+            f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+            f"carry={carry_amount}, remaining={remaining_amount}, "
+            f"price={grid_order.price}, reason={reason}"
+        )
+        self.logger.critical(fatal_reason)
+        request_fatal_stop = getattr(coordinator, "_request_fatal_stop", None)
+        if callable(request_fatal_stop):
+            request_fatal_stop(fatal_reason)
+
+    def _clear_matching_grid_lock(self, grid_order: GridOrder) -> None:
+        """Release only the coordinator lock owned by this exhausted restore."""
+        coordinator = getattr(self, "coordinator", None)
+        locks = getattr(coordinator, "_grid_level_locks", None) if coordinator else None
+        if not locks:
+            return
+        lock = locks.get(grid_order.grid_id)
+        if not isinstance(lock, dict):
+            return
+        if str(lock.get("tp_side", "")).lower() != grid_order.side.value.lower():
+            return
+        lock_price = lock.get("tp_price")
+        if lock_price is None or Decimal(str(lock_price)) != Decimal(str(grid_order.price)):
+            return
+        del locks[grid_order.grid_id]
 
     def _replace_state_order(self, old_order_id: str, new_order: GridOrder) -> None:
         """Replace one coordinator state order entry after a restore."""
@@ -1835,6 +2613,50 @@ class GridEngineImpl(IGridEngine):
             tracking["fills_by_id"] = {}
         return tracking
 
+    def _record_exchange_order_progress(
+        self,
+        grid_order: GridOrder,
+        exchange_order: ExchangeOrderData,
+    ) -> None:
+        """Record a cumulative exchange snapshot without finalizing a partial fill."""
+        reported_filled = self._safe_decimal(
+            getattr(exchange_order, "filled", None),
+            Decimal("0"),
+        )
+        reported_remaining = self._safe_decimal(
+            getattr(exchange_order, "remaining", None),
+            Decimal("0"),
+        )
+        if reported_filled <= 0 and reported_remaining <= 0:
+            return
+
+        tracking = self._get_tradexyz_fill_tracking(grid_order)
+        target_amount = self._ensure_tradexyz_target_amount(grid_order)
+        carry_amount = self._safe_decimal(
+            tracking.get("carry_filled_amount"),
+            Decimal("0"),
+        )
+        current_order_target = max(target_amount - carry_amount, Decimal("0"))
+        if current_order_target > 0:
+            reported_filled = min(reported_filled, current_order_target)
+
+        cumulative_filled = carry_amount + reported_filled
+        previous_cumulative = self._safe_decimal(
+            tracking.get("cumulative_filled"),
+            Decimal("0"),
+        )
+        if cumulative_filled > previous_cumulative:
+            tracking["snapshot_cumulative_filled"] = str(reported_filled)
+            tracking["cumulative_filled"] = str(cumulative_filled)
+
+        effective_cumulative = max(previous_cumulative, cumulative_filled)
+        tracking["remaining_amount"] = str(
+            max(target_amount - effective_cumulative, Decimal("0"))
+        )
+        tracking["exchange_remaining_amount"] = str(reported_remaining)
+        status = getattr(exchange_order, "status", None)
+        tracking["last_exchange_status"] = getattr(status, "value", str(status or ""))
+
     def _record_tradexyz_fill_entry(
         self,
         tracking: Dict[str, Any],
@@ -1960,6 +2782,605 @@ class GridEngineImpl(IGridEngine):
         """Return whether get_order() only has a TradeXYZ user-fill snapshot."""
         params = getattr(exchange_order, "params", {}) or {}
         return bool(params.get("user_fill_snapshot_only"))
+
+    @staticmethod
+    def _exchange_order_status(exchange_order: ExchangeOrderData) -> str:
+        """Return one normalized exchange-order status value."""
+        status = getattr(exchange_order, "status", None)
+        return str(getattr(status, "value", status) or "unknown").lower()
+
+    @staticmethod
+    def _is_nonterminal_cancel_ack(cancel_result: Any) -> bool:
+        """Return whether a cancel response is only a transaction acknowledgement."""
+        for payload in (
+            getattr(cancel_result, "params", None),
+            getattr(cancel_result, "raw_data", None),
+        ):
+            if isinstance(payload, dict) and payload.get("cancel_terminal") is False:
+                return True
+        return False
+
+    @staticmethod
+    def _exchange_submission_is_uncertain(exchange_order: ExchangeOrderData) -> bool:
+        """Return whether an exchange result is a transport-uncertain placeholder."""
+        params = getattr(exchange_order, "params", {}) or {}
+        raw_data = getattr(exchange_order, "raw_data", {}) or {}
+        return bool(
+            (isinstance(params, dict) and params.get("submission_uncertain"))
+            or (
+                isinstance(raw_data, dict)
+                and raw_data.get("submission_uncertain")
+            )
+        )
+
+    def _fail_closed_submission(
+        self,
+        reason: str,
+        grid_order: Optional[GridOrder] = None,
+    ) -> None:
+        """Synchronously close the placement gate and request one fatal stop."""
+        self.pause_placements()
+        coordinator = getattr(self, "coordinator", None)
+        locks = getattr(coordinator, "_grid_level_locks", None) if coordinator else None
+        if grid_order is not None and isinstance(locks, dict):
+            locks.setdefault(
+                grid_order.grid_id,
+                {
+                    "tp_side": grid_order.side.value,
+                    "tp_price": grid_order.price,
+                    "tp_order_id": None,
+                    "reason": "submission_uncertain",
+                },
+            )
+
+        self.logger.critical(reason)
+        request_fatal_stop = getattr(coordinator, "_request_fatal_stop", None)
+        if callable(request_fatal_stop):
+            request_fatal_stop(reason)
+
+    def _quarantine_uncertain_grid_submission(self, grid_order: GridOrder) -> None:
+        """Keep one ambiguous client id read-only and prevent replacement orders."""
+        exchange_data = getattr(grid_order, "exchange_data", None)
+        if not isinstance(exchange_data, dict):
+            exchange_data = {}
+            grid_order.exchange_data = exchange_data
+        if exchange_data.get("submission_quarantined"):
+            return
+        exchange_data["submission_quarantined"] = True
+        self._fail_closed_submission(
+            "Order submission outcome is uncertain; retaining the original client id "
+            "without restore: "
+            f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+            f"amount={grid_order.amount}, price={grid_order.price}, "
+            f"client_id={grid_order.order_id}",
+            grid_order,
+        )
+
+    def _adopt_reconciled_grid_submission(
+        self,
+        grid_order: GridOrder,
+        exchange_order: ExchangeOrderData,
+    ) -> None:
+        """Adopt an exact client-id match without issuing another mutation."""
+        order_id = self._string_or_none(getattr(exchange_order, "id", None))
+        client_id = self._string_or_none(getattr(exchange_order, "client_id", None))
+        if order_id:
+            grid_order.order_id = order_id
+        self._register_pending_order(grid_order, order_id, client_id)
+        exchange_data = getattr(grid_order, "exchange_data", None)
+        if not isinstance(exchange_data, dict):
+            exchange_data = {}
+            grid_order.exchange_data = exchange_data
+        exchange_data["submission_uncertain"] = False
+        exchange_data["submission_reconciled"] = True
+        resolved = getattr(self, "_resolved_submission_client_ids", None)
+        if resolved is None:
+            resolved = set()
+            self._resolved_submission_client_ids = resolved
+        for key in (order_id, client_id):
+            if key:
+                resolved.add(key)
+        self.logger.warning(
+            "Adopted previously uncertain order submission by exact client id: "
+            f"grid_id={grid_order.grid_id}, order_id={order_id}, client_id={client_id}"
+        )
+
+    def _schedule_deferred_fill_finalization(
+        self,
+        grid_order: GridOrder,
+        exchange_order: ExchangeOrderData,
+        order_id: str,
+        client_id: Optional[str],
+    ) -> None:
+        """Finalize an immediate fill after the placement caller records state."""
+        self._record_exchange_order_progress(grid_order, exchange_order)
+        filled_price = (
+            getattr(exchange_order, "average", None)
+            or getattr(exchange_order, "price", None)
+            or grid_order.price
+        )
+        reported_filled_amount = (
+            getattr(exchange_order, "filled", None)
+            or grid_order.amount
+        )
+        filled_amount = self._get_finalized_fill_amount(
+            grid_order,
+            Decimal(str(reported_filled_amount)),
+        )
+
+        def schedule() -> None:
+            asyncio.create_task(
+                self._finalize_fill(
+                    grid_order,
+                    Decimal(str(filled_price)),
+                    filled_amount,
+                    "Immediate exchange fill received",
+                    order_id,
+                    client_id,
+                )
+            )
+
+        asyncio.get_running_loop().call_soon(schedule)
+
+    def _record_uncertain_market_submission(
+        self,
+        exchange_order: ExchangeOrderData,
+        side: GridOrderSide,
+        amount: Decimal,
+        reduce_only: bool,
+    ) -> None:
+        """Retain one market mutation intent until reads confirm its outcome."""
+        client_id = self._string_or_none(
+            getattr(exchange_order, "client_id", None)
+            or getattr(exchange_order, "id", None)
+        )
+        if not client_id:
+            return
+        tracker = getattr(getattr(self, "coordinator", None), "tracker", None)
+        position_before = None
+        if tracker and hasattr(tracker, "get_current_position"):
+            sign = (
+                Decimal("1")
+                if self._base_side_for_grid_type() == GridOrderSide.BUY
+                else Decimal("-1")
+            )
+            position_before = sign * Decimal(str(tracker.get_current_position()))
+        records = getattr(self, "_uncertain_market_submissions", None)
+        if records is None:
+            records = {}
+            self._uncertain_market_submissions = records
+        records[client_id] = {
+            "client_id": client_id,
+            "side": side,
+            "amount": Decimal(str(amount)),
+            "reduce_only": bool(reduce_only),
+            "position_before": position_before,
+        }
+        getattr(self, "_resolved_submission_client_ids", set()).discard(client_id)
+
+    def _reconcile_uncertain_market_submissions(
+        self,
+        open_orders_by_key: Dict[str, ExchangeOrderData],
+        history_by_key: Dict[str, ExchangeOrderData],
+    ) -> None:
+        """Resolve market mutation intents only from an exact client-id match."""
+        records = getattr(self, "_uncertain_market_submissions", None)
+        if not records:
+            return
+        resolved_ids = getattr(self, "_resolved_submission_client_ids", None)
+        if resolved_ids is None:
+            resolved_ids = set()
+            self._resolved_submission_client_ids = resolved_ids
+        for client_id in list(records):
+            exchange_order = open_orders_by_key.get(client_id) or history_by_key.get(client_id)
+            if exchange_order is None:
+                continue
+            records.pop(client_id, None)
+            resolved_ids.add(client_id)
+            self.logger.warning(
+                "Resolved uncertain market submission by exact client id: "
+                f"client_id={client_id}, status={self._exchange_order_status(exchange_order)}"
+            )
+
+    def _reconcile_uncertain_market_positions(self, current_position: Decimal) -> None:
+        """Resolve a market intent only after REST position movement proves it."""
+        records = getattr(self, "_uncertain_market_submissions", None)
+        if not records:
+            return
+        sign = (
+            Decimal("1")
+            if self._base_side_for_grid_type() == GridOrderSide.BUY
+            else Decimal("-1")
+        )
+        directional_position = sign * Decimal(str(current_position))
+        precision = int(getattr(self.config, "quantity_precision", 8) or 8)
+        tolerance = Decimal("1").scaleb(-precision)
+        resolved_ids = getattr(self, "_resolved_submission_client_ids", None)
+        if resolved_ids is None:
+            resolved_ids = set()
+            self._resolved_submission_client_ids = resolved_ids
+
+        for client_id, record in list(records.items()):
+            position_before = record.get("position_before")
+            if position_before is None:
+                continue
+            amount = Decimal(str(record["amount"]))
+            if record.get("reduce_only"):
+                target = max(Decimal(str(position_before)) - amount, Decimal("0"))
+                confirmed = directional_position <= target + tolerance
+            else:
+                target = Decimal(str(position_before)) + amount
+                confirmed = directional_position >= target - tolerance
+            if confirmed:
+                records.pop(client_id, None)
+                resolved_ids.add(client_id)
+                self.logger.warning(
+                    "Resolved uncertain market submission from REST position movement: "
+                    f"client_id={client_id}, position={current_position}"
+                )
+
+    async def _resolve_unresolved_submissions_read_only(
+        self,
+    ) -> Tuple[List[str], List[str]]:
+        """Resolve adapter intents by reads before declaring cancel-all safe."""
+        resolver = getattr(self.exchange, "resolve_unresolved_submissions", None)
+        if not callable(resolver):
+            return [], []
+        resolved_orders = list(await resolver() or [])
+        if not resolved_orders:
+            return [], []
+
+        resolved_by_key = {
+            normalized: exchange_order
+            for exchange_order in resolved_orders
+            for key in (
+                getattr(exchange_order, "id", None),
+                getattr(exchange_order, "client_id", None),
+            )
+            if (normalized := self._string_or_none(key))
+        }
+        self._reconcile_uncertain_market_submissions({}, resolved_by_key)
+
+        active: List[str] = []
+        filled: List[str] = []
+        resolved_ids = getattr(self, "_resolved_submission_client_ids", None)
+        if resolved_ids is None:
+            resolved_ids = set()
+            self._resolved_submission_client_ids = resolved_ids
+
+        for exchange_order in resolved_orders:
+            order_id = self._string_or_none(getattr(exchange_order, "id", None))
+            client_id = self._string_or_none(getattr(exchange_order, "client_id", None))
+            label = order_id or client_id or "unknown"
+            status = self._exchange_order_status(exchange_order)
+            _, grid_order = self._find_cached_order(order_id, client_id)
+
+            if status in {"filled"}:
+                if grid_order is not None:
+                    await self._finalize_fill(
+                        grid_order,
+                        getattr(exchange_order, "average", None)
+                        or getattr(exchange_order, "price", None)
+                        or grid_order.price,
+                        getattr(exchange_order, "filled", None) or grid_order.amount,
+                        "Read-only submission reconciliation found a fill",
+                        order_id,
+                        client_id,
+                    )
+                resolved_ids.update(key for key in (order_id, client_id) if key)
+                reason = (
+                    "Previously uncertain submission resolved as filled during "
+                    f"shutdown verification: order_id={label}"
+                )
+                self._fail_closed_submission(reason, grid_order)
+                filled.append(label)
+                continue
+
+            if status in {"canceled", "cancelled", "rejected", "expired"}:
+                if grid_order is not None:
+                    await self._finalize_cancellation(
+                        grid_order,
+                        "Read-only submission reconciliation found a terminal failure",
+                        order_id,
+                        client_id,
+                    )
+                resolved_ids.update(key for key in (order_id, client_id) if key)
+                continue
+
+            if grid_order is not None and self._is_submission_uncertain(grid_order):
+                self._adopt_reconciled_grid_submission(grid_order, exchange_order)
+            active.append(label)
+
+        return active, filled
+
+    async def _reconcile_shutdown_pending_orders(
+        self,
+        pending_orders: Sequence[GridOrder],
+        cancelled_orders: Any,
+    ) -> Tuple[List[str], List[str]]:
+        """Require exact cancel-response or terminal-history proof per local order."""
+        cancel_proof_by_key: Dict[str, Any] = {}
+        if isinstance(cancelled_orders, (list, tuple, set)):
+            for exchange_order in cancelled_orders:
+                if self._is_nonterminal_cancel_ack(exchange_order):
+                    continue
+                for key in (
+                    getattr(exchange_order, "id", None),
+                    getattr(exchange_order, "client_id", None),
+                    getattr(exchange_order, "order_id", None),
+                ):
+                    normalized = self._string_or_none(key)
+                    if normalized:
+                        cancel_proof_by_key[normalized] = exchange_order
+
+        pending_keys = []
+        needs_history = False
+        for grid_order in pending_orders:
+            aliases = set(self._pending_keys_for_order(grid_order))
+            if not aliases:
+                continue
+            order_id = self._string_or_none(grid_order.order_id)
+            if order_id:
+                aliases.add(order_id)
+            pending_keys.append((grid_order, aliases))
+            if not any(alias in cancel_proof_by_key for alias in aliases):
+                needs_history = True
+
+        history_by_key: Dict[str, Any] = {}
+        if needs_history:
+            get_history = getattr(self.exchange, "get_order_history", None)
+            if callable(get_history):
+                try:
+                    history = await get_history(self.config.symbol, limit=100)
+                except TypeError:
+                    history = await get_history(self.config.symbol)
+                except Exception as exc:
+                    self.logger.error(
+                        f"Shutdown terminal-history verification failed: {exc}"
+                    )
+                    history = []
+                for exchange_order in history or []:
+                    for key in (
+                        getattr(exchange_order, "id", None),
+                        getattr(exchange_order, "client_id", None),
+                    ):
+                        normalized = self._string_or_none(key)
+                        if normalized:
+                            history_by_key[normalized] = exchange_order
+
+        unresolved: List[str] = []
+        filled: List[str] = []
+        cancel_statuses = {"canceled", "cancelled", "rejected", "expired"}
+
+        for grid_order, aliases in pending_keys:
+            proof = next(
+                (cancel_proof_by_key[key] for key in aliases if key in cancel_proof_by_key),
+                None,
+            )
+            explicit_cancel = proof is not None
+            if proof is None:
+                proof = next(
+                    (history_by_key[key] for key in aliases if key in history_by_key),
+                    None,
+                )
+
+            label = self._string_or_none(grid_order.order_id) or str(grid_order.grid_id)
+            if proof is None:
+                unresolved.append(label)
+                continue
+
+            status = self._exchange_order_status(proof)
+            if status in {"filled", "closed"}:
+                self._record_exchange_order_progress(grid_order, proof)
+                await self._finalize_fill(
+                    grid_order,
+                    getattr(proof, "average", None)
+                    or getattr(proof, "price", None)
+                    or grid_order.price,
+                    self._get_finalized_fill_amount(
+                        grid_order,
+                        getattr(proof, "filled", None) or grid_order.amount,
+                    ),
+                    "Shutdown terminal-history reconciliation found a fill",
+                    *aliases,
+                    getattr(proof, "id", None),
+                    getattr(proof, "client_id", None),
+                )
+                self._clear_uncertain_cancellation_markers(aliases)
+                reason = (
+                    "Order filled during shutdown cancellation verification: "
+                    f"order_id={label}"
+                )
+                self._fail_closed_submission(reason, grid_order)
+                filled.append(label)
+                continue
+
+            if explicit_cancel or status in cancel_statuses:
+                self._clear_uncertain_cancellation_markers(aliases)
+                await self._finalize_cancellation(
+                    grid_order,
+                    "Shutdown cancellation confirmed",
+                    *aliases,
+                    getattr(proof, "id", None),
+                    getattr(proof, "client_id", None),
+                )
+                continue
+
+            unresolved.append(label)
+
+        return unresolved, filled
+
+    async def _resolve_uncertain_cancellations_read_only(
+        self,
+    ) -> Tuple[List[str], List[str]]:
+        """Require exact terminal history before clearing response-loss cancels."""
+        uncertain_ids = set(getattr(self, "_uncertain_cancel_order_ids", set()))
+        marker_sources = (
+            self.exchange,
+            getattr(self.exchange, "_rest", None),
+            getattr(self.exchange, "_base", None),
+        )
+        for source in marker_sources:
+            markers = getattr(source, "_uncertain_cancellations", ()) if source else ()
+            for marker in markers:
+                marker_id = marker[1] if isinstance(marker, tuple) and len(marker) > 1 else marker
+                normalized = self._string_or_none(marker_id)
+                if normalized:
+                    uncertain_ids.add(normalized)
+
+        if not uncertain_ids:
+            return [], []
+
+        history = await self.exchange.get_order_history(self.config.symbol, limit=100)
+        history_by_key = {
+            normalized: order
+            for order in history or []
+            for key in (
+                getattr(order, "id", None),
+                getattr(order, "client_id", None),
+            )
+            if (normalized := self._string_or_none(key))
+        }
+        unresolved: List[str] = []
+        filled: List[str] = []
+        processed_groups: set[frozenset[str]] = set()
+
+        for uncertain_id in sorted(uncertain_ids):
+            _, grid_order = self._find_cached_order(uncertain_id)
+            group = {uncertain_id}
+            if grid_order is not None:
+                group.update(self._pending_keys_for_order(grid_order))
+                normalized_order_id = self._string_or_none(grid_order.order_id)
+                if normalized_order_id:
+                    group.add(normalized_order_id)
+            frozen_group = frozenset(group)
+            if frozen_group in processed_groups:
+                continue
+            processed_groups.add(frozen_group)
+
+            exchange_order = next(
+                (history_by_key[key] for key in group if key in history_by_key),
+                None,
+            )
+            if exchange_order is None:
+                unresolved.append(uncertain_id)
+                continue
+
+            status = self._exchange_order_status(exchange_order)
+            if status not in {"filled", "canceled", "cancelled", "rejected", "expired"}:
+                unresolved.append(uncertain_id)
+                continue
+
+            self._clear_uncertain_cancellation_markers(group)
+            if status != "filled":
+                if grid_order is not None:
+                    await self._finalize_cancellation(
+                        grid_order,
+                        "Read-only cancellation reconciliation found a terminal cancellation",
+                        getattr(exchange_order, "id", None),
+                        getattr(exchange_order, "client_id", None),
+                        *group,
+                    )
+                continue
+
+            label = (
+                self._string_or_none(getattr(exchange_order, "id", None))
+                or uncertain_id
+            )
+            if grid_order is not None:
+                self._record_exchange_order_progress(grid_order, exchange_order)
+                await self._finalize_fill(
+                    grid_order,
+                    getattr(exchange_order, "average", None)
+                    or getattr(exchange_order, "price", None)
+                    or grid_order.price,
+                    self._get_finalized_fill_amount(
+                        grid_order,
+                        getattr(exchange_order, "filled", None) or grid_order.amount,
+                    ),
+                    "Read-only cancellation reconciliation found a fill",
+                    getattr(exchange_order, "id", None),
+                    getattr(exchange_order, "client_id", None),
+                    *group,
+                )
+            reason = (
+                "Previously uncertain cancellation resolved as filled during "
+                f"shutdown verification: order_id={label}"
+            )
+            self._fail_closed_submission(reason, grid_order)
+            filled.append(label)
+
+        return unresolved, filled
+
+    def _clear_uncertain_cancellation_markers(self, keys: set[str]) -> None:
+        """Clear local and adapter response-loss markers after exact terminal proof."""
+        getattr(self, "_uncertain_cancel_order_ids", set()).difference_update(keys)
+        for source in (
+            self.exchange,
+            getattr(self.exchange, "_rest", None),
+            getattr(self.exchange, "_base", None),
+        ):
+            markers = getattr(source, "_uncertain_cancellations", None) if source else None
+            if not isinstance(markers, set):
+                continue
+            for marker in list(markers):
+                marker_id = marker[1] if isinstance(marker, tuple) and len(marker) > 1 else marker
+                if self._string_or_none(marker_id) in keys:
+                    markers.discard(marker)
+
+    def _unresolved_submission_descriptions(self) -> List[str]:
+        """Return local and adapter mutation intents that still lack exact proof."""
+        descriptions = [
+            f"limit:{order.order_id}"
+            for order in self.get_pending_orders()
+            if self._is_submission_uncertain(order)
+        ]
+        descriptions.extend(
+            f"market:{client_id}"
+            for client_id in getattr(self, "_uncertain_market_submissions", {})
+        )
+
+        get_unresolved = getattr(self.exchange, "get_unresolved_submissions", None)
+        resolved_ids = getattr(self, "_resolved_submission_client_ids", set())
+        if callable(get_unresolved):
+            for item in get_unresolved() or []:
+                client_id = self._string_or_none(item.get("client_order_id"))
+                if client_id and client_id not in resolved_ids:
+                    descriptions.append(f"adapter:{client_id}")
+        return list(dict.fromkeys(descriptions))
+
+    def _cancel_outcome_is_uncertain(self, order_id: str) -> bool:
+        """Inspect the Lighter adapter marker after a response-loss exception."""
+        target = str(order_id)
+        for source in (
+            self.exchange,
+            getattr(self.exchange, "_rest", None),
+            getattr(self.exchange, "_base", None),
+        ):
+            uncertain = getattr(source, "_uncertain_cancellations", ()) if source else ()
+            for marker in uncertain:
+                marker_id = marker[1] if isinstance(marker, tuple) and len(marker) > 1 else marker
+                if str(marker_id) == target:
+                    return True
+        return False
+
+    def _is_uncertain_cancel(self, *keys: Optional[str]) -> bool:
+        """Return whether cancellation proof is still pending for any alias."""
+        uncertain_ids = getattr(self, "_uncertain_cancel_order_ids", set())
+        return any(
+            normalized in uncertain_ids
+            for key in keys
+            if (normalized := self._string_or_none(key))
+        )
+
+    @staticmethod
+    def _is_submission_uncertain(grid_order: GridOrder) -> bool:
+        """Return whether placement produced a tracked transport-uncertain phantom."""
+        exchange_data = getattr(grid_order, "exchange_data", {}) or {}
+        return bool(
+            isinstance(exchange_data, dict)
+            and exchange_data.get("submission_uncertain")
+        )
 
     def _build_tradexyz_fill_event_key(
         self,

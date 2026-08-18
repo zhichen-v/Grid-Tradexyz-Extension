@@ -101,8 +101,10 @@ class OrderOperations:
         self.logger.info(" 取消所有订单并验证...")
 
         # 1. 首次批量取消
+        cancel_succeeded = False
         try:
             cancelled_count = await self.engine.cancel_all_orders()
+            cancel_succeeded = True
             self.logger.info(f" 批量取消API返回: {cancelled_count} 个订单")
         except Exception as e:
             self.logger.error(f" 批量取消订单失败: {e}")
@@ -120,7 +122,7 @@ class OrderOperations:
             # 获取当前未成交订单数量
             open_count = await self.verifier.get_open_orders_count()
 
-            if open_count == 0:
+            if open_count == 0 and cancel_succeeded:
                 # 验证成功
                 self.logger.info(f" 订单取消验证通过: 当前未成交订单 {open_count} 个")
                 cancel_verified = True
@@ -139,8 +141,10 @@ class OrderOperations:
                     self.logger.info(f" 尝试再次取消这些订单...")
 
                     # 再次调用取消订单
+                    cancel_succeeded = False
                     try:
                         retry_cancelled = await self.engine.cancel_all_orders()
+                        cancel_succeeded = True
                         self.logger.info(f"重试取消返回: {retry_cancelled} 个订单")
                     except Exception as e:
                         self.logger.error(f"重试取消失败: {e}")
@@ -229,20 +233,15 @@ class OrderOperations:
                     if not order_id:
                         return False, "unknown"
 
-                    await self.engine.cancel_order(order_id)
+                    cancelled = await self.engine.cancel_order(order_id)
+                    if cancelled is not True:
+                        return False, order_id
                     self.state.remove_order(order_id)
                     return True, order_id
                 except Exception as e:
-                    error_msg = str(e).lower()
                     order_id = getattr(order, 'order_id', None) or getattr(
                         order, 'id', None)
-                    if "not found" in error_msg or "does not exist" in error_msg:
-                        # 订单已不存在，从状态移除
-                        if order_id:
-                            self.state.remove_order(order_id)
-                        return True, order_id or "unknown"
-                    else:
-                        return False, order_id or "unknown"
+                    return False, order_id or "unknown"
 
             # 并发取消（限制批次大小避免API限流）
             batch_size = 10
@@ -275,6 +274,13 @@ class OrderOperations:
             self.logger.info(
                 f" 批量取消完成: 成功={cancelled_count}, 失败={failed_count}"
             )
+
+            if failed_count:
+                self.logger.warning(
+                    f"{failed_count} 个{filter_description}尚无精确取消终态；"
+                    "不能用开放订单暂时缺席判定成功"
+                )
+                continue
 
             # 3. 等待一小段时间，让交易所处理取消请求
             await asyncio.sleep(0.3)

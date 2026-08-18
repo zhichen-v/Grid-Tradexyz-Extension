@@ -286,6 +286,7 @@ class LighterAdapter(ExchangeAdapter):
             "exchange": "lighter",
             "connected": self._connected,
             "authenticated": self._authenticated,
+            "websocket": self._websocket.get_connection_status(),
             "timestamp": datetime.now().isoformat()
         }
 
@@ -293,9 +294,11 @@ class LighterAdapter(ExchangeAdapter):
             # 尝试获取交易所信息作为健康检查
             if self._connected:
                 info = await self.get_exchange_info()
-                status["healthy"] = True
+                status["healthy"] = status["websocket"]["healthy"]
                 status["market_count"] = len(
                     info.symbols) if info and info.symbols else 0
+                if not status["healthy"]:
+                    status["error"] = "Direct WebSocket subscription is not healthy"
             else:
                 status["healthy"] = False
                 status["error"] = "Not connected"
@@ -552,10 +555,19 @@ class LighterAdapter(ExchangeAdapter):
         Returns:
             List[OrderData]: 历史订单列表
         """
-        # Lighter SDK可能不直接支持历史订单查询
-        # 暂时返回空列表
-        self.logger.warning("Lighter适配器暂不支持历史订单查询")
-        return []
+        normalized_symbol = self._normalize_symbol(symbol) if symbol else None
+        return await self._rest.get_order_history(
+            normalized_symbol,
+            limit=limit or 100,
+        )
+
+    def get_unresolved_submissions(self) -> List[Dict[str, Any]]:
+        """Return read-only snapshots of unconfirmed signer mutations."""
+        return self._rest.get_unresolved_submissions()
+
+    async def resolve_unresolved_submissions(self) -> List[OrderData]:
+        """Resolve unconfirmed mutations with active/history reads only."""
+        return await self._rest.resolve_unresolved_submissions()
 
     # ============= 交易功能 =============
 
@@ -677,11 +689,13 @@ class LighterAdapter(ExchangeAdapter):
         """
         normalized_symbol = self._normalize_symbol(symbol)
         success = await self._rest.cancel_order(normalized_symbol, order_id)
+        cancellation_uncertain = (
+            normalized_symbol,
+            str(order_id),
+        ) in getattr(self._rest, "_uncertain_cancellations", set())
 
-        if success:
-            # A successful cancel removes the order from active orders before
-            # inactive history is necessarily indexed.  Do not query it again;
-            # the caller verifies the final open-order set independently.
+        if success or cancellation_uncertain:
+            terminal_confirmed = bool(success) and not cancellation_uncertain
             return OrderData(
                 id=order_id,
                 client_id=None,
@@ -694,13 +708,21 @@ class LighterAdapter(ExchangeAdapter):
                 remaining=Decimal("0"),
                 cost=Decimal("0"),
                 average=None,
-                status=OrderStatus.CANCELED,
+                status=(
+                    OrderStatus.CANCELED
+                    if terminal_confirmed
+                    else OrderStatus.PENDING
+                ),
                 timestamp=datetime.now(),
                 updated=None,
                 fee=None,
                 trades=[],
-                params={},
-                raw_data={}
+                params={
+                    "cancel_terminal": terminal_confirmed,
+                },
+                raw_data={
+                    "cancel_terminal": terminal_confirmed,
+                }
             )
         else:
             raise Exception(f"Failed to cancel order {order_id}")

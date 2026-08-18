@@ -53,6 +53,7 @@ class GridConfig:
     max_position: Optional[Decimal] = None  # 最大持仓限制
     enable_notifications: bool = True        # 是否启用通知
     order_health_check_interval: int = 300   # 订单健康检查间隔（秒，默认5分钟）
+    position_monitor_interval: int = 10       # REST持仓轮询基础间隔（秒）
     fee_rate: Decimal = Decimal('0.0001')    # 手续费率（默认万分之1）
 
     # 交易精度参数（重要！）
@@ -155,6 +156,15 @@ class GridConfig:
 
     def _validate(self):
         """验证配置参数"""
+        if self.max_position is not None:
+            if self.max_position <= 0:
+                raise ValueError("max_position must be greater than 0")
+            if self.max_position < self.order_amount:
+                raise ValueError("max_position must be at least order_amount")
+
+        if self.position_monitor_interval < 5:
+            raise ValueError("position_monitor_interval must be at least 5 seconds")
+
         if self.stop_loss_enabled:
             if self.stop_loss_price is None or self.stop_loss_price <= 0:
                 raise ValueError("stop_loss_price must be greater than 0 when stop_loss_enabled is true")

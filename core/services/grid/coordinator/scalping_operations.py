@@ -666,7 +666,15 @@ class ScalpingOperations:
 
             for attempt in range(max_cancel_attempts):
                 try:
-                    await self.engine.cancel_order(old_tp_order.order_id)
+                    cancelled = await self.engine.cancel_order(old_tp_order.order_id)
+                    if cancelled is not True:
+                        self.logger.warning(
+                            f"旧止盈订单取消尚未取得终态证明 "
+                            f"(尝试{attempt+1}/{max_cancel_attempts}): "
+                            f"{old_tp_order.order_id}"
+                        )
+                        await asyncio.sleep(0.3)
+                        continue
                     self.state.remove_order(old_tp_order.order_id)
                     self.logger.info(f" 已取消旧止盈订单: {old_tp_order.order_id}")
 
@@ -696,13 +704,7 @@ class ScalpingOperations:
                         self.logger.error(f"验证取消失败: {e}")
 
                 except Exception as e:
-                    error_msg = str(e).lower()
-                    if "not found" in error_msg or "does not exist" in error_msg:
-                        self.logger.info("订单已不存在，视为取消成功")
-                        cancel_success = True
-                        break
-                    else:
-                        self.logger.error(f"取消旧止盈订单失败: {e}")
+                    self.logger.error(f"取消旧止盈订单失败: {e}")
 
             if not cancel_success:
                 self.logger.error(" 取消旧止盈订单失败，中止更新")

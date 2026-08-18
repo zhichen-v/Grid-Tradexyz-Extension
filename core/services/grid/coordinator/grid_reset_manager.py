@@ -54,6 +54,13 @@ class GridResetManager:
         """Acquire the coordinator-wide reset gate without awaiting."""
         if self.coordinator._is_resetting or self.coordinator._resetting:
             return False
+        clear_deferred_fills = getattr(
+            self.coordinator,
+            "_clear_deferred_fills",
+            None,
+        )
+        if callable(clear_deferred_fills):
+            clear_deferred_fills()
         self.coordinator._is_resetting = True
         self.coordinator._resetting = True
         engine = getattr(self, "engine", None)
@@ -242,6 +249,7 @@ class GridResetManager:
                 self.state.active_orders.clear()
                 self.state.pending_buy_orders = 0
                 self.state.pending_sell_orders = 0
+                self.coordinator._grid_level_locks.clear()
                 self.tracker.reset()
                 self.coordinator._stop_loss_trigger_count += 1
             else:
@@ -406,6 +414,7 @@ class GridResetManager:
 
         # ======== 步骤2: 平仓（如果需要）========
         new_capital = None
+        retained_position: Optional[Decimal] = None
         if should_close_position:
             self.logger.info(" 步骤 2/7: 平仓...")
             try:
@@ -460,12 +469,18 @@ class GridResetManager:
                     )
         else:
             self.logger.info(" 步骤 2-3/7: 不平仓，跳过")
+            try:
+                retained_position = await self._resolve_live_position_for_close()
+            except Exception as exc:
+                self.logger.error(f" {reset_type}保留持仓查询失败: {exc}")
+                return None
 
         # ======== 步骤4: 清空状态 ========
         self.logger.info(" 步骤 4/7: 清空网格状态...")
         self.state.active_orders.clear()
         self.state.pending_buy_orders = 0
         self.state.pending_sell_orders = 0
+        self.coordinator._grid_level_locks.clear()
 
         # 重置所有管理器状态
         if self.coordinator.scalping_manager:
@@ -477,8 +492,26 @@ class GridResetManager:
         if self.coordinator.price_lock_manager:
             self.coordinator.price_lock_manager.reset()
 
-        # 重置追踪器
-        self.tracker.reset()
+        # 重置追踪器；保留实仓时必须先恢复可靠仓位，避免 max_position 低估曝险。
+        if retained_position is None:
+            self.tracker.reset()
+        else:
+            get_average_cost = getattr(self.tracker, "get_average_cost", None)
+            retained_entry_price = (
+                Decimal(str(get_average_cost()))
+                if callable(get_average_cost)
+                else Decimal("0")
+            )
+            self.tracker.sync_initial_position(
+                position=retained_position,
+                entry_price=retained_entry_price,
+            )
+            sync_state_position = getattr(self.state, "sync_position_snapshot", None)
+            if callable(sync_state_position):
+                sync_state_position(
+                    position=retained_position,
+                    average_cost=retained_entry_price,
+                )
         self.logger.info(" 网格状态已清空")
 
         # ======== 步骤5: 更新价格区间（如果需要）========
@@ -512,6 +545,13 @@ class GridResetManager:
         self.logger.info(" 步骤 7/7: 生成并挂出新订单...")
         current_price = await self.engine.get_current_price()
         initial_orders = self.strategy.initialize(self.config, current_price)
+        filter_orders = getattr(
+            self.coordinator,
+            "filter_orders_within_max_position",
+            None,
+        )
+        if callable(filter_orders):
+            initial_orders = filter_orders(initial_orders, f"{reset_type} reset grid")
         placed_orders = await self.engine.place_batch_orders(
             initial_orders,
             allow_while_paused=True,

@@ -10,6 +10,7 @@ from datetime import datetime
 import asyncio
 import logging
 import json
+import time
 
 try:
     import lighter
@@ -58,6 +59,9 @@ class LighterWebSocket(LighterBase):
         # 直接WebSocket连接（用于account_all_orders、market_stats和trade）
         self._direct_ws = None
         self._direct_ws_task: Optional[asyncio.Task] = None
+        self._direct_ws_connected = False
+        self._account_orders_subscribed = False
+        self._direct_last_message_time = 0.0
         self._subscribed_market_stats: List[int] = []  # 订阅的market_stats市场
         self._subscribed_trades: List[int] = []
 
@@ -157,6 +161,7 @@ class LighterWebSocket(LighterBase):
                     await self._direct_ws_task
                 except asyncio.CancelledError:
                     pass
+            self._direct_ws_task = None
 
             if self._direct_ws:
                 try:
@@ -164,6 +169,9 @@ class LighterWebSocket(LighterBase):
                 except:
                     pass
                 self._direct_ws = None
+
+            self._direct_ws_connected = False
+            self._account_orders_subscribed = False
 
             logger.info("✅ WebSocket已断开（包括直接订阅）")
 
@@ -192,13 +200,52 @@ class LighterWebSocket(LighterBase):
 
     async def _resubscribe_all(self):
         """重新订阅所有频道"""
-        # 重新订阅市场数据
-        for market_index in self._subscribed_markets.copy():
-            await self.subscribe_orderbook(market_index)
+        # Subscription lists survive disconnect(), so the public subscribe
+        # methods would be no-ops here. Recreate the SDK stream directly.
+        if self._subscribed_markets or self._subscribed_accounts:
+            await self._recreate_ws_client()
 
-        # 重新订阅账户数据
-        for account_index in self._subscribed_accounts.copy():
-            await self.subscribe_account(account_index)
+        if self._needs_direct_ws():
+            await self._ensure_direct_ws_running()
+
+    def _needs_direct_ws(self) -> bool:
+        """Return whether any active subscription depends on the direct socket."""
+        return bool(
+            self._order_callbacks
+            or self._order_fill_callbacks
+            or self._subscribed_market_stats
+            or self._subscribed_trades
+        )
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        """Return connection health including the direct account-order stream."""
+        direct_required = self._needs_direct_ws()
+        account_orders_required = bool(
+            self._order_callbacks or self._order_fill_callbacks
+        )
+        task_running = bool(
+            self._direct_ws_task and not self._direct_ws_task.done()
+        )
+        direct_healthy = (
+            not direct_required
+            or (
+                task_running
+                and self._direct_ws_connected
+                and (
+                    not account_orders_required
+                    or self._account_orders_subscribed
+                )
+            )
+        )
+        return {
+            "connected": self._connected,
+            "direct_required": direct_required,
+            "direct_task_running": task_running,
+            "direct_connected": self._direct_ws_connected,
+            "account_orders_subscribed": self._account_orders_subscribed,
+            "last_direct_message_time": self._direct_last_message_time,
+            "healthy": self._connected and direct_healthy,
+        }
 
     # ============= 订阅管理 =============
 
@@ -1210,6 +1257,8 @@ class LighterWebSocket(LighterBase):
                     close_timeout=10       # 只保留关闭连接的超时时间
                 ) as ws:
                     self._direct_ws = ws
+                    self._direct_ws_connected = True
+                    self._account_orders_subscribed = False
 
                     # 发送订阅消息
                     # 1️⃣ 订阅account_all_orders（需要认证）
@@ -1220,6 +1269,7 @@ class LighterWebSocket(LighterBase):
                             "auth": auth_token
                         }
                         await ws.send(json.dumps(subscribe_msg))
+                        self._account_orders_subscribed = True
                         logger.info(
                             f"✅ 已订阅频道: account_all_orders/{self.account_index}")
 
@@ -1235,6 +1285,7 @@ class LighterWebSocket(LighterBase):
                     # 持续接收消息
                     async for message in ws:
                         try:
+                            self._direct_last_message_time = time.time()
                             data = json.loads(message)
                             await self._handle_direct_ws_message(data)
                         except json.JSONDecodeError as e:
@@ -1244,6 +1295,9 @@ class LighterWebSocket(LighterBase):
 
             except websockets.exceptions.ConnectionClosedError as e:
                 # WebSocket连接关闭
+                self._direct_ws_connected = False
+                self._account_orders_subscribed = False
+                self._direct_ws = None
                 retry_count += 1
                 logger.warning(
                     f"⚠️ WebSocket连接已关闭: {e}，5秒后重连 (第{retry_count}次)...")
@@ -1252,6 +1306,9 @@ class LighterWebSocket(LighterBase):
 
             except Exception as e:
                 # 🔥 修复2：捕获所有异常，确保任务不退出
+                self._direct_ws_connected = False
+                self._account_orders_subscribed = False
+                self._direct_ws = None
                 retry_count += 1
                 retry_delay = min(retry_count * 5, 60)  # 指数退避，最多60秒
                 logger.error(
@@ -1261,6 +1318,11 @@ class LighterWebSocket(LighterBase):
                 )
                 await asyncio.sleep(retry_delay)
                 # 外层循环会自动重连
+
+            finally:
+                self._direct_ws_connected = False
+                self._account_orders_subscribed = False
+                self._direct_ws = None
 
         logger.info("🛑 WebSocket订阅任务已停止")
 
@@ -1424,6 +1486,8 @@ class LighterWebSocket(LighterBase):
             "pending": OrderStatus.PENDING,
             "in-progress": OrderStatus.OPEN,
             "open": OrderStatus.OPEN,
+            "partial": OrderStatus.OPEN,
+            "partially_filled": OrderStatus.OPEN,
             "filled": OrderStatus.FILLED,
             "expired": OrderStatus.EXPIRED,
             "rejected": OrderStatus.REJECTED,

@@ -30,6 +30,11 @@ class GridTerminalUITimeTests(unittest.TestCase):
 
         self.assertEqual(str(panel.title), "Confirmed Fills (Last 5)")
 
+    def test_terminal_loop_can_detect_automatic_strategy_stop(self):
+        self.ui.coordinator = SimpleNamespace(is_stopped=lambda: True)
+
+        self.assertTrue(self.ui._coordinator_is_stopped())
+
 
 if __name__ == "__main__":
     unittest.main()

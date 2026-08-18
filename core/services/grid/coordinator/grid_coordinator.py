@@ -90,21 +90,31 @@ class GridCoordinator:
         # Operation control
         self._running = False
         self._paused = False
+        self._manual_pause_owned = False
         self._resetting = False  # Reset-in-progress flag used by protection and scalping flows.
         self._emergency_stop_requested = False
+        self._emergency_stop_task: Optional[asyncio.Task] = None
+        self._stop_lock = asyncio.Lock()
+        self._shutdown_completed = False
+        self._shutdown_order_cancellation_failed = False
+        self._shutdown_cleanup_error: Optional[str] = None
+        self._unsafe_shutdown_incident: Optional[str] = None
+        self._fatal_stop_reason: Optional[str] = None
 
         #  Transaction deduplication mechanism: Prevents the same transaction from being processed repeatedly by multiple detection mechanisms.
         # key = 'grid_id:side:price', value = timestamp
         self._recent_fills: Dict[str, float] = {}
         self._fill_dedup_window: float = 10.0
         self._last_fill_time: float = 0
+        self._active_fill_callbacks: int = 0
+        self._deferred_fills: Dict[str, GridOrder] = {}
+        self._deferred_fill_drain_task: Optional[asyncio.Task] = None
 
         #  Grid-level locking: Tracks the status of pending take-profit orders at each grid level.
         # key = grid_id, value = {'tp_side': str, 'tp_price': Decimal}
         self._grid_level_locks: Dict[int, Dict] = {}
 
         # 系统状态管理（REST失败保护）
-        self.is_paused = False  # REST失败时暂停订单操作
         self.is_emergency_stopped = False  # 持仓异常时紧急停止
 
         # 异常计数
@@ -233,6 +243,14 @@ class GridCoordinator:
 
             # 3. 初始化策略，生成初始订单（传入市价，过滤高于市价的买单/低于市价的卖单）
             initial_orders = self.strategy.initialize(self.config, current_price)
+            initial_orders = self.filter_orders_within_max_position(
+                initial_orders,
+                "startup grid",
+            )
+            if not initial_orders:
+                raise RuntimeError(
+                    "No initial grid orders are eligible at the current price and max_position"
+                )
 
             #  价格移动网格：价格区间在初始化后才设置
             if self.config.is_follow_mode():
@@ -265,6 +283,31 @@ class GridCoordinator:
                 f"Starting initial batch placement for {len(initial_orders)} orders"
             )
             placed_orders = await self.engine.place_batch_orders(initial_orders)
+
+            placement_error: Optional[RuntimeError] = None
+            if len(placed_orders) != len(initial_orders):
+                placement_error = RuntimeError(
+                    "Partial initial grid placement: "
+                    f"submitted={len(placed_orders)}/{len(initial_orders)}; "
+                    "startup is unsafe"
+                )
+            else:
+                try:
+                    await self._verify_initial_orders_live(placed_orders)
+                except Exception as verification_error:
+                    placement_error = RuntimeError(
+                        f"Initial grid verification failed: {verification_error}"
+                    )
+
+            if placement_error is not None:
+                self.logger.critical(str(placement_error))
+                try:
+                    await self.stop()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"{placement_error}; cleanup failed: {cleanup_error}"
+                    ) from cleanup_error
+                raise placement_error
 
             # 6. 批量添加到状态追踪（只添加未成交的订单）
             self.logger.info(
@@ -330,6 +373,60 @@ class GridCoordinator:
             self.state.set_error()
             raise
 
+    async def _verify_initial_orders_live(
+        self,
+        placed_orders: List[GridOrder],
+    ) -> None:
+        """Require each accepted startup order to be live or already filled."""
+        exchange_orders = await self.engine.exchange.get_open_orders(
+            self.config.symbol
+        )
+        exchange_keys = {
+            str(key)
+            for exchange_order in exchange_orders
+            for key in (
+                getattr(exchange_order, "id", None),
+                getattr(exchange_order, "client_id", None),
+            )
+            if key is not None
+        }
+        pending_key_getter = getattr(self.engine, "_pending_keys_for_order", None)
+        unverified_orders = []
+
+        for order in placed_orders:
+            if order.status == GridOrderStatus.FILLED:
+                continue
+
+            order_keys = {str(order.order_id)} if order.order_id else set()
+            if callable(pending_key_getter):
+                order_keys.update(
+                    str(key)
+                    for key in pending_key_getter(order)
+                    if key is not None
+                )
+
+            if order.status != GridOrderStatus.PENDING or not (
+                order_keys & exchange_keys
+            ):
+                unverified_orders.append(order)
+
+        if unverified_orders:
+            summary = ", ".join(
+                f"grid={order.grid_id}/{order.side.value}@{order.price}/"
+                f"status={order.status.value}"
+                for order in unverified_orders[:5]
+            )
+            if len(unverified_orders) > 5:
+                summary += f", +{len(unverified_orders) - 5} more"
+            raise RuntimeError(
+                f"{len(unverified_orders)}/{len(placed_orders)} accepted orders "
+                f"are not live: {summary}"
+            )
+
+        self.logger.info(
+            f"Initial exchange verification passed: {len(placed_orders)} orders covered"
+        )
+
     async def _on_order_filled(self, filled_order: GridOrder):
         """
         订单成交回调 - 核心逻辑
@@ -343,14 +440,23 @@ class GridCoordinator:
         Args:
             filled_order: 已成交订单
         """
+        self._active_fill_callbacks = getattr(self, "_active_fill_callbacks", 0) + 1
+        fill_committed = False
+        reverse_secured = False
         try:
             # Critical: do not process fills after the system has stopped; this prevents new orders during shutdown.
             if not self._running:
                 self.logger.debug("System is stopped; skipping order handling")
                 return
 
+            if getattr(self, "_emergency_stop_requested", False):
+                self.logger.warning("Fatal stop is pending; skipping order handling")
+                return
+
             #  关键检查：防止在重置期间处理订单
             if self._paused:
+                if self._defer_fill_during_rest_pause(filled_order):
+                    return
                 self.logger.warning("System is paused; skipping order handling")
                 return
 
@@ -360,10 +466,7 @@ class GridCoordinator:
 
             #  成交去重：防止同一笔成交被 REST 轮询和健康检查同步重复处理
             import time as _time
-            fill_key = (
-                f"{filled_order.order_id}:{filled_order.side.value}:"
-                f"{filled_order.price}:{filled_order.filled_amount or filled_order.amount}"
-            )
+            fill_key = self._fill_key(filled_order)
             current_time = _time.time()
             # 清理过期条目
             self._recent_fills = {
@@ -421,6 +524,10 @@ class GridCoordinator:
                 )
                 return
 
+            # The source order is now authoritatively filled. Until a reverse
+            # is intentionally skipped or secured, any error must fail closed.
+            fill_committed = True
+
             #  2. 记录交易历史（不影响持仓，只用于统计和显示）
             # 持仓数据完全来自 position_monitor 的REST查询
             # 此方法只记录交易历史和统计，不更新持仓
@@ -442,6 +549,7 @@ class GridCoordinator:
                 # Check whether this fill is the take-profit order.
                 if self._is_take_profit_order_filled(filled_order):
                     await self.scalping_ops.handle_take_profit_filled()
+                    reverse_secured = True
                     return  # 止盈成交后不再挂反向订单
 
                 # 🆕 更新最后一次方向性订单ID（做多追踪买单，做空追踪卖单）
@@ -488,6 +596,7 @@ class GridCoordinator:
                 # Scalping mode keeps entry-side behavior only and does not place exit-side reverse orders.
                 if not self._should_place_reverse_order_in_scalping(filled_order):
                     self.logger.info("Scalping mode active; skipping reverse order placement")
+                    reverse_secured = True
                     return
 
             new_side, new_price, new_grid_id = self.strategy.calculate_reverse_order(
@@ -497,7 +606,7 @@ class GridCoordinator:
             )
 
             #  网格层级锁定检查：防止重复挂单
-            grid_id = filled_order.grid_id
+            grid_id = new_grid_id
             if grid_id in self._grid_level_locks:
                 lock_info = self._grid_level_locks[grid_id]
                 if lock_info['tp_side'] == new_side.value:
@@ -506,6 +615,7 @@ class GridCoordinator:
                         f"{lock_info['tp_side']}@{lock_info['tp_price']}; "
                         f"skipping duplicate placement"
                     )
+                    reverse_secured = True
                     return
 
             #  反向订单去重：检查当前挂单中是否已有相同 grid_id + 方向 + 价格 的订单
@@ -519,6 +629,7 @@ class GridCoordinator:
                         f"Grid {new_grid_id} {new_side.value}@{new_price}; "
                         f"skipping duplicate placement"
                     )
+                    reverse_secured = True
                     return
 
             #  反向订单不做 Taker 防护
@@ -537,14 +648,45 @@ class GridCoordinator:
                 parent_order_id=filled_order.order_id
             )
 
-            # 6. 下反向订单
-            placed_order = await self.engine.place_order(reverse_order)
-            if placed_order is None:
+            if not self.can_place_order_within_max_position(
+                reverse_order.side,
+                reverse_order.amount,
+            ):
                 self.logger.warning(
-                    f"Reverse order was not submitted: {new_side.value} "
+                    f"Reverse order skipped by max_position: {new_side.value} "
                     f"{reverse_order.amount}@{new_price} (Grid {new_grid_id})"
                 )
+                self._fail_stop_for_unmanaged_fill(
+                    filled_order,
+                    RuntimeError("reverse order rejected by max_position"),
+                )
                 return
+
+            # Reserve the reverse intent before the network request so health
+            # repair cannot refill the opening side after an unmanaged fill.
+            self._grid_level_locks[new_grid_id] = {
+                'tp_side': new_side.value,
+                'tp_price': new_price,
+                'tp_order_id': None,
+            }
+
+            # 6. 下反向订单
+            try:
+                placed_order = await self.engine.place_order(reverse_order)
+            except Exception as exc:
+                self._fail_stop_for_unmanaged_reverse(reverse_order, exc)
+                raise
+            if placed_order is None:
+                failure = RuntimeError("reverse order placement returned no result")
+                self._fail_stop_for_unmanaged_reverse(reverse_order, failure)
+                self._fail_stop_for_unmanaged_fill(filled_order, failure)
+                self.logger.critical(
+                    f"Reverse order was not submitted; fail-stop requested: "
+                    f"{new_side.value} {reverse_order.amount}@{new_price} "
+                    f"(Grid {new_grid_id})"
+                )
+                return
+            reverse_secured = True
             self.state.add_order(placed_order)
 
             # 7. 记录关联关系
@@ -588,7 +730,167 @@ class GridCoordinator:
 
         except Exception as e:
             self.logger.error(f"Order fill handling failed: {e}")
+            if fill_committed and not reverse_secured:
+                self._fail_stop_for_unmanaged_fill(filled_order, e)
             self._handle_error(e)
+        finally:
+            self._active_fill_callbacks = max(
+                0,
+                getattr(self, "_active_fill_callbacks", 1) - 1,
+            )
+
+    def _fail_stop_for_unmanaged_reverse(
+        self,
+        reverse_order: GridOrder,
+        error: Exception,
+    ) -> None:
+        """Keep the reverse intent locked and stop after an unmanaged fill."""
+        fatal_reason = (
+            "Reverse placement failed after a fill: "
+            f"grid_id={reverse_order.grid_id}, side={reverse_order.side.value}, "
+            f"amount={reverse_order.amount}, price={reverse_order.price}, error={error}"
+        )
+        if not getattr(self, "_fatal_stop_reason", None):
+            self._fatal_stop_reason = fatal_reason
+        self.logger.critical(
+            "Reverse placement failed after a fill; stopping to prevent base-grid "
+            f"replenishment: grid_id={reverse_order.grid_id}, "
+            f"side={reverse_order.side.value}, amount={reverse_order.amount}, "
+            f"price={reverse_order.price}, error={error}"
+        )
+        self._request_fatal_stop(fatal_reason)
+
+    def _fail_stop_for_unmanaged_fill(
+        self,
+        filled_order: GridOrder,
+        error: Exception,
+    ) -> None:
+        """Lock an accepted fill whose reverse exposure was never secured."""
+        locks = getattr(self, "_grid_level_locks", None)
+        if locks is None:
+            locks = {}
+            self._grid_level_locks = locks
+        locks.setdefault(
+            filled_order.grid_id,
+            {
+                "tp_side": filled_order.side.value,
+                "tp_price": filled_order.price,
+                "tp_order_id": None,
+                "reason": "unmanaged_fill",
+            },
+        )
+        fatal_reason = (
+            "Fill committed without a secured reverse order: "
+            f"grid_id={filled_order.grid_id}, side={filled_order.side.value}, "
+            f"amount={filled_order.filled_amount or filled_order.amount}, "
+            f"price={filled_order.price}, error={error}"
+        )
+        self.logger.critical(fatal_reason)
+        self._request_fatal_stop(fatal_reason)
+
+    def _request_fatal_stop(self, reason: str) -> None:
+        """Record a process-visible fatal reason and schedule one safe shutdown."""
+        if not getattr(self, "_fatal_stop_reason", None):
+            self._fatal_stop_reason = str(reason)
+        already_requested = getattr(self, "_emergency_stop_requested", False)
+        self._emergency_stop_requested = True
+        self._manual_pause_owned = False
+        self._paused = True
+        pause_placements = getattr(
+            getattr(self, "engine", None),
+            "pause_placements",
+            None,
+        )
+        if callable(pause_placements):
+            try:
+                pause_placements()
+            except Exception as exc:
+                self.logger.error(f"Failed to close engine placement gate: {exc}")
+        pause_state = getattr(getattr(self, "state", None), "pause", None)
+        if callable(pause_state):
+            try:
+                pause_state()
+            except Exception as exc:
+                self.logger.error(f"Failed to pause coordinator state: {exc}")
+        if already_requested:
+            return
+        self._emergency_stop_task = asyncio.create_task(
+            self._stop_after_error_threshold()
+        )
+
+    @staticmethod
+    def _fill_key(filled_order: GridOrder) -> str:
+        """Return the stable identity used for fill deduplication and deferral."""
+        return (
+            f"{filled_order.order_id}:{filled_order.side.value}:"
+            f"{filled_order.price}:{filled_order.filled_amount or filled_order.amount}"
+        )
+
+    def _defer_fill_during_rest_pause(self, filled_order: GridOrder) -> bool:
+        """Retain fills while a recoverable REST or manual pause owns the gate."""
+        monitor = getattr(self, "position_monitor", None)
+        if (
+            not (
+                getattr(monitor, "_rest_pause_owned", False)
+                or getattr(self, "_manual_pause_owned", False)
+            )
+            or getattr(self, "_resetting", False)
+            or getattr(self, "is_emergency_stopped", False)
+        ):
+            return False
+
+        deferred_fills = getattr(self, "_deferred_fills", None)
+        if deferred_fills is None:
+            deferred_fills = {}
+            self._deferred_fills = deferred_fills
+        fill_key = self._fill_key(filled_order)
+        if fill_key not in deferred_fills:
+            deferred_fills[fill_key] = filled_order
+            self.logger.warning(
+                "Deferring fill while REST-owned pause is active: "
+                f"grid_id={filled_order.grid_id}, order_id={filled_order.order_id}, "
+                f"fill_key={fill_key}"
+            )
+        return True
+
+    def schedule_deferred_fill_drain(self) -> None:
+        """Schedule queued REST-pause fills after the monitor restores service."""
+        if (
+            not getattr(self, "_deferred_fills", None)
+            or not getattr(self, "_running", False)
+            or getattr(self, "_paused", False)
+            or getattr(self, "_resetting", False)
+            or getattr(self, "is_emergency_stopped", False)
+        ):
+            return
+
+        active_task = getattr(self, "_deferred_fill_drain_task", None)
+        if active_task and not active_task.done():
+            return
+        self._deferred_fill_drain_task = asyncio.create_task(
+            self._drain_deferred_fills()
+        )
+
+    async def _drain_deferred_fills(self) -> None:
+        """Replay each deferred terminal fill once while the runtime stays active."""
+        try:
+            while (
+                getattr(self, "_deferred_fills", None)
+                and getattr(self, "_running", False)
+                and not getattr(self, "_paused", False)
+                and not getattr(self, "_resetting", False)
+            ):
+                fill_key, filled_order = next(iter(self._deferred_fills.items()))
+                del self._deferred_fills[fill_key]
+                await self._on_order_filled(filled_order)
+        finally:
+            self._deferred_fill_drain_task = None
+
+    def _clear_deferred_fills(self) -> None:
+        """Discard fills that belong to a stopped or reset runtime generation."""
+        deferred_fills = getattr(self, "_deferred_fills", None)
+        if deferred_fills is not None:
+            deferred_fills.clear()
 
     async def _on_batch_orders_filled(self, filled_orders: List[GridOrder]):
         """
@@ -600,8 +902,19 @@ class GridCoordinator:
             filled_orders: 已成交订单列表
         """
         try:
+            if getattr(self, "_emergency_stop_requested", False):
+                self.logger.warning("Fatal stop is pending; skipping batch fill handling")
+                return
+
             #  关键检查：防止在重置期间处理订单
             if self._paused:
+                deferred_count = sum(
+                    1
+                    for order in filled_orders
+                    if self._defer_fill_during_rest_pause(order)
+                )
+                if deferred_count == len(filled_orders):
+                    return
                 self.logger.warning("System is paused; skipping batch fill handling")
                 return
 
@@ -632,7 +945,7 @@ class GridCoordinator:
 
             # 3. 创建反向订单列表
             reverse_orders = []
-            for side, price, grid_id, amount in reverse_params:
+            for index, (side, price, grid_id, amount) in enumerate(reverse_params):
                 order = GridOrder(
                     order_id="",
                     grid_id=grid_id,
@@ -640,12 +953,23 @@ class GridCoordinator:
                     price=price,
                     amount=amount,
                     status=GridOrderStatus.PENDING,
-                    created_at=datetime.now()
+                    created_at=datetime.now(),
+                    parent_order_id=filled_orders[index].order_id,
                 )
                 reverse_orders.append(order)
 
+            reverse_orders = self.filter_orders_within_max_position(
+                reverse_orders,
+                "batch reverse orders",
+            )
+
             # 4. 批量下单
             placed_orders = await self.engine.place_batch_orders(reverse_orders)
+            if len(placed_orders) != len(reverse_orders):
+                raise RuntimeError(
+                    "Partial batch reverse placement: "
+                    f"submitted={len(placed_orders)}/{len(reverse_orders)}"
+                )
 
             # 5. 批量更新状态
             for order in placed_orders:
@@ -690,11 +1014,23 @@ class GridCoordinator:
         if self._error_count >= self._max_errors:
             if self._emergency_stop_requested:
                 return
-            self._emergency_stop_requested = True
+            fatal_reason = (
+                f"Order handling failed {self._error_count} consecutive times: {error}"
+            )
             self.logger.error(
                 f"Error threshold exceeded ({self._max_errors}); stopping system and cancelling open orders"
             )
-            asyncio.create_task(self.stop())
+            self._request_fatal_stop(fatal_reason)
+
+    async def _stop_after_error_threshold(self) -> None:
+        """Stop after repeated fill errors without losing cleanup exceptions."""
+        try:
+            await self.stop()
+        except Exception as exc:
+            self.logger.critical(
+                f"UNSAFE STOP after error threshold: {exc}. "
+                "Open orders may remain; verify the exchange immediately."
+            )
 
     async def _cleanup_before_start(self):
         """
@@ -727,10 +1063,31 @@ class GridCoordinator:
             cancel_errors = []
             for order in existing_orders:
                 try:
-                    await self.engine.exchange.cancel_order(
+                    cancel_result = await self.engine.exchange.cancel_order(
                         order_id=order.id,
                         symbol=self.config.symbol
                     )
+                    status = getattr(cancel_result, "status", None)
+                    status_value = str(
+                        getattr(status, "value", status) or "unknown"
+                    ).lower()
+                    terminal_flags = [
+                        payload.get("cancel_terminal")
+                        for payload in (
+                            getattr(cancel_result, "params", None),
+                            getattr(cancel_result, "raw_data", None),
+                        )
+                        if isinstance(payload, dict)
+                        and "cancel_terminal" in payload
+                    ]
+                    if (
+                        status_value not in {"canceled", "cancelled"}
+                        or False in terminal_flags
+                    ):
+                        cancel_errors.append(
+                            f"{order.id}: cancellation is not terminal "
+                            f"(status={status_value})"
+                        )
                 except Exception as exc:
                     cancel_errors.append(f"{order.id}: {exc}")
 
@@ -821,8 +1178,16 @@ class GridCoordinator:
             return
 
         # 🆕 启动前清理旧订单和持仓
+        self._clear_deferred_fills()
+        self._manual_pause_owned = False
         self._paused = False
         self._emergency_stop_requested = False
+        self._shutdown_completed = False
+        self._shutdown_order_cancellation_failed = False
+        self._shutdown_cleanup_error = None
+        self._unsafe_shutdown_incident = None
+        self._fatal_stop_reason = None
+        self._grid_level_locks.clear()
 
         await self._cleanup_before_start()
 
@@ -946,23 +1311,61 @@ class GridCoordinator:
 
     async def pause(self):
         """暂停网格系统（保留挂单）"""
-        self._paused = True
-        self.state.pause()
+        self._manual_pause_owned = True
+        self._refresh_recoverable_pause_state()
 
         self.logger.info("Grid system paused")
 
     async def resume(self):
         """恢复网格系统"""
-        self._paused = False
+        self._manual_pause_owned = False
+        still_paused = self._refresh_recoverable_pause_state()
         self._error_count = 0  # 重置错误计数
-        self.state.resume()
+        if not still_paused:
+            self.schedule_deferred_fill_drain()
 
-        self.logger.info("Grid system resumed")
+        if still_paused:
+            self.logger.warning(
+                "Manual pause released, but a REST or emergency pause remains active"
+            )
+        else:
+            self.logger.info("Grid system resumed")
+
+    def _refresh_recoverable_pause_state(self) -> bool:
+        """Apply independent manual, REST-outage, and emergency pause ownership."""
+        monitor = getattr(self, "position_monitor", None)
+        should_pause = bool(
+            getattr(self, "_manual_pause_owned", False)
+            or getattr(monitor, "_rest_pause_owned", False)
+            or getattr(self, "_emergency_stop_requested", False)
+            or getattr(self, "is_emergency_stopped", False)
+        )
+        self._paused = should_pause
+        state_method = getattr(
+            self.state,
+            "pause" if should_pause else "resume",
+            None,
+        )
+        if callable(state_method):
+            state_method()
+        return should_pause
 
     async def stop(self):
+        """Stop once, while allowing a later retry after failed cleanup."""
+        if not hasattr(self, "_stop_lock"):
+            self._stop_lock = asyncio.Lock()
+
+        async with self._stop_lock:
+            if getattr(self, "_shutdown_completed", False):
+                return
+            await self._stop_once()
+
+    async def _stop_once(self):
         """停止网格系统（取消所有挂单）"""
         self._running = False
         self._paused = True  #  修复：设为 True 阻止 shutdown 期间的订单回调
+        self._manual_pause_owned = False
+        self._clear_deferred_fills()
 
         #  停止余额监控（使用新模块）
         if hasattr(self.engine, 'begin_shutdown'):
@@ -998,7 +1401,7 @@ class GridCoordinator:
 
         try:
             # 取消所有挂单；保留持仓是原有的 Ctrl+C 语意
-            cancelled_count = await self.engine.cancel_all_orders()
+            cancelled_count = await self._cancel_all_orders_with_retry()
             self.logger.info(f"Cancelled {cancelled_count} open orders")
         except Exception as exc:
             shutdown_errors.append(f"order cancellation: {exc}")
@@ -1017,12 +1420,61 @@ class GridCoordinator:
             shutdown_errors.append(f"state stop: {exc}")
             self.logger.error(f"Failed to stop grid state: {exc}")
 
-        self.logger.info("Grid system stopped")
-
         if shutdown_errors:
+            self._shutdown_cleanup_error = "; ".join(shutdown_errors)
+            if not getattr(self, "_unsafe_shutdown_incident", None):
+                self._unsafe_shutdown_incident = self._shutdown_cleanup_error
+            self.logger.critical(
+                "UNSAFE STOP: cleanup did not complete. Open orders may remain; "
+                f"verify the exchange immediately. Details: {self._shutdown_cleanup_error}"
+            )
             raise RuntimeError(
                 "Grid stopped with cleanup errors: " + "; ".join(shutdown_errors)
             )
+
+        self._shutdown_cleanup_error = None
+        self._shutdown_completed = True
+        if getattr(self, "_unsafe_shutdown_incident", None):
+            self.logger.warning(
+                "Grid system is now stopped safely, but an earlier unsafe cleanup "
+                "incident remains recorded until the next start"
+            )
+        else:
+            self.logger.info("Grid system stopped safely")
+
+    async def _cancel_all_orders_with_retry(
+        self,
+        max_attempts: int = 5,
+        base_delay: float = 1.0,
+    ) -> int:
+        """Cancel and verify open orders with bounded exponential backoff."""
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                cancelled_count = await self.engine.cancel_all_orders()
+                self._shutdown_order_cancellation_failed = False
+                return cancelled_count
+            except Exception as exc:
+                last_error = exc
+                if attempt == max_attempts:
+                    break
+
+                retry_delay = min(8.0, base_delay * (2 ** (attempt - 1)))
+                self.logger.warning(
+                    f"Cancel-all attempt {attempt}/{max_attempts} failed: {exc}; "
+                    f"retrying in {retry_delay:.1f}s"
+                )
+                await asyncio.sleep(retry_delay)
+
+        self._shutdown_order_cancellation_failed = True
+        self.logger.critical(
+            f"Cancel-all failed after {max_attempts} attempts: {last_error}. "
+            "Open orders may remain; verify the exchange immediately."
+        )
+        raise RuntimeError(
+            f"cancel-all failed after {max_attempts} attempts: {last_error}"
+        ) from last_error
 
     async def get_statistics(self) -> GridStatistics:
         """
@@ -1196,13 +1648,97 @@ class GridCoordinator:
         """获取网格状态"""
         return self.state
 
+    def _strategy_opening_side(self) -> Optional[GridOrderSide]:
+        """Return the side that increases exposure for the configured grid."""
+        if self.config.is_long():
+            return GridOrderSide.BUY
+        if self.config.is_short():
+            return GridOrderSide.SELL
+        return None
+
+    def can_place_order_within_max_position(
+        self,
+        side: GridOrderSide,
+        amount: Decimal,
+        additional_open_amount: Decimal = Decimal("0"),
+    ) -> bool:
+        """Check worst-case strategy exposure including pending entry orders."""
+        max_position = getattr(self.config, "max_position", None)
+        if max_position is None:
+            return True
+
+        opening_side = self._strategy_opening_side()
+        if opening_side is None or side != opening_side:
+            return True
+
+        current_position = Decimal(str(self.tracker.get_current_position()))
+        pending_open_amount = sum(
+            (
+                Decimal(str(order.amount))
+                for order in self.engine.get_pending_orders()
+                if order.side == opening_side
+            ),
+            Decimal("0"),
+        )
+        opening_sign = Decimal("1") if opening_side == GridOrderSide.BUY else Decimal("-1")
+        projected_position = current_position + opening_sign * (
+            pending_open_amount
+            + Decimal(str(additional_open_amount))
+            + Decimal(str(amount))
+        )
+        within_limit = opening_sign * projected_position <= Decimal(str(max_position))
+
+        if not within_limit:
+            self.logger.warning(
+                f"max_position blocked {side.value} {amount}: "
+                f"current={current_position}, pending_entries={pending_open_amount}, "
+                f"additional_entries={additional_open_amount}, "
+                f"projected={projected_position}, limit={max_position}"
+            )
+        return within_limit
+
+    def filter_orders_within_max_position(
+        self,
+        orders: List[GridOrder],
+        context: str,
+    ) -> List[GridOrder]:
+        """Keep a batch within max_position while always allowing closing orders."""
+        if getattr(self.config, "max_position", None) is None:
+            return orders
+
+        opening_side = self._strategy_opening_side()
+        reserved_open_amount = Decimal("0")
+        accepted_orders: List[GridOrder] = []
+
+        for order in orders:
+            if self.can_place_order_within_max_position(
+                order.side,
+                order.amount,
+                additional_open_amount=reserved_open_amount,
+            ):
+                accepted_orders.append(order)
+                if order.side == opening_side:
+                    reserved_open_amount += Decimal(str(order.amount))
+
+        rejected_count = len(orders) - len(accepted_orders)
+        if rejected_count:
+            self.logger.warning(
+                f"max_position filtered {rejected_count}/{len(orders)} {context}"
+            )
+        return accepted_orders
+
     def is_running(self) -> bool:
         """Return whether the runtime is currently running."""
         return self._running and not self._paused
 
+    @property
     def is_paused(self) -> bool:
         """Return whether the runtime is currently paused."""
         return self._paused
+
+    @is_paused.setter
+    def is_paused(self, value: bool) -> None:
+        self._paused = bool(value)
 
     def is_stopped(self) -> bool:
         """Return whether the runtime has stopped."""
@@ -1210,12 +1746,27 @@ class GridCoordinator:
 
     def get_status_text(self) -> str:
         """Return a short human-readable runtime status."""
+        if getattr(self, "_shutdown_cleanup_error", None) or getattr(
+            self,
+            "_shutdown_order_cancellation_failed",
+            False,
+        ):
+            return "UNSAFE STOP: CLEANUP FAILED"
+        if not self._running:
+            if getattr(self, "_unsafe_shutdown_incident", None):
+                return "Stopped (unsafe cleanup incident recovered)"
+            return "Stopped"
         if self._paused:
             return "Paused"
-        elif self._running:
-            return "Running"
-        else:
-            return "Stopped"
+        return "Running"
+
+    def get_unsafe_shutdown_incident(self) -> Optional[str]:
+        """Return the sticky cleanup incident recorded during this run, if any."""
+        return getattr(self, "_unsafe_shutdown_incident", None)
+
+    def get_fatal_stop_reason(self) -> Optional[str]:
+        """Return why the strategy stopped itself after a runtime safety failure."""
+        return getattr(self, "_fatal_stop_reason", None)
 
     async def _scalping_position_monitor_loop(self):
         """
@@ -1307,7 +1858,13 @@ class GridCoordinator:
             if self.scalping_manager.get_current_take_profit_order():
                 tp_order = self.scalping_manager.get_current_take_profit_order()
                 try:
-                    await self.engine.cancel_order(tp_order.order_id)
+                    cancelled = await self.engine.cancel_order(tp_order.order_id)
+                    if cancelled is not True:
+                        self.logger.error(
+                            "Take-profit cancellation was not confirmed; "
+                            "retaining local state"
+                        )
+                        return
                     self.state.remove_order(tp_order.order_id)
                     self.logger.info("Position returned to zero; take-profit order cancelled")
                 except Exception as e:
@@ -1318,13 +1875,20 @@ class GridCoordinator:
         old_tp_order = self.scalping_manager.get_current_take_profit_order()
         if old_tp_order:
             try:
-                await self.engine.cancel_order(old_tp_order.order_id)
+                cancelled = await self.engine.cancel_order(old_tp_order.order_id)
+                if cancelled is not True:
+                    self.logger.error(
+                        "Previous take-profit cancellation was not confirmed; "
+                        "replacement suppressed"
+                    )
+                    return
                 self.state.remove_order(old_tp_order.order_id)
                 self.logger.info(
                     f"Cancelled previous take-profit order: {old_tp_order.order_id}"
                 )
             except Exception as e:
                 self.logger.error(f"Failed to cancel previous take-profit order: {e}")
+                return
 
         # Place the new take-profit order.
         await self._place_take_profit_order()
@@ -1583,6 +2147,7 @@ class GridCoordinator:
         """
         try:
             self.logger.info("Resetting fixed-range grid while keeping the price band")
+            self._clear_deferred_fills()
 
             # 重置所有管理器状态
             if self.scalping_manager:
@@ -1597,6 +2162,7 @@ class GridCoordinator:
             self.state.active_orders.clear()  # 清空所有活跃订单
             self.state.pending_buy_orders = 0
             self.state.pending_sell_orders = 0
+            self._grid_level_locks.clear()
 
             # 重新初始化网格层级（保持原有价格区间）
             self.state.initialize_grid_levels(
@@ -1998,6 +2564,23 @@ class GridCoordinator:
             and order.price == filled_order.price
         ]
         if not matches:
+            suspend_reason = ""
+            if hasattr(self.engine, "get_health_repair_suspend_reason"):
+                suspend_reason = self.engine.get_health_repair_suspend_reason() or ""
+            if suspend_reason == "startup initial grid placement":
+                self.logger.warning(
+                    "Fill arrived before startup state registration; "
+                    f"registering authoritative engine fill first: "
+                    f"order_id={filled_order.order_id}, grid_id={filled_order.grid_id}, "
+                    f"side={filled_order.side.value}, price={filled_order.price}"
+                )
+                self.state.add_order(filled_order)
+                return self.state.mark_order_filled(
+                    filled_order.order_id,
+                    filled_order.filled_price,
+                    filled_amount,
+                )
+
             engine_matches = [
                 order
                 for order in self.engine.get_pending_orders()

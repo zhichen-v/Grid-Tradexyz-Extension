@@ -210,6 +210,7 @@ grid_system:
   quantity_precision: 1
   fee_rate: "0.0001"
   order_health_check_interval: 60
+  position_monitor_interval: 10
 ```
 
 ### Fixed-range grid example
@@ -228,7 +229,13 @@ grid_system:
   quantity_precision: 1
   fee_rate: "0.0001"
   order_health_check_interval: 60
+  position_monitor_interval: 10
 ```
+
+`max_position` is an optional hard cap on strategy-direction exposure. The
+runtime includes current position and pending entry orders when applying it.
+`position_monitor_interval` defaults to 10 seconds; failed REST checks back off
+exponentially up to 60 seconds before retrying.
 
 Common `grid_type` values:
 

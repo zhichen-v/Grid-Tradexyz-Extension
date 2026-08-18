@@ -33,6 +33,7 @@ class OrderHealthChecker:
     RECENT_FILL_COOLDOWN_SECONDS = 15
     TP_ONLY_MISMATCH_WARNING_CYCLES = 4
     TP_ONLY_MISMATCH_WARNING_SECONDS = 60.0
+    ORDER_HISTORY_LIMIT = 100
 
     def __init__(self, config: GridConfig, engine, reserve_manager=None):
         self.config = config
@@ -51,6 +52,9 @@ class OrderHealthChecker:
         self._health_summary_log_key: Optional[str] = None
         self._health_summary_log_time = 0.0
         self._position_repair_skip_logged = False
+        self._minimum_position_repair_skip_key: Optional[Tuple[str, ...]] = None
+        self._position_drift_signature: Optional[Tuple[str, str]] = None
+        self._position_drift_cycles = 0
         self._tp_only_mismatch_cycles = 0
         self._tp_only_mismatch_started_at = 0.0
 
@@ -147,11 +151,13 @@ class OrderHealthChecker:
                         )
 
                     if not unresolved_orders and self._should_repair_position():
-                        position_result = self._check_position_health(exchange_orders, positions)
-                        if position_result.needs_adjustment:
-                            adjusted = await self._adjust_position(position_result)
-                            if adjusted:
-                                repair_count += 1
+                        if await self._repair_position_if_confirmed(
+                            exchange_orders,
+                            positions,
+                        ):
+                            repair_count += 1
+                    elif unresolved_orders:
+                        self._reset_position_drift_confirmation()
 
             self._log_runtime_consistency(
                 exchange_orders=exchange_orders,
@@ -220,19 +226,15 @@ class OrderHealthChecker:
 
     async def _fetch_orders_and_positions(self) -> Tuple[List[OrderData], List[PositionData]]:
         """Fetch open orders and positions from the exchange."""
-        orders: List[OrderData] = []
-        positions: List[PositionData] = []
-
         try:
             orders = await self.engine.exchange.get_open_orders(self.config.symbol)
         except Exception as exc:
-            self.logger.error(f"Failed to fetch open orders: {exc}")
-            self.logger.error(traceback.format_exc())
+            raise RuntimeError("Failed to fetch open orders during health check") from exc
 
         try:
             positions = await self.engine.exchange.get_positions([self.config.symbol])
         except Exception as exc:
-            self.logger.debug(f"Failed to fetch positions during health check: {exc}")
+            raise RuntimeError("Failed to fetch positions during health check") from exc
 
         return orders, positions
 
@@ -242,8 +244,8 @@ class OrderHealthChecker:
         allow_restore: bool = True,
     ) -> int:
         """Sync remote open orders into the engine pending-order cache."""
-        exchange_order_ids = {
-            str(alias)
+        exchange_orders_by_id = {
+            str(alias): order
             for order in exchange_orders
             for alias in (
                 getattr(order, "id", None),
@@ -251,37 +253,112 @@ class OrderHealthChecker:
             )
             if alias is not None and str(alias)
         }
+        exchange_order_ids = set(exchange_orders_by_id)
+        pending_orders = list(self.engine.get_pending_orders())
+        history_by_id: Dict[str, OrderData] = {}
+        history_is_complete = True
+        needs_history = False
+        for order in pending_orders:
+            aliases = self._pending_keys_for_order(order)
+            if any(alias in exchange_order_ids for alias in aliases):
+                continue
+            expected_cancel = any(
+                alias in self.engine._expected_cancellations for alias in aliases
+            )
+            if expected_cancel and not self._is_uncertain_cancellation(aliases):
+                continue
+            if self._is_past_exchange_sync_grace(order):
+                needs_history = True
+                break
+        if needs_history:
+            try:
+                history_orders = await self.engine.exchange.get_order_history(
+                    self.config.symbol,
+                    limit=self.ORDER_HISTORY_LIMIT,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to fetch bulk order history during health check"
+                ) from exc
+            history_by_id = {
+                str(alias): order
+                for order in history_orders
+                for alias in (
+                    getattr(order, "id", None),
+                    getattr(order, "client_id", None),
+                )
+                if alias is not None and str(alias)
+            }
+            history_is_complete = len(history_orders) < self.ORDER_HISTORY_LIMIT
+
         filled_orders: List[GridOrder] = []
         unresolved_orders = 0
         unresolved_price_keys: set[Tuple[str, str]] = set()
 
-        for grid_order in list(self.engine.get_pending_orders()):
+        for grid_order in pending_orders:
             alias_keys = self._pending_keys_for_order(grid_order)
             if any(alias in exchange_order_ids for alias in alias_keys):
+                matched_order = next(
+                    (
+                        exchange_orders_by_id[alias]
+                        for alias in alias_keys
+                        if alias in exchange_orders_by_id
+                    ),
+                    None,
+                )
+                record_progress = getattr(
+                    self.engine,
+                    "_record_exchange_order_progress",
+                    None,
+                )
+                if matched_order is not None and callable(record_progress):
+                    record_progress(grid_order, matched_order)
                 self._clear_missing_order_tracking(alias_keys)
                 continue
 
-            if any(alias in self.engine._expected_cancellations for alias in alias_keys):
+            expected_cancel = any(
+                alias in self.engine._expected_cancellations for alias in alias_keys
+            )
+            uncertain_cancel = expected_cancel and self._is_uncertain_cancellation(alias_keys)
+            if expected_cancel and not uncertain_cancel:
+                if not self._claim_order_finalization(
+                    *alias_keys,
+                    grid_order.order_id,
+                ):
+                    self._consume_expected_cancellations(alias_keys)
+                    self._clear_missing_order_tracking(alias_keys)
+                    self._clear_pending_order_refs(grid_order, alias_keys)
+                    continue
+                clear_restore_state = getattr(
+                    self.engine,
+                    "_clear_restore_state",
+                    None,
+                )
+                if callable(clear_restore_state):
+                    clear_restore_state(grid_order)
                 grid_order.mark_cancelled()
                 self._consume_expected_cancellations(alias_keys)
                 self._clear_missing_order_tracking(alias_keys)
                 self._clear_pending_order_refs(grid_order, alias_keys)
                 continue
 
-            order_age = max(
-                0.0,
-                time.time() - grid_order.created_at.timestamp()
-            ) if grid_order.created_at else self.engine._exchange_sync_grace_period
-            if order_age < self.engine._exchange_sync_grace_period:
+            if not self._is_past_exchange_sync_grace(grid_order):
                 continue
 
-            try:
-                exchange_order = await self.engine.exchange.get_order(
-                    grid_order.order_id,
-                    self.config.symbol,
-                )
-            except Exception:
-                if allow_restore and await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
+            exchange_order = next(
+                (history_by_id[alias] for alias in alias_keys if alias in history_by_id),
+                None,
+            )
+            if exchange_order is None:
+                if uncertain_cancel:
+                    unresolved_orders += 1
+                    unresolved_price_keys.add(self._order_price_key(grid_order))
+                    continue
+                if (
+                    allow_restore
+                    and history_is_complete
+                    and await self._restore_missing_order_if_timed_out(grid_order, alias_keys)
+                ):
                     continue
                 unresolved_orders += 1
                 unresolved_price_keys.add(self._order_price_key(grid_order))
@@ -292,6 +369,13 @@ class OrderHealthChecker:
             filled_amount = self._decimal_or_zero(getattr(exchange_order, "filled", Decimal("0")))
             order_amount = self._get_logical_order_amount(grid_order)
             tolerance = self._get_order_fill_tolerance()
+            record_progress = getattr(
+                self.engine,
+                "_record_exchange_order_progress",
+                None,
+            )
+            if callable(record_progress):
+                record_progress(grid_order, exchange_order)
 
             if self._is_user_fill_snapshot(exchange_order):
                 fills = []
@@ -317,7 +401,19 @@ class OrderHealthChecker:
 
                     if order_amount > 0 and abs(order_amount - effective_fill) <= tolerance:
                         self._clear_missing_order_tracking(alias_keys)
-                        self._note_finalized_order(*alias_keys, grid_order.order_id)
+                        if not self._claim_order_finalization(
+                            *alias_keys,
+                            grid_order.order_id,
+                        ):
+                            self._clear_pending_order_refs(grid_order, alias_keys)
+                            continue
+                        clear_restore_state = getattr(
+                            self.engine,
+                            "_clear_restore_state",
+                            None,
+                        )
+                        if callable(clear_restore_state):
+                            clear_restore_state(grid_order)
                         grid_order.mark_filled(filled_price, order_amount)
                         filled_orders.append(grid_order)
                         self._clear_pending_order_refs(grid_order, alias_keys)
@@ -329,18 +425,78 @@ class OrderHealthChecker:
                     grid_order,
                     filled_amount or grid_order.amount,
                 )
-                self._note_finalized_order(*alias_keys, grid_order.order_id)
+                if uncertain_cancel:
+                    self._consume_expected_cancellations(alias_keys)
+                    self._clear_uncertain_cancellation(alias_keys)
+                if not self._claim_order_finalization(
+                    *alias_keys,
+                    grid_order.order_id,
+                ):
+                    self._clear_pending_order_refs(grid_order, alias_keys)
+                    continue
+                clear_restore_state = getattr(
+                    self.engine,
+                    "_clear_restore_state",
+                    None,
+                )
+                if callable(clear_restore_state):
+                    clear_restore_state(grid_order)
                 grid_order.mark_filled(filled_price, finalized_amount)
                 filled_orders.append(grid_order)
                 self._clear_pending_order_refs(grid_order, alias_keys)
-            elif status in {"canceled", "cancelled", "rejected", "expired"}:
+            elif uncertain_cancel and status in {
+                "canceled",
+                "cancelled",
+                "rejected",
+                "expired",
+            }:
                 self._clear_missing_order_tracking(alias_keys)
-                self._note_finalized_order(*alias_keys, grid_order.order_id)
+                self._consume_expected_cancellations(alias_keys)
+                self._clear_uncertain_cancellation(alias_keys)
+                if not self._claim_order_finalization(
+                    *alias_keys,
+                    grid_order.order_id,
+                ):
+                    self._clear_pending_order_refs(grid_order, alias_keys)
+                    continue
+                clear_restore_state = getattr(
+                    self.engine,
+                    "_clear_restore_state",
+                    None,
+                )
+                if callable(clear_restore_state):
+                    clear_restore_state(grid_order)
                 grid_order.mark_cancelled()
                 self._clear_pending_order_refs(grid_order, alias_keys)
-            else:
-                if allow_restore and await self._restore_missing_order_if_timed_out(grid_order, alias_keys):
+                self._remove_order_from_state(grid_order.order_id)
+            elif status in {"canceled", "cancelled", "rejected", "expired"}:
+                self._clear_missing_order_tracking(alias_keys)
+                if not self._claim_order_finalization(
+                    *alias_keys,
+                    grid_order.order_id,
+                ):
+                    self._clear_pending_order_refs(grid_order, alias_keys)
                     continue
+                grid_order.mark_cancelled()
+                self._clear_pending_order_refs(grid_order, alias_keys)
+                self._remove_order_from_state(grid_order.order_id)
+                restore_cancelled = getattr(
+                    self.engine,
+                    "_restore_cancelled_grid_order",
+                    None,
+                )
+                if callable(restore_cancelled):
+                    restore_scheduled = await restore_cancelled(
+                        grid_order,
+                        grid_order.order_id,
+                    )
+                    if restore_scheduled:
+                        self._restored_missing_orders_in_sync += 1
+                    else:
+                        self._clear_grid_lock_for_order(grid_order)
+                else:
+                    self._clear_grid_lock_for_order(grid_order)
+            else:
                 unresolved_orders += 1
                 unresolved_price_keys.add(self._order_price_key(grid_order))
 
@@ -807,6 +963,27 @@ class OrderHealthChecker:
         locks = getattr(coordinator, "_grid_level_locks", None) if coordinator else None
         return bool(locks and grid_id in locks)
 
+    def _clear_grid_lock_for_order(self, order: GridOrder) -> None:
+        """Release a stale lock only when it still describes this exact order."""
+        coordinator = getattr(self.engine, "coordinator", None)
+        locks = getattr(coordinator, "_grid_level_locks", None) if coordinator else None
+        if not locks:
+            return
+
+        lock = locks.get(order.grid_id)
+        if not isinstance(lock, dict):
+            return
+        if str(lock.get("tp_side", "")).lower() != order.side.value.lower():
+            return
+        if self._normalize_price_key(lock.get("tp_price")) != self._normalize_price_key(order.price):
+            return
+
+        del locks[order.grid_id]
+        self.logger.info(
+            "Released stale grid lock after order cancellation/repair failure: "
+            f"grid_id={order.grid_id}, side={order.side.value}, price={order.price}"
+        )
+
     def _log_runtime_consistency(
         self,
         exchange_orders: List[OrderData],
@@ -1258,6 +1435,14 @@ class OrderHealthChecker:
             return list(self.engine._pending_keys_for_order(grid_order))
         return [grid_order.order_id] if grid_order.order_id else []
 
+    def _is_past_exchange_sync_grace(self, grid_order: GridOrder) -> bool:
+        """Return whether a local order is old enough for final-status reconciliation."""
+        grace_period = self.engine._exchange_sync_grace_period
+        if not grid_order.created_at:
+            return True
+        order_age = max(0.0, time.time() - grid_order.created_at.timestamp())
+        return order_age >= grace_period
+
     def _clear_pending_order_refs(self, grid_order: GridOrder, alias_keys: List[str]) -> None:
         """Remove every pending-cache alias for one local order."""
         if hasattr(self.engine, "_clear_pending_order_refs"):
@@ -1272,6 +1457,32 @@ class OrderHealthChecker:
         for key in alias_keys:
             if key in self.engine._expected_cancellations:
                 self.engine._expected_cancellations.remove(key)
+
+    def _is_uncertain_cancellation(self, alias_keys: List[str]) -> bool:
+        """Keep local state until a response-loss cancellation has terminal proof."""
+        checker = getattr(self.engine, "_is_uncertain_cancel", None)
+        if callable(checker) and checker(*alias_keys):
+            return True
+
+        aliases = {str(alias) for alias in alias_keys if alias is not None}
+        exchange = getattr(self.engine, "exchange", None)
+        for source in (
+            exchange,
+            getattr(exchange, "_rest", None),
+            getattr(exchange, "_base", None),
+        ):
+            markers = getattr(source, "_uncertain_cancellations", ()) if source else ()
+            for marker in markers:
+                marker_id = marker[1] if isinstance(marker, tuple) and len(marker) > 1 else marker
+                if str(marker_id) in aliases:
+                    return True
+        return False
+
+    def _clear_uncertain_cancellation(self, alias_keys: List[str]) -> None:
+        """Clear response-loss markers only after exact terminal history proof."""
+        clear = getattr(self.engine, "_clear_uncertain_cancellation_markers", None)
+        if callable(clear):
+            clear(set(alias_keys))
 
     def _register_engine_pending_order(
         self,
@@ -1374,6 +1585,14 @@ class OrderHealthChecker:
         if callable(notifier):
             notifier(*keys)
 
+    def _claim_order_finalization(self, *keys: Optional[str]) -> bool:
+        """Claim one terminal transition through the engine's shared guard."""
+        claim = getattr(self.engine, "_claim_order_finalization", None)
+        if callable(claim):
+            return bool(claim(*keys))
+        self._note_finalized_order(*keys)
+        return True
+
     def _was_recently_finalized_order(self, key: Optional[str]) -> bool:
         """Return whether the engine recently finalized this order id."""
         checker = getattr(self.engine, "_was_recently_finalized_order", None)
@@ -1409,9 +1628,32 @@ class OrderHealthChecker:
         self._remove_order_from_state(grid_order.order_id)
 
         if hasattr(self.engine, "_restore_cancelled_grid_order"):
-            await self.engine._restore_cancelled_grid_order(grid_order, grid_order.order_id)
-            self._restored_missing_orders_in_sync += 1
-            return True
+            restore_scheduled = await self.engine._restore_cancelled_grid_order(
+                grid_order,
+                grid_order.order_id,
+            )
+            if restore_scheduled:
+                self._restored_missing_orders_in_sync += 1
+                return True
+            restored = any(
+                pending.status == GridOrderStatus.PENDING
+                and pending.grid_id == grid_order.grid_id
+                and pending.side == grid_order.side
+                and self._normalize_price_key(pending.price)
+                == self._normalize_price_key(grid_order.price)
+                for pending in self.engine.get_pending_orders()
+            )
+            if restored:
+                self._restored_missing_orders_in_sync += 1
+                return True
+
+            self.logger.warning(
+                "Order restoration did not create a live replacement; "
+                f"grid_id={grid_order.grid_id}, side={grid_order.side.value}, "
+                f"price={grid_order.price}"
+            )
+
+        self._clear_grid_lock_for_order(grid_order)
 
         return False
 
@@ -1570,6 +1812,10 @@ class OrderHealthChecker:
 
     def _should_repair_position(self) -> bool:
         """Return whether automatic position repair should run for this exchange."""
+        coordinator = getattr(self.engine, "coordinator", None)
+        if getattr(coordinator, "_active_fill_callbacks", 0) > 0 or self._has_recent_fill():
+            self._reset_position_drift_confirmation()
+            return False
         exchange_name = str(getattr(self.config, "exchange", "")).lower()
         if exchange_name == "tradexyz":
             if not self._position_repair_skip_logged:
@@ -1580,6 +1826,40 @@ class OrderHealthChecker:
                 self._position_repair_skip_logged = True
             return False
         return True
+
+    async def _repair_position_if_confirmed(
+        self,
+        exchange_orders: List[OrderData],
+        positions: List[PositionData],
+    ) -> bool:
+        """Repair only a drift repeated by two complete health snapshots."""
+        result = self._check_position_health(exchange_orders, positions)
+        if not result.needs_adjustment:
+            self._reset_position_drift_confirmation()
+            return False
+
+        signature = (str(result.expected_position), str(result.actual_position))
+        if signature == getattr(self, "_position_drift_signature", None):
+            self._position_drift_cycles = getattr(self, "_position_drift_cycles", 0) + 1
+        else:
+            self._position_drift_signature = signature
+            self._position_drift_cycles = 1
+
+        if self._position_drift_cycles < 2:
+            self.logger.info(
+                "Defer position repair until drift is confirmed by the next health cycle: "
+                f"expected={result.expected_position}, actual={result.actual_position}"
+            )
+            return False
+
+        adjusted = await self._adjust_position(result)
+        if adjusted:
+            self._reset_position_drift_confirmation()
+        return adjusted
+
+    def _reset_position_drift_confirmation(self) -> None:
+        self._position_drift_signature = None
+        self._position_drift_cycles = 0
 
     def _log_runtime_consistency_message(
         self,
@@ -1744,45 +2024,113 @@ class OrderHealthChecker:
             return Decimal("0")
 
     def _calculate_expected_position(self, exchange_orders: List[OrderData]) -> Decimal:
-        """Estimate target exposure from current open buy/sell grid counts."""
-        buy_count = sum(1 for order in exchange_orders if order.side.value.lower() == "buy")
-        sell_count = sum(1 for order in exchange_orders if order.side.value.lower() == "sell")
+        """Estimate exposure from open TP remainders and partial base fills."""
+        buy_remaining = Decimal("0")
+        sell_remaining = Decimal("0")
+        buy_filled = Decimal("0")
+        sell_filled = Decimal("0")
+
+        for order in exchange_orders:
+            side = order.side.value.lower()
+            amount = max(self._decimal_or_zero(getattr(order, "amount", None)), Decimal("0"))
+            filled = max(self._decimal_or_zero(getattr(order, "filled", None)), Decimal("0"))
+            if amount > 0:
+                filled = min(filled, amount)
+
+            raw_remaining = getattr(order, "remaining", None)
+            remaining = (
+                max(self._decimal_or_zero(raw_remaining), Decimal("0"))
+                if raw_remaining is not None
+                else max(amount - filled, Decimal("0"))
+            )
+            if amount > 0:
+                remaining = min(remaining, amount)
+
+            if side == "buy":
+                buy_remaining += remaining
+                buy_filled += filled
+            elif side == "sell":
+                sell_remaining += remaining
+                sell_filled += filled
+
+        continuation_carry = (
+            self._get_active_opening_continuation_carry(exchange_orders)
+            + self._get_quarantined_opening_carry()
+        )
 
         if self.config.grid_type in {
             GridType.LONG,
             GridType.FOLLOW_LONG,
             GridType.MARTINGALE_LONG,
         }:
-            filled_buy_count = sell_count
-            if self.config.is_martingale_mode():
-                start_grid_id = self.config.grid_count - filled_buy_count + 1
-                return sum(
-                    (
-                        self.config.get_formatted_grid_order_amount(grid_id)
-                        for grid_id in range(start_grid_id, self.config.grid_count + 1)
-                    ),
-                    Decimal("0"),
-                )
-            return Decimal(str(filled_buy_count)) * self.config.order_amount
+            return sell_remaining + buy_filled + continuation_carry
 
         if self.config.grid_type in {
             GridType.SHORT,
             GridType.FOLLOW_SHORT,
             GridType.MARTINGALE_SHORT,
         }:
-            filled_sell_count = buy_count
-            if self.config.is_martingale_mode():
-                amount = sum(
-                    (
-                        self.config.get_formatted_grid_order_amount(grid_id)
-                        for grid_id in range(1, filled_sell_count + 1)
-                    ),
-                    Decimal("0"),
-                )
-                return -amount
-            return -Decimal(str(filled_sell_count)) * self.config.order_amount
+            return -(buy_remaining + sell_filled + continuation_carry)
 
         return Decimal("0")
+
+    def _get_active_opening_continuation_carry(
+        self,
+        exchange_orders: List[OrderData],
+    ) -> Decimal:
+        """Return prior fills carried by active replacement entry orders."""
+        base_side = self._base_side_for_grid_type()
+        if base_side is None or not getattr(self, "engine", None):
+            return Decimal("0")
+
+        exchange_keys = {
+            str(alias)
+            for order in exchange_orders
+            for alias in (
+                getattr(order, "id", None),
+                getattr(order, "client_id", None),
+            )
+            if alias is not None and str(alias)
+        }
+        total = Decimal("0")
+        for order in self._iter_unique_local_pending_orders():
+            if order.side != base_side:
+                continue
+            if not exchange_keys.intersection(self._pending_keys_for_order(order)):
+                continue
+
+            exchange_data = getattr(order, "exchange_data", {}) or {}
+            tracking = exchange_data.get("tradexyz_fill_tracking", {})
+            if not isinstance(tracking, dict):
+                continue
+            carry = max(
+                self._decimal_or_zero(tracking.get("carry_filled_amount")),
+                Decimal("0"),
+            )
+            target = self._get_logical_order_amount(order)
+            total += min(carry, target) if target > 0 else carry
+        return total
+
+    def _get_quarantined_opening_carry(self) -> Decimal:
+        """Return partial opening exposure retained after an unsafe continuation."""
+        base_side = self._base_side_for_grid_type()
+        if base_side is None:
+            return Decimal("0")
+        carries = getattr(
+            getattr(self, "engine", None),
+            "_unmanaged_partial_carries",
+            {},
+        )
+        if not isinstance(carries, dict):
+            return Decimal("0")
+        return sum(
+            (
+                self._decimal_or_zero(item.get("carry_amount"))
+                for item in carries.values()
+                if isinstance(item, dict) and item.get("side") == base_side
+            ),
+            Decimal("0"),
+        )
 
     def _extract_actual_position(self, positions: Iterable[PositionData]) -> Decimal:
         """Return the signed live position size for the configured symbol."""
@@ -1863,6 +2211,15 @@ class OrderHealthChecker:
             return True
 
         open_side = ExchangeOrderSide.BUY if side == PositionSide.LONG else ExchangeOrderSide.SELL
+        coordinator = getattr(self.engine, "coordinator", None)
+        exposure_gate = getattr(coordinator, "can_place_order_within_max_position", None)
+        grid_side = GridOrderSide.BUY if side == PositionSide.LONG else GridOrderSide.SELL
+        if callable(exposure_gate) and not exposure_gate(grid_side, amount):
+            self.logger.warning(
+                "Skip position repair because it would exceed max_position: "
+                f"side={grid_side.value}, amount={amount}"
+            )
+            return False
         return await self._submit_market_order(open_side, amount, current_price, "open_position")
 
     async def _submit_market_order(
@@ -1879,6 +2236,27 @@ class OrderHealthChecker:
                 f"Skip stale health repair after reset: reason={reason}"
             )
             return False
+        minimum_violation = None if reduce_only else self._market_minimum_violation(
+            amount,
+            current_price,
+        )
+        if minimum_violation:
+            skip_key = (
+                reason,
+                side.value,
+                str(amount),
+                minimum_violation,
+            )
+            if skip_key != getattr(self, "_minimum_position_repair_skip_key", None):
+                self.logger.warning(
+                    "Skip position repair below exchange minimum without clamping: "
+                    f"reason={reason}, side={side.value}, amount={amount}, "
+                    f"reference_price={current_price}, violation={minimum_violation}"
+                )
+            self._minimum_position_repair_skip_key = skip_key
+            return False
+
+        self._minimum_position_repair_skip_key = None
         try:
             grid_side = (
                 GridOrderSide.BUY
@@ -1904,6 +2282,47 @@ class OrderHealthChecker:
             self.logger.error(traceback.format_exc())
             return False
 
+    def _market_minimum_violation(
+        self,
+        amount: Decimal,
+        reference_price: Decimal,
+    ) -> Optional[str]:
+        """Return a cached market-minimum violation without making another API request."""
+        market_info = self._get_cached_market_info()
+        if not market_info:
+            return None
+
+        min_base = self._decimal_or_zero(market_info.get("min_base_amount"))
+        if min_base > 0 and amount < min_base:
+            return f"min_base_amount={min_base}"
+
+        min_quote = self._decimal_or_zero(market_info.get("min_quote_amount"))
+        if min_quote > 0 and amount * reference_price < min_quote:
+            return f"min_quote_amount={min_quote}"
+        return None
+
+    def _get_cached_market_info(self) -> Dict[str, Any]:
+        """Return already-loaded metadata for the configured symbol."""
+        exchange = self.engine.exchange
+        market_maps = [getattr(exchange, "_market_info", None)]
+        rest = getattr(exchange, "_rest", None)
+        market_maps.append(getattr(rest, "_market_info_cache", None))
+
+        target_symbol = str(self.config.symbol)
+        target_base = target_symbol.split("/")[0].split("-")[0]
+        for market_map in market_maps:
+            if not isinstance(market_map, dict):
+                continue
+            for key, raw_info in market_map.items():
+                info = raw_info.get("info", raw_info) if isinstance(raw_info, dict) else None
+                if not isinstance(info, dict):
+                    continue
+                symbol = str(info.get("symbol", key))
+                base = symbol.split("/")[0].split("-")[0]
+                if symbol == target_symbol or base == target_base:
+                    return info
+        return {}
+
     async def _place_missing_orders(self, orders: List[GridOrder]) -> int:
         """Place missing grid orders back on the exchange."""
         if not orders:
@@ -1911,13 +2330,38 @@ class OrderHealthChecker:
         if self._health_cycle_is_stale():
             return 0
 
+        quarantine_continuation = getattr(
+            self.engine,
+            "_quarantine_subminimum_continuation_if_needed",
+            None,
+        )
+        if callable(quarantine_continuation):
+            orders = [
+                order
+                for order in orders
+                if not quarantine_continuation(order, order.amount)
+            ]
+            if not orders:
+                return 0
+
+        coordinator = getattr(self.engine, "coordinator", None)
+        exposure_filter = getattr(coordinator, "filter_orders_within_max_position", None)
+        if callable(exposure_filter):
+            orders = exposure_filter(orders, "health gap repair")
+            if not orders:
+                return 0
+
         source_order_ids = {
             id(order): getattr(order, "order_id", None)
             for order in orders
         }
 
         if len(orders) == 1:
-            placed = await self.engine.place_order(orders[0])
+            try:
+                placed = await self.engine.place_order(orders[0])
+            except Exception:
+                self._clear_grid_lock_for_order(orders[0])
+                raise
             if placed:
                 self._sync_placed_missing_order_to_state(
                     placed,
@@ -1928,9 +2372,14 @@ class OrderHealthChecker:
                     f"side={placed.side.value}, price={placed.price}, amount={placed.amount}"
                 )
                 return 1
+            self._clear_grid_lock_for_order(orders[0])
             return 0
 
         placed_orders = await self.engine.place_batch_orders(orders)
+        placed_refs = {id(order) for order in placed_orders}
+        for order in orders:
+            if id(order) not in placed_refs:
+                self._clear_grid_lock_for_order(order)
         for order in placed_orders:
             self._sync_placed_missing_order_to_state(
                 order,

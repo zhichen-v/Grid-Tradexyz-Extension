@@ -157,12 +157,15 @@ def create_grid_config(config_data: dict) -> GridConfig:
         "order_amount": Decimal(str(grid_config["order_amount"])),
         "max_position": (
             Decimal(str(grid_config.get("max_position")))
-            if grid_config.get("max_position")
+            if grid_config.get("max_position") is not None
             else None
         ),
         "enable_notifications": grid_config.get("enable_notifications", False),
         "order_health_check_interval": grid_config.get(
             "order_health_check_interval", 600
+        ),
+        "position_monitor_interval": int(
+            grid_config.get("position_monitor_interval", 10)
         ),
         "fee_rate": Decimal(str(grid_config.get("fee_rate", "0.0001"))),
         "quantity_precision": int(grid_config.get("quantity_precision", 3)),
@@ -654,6 +657,7 @@ async def main(
     from core.adapters.exchanges.models import ExchangeType
 
     runtime_error = None
+    unsafe_shutdown_incident = None
     try:
         # 1. Load configuration.
         grid_config = create_grid_config(config_data)
@@ -799,7 +803,8 @@ async def main(
 
         await coordinator.start()
         print("Grid system started")
-        print(f"   - Active startup order count: {grid_config.grid_count}")
+        active_startup_orders = len(engine.get_pending_orders())
+        print(f"   - Active startup order count: {active_startup_orders}")
 
         if reserve_monitor:
             await reserve_monitor.start()
@@ -810,7 +815,7 @@ async def main(
                 f"   - Effective price range: ${grid_config.lower_price:,.2f} - ${grid_config.upper_price:,.2f}"
             )
 
-        print("   - All grids are in place, waiting for fills...")
+        print("   - Initial grid placement verified, waiting for fills...")
 
         # 6. Start the terminal UI.
         print("\nStep 6/6: Starting terminal UI...")
@@ -822,6 +827,10 @@ async def main(
         print()
 
         await terminal_ui.run()
+        fatal_reason_getter = getattr(coordinator, "get_fatal_stop_reason", None)
+        fatal_reason = fatal_reason_getter() if callable(fatal_reason_getter) else None
+        if fatal_reason:
+            raise RuntimeError(f"Grid stopped automatically: {fatal_reason}")
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         # asyncio.run turns SIGINT into task cancellation. Handle it here so
@@ -850,6 +859,14 @@ async def main(
                 print("   - Grid system stopped")
             except Exception as exc:
                 cleanup_errors.append(f"grid stop: {exc}")
+            finally:
+                incident_getter = getattr(
+                    coordinator,
+                    "get_unsafe_shutdown_incident",
+                    None,
+                )
+                if callable(incident_getter):
+                    unsafe_shutdown_incident = incident_getter()
 
         if "exchange_adapter" in locals():
             try:
@@ -857,6 +874,14 @@ async def main(
                 print("   - Exchange disconnected")
             except Exception as exc:
                 cleanup_errors.append(f"exchange disconnect: {exc}")
+
+        if unsafe_shutdown_incident and not any(
+            error.startswith("grid stop:") for error in cleanup_errors
+        ):
+            cleanup_errors.append(
+                "grid recovered from an earlier unsafe shutdown incident: "
+                f"{unsafe_shutdown_incident}"
+            )
 
         if cleanup_errors:
             print("\nCleanup completed with errors:")

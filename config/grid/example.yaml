@@ -60,6 +60,11 @@ grid_system:
 
   # Runtime health checks.
   order_health_check_interval: 15
+  # REST position polling uses exponential backoff (up to 60s) after failures.
+  position_monitor_interval: 10
+
+  # Optional hard cap for strategy-direction exposure, including pending entry orders.
+  # max_position: 1.0
 
   # Optional position health-check tolerance.
   position_tolerance:
