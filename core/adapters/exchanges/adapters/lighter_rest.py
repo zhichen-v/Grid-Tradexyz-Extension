@@ -522,45 +522,6 @@ class LighterRest(LighterBase):
         )
         return False
 
-    @staticmethod
-    def _looks_like_client_order_index(order_id: str) -> bool:
-        """Identify the epoch-millisecond client ids allocated by this process."""
-        try:
-            return int(order_id) >= 1_000_000_000_000
-        except (TypeError, ValueError):
-            return False
-
-    async def _resolve_cancel_order_index(
-        self,
-        symbol: str,
-        logical_order_id: str,
-    ) -> Optional[str]:
-        """Resolve a temporary client id without ever sending it as an order index."""
-        if not self._looks_like_client_order_index(logical_order_id):
-            return logical_order_id
-
-        try:
-            orders = await self.get_open_orders(symbol)
-        except Exception as exc:
-            logger.error(
-                "Cannot resolve client_order_index before cancellation; fail closed: "
-                f"client_order_id={logical_order_id}, error={exc}"
-            )
-            return None
-
-        for order in orders:
-            if str(getattr(order, "client_id", "") or "") != logical_order_id:
-                continue
-            resolved = str(getattr(order, "id", "") or "")
-            if resolved and resolved != logical_order_id:
-                return resolved
-
-        logger.error(
-            "Client order intent has no cancellable order_index yet; fail closed: "
-            f"client_order_id={logical_order_id}"
-        )
-        return None
-
     async def connect(self):
         """连接（调用initialize）"""
         await self.initialize()
@@ -2131,7 +2092,22 @@ class LighterRest(LighterBase):
             logger.error("未配置SignerClient，无法取消订单")
             return False
 
-        logical_order_id = str(order_id)
+        try:
+            mutation_order_index = int(str(order_id))
+        except (TypeError, ValueError):
+            logger.error(
+                "Cancellation order_index is not numeric; mutation was not sent: "
+                f"order_id={order_id}"
+            )
+            return False
+        if not 1 <= mutation_order_index < (1 << 60):
+            logger.error(
+                "Cancellation order_index is outside Lighter's valid range; "
+                f"mutation was not sent: order_id={order_id}"
+            )
+            return False
+
+        logical_order_id = str(mutation_order_index)
         uncertain = getattr(self, "_uncertain_cancellations", set())
         uncertain_key = (symbol, logical_order_id)
         if uncertain_key in uncertain:
@@ -2149,38 +2125,6 @@ class LighterRest(LighterBase):
             market_index = self.get_market_index(symbol)
             if market_index is None:
                 logger.error(f"未找到交易对 {symbol} 的市场索引")
-                return False
-
-            # 🔥 检查order_id是否为tx_hash（128字符十六进制）
-            if len(logical_order_id) > 20:  # tx_hash通常是128字符，order_index是整数
-                logger.warning(
-                    f"⚠️ 订单ID似乎是tx_hash（长度{len(order_id)}），无法直接取消。"
-                    f"需要等待WebSocket更新为真实的order_index"
-                )
-                # 尝试从挂单列表中查找真实的order_index
-                try:
-                    orders = await self.get_open_orders(symbol)
-                    for order in orders:
-                        # 通过client_order_id或其他方式匹配
-                        # 暂时返回False，等待WebSocket更新
-                        pass
-                except Exception as e:
-                    logger.error(f"查询挂单失败: {e}")
-                return False
-
-            mutation_order_id = await self._resolve_cancel_order_index(
-                symbol,
-                logical_order_id,
-            )
-            if mutation_order_id is None:
-                return False
-            try:
-                mutation_order_index = int(mutation_order_id)
-            except (TypeError, ValueError):
-                logger.error(
-                    "Cancellation order_index is not numeric; mutation was not sent: "
-                    f"order_id={mutation_order_id}"
-                )
                 return False
 
             # 取消订单

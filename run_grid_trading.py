@@ -1029,7 +1029,7 @@ if __name__ == "__main__":
         print(f"\nStartup failed: {exc}")
         sys.exit(1)
     except Exception as exc:
-        print(f"\nStartup failed: {exc}")
+        print(f"\nProgram failed: {exc}")
         import traceback
 
         traceback.print_exc()

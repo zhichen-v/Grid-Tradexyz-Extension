@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict
 
 from .logger import (
@@ -38,11 +37,7 @@ def _ensure_initialized() -> None:
     if _auto_initialized:
         return
 
-    config_path = "config/logging.yaml"
-    if os.path.exists(config_path):
-        initialize_logging()
-    else:
-        initialize_logging()
+    initialize_logging(clear_existing=False)
 
 
 def get_logger(name: str) -> BaseLogger:

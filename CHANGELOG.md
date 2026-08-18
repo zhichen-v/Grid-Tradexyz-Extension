@@ -18,6 +18,8 @@
 - Made Lighter mutations ambiguity-safe with process-unique client order indexes, exact client/order history reconciliation, no blind mutation retries, and terminal-status-aware cancellation so response loss cannot silently create duplicates or turn a fill into a cancellation.
 - Made health, startup, pause, reset, and shutdown reconciliation fail closed: snapshot failures no longer look like empty exchange state, startup batches require live-order proof, fills are deferred across recoverable pauses, follow-grid resets retain real exposure, and `max_position` includes pending/reserved opening risk.
 - Added verified emergency cleanup: fatal errors close the placement gate immediately, cancel-all requires per-order terminal proof, shutdown-time fills remain accounted for, and any unresolved order or unsafe cleanup remains visible instead of being reported as a safe stop.
+- Fixed Lighter shutdown cancellation for production-sized exchange order indexes by removing the decimal-size ID heuristic, validating protocol-range numeric cancellation handles directly, and continuing cancel-all across later orders before reporting any per-order failures.
+- Prevented lazy logging initialization from deleting existing runtime logs during diagnostic adapter use, while preserving explicit per-run log cleanup; generic runtime and shutdown failures are now reported as `Program failed` instead of the misleading `Startup failed`.
 
 #### 2026-05-21
 
@@ -135,6 +137,7 @@
 
 ### Validation
 
+- 2026-08-18: Local `unittest` discovery passed all 184 tests after the shutdown-cancellation and lazy-logging fixes; `compileall` and diff checks also passed.
 - 2026-08-18: Local `unittest` discovery passed all 179 tests, including Lighter partial-fill, mutation ambiguity, cancellation recovery, 429 backoff, WebSocket reconnect, max-position, pause/startup, reset, and shutdown race regressions; `compileall` and diff checks were also run before deployment.
 
 - 2026-05-21: `.\.venv\Scripts\python.exe -m py_compile run_grid_trading.py core\services\grid\models\grid_config.py core\services\grid\models\grid_metrics.py core\services\grid\coordinator\grid_coordinator.py core\services\grid\coordinator\grid_reset_manager.py core\services\grid\terminal_ui.py`

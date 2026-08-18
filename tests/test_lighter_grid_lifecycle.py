@@ -1501,7 +1501,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         rest.get_open_orders.assert_not_awaited()
         rest.get_order_history.assert_not_awaited()
 
-    async def test_cancel_ack_resolves_epoch_client_id_but_stays_nonterminal(self):
+    async def test_cancel_ack_sends_epoch_client_id_but_stays_nonterminal(self):
         rest = self._rest()
         rest.get_market_index = MagicMock(return_value=1)
         rest.get_open_orders = AsyncMock(
@@ -1524,11 +1524,42 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(cancelled)
         rest.signer_client.cancel_order.assert_awaited_once_with(
             market_index=1,
-            order_index=101,
+            order_index=self.CLIENT_ID,
         )
         self.assertEqual(
             rest._uncertain_cancellations,
             {("BTC", str(self.CLIENT_ID))},
+        )
+
+    async def test_cancel_accepts_large_exchange_order_index_from_production(self):
+        order_index = 562949976471706
+        rest = self._rest()
+        rest.get_market_index = MagicMock(return_value=1)
+        rest.get_order_history = AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id=str(order_index),
+                    client_id=str(self.CLIENT_ID),
+                    status=OrderStatus.CANCELED,
+                )
+            ]
+        )
+        rest.signer_client = SimpleNamespace(
+            cancel_order=AsyncMock(
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="cancel-tx"),
+                    None,
+                )
+            )
+        )
+
+        cancelled = await rest.cancel_order("BTC", str(order_index))
+
+        self.assertTrue(cancelled)
+        rest.signer_client.cancel_order.assert_awaited_once_with(
+            market_index=1,
+            order_index=order_index,
         )
 
     async def test_cancel_ack_succeeds_only_with_exact_cancel_history(self):
@@ -1555,15 +1586,45 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cancelled)
         self.assertEqual(rest._uncertain_cancellations, set())
 
-    async def test_cancel_client_id_without_order_index_fails_closed(self):
+    async def test_cancel_numeric_client_id_does_not_require_exchange_index(self):
         rest = self._rest()
         rest.get_market_index = MagicMock(return_value=1)
-        rest.signer_client = SimpleNamespace(cancel_order=AsyncMock())
+        rest.signer_client = SimpleNamespace(
+            cancel_order=AsyncMock(
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="cancel-tx"),
+                    None,
+                )
+            )
+        )
 
         cancelled = await rest.cancel_order("BTC", str(self.CLIENT_ID))
 
         self.assertFalse(cancelled)
+        rest.signer_client.cancel_order.assert_awaited_once_with(
+            market_index=1,
+            order_index=self.CLIENT_ID,
+        )
+
+    async def test_cancel_rejects_non_numeric_or_out_of_lighter_range(self):
+        rest = self._rest()
+        rest.get_market_index = MagicMock(return_value=1)
+        rest.signer_client = SimpleNamespace(cancel_order=AsyncMock())
+
+        for invalid_order_id in (
+            "not-an-index",
+            "0",
+            "-1",
+            str(1 << 60),
+        ):
+            with self.subTest(order_id=invalid_order_id):
+                self.assertFalse(
+                    await rest.cancel_order("BTC", invalid_order_id)
+                )
+
         rest.signer_client.cancel_order.assert_not_awaited()
+        rest.get_market_index.assert_not_called()
 
     async def test_ambiguous_cancel_never_repeats_signer_mutation(self):
         rest = self._rest()
@@ -1699,6 +1760,29 @@ class LighterAdapterHistoryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, OrderStatus.PENDING)
         self.assertFalse(result.params["cancel_terminal"])
+
+    async def test_cancel_all_continues_after_failure_then_raises_summary(self):
+        adapter = object.__new__(LighterAdapter)
+        adapter.get_open_orders = AsyncMock(
+            return_value=[
+                SimpleNamespace(id="first", symbol="BTC"),
+                SimpleNamespace(id="second", symbol="BTC"),
+            ]
+        )
+        adapter.cancel_order = AsyncMock(
+            side_effect=[RuntimeError("rejected"), nonterminal_cancel_ack()]
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Failed to cancel 1 order.*first: rejected",
+        ):
+            await adapter.cancel_all_orders("BTC")
+
+        self.assertEqual(
+            [call.args for call in adapter.cancel_order.await_args_list],
+            [("first", "BTC"), ("second", "BTC")],
+        )
 
     async def test_order_history_delegates_to_rest(self):
         adapter = object.__new__(LighterAdapter)

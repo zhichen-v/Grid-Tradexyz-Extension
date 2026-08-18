@@ -739,9 +739,18 @@ class LighterAdapter(ExchangeAdapter):
         """
         orders = await self.get_open_orders(symbol)
         cancelled_orders = []
+        failures = []
         for order in orders:
-            cancelled_order = await self.cancel_order(order.id, order.symbol)
-            cancelled_orders.append(cancelled_order)
+            try:
+                cancelled_order = await self.cancel_order(order.id, order.symbol)
+            except Exception as exc:
+                failures.append(f"{order.id}: {exc}")
+            else:
+                cancelled_orders.append(cancelled_order)
+        if failures:
+            raise RuntimeError(
+                f"Failed to cancel {len(failures)} order(s): " + "; ".join(failures)
+            )
         return cancelled_orders
 
     # ============= WebSocket订阅 =============
