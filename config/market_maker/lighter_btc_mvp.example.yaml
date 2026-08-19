@@ -1,0 +1,44 @@
+# Lighter BTC Market Maker MVP 範例設定。
+# 身分驗證沿用既有 wallet profile；本檔不得存放任何憑證。
+market_maker:
+  exchange: "lighter"
+  symbol: "BTC"
+
+  # 金融數值以字串保存，避免 YAML 先轉成浮點數。
+  order_size: "0.00020"
+
+  # 單邊距離；完整 Bid-Ask spread 約為兩倍此值。
+  base_half_spread_ticks: 1
+  max_inventory_skew_ticks: 4
+  reprice_threshold_ticks: 1
+
+  # Live 前依實際帳戶 tier 核對 maker fee；不可假設永遠為零。
+  maker_fee_rate: "0"
+  min_profit_buffer_bps: "0.5"
+
+  max_position: "0.00200"
+  soft_position_ratio: "0.50"
+  hard_position_ratio: "0.80"
+
+  refresh_interval_ms: 1000
+  min_order_lifetime_ms: 1000
+
+  stale_book_seconds: 3
+  stale_position_seconds: 10
+  position_poll_interval_seconds: 3
+  order_sync_interval_seconds: 10
+  health_check_interval_seconds: 60
+
+  max_consecutive_errors: 5
+  error_cooldown_seconds: 5
+  max_mutations_per_minute: 30
+
+  post_only: true
+  exclusive_symbol_control: true
+  startup_open_order_policy: "abort"
+  unknown_order_policy: "pause"
+  cancel_on_shutdown: true
+
+  # 安全預設；live 必須由操作者明確改為 false。
+  dry_run: true
+  log_status_interval_seconds: 10
