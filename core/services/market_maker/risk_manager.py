@@ -94,12 +94,22 @@ class RiskManager:
             or isinstance(position.received_monotonic, bool)
             or not isinstance(position.received_monotonic, (int, float))
             or not math.isfinite(position.received_monotonic)
-            or now - position.received_monotonic
-            > self.config.stale_position_seconds
         ):
             return self._paused(
                 RuntimeState.PAUSED_POSITION,
                 "position snapshot is stale",
+                position=position.signed_size,
+                inventory_ratio=inventory_ratio,
+            )
+        position_age = now - position.received_monotonic
+        if position_age < 0 or position_age > self.config.stale_position_seconds:
+            return self._paused(
+                RuntimeState.PAUSED_POSITION,
+                (
+                    "position snapshot timestamp is in the future"
+                    if position_age < 0
+                    else "position snapshot is stale"
+                ),
                 position=position.signed_size,
                 inventory_ratio=inventory_ratio,
             )
@@ -250,6 +260,12 @@ class RiskManager:
         buy = _ZERO
         sell = _ZERO
         for order in orders:
+            if (
+                not isinstance(order, ManagedOrder)
+                or not isinstance(order.state, OrderSlotState)
+                or order.side not in {OrderSide.BUY, OrderSide.SELL}
+            ):
+                return _ZERO, _ZERO, "live order state is invalid"
             exposure_live = (
                 order.state in _EXPOSURE_STATES
                 or order.submission_uncertain
@@ -258,8 +274,7 @@ class RiskManager:
             if not exposure_live:
                 continue
             if (
-                order.side not in {OrderSide.BUY, OrderSide.SELL}
-                or not _finite_decimal(order.remaining)
+                not _finite_decimal(order.remaining)
                 or order.remaining < 0
                 or type(order.reduce_only) is not bool
             ):

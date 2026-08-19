@@ -167,6 +167,28 @@ class RiskManagerTests(unittest.TestCase):
         self.assertIsNone(decision.buy_amount)
         self.assertIsNone(decision.sell_amount)
 
+    def test_future_position_timestamp_disables_both_sides(self) -> None:
+        decision = self.manager.evaluate(
+            self.position("0", received=101.0),
+            (),
+            self.metadata,
+            now_monotonic=100.0,
+        )
+
+        self.assertFalse(decision.safe)
+        self.assertEqual(decision.runtime_state, RuntimeState.PAUSED_POSITION)
+        self.assertIn("future", decision.reason)
+
+    def test_unknown_order_state_fails_closed(self) -> None:
+        order = self.order(OrderSide.BUY, OrderSlotState.LIVE, "1")
+        order.state = "mystery"
+
+        decision = self.evaluate("0", (order,))
+
+        self.assertFalse(decision.safe)
+        self.assertEqual(decision.runtime_state, RuntimeState.PAUSED_ORDER_STATE)
+        self.assertIsNone(decision.buy_amount)
+
     def test_rounding_below_minimum_disables_side(self) -> None:
         manager = RiskManager(
             MarketMakerConfig(

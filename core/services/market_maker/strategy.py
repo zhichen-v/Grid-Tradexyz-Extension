@@ -65,7 +65,10 @@ def validate_market_snapshot(
             or not math.isfinite(market.received_monotonic)
         ):
             raise ValueError("monotonic timestamps must be finite")
-        if now_monotonic - market.received_monotonic > stale_after_seconds:
+        age = now_monotonic - market.received_monotonic
+        if age < 0:
+            raise ValueError("order book timestamp is in the future")
+        if age > stale_after_seconds:
             raise ValueError("order book is stale")
 
 
@@ -151,15 +154,16 @@ class MarketMakerStrategy:
         *,
         now_monotonic: float | None = None,
     ) -> DesiredQuotes:
+        if now_monotonic is None:
+            return self._no_quotes(
+                RuntimeState.PAUSED_DATA,
+                "current monotonic time is required",
+            )
         try:
             validate_market_snapshot(
                 market,
                 now_monotonic=now_monotonic,
-                stale_after_seconds=(
-                    self.config.stale_book_seconds
-                    if now_monotonic is not None
-                    else None
-                ),
+                stale_after_seconds=self.config.stale_book_seconds,
             )
             self._validate_metadata(market, metadata)
             external_bid, external_ask = calculate_external_bbo(

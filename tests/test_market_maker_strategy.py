@@ -76,6 +76,7 @@ class MarketMakerStrategyTests(unittest.TestCase):
         )
 
     def quotes(self, size: str = "0", **kwargs):
+        kwargs.setdefault("now_monotonic", 100.0)
         return self.strategy.calculate_quotes(
             self.market,
             self.position(size),
@@ -118,7 +119,11 @@ class MarketMakerStrategyTests(unittest.TestCase):
             )
         )
         quotes = strategy.calculate_quotes(
-            self.market, self.position("0"), self.metadata, self.risk
+            self.market,
+            self.position("0"),
+            self.metadata,
+            self.risk,
+            now_monotonic=100.0,
         )
 
         self.assertEqual(quotes.half_spread, Decimal("0.2"))
@@ -142,7 +147,11 @@ class MarketMakerStrategyTests(unittest.TestCase):
         )
         market = self.make_market(Decimal("99.91"), Decimal("100.07"))
         quotes = self.strategy.calculate_quotes(
-            market, self.position("0"), metadata, self.risk
+            market,
+            self.position("0"),
+            metadata,
+            self.risk,
+            now_monotonic=100.0,
         )
 
         self.assertEqual(quotes.bid.price, Decimal("99.90"))
@@ -167,7 +176,11 @@ class MarketMakerStrategyTests(unittest.TestCase):
         for market in invalid_markets:
             with self.subTest(market=market):
                 quotes = self.strategy.calculate_quotes(
-                    market, self.position("0"), self.metadata, self.risk
+                    market,
+                    self.position("0"),
+                    self.metadata,
+                    self.risk,
+                    now_monotonic=100.0,
                 )
                 self.assertIsNone(quotes.bid)
                 self.assertIsNone(quotes.ask)
@@ -188,6 +201,22 @@ class MarketMakerStrategyTests(unittest.TestCase):
         self.assertEqual(quotes.runtime_state, RuntimeState.PAUSED_DATA)
         self.assertIsNone(quotes.bid)
         self.assertIn("stale", quotes.reason)
+
+    def test_missing_or_future_clock_fails_closed(self) -> None:
+        missing = self.strategy.calculate_quotes(
+            self.market,
+            self.position("0"),
+            self.metadata,
+            self.risk,
+        )
+        future = self.quotes(now_monotonic=99.0)
+
+        self.assertEqual(missing.runtime_state, RuntimeState.PAUSED_DATA)
+        self.assertIsNone(missing.bid)
+        self.assertIn("required", missing.reason)
+        self.assertEqual(future.runtime_state, RuntimeState.PAUSED_DATA)
+        self.assertIsNone(future.ask)
+        self.assertIn("future", future.reason)
 
     @staticmethod
     def managed_bid(remaining: Decimal) -> ManagedOrder:
