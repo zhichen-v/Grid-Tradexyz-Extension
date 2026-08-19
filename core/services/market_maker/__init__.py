@@ -24,12 +24,18 @@ from .strategy import (
     validate_market_snapshot,
 )
 from .risk_manager import RiskDecision, RiskManager
+from .order_manager import (
+    MarketMakerOrderManager,
+    ReconcileAction,
+    ReconcileResult,
+)
 
 __all__ = [
     "DesiredOrder",
     "DesiredQuotes",
     "ManagedOrder",
     "MarketMakerConfig",
+    "MarketMakerOrderManager",
     "MarketMakerStrategy",
     "MarketMetadata",
     "MarketSnapshot",
@@ -39,6 +45,8 @@ __all__ = [
     "PositionSnapshot",
     "RiskDecision",
     "RiskManager",
+    "ReconcileAction",
+    "ReconcileResult",
     "RuntimeState",
     "ceil_to_step",
     "calculate_external_bbo",
