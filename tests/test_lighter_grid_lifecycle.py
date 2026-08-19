@@ -24,6 +24,9 @@ from core.services.grid.models import (
     GridState,
     GridType,
 )
+from core.services.market_maker.config import MarketMakerConfig
+from core.services.market_maker.models import MarketMetadata, OrderSlotState
+from core.services.market_maker.order_manager import MarketMakerOrderManager
 
 
 def exchange_order(
@@ -1166,18 +1169,154 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def test_connection_health_requires_authenticated_order_stream(self):
         websocket = object.__new__(LighterWebSocket)
         websocket._connected = True
+        websocket._ws_task = SimpleNamespace(done=lambda: False)
         websocket._direct_ws_task = SimpleNamespace(done=lambda: False)
         websocket._direct_ws_connected = True
         websocket._account_orders_subscribed = False
         websocket._direct_last_message_time = 0.0
+        websocket._reconnect_attempts = 2
+        websocket._reconnect_count = 5
+        websocket._direct_reconnect_count = 3
+        websocket._subscribed_markets = [1]
+        websocket._subscribed_accounts = []
         websocket._subscribed_market_stats = []
         websocket._subscribed_trades = []
         websocket._order_callbacks = [lambda order: None]
         websocket._order_fill_callbacks = []
 
-        self.assertFalse(websocket.get_connection_status()["healthy"])
+        status = websocket.get_connection_status()
+        self.assertFalse(status["healthy"])
+        self.assertEqual(status["reconnect_attempts"], 2)
+        self.assertEqual(status["reconnect_count"], 8)
+        self.assertEqual(status["public_reconnect_count"], 5)
+        self.assertEqual(status["direct_reconnect_count"], 3)
         websocket._account_orders_subscribed = True
         self.assertTrue(websocket.get_connection_status()["healthy"])
+        websocket._ws_task = SimpleNamespace(done=lambda: True)
+        self.assertFalse(websocket.get_connection_status()["healthy"])
+
+    async def test_account_order_health_waits_for_ack_or_valid_update(self):
+        websocket = object.__new__(LighterWebSocket)
+        websocket._account_orders_subscribed = False
+        websocket._order_callbacks = []
+        websocket._order_fill_callbacks = []
+        websocket._trade_callbacks = []
+
+        await websocket._handle_direct_ws_message({
+            "type": "update/account_all_orders",
+            "channel": "account_all_orders:7",
+            "orders": {},
+        })
+        self.assertTrue(websocket._account_orders_subscribed)
+
+        await websocket._handle_direct_ws_message({
+            "type": "subscription/error",
+            "channel": "account_all_orders/7",
+        })
+        self.assertFalse(websocket._account_orders_subscribed)
+
+    async def test_sdk_stream_normal_exit_schedules_reconnect(self):
+        websocket = object.__new__(LighterWebSocket)
+        websocket.ws_client = SimpleNamespace(run=lambda: None)
+        websocket._connected = True
+        websocket._stopping_sdk_ws = False
+        websocket._explicit_stop = False
+        websocket._connection_generation = 3
+        websocket._reconnect_task = None
+        websocket.reconnect = AsyncMock()
+
+        await websocket._run_ws_client()
+        await asyncio.sleep(0)
+
+        websocket.reconnect.assert_awaited_once_with(3)
+
+    async def test_disconnect_cancels_pending_reconnect_before_it_can_resurrect(self):
+        websocket = object.__new__(LighterWebSocket)
+        websocket._connected = True
+        websocket._explicit_stop = False
+        websocket._connection_generation = 1
+        websocket._reconnect_attempts = 0
+        websocket._reconnect_count = 0
+        websocket._max_reconnect_attempts = 10
+        websocket._reconnect_task = None
+        websocket._lifecycle_lock = asyncio.Lock()
+
+        async def mark_disconnected():
+            websocket._connected = False
+
+        async def mark_connected():
+            websocket._connected = True
+
+        websocket._disconnect_locked = AsyncMock(side_effect=mark_disconnected)
+        websocket._connect_locked = AsyncMock(side_effect=mark_connected)
+        websocket._resubscribe_all = AsyncMock()
+        sleep_started = asyncio.Event()
+        release_sleep = asyncio.Event()
+
+        async def gated_sleep(_seconds):
+            sleep_started.set()
+            await release_sleep.wait()
+
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_websocket.asyncio.sleep",
+            new=gated_sleep,
+        ):
+            reconnect_task = websocket._schedule_reconnect()
+            await sleep_started.wait()
+            await websocket.disconnect()
+
+        self.assertTrue(reconnect_task.done())
+        self.assertTrue(reconnect_task.cancelled())
+        self.assertIsNone(websocket._reconnect_task)
+        self.assertTrue(websocket._explicit_stop)
+        self.assertFalse(websocket._connected)
+        websocket._connect_locked.assert_not_awaited()
+        websocket._resubscribe_all.assert_not_awaited()
+
+    async def test_direct_stream_clean_close_is_counted_and_backed_off(self):
+        websocket = object.__new__(LighterWebSocket)
+        websocket._connected = True
+        websocket.signer_client = None
+        websocket.account_index = 0
+        websocket.ws_url = "wss://example.invalid/stream"
+        websocket._direct_reconnect_count = 0
+        websocket._direct_ws = None
+        websocket._direct_ws_connected = False
+        websocket._account_orders_subscribed = False
+        websocket._send_market_stats_subscriptions = AsyncMock()
+        websocket._send_trade_subscriptions = AsyncMock()
+
+        class CleanConnection:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        async def stop_after_backoff(seconds):
+            self.assertEqual(seconds, 5)
+            websocket._connected = False
+
+        with (
+            patch(
+                "core.adapters.exchanges.adapters.lighter_websocket.websockets.connect",
+                return_value=CleanConnection(),
+            ),
+            patch(
+                "core.adapters.exchanges.adapters.lighter_websocket.asyncio.sleep",
+                side_effect=stop_after_backoff,
+            ),
+        ):
+            await websocket._run_direct_ws_subscription()
+
+        self.assertEqual(websocket._direct_reconnect_count, 1)
+        self.assertFalse(websocket._direct_ws_connected)
 
     def test_direct_parser_preserves_partial_amounts(self):
         websocket = object.__new__(LighterWebSocket)
@@ -1350,7 +1489,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
                 self._market_info(),
             )
 
-        self.assertEqual(result.id, str(self.CLIENT_ID))
+        self.assertIsNone(result.id)
         self.assertEqual(result.client_id, str(self.CLIENT_ID))
         self.assertTrue(result.raw_data["submission_uncertain"])
         unresolved = rest.get_unresolved_submissions()
@@ -1449,6 +1588,123 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved, [found])
         self.assertEqual(rest.get_unresolved_submissions(), [])
 
+    async def test_unresolved_submission_rejects_order_id_namespace_collision(self):
+        rest = self._rest()
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(side_effect=TimeoutError("response lost"))
+        )
+
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            placeholder = await rest._execute_limit_order(
+                "BTC",
+                "buy",
+                Decimal("0.00020"),
+                Decimal("64000"),
+                self._market_info(),
+            )
+
+        self.assertIsNone(placeholder.id)
+        self.assertEqual(placeholder.client_id, str(self.CLIENT_ID))
+
+        foreign = exchange_order(OrderStatus.OPEN, "0", "0.00020")
+        foreign.id = str(self.CLIENT_ID)
+        foreign.client_id = "unrelated-client"
+        rest._clear_resolved_submissions_from_orders([foreign])
+        self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+
+        rest.get_open_orders = AsyncMock(return_value=[foreign])
+        rest.get_order_history = AsyncMock(return_value=[])
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            resolved = await rest.resolve_unresolved_submissions()
+
+        self.assertEqual(resolved, [])
+        self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+
+    async def test_success_ack_without_exchange_index_is_quarantined(self):
+        rest = self._rest()
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="accepted-tx"),
+                    None,
+                )
+            )
+        )
+        rest._query_order_index = AsyncMock(return_value=None)
+
+        result = await rest._execute_limit_order(
+            "BTC",
+            "buy",
+            Decimal("0.00020"),
+            Decimal("64000"),
+            self._market_info(),
+        )
+
+        self.assertIsNone(result.id)
+        self.assertEqual(result.client_id, str(self.CLIENT_ID))
+        self.assertTrue(result.params["submission_uncertain"])
+        self.assertTrue(result.raw_data["submission_uncertain"])
+        self.assertTrue(result.raw_data["submission_acknowledged"])
+        self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+        rest._query_order_index.assert_awaited_once()
+
+    async def test_success_ack_placeholder_cannot_cancel_by_client_id(self):
+        rest = self._rest()
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="accepted-tx"),
+                    None,
+                )
+            )
+        )
+        rest._query_order_index = AsyncMock(return_value=None)
+        placeholder = await rest._execute_limit_order(
+            "BTC",
+            "buy",
+            Decimal("0.00020"),
+            Decimal("64000"),
+            self._market_info(),
+        )
+        cancel_order = AsyncMock()
+        manager = MarketMakerOrderManager(
+            SimpleNamespace(cancel_order=cancel_order),
+            MarketMakerConfig(
+                symbol="BTC",
+                order_size=Decimal("0.00020"),
+                max_position=Decimal("0.001"),
+                min_profit_buffer_bps=Decimal("0"),
+                dry_run=False,
+            ),
+            MarketMetadata(
+                symbol="BTC",
+                price_decimals=1,
+                size_decimals=5,
+                price_tick=Decimal("0.1"),
+                quantity_step=Decimal("0.00001"),
+                min_base_amount=Decimal("0.00020"),
+                min_quote_amount=Decimal("10"),
+            ),
+        )
+        manager._apply_order_update(OrderSide.BUY, placeholder)
+
+        result = await manager.cancel_managed_orders("safety stop")
+
+        cancel_order.assert_not_awaited()
+        self.assertEqual(
+            manager.slots[OrderSide.BUY].state,
+            OrderSlotState.UNCERTAIN_SUBMISSION,
+        )
+        self.assertTrue(result.errors)
+
     async def test_unknown_market_submission_is_not_resent(self):
         rest = self._rest()
         rest._calculate_slippage_protection_price = AsyncMock(
@@ -1471,6 +1727,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.client_id, str(self.CLIENT_ID))
+        self.assertIsNone(result.id)
         self.assertEqual(result.type, OrderType.MARKET)
         self.assertTrue(result.params["submission_uncertain"])
         rest.signer_client.create_market_order.assert_awaited_once()

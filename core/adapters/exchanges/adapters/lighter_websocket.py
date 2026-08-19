@@ -87,7 +87,13 @@ class LighterWebSocket(LighterBase):
         # 连接状态
         self._connected = False
         self._reconnect_attempts = 0
+        self._reconnect_count = 0
+        self._direct_reconnect_count = 0
         self._max_reconnect_attempts = 10
+        self._lifecycle_lock = asyncio.Lock()
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._connection_generation = 0
+        self._explicit_stop = True
 
         # 🔥 确保logger有文件handler，写入ExchangeAdapter.log
         self._setup_logger()
@@ -130,11 +136,18 @@ class LighterWebSocket(LighterBase):
 
     async def connect(self):
         """建立WebSocket连接"""
-        try:
+        async with self._lifecycle_lock:
             if self._connected:
                 logger.warning("WebSocket已连接")
                 return
 
+            self._explicit_stop = False
+            self._connection_generation += 1
+            await self._connect_locked()
+
+    async def _connect_locked(self):
+        """Mark the client connected while the lifecycle lock is held."""
+        try:
             # 🔥 保存事件循环引用（用于线程安全的回调调度）
             self._event_loop = asyncio.get_event_loop()
 
@@ -149,54 +162,135 @@ class LighterWebSocket(LighterBase):
 
     async def disconnect(self):
         """断开WebSocket连接"""
+        self._explicit_stop = True
+        self._connection_generation += 1
+        self._connected = False
+
+        current_task = asyncio.current_task()
+        reconnect_task = self._reconnect_task
+        if (
+            reconnect_task is not None
+            and reconnect_task is not current_task
+            and not reconnect_task.done()
+        ):
+            reconnect_task.cancel()
+            try:
+                await reconnect_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"等待WebSocket重连任务退出时出错: {e}")
+
+        if self._reconnect_task is reconnect_task:
+            self._reconnect_task = None
+
         try:
+            async with self._lifecycle_lock:
+                await self._disconnect_locked()
+            logger.info("✅ WebSocket已断开（包括直接订阅）")
+        except Exception as e:
+            logger.error(f"断开WebSocket时出错: {e}")
+        finally:
             self._connected = False
-
-            await self._stop_sdk_ws_client()
-
-            # 关闭直接WebSocket连接
-            if self._direct_ws_task and not self._direct_ws_task.done():
-                self._direct_ws_task.cancel()
-                try:
-                    await self._direct_ws_task
-                except asyncio.CancelledError:
-                    pass
-            self._direct_ws_task = None
-
-            if self._direct_ws:
-                try:
-                    await self._direct_ws.close()
-                except:
-                    pass
-                self._direct_ws = None
-
             self._direct_ws_connected = False
             self._account_orders_subscribed = False
 
-            logger.info("✅ WebSocket已断开（包括直接订阅）")
+    async def _disconnect_locked(self):
+        """Close active sockets while the lifecycle lock is held."""
+        self._connected = False
 
-        except Exception as e:
-            logger.error(f"断开WebSocket时出错: {e}")
+        await self._stop_sdk_ws_client()
 
-    async def reconnect(self):
+        # 关闭直接WebSocket连接
+        if self._direct_ws_task and not self._direct_ws_task.done():
+            self._direct_ws_task.cancel()
+            try:
+                await self._direct_ws_task
+            except asyncio.CancelledError:
+                pass
+        self._direct_ws_task = None
+
+        if self._direct_ws:
+            try:
+                await self._direct_ws.close()
+            except Exception:
+                pass
+            self._direct_ws = None
+
+        self._direct_ws_connected = False
+        self._account_orders_subscribed = False
+
+    def _schedule_reconnect(self):
+        """Schedule at most one reconnect for the active connection generation."""
+        if self._explicit_stop or not self._connected:
+            return None
+
+        existing = self._reconnect_task
+        if existing is not None and not existing.done():
+            return existing
+
+        generation = self._connection_generation
+        task = asyncio.create_task(self.reconnect(generation))
+        self._reconnect_task = task
+
+        def clear_reconnect_task(done_task):
+            if self._reconnect_task is done_task:
+                self._reconnect_task = None
+            if not done_task.cancelled():
+                try:
+                    error = done_task.exception()
+                except asyncio.CancelledError:
+                    return
+                if error is not None:
+                    logger.error(f"WebSocket重连任务异常退出: {error}")
+
+        task.add_done_callback(clear_reconnect_task)
+        return task
+
+    async def reconnect(self, expected_generation: Optional[int] = None):
         """重新连接WebSocket"""
-        logger.info("尝试重新连接WebSocket...")
+        generation = (
+            self._connection_generation
+            if expected_generation is None
+            else expected_generation
+        )
 
-        await self.disconnect()
-        await asyncio.sleep(min(self._reconnect_attempts * 2, 30))
+        while self._reconnect_attempts < self._max_reconnect_attempts:
+            if self._explicit_stop or generation != self._connection_generation:
+                return
 
-        try:
-            await self.connect()
-            await self._resubscribe_all()
-            self._reconnect_attempts = 0
-            logger.info("WebSocket重连成功")
-        except Exception as e:
-            self._reconnect_attempts += 1
-            logger.error(
-                f"WebSocket重连失败 (尝试 {self._reconnect_attempts}/{self._max_reconnect_attempts}): {e}")
+            self._reconnect_count = getattr(self, "_reconnect_count", 0) + 1
+            logger.info("尝试重新连接WebSocket...")
 
-            if self._reconnect_attempts < self._max_reconnect_attempts:
-                asyncio.create_task(self.reconnect())
+            try:
+                async with self._lifecycle_lock:
+                    if self._explicit_stop or generation != self._connection_generation:
+                        return
+                    await self._disconnect_locked()
+                    if self._explicit_stop or generation != self._connection_generation:
+                        return
+
+                await asyncio.sleep(min(self._reconnect_attempts * 2, 30))
+                if self._explicit_stop or generation != self._connection_generation:
+                    return
+
+                async with self._lifecycle_lock:
+                    if self._explicit_stop or generation != self._connection_generation:
+                        return
+                    await self._connect_locked()
+                    await self._resubscribe_all()
+                    if self._explicit_stop or generation != self._connection_generation:
+                        return
+
+                self._reconnect_attempts = 0
+                logger.info("WebSocket重连成功")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._reconnect_attempts += 1
+                logger.error(
+                    f"WebSocket重连失败 (尝试 {self._reconnect_attempts}/{self._max_reconnect_attempts}): {e}")
 
     async def _resubscribe_all(self):
         """重新订阅所有频道"""
@@ -223,9 +317,18 @@ class LighterWebSocket(LighterBase):
         account_orders_required = bool(
             self._order_callbacks or self._order_fill_callbacks
         )
+        sdk_required = bool(
+            getattr(self, "_subscribed_markets", ())
+            or getattr(self, "_subscribed_accounts", ())
+        )
+        sdk_task_running = bool(
+            getattr(self, "_ws_task", None)
+            and not self._ws_task.done()
+        )
         task_running = bool(
             self._direct_ws_task and not self._direct_ws_task.done()
         )
+        sdk_healthy = not sdk_required or sdk_task_running
         direct_healthy = (
             not direct_required
             or (
@@ -237,14 +340,22 @@ class LighterWebSocket(LighterBase):
                 )
             )
         )
+        reconnect_count = getattr(self, "_reconnect_count", 0)
+        direct_reconnect_count = getattr(self, "_direct_reconnect_count", 0)
         return {
             "connected": self._connected,
+            "reconnect_attempts": getattr(self, "_reconnect_attempts", 0),
+            "reconnect_count": reconnect_count + direct_reconnect_count,
+            "public_reconnect_count": reconnect_count,
+            "direct_reconnect_count": direct_reconnect_count,
+            "sdk_required": sdk_required,
+            "sdk_task_running": sdk_task_running,
             "direct_required": direct_required,
             "direct_task_running": task_running,
             "direct_connected": self._direct_ws_connected,
             "account_orders_subscribed": self._account_orders_subscribed,
             "last_direct_message_time": self._direct_last_message_time,
-            "healthy": self._connected and direct_healthy,
+            "healthy": self._connected and sdk_healthy and direct_healthy,
         }
 
     # ============= 订阅管理 =============
@@ -559,12 +670,14 @@ class LighterWebSocket(LighterBase):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.ws_client.run)
             logger.warning("⚠️ WebSocket客户端run()方法退出了")
+            if self._connected and not self._stopping_sdk_ws:
+                self._schedule_reconnect()
         except asyncio.CancelledError:
             logger.info("WebSocket任务已取消")
         except Exception as e:
             logger.error(f"❌ WebSocket运行出错: {e}", exc_info=True)
             if self._connected and not self._stopping_sdk_ws:
-                asyncio.create_task(self.reconnect())
+                self._schedule_reconnect()
 
     # ============= 消息处理 =============
 
@@ -1269,9 +1382,9 @@ class LighterWebSocket(LighterBase):
                             "auth": auth_token
                         }
                         await ws.send(json.dumps(subscribe_msg))
-                        self._account_orders_subscribed = True
                         logger.info(
-                            f"✅ 已订阅频道: account_all_orders/{self.account_index}")
+                            f"已发送订阅请求: account_all_orders/{self.account_index}"
+                        )
 
                     # 2️⃣ 订阅market_stats（无需认证）
                     await self._send_market_stats_subscriptions()
@@ -1293,12 +1406,29 @@ class LighterWebSocket(LighterBase):
                         except Exception as e:
                             logger.error(f"❌ 处理消息失败: {e}", exc_info=True)
 
+                    if self._connected:
+                        self._direct_ws_connected = False
+                        self._account_orders_subscribed = False
+                        self._direct_ws = None
+                        retry_count += 1
+                        self._direct_reconnect_count = (
+                            getattr(self, "_direct_reconnect_count", 0) + 1
+                        )
+                        logger.warning(
+                            "直接WebSocket正常关闭，5秒后重新连接 "
+                            f"(第{retry_count}次)..."
+                        )
+                        await asyncio.sleep(5)
+
             except websockets.exceptions.ConnectionClosedError as e:
                 # WebSocket连接关闭
                 self._direct_ws_connected = False
                 self._account_orders_subscribed = False
                 self._direct_ws = None
                 retry_count += 1
+                self._direct_reconnect_count = (
+                    getattr(self, "_direct_reconnect_count", 0) + 1
+                )
                 logger.warning(
                     f"⚠️ WebSocket连接已关闭: {e}，5秒后重连 (第{retry_count}次)...")
                 await asyncio.sleep(5)
@@ -1310,6 +1440,9 @@ class LighterWebSocket(LighterBase):
                 self._account_orders_subscribed = False
                 self._direct_ws = None
                 retry_count += 1
+                self._direct_reconnect_count = (
+                    getattr(self, "_direct_reconnect_count", 0) + 1
+                )
                 retry_delay = min(retry_count * 5, 60)  # 指数退避，最多60秒
                 logger.error(
                     f"❌ 直接WebSocket订阅失败 (第{retry_count}次): {e}，"
@@ -1346,8 +1479,23 @@ class LighterWebSocket(LighterBase):
             logger.debug(
                 f"📥 收到直接WebSocket推送: channel={channel}, type={msg_type}")
 
+            if msg_type in {
+                "subscribed/account_all_orders",
+                "update/account_all_orders",
+            }:
+                self._account_orders_subscribed = True
+            elif (
+                msg_type in {"error", "subscription/error", "failed/subscribe"}
+                and "account_all_orders" in str(channel)
+            ):
+                self._account_orders_subscribed = False
+                logger.error("account_all_orders subscription was rejected")
+
             # 处理订单更新
-            if msg_type == "update/account_all_orders" and "orders" in data:
+            if msg_type in {
+                "subscribed/account_all_orders",
+                "update/account_all_orders",
+            } and "orders" in data:
                 orders_data = data["orders"]
 
                 if isinstance(orders_data, dict):

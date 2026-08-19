@@ -262,9 +262,7 @@ class LighterRest(LighterBase):
     @staticmethod
     def _order_matches_client_id(order: OrderData, client_order_id: int) -> bool:
         target = str(client_order_id)
-        return str(getattr(order, "client_id", "") or "") == target or (
-            str(getattr(order, "id", "") or "") == target
-        )
+        return str(getattr(order, "client_id", "") or "") == target
 
     def _register_unresolved_submission(
         self,
@@ -303,11 +301,8 @@ class LighterRest(LighterBase):
             return
         for order in orders:
             client_id = str(getattr(order, "client_id", "") or "")
-            order_id = str(getattr(order, "id", "") or "")
             if client_id in registry:
                 registry.pop(client_id, None)
-            elif order_id in registry:
-                registry.pop(order_id, None)
 
     def get_unresolved_submissions(self) -> List[Dict[str, Any]]:
         """Return copies of mutation intents that remain unconfirmed."""
@@ -386,7 +381,7 @@ class LighterRest(LighterBase):
         params["client_order_id"] = client_order_id
         params["submission_uncertain"] = True
         return OrderData(
-            id=client_id,
+            id=None,
             client_id=client_id,
             symbol=symbol,
             side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
@@ -1643,8 +1638,10 @@ class LighterRest(LighterBase):
             )
         except Exception as exc:
             if self._is_definitive_mutation_exception(exc):
-                logger.error(f"执行市价单失败: {exc}")
-                return None
+                logger.error("执行市价单失败: HTTP 429 rate limited")
+                raise RuntimeError(
+                    "market order submission rate limited (HTTP 429)"
+                ) from None
             return await self._handle_ambiguous_order_submission(
                 symbol,
                 side,
@@ -1705,8 +1702,10 @@ class LighterRest(LighterBase):
             )
         except Exception as exc:
             if self._is_definitive_mutation_exception(exc):
-                logger.error(f"执行限价单失败: {exc}")
-                return None
+                logger.error("执行限价单失败: HTTP 429 rate limited")
+                raise RuntimeError(
+                    "limit order submission rate limited (HTTP 429)"
+                ) from None
             return await self._handle_ambiguous_order_submission(
                 symbol,
                 side,
@@ -1745,13 +1744,10 @@ class LighterRest(LighterBase):
             error_msg = self.parse_error(err) if err else "未知错误"
             mutation_error = err if isinstance(err, Exception) else RuntimeError(error_msg)
             if self._is_definitive_mutation_exception(mutation_error):
-                logger.error(f"❌ Lighter下单失败: {error_msg}")
-                logger.error(f"   订单类型: {order_type}, 方向: {side}, 数量: {quantity}")
-                if order_type == "market":
-                    logger.error(f"   市价单保护价格: {price}")
-                else:
-                    logger.error(f"   限价单价格: {price}")
-                return None
+                logger.error("Lighter下单失败: HTTP 429 rate limited")
+                raise RuntimeError(
+                    "order submission rate limited (HTTP 429)"
+                ) from None
             return await self._handle_ambiguous_order_submission(
                 symbol,
                 side,
@@ -1776,6 +1772,10 @@ class LighterRest(LighterBase):
         try:
             self._require_success_response(response, "order submission")
         except RuntimeError as exc:
+            if self._is_definitive_mutation_exception(exc):
+                raise RuntimeError(
+                    "order submission rate limited (HTTP 429)"
+                ) from None
             logger.error(f"❌ Lighter下单失败: {exc}")
             return None
 
@@ -1829,21 +1829,22 @@ class LighterRest(LighterBase):
         if client_order_id is None:
             raise RuntimeError("order submission lost its client_order_id")
 
+        unresolved_reason: Optional[str] = None
         if batch_mode:
-            # 批量模式：使用 client_order_id
-            client_order_id_str = str(client_order_id)
-            order_id = client_order_id_str
+            # Batch mode deliberately skips the exchange order-index lookup.
+            order_id = None
+            unresolved_reason = "batch submission acknowledged without exchange order index"
             logger.info(
-                f"📦 批量模式：使用 client_order_id={order_id}，"
-                f"稍后批量同步 order_index"
+                f"📦 批量模式：等待 client_order_id={client_order_id} "
+                "对应的 exchange order_index"
             )
         elif skip_order_index_query:
-            # 跳过查询模式：直接使用临时ID（Volume Maker 刷量程序）
-            client_order_id_str = str(client_order_id)
-            order_id = client_order_id_str
+            # Skipping the lookup does not turn a client id into an exchange id.
+            order_id = None
+            unresolved_reason = "submission acknowledged without exchange order-index lookup"
             logger.debug(
-                f"🔖 跳过查询模式：使用临时ID={order_id}，"
-                f"依赖状态机匹配"
+                f"🔖 跳过查询模式：等待 client_order_id={client_order_id} "
+                "对应的 exchange order_index"
             )
         else:
             # 单个模式：立即查询 order_index（网格程序）
@@ -1865,13 +1866,36 @@ class LighterRest(LighterBase):
                     f"✅ 使用 order_index 作为订单ID: {order_id}"
                 )
             else:
-                # ⚠️ 查询失败，降级使用 client_order_id
-                client_order_id_str = str(client_order_id)
-                order_id = client_order_id_str
+                # A client id and an exchange order index are different
+                # namespaces. Keep the exchange id unset until an exact read
+                # confirms it so cancellation can never target the wrong order.
+                order_id = None
+                unresolved_reason = "submission acknowledged but exchange order index lookup missed"
                 logger.warning(
-                    f"⚠️ 降级使用 client_order_id: {order_id}，"
+                    f"⚠️ 尚未取得 client_order_id={client_order_id} 的 order_index，"
                     f"tx_hash={tx_hash_str[:16]}..."
                 )
+
+        if order_id is None:
+            placeholder_params = dict(kwargs)
+            placeholder_params.pop("client_order_id", None)
+            placeholder = self._build_uncertain_order(
+                symbol,
+                side,
+                order_type,
+                quantity,
+                price,
+                int(client_order_id),
+                unresolved_reason or "exchange order index is unresolved",
+                **placeholder_params,
+            )
+            placeholder.raw_data.update({
+                'tx': tx,
+                'response': response,
+                'tx_hash_str': tx_hash_str,
+                'submission_acknowledged': True,
+            })
+            return placeholder
 
         return OrderData(
             id=order_id,
@@ -2074,6 +2098,11 @@ class LighterRest(LighterBase):
                 )
 
         except Exception as e:
+            if self._is_definitive_mutation_exception(e):
+                logger.error(f"下单失败 {symbol}: HTTP 429 rate limited")
+                raise RuntimeError(
+                    "order submission rate limited (HTTP 429)"
+                ) from None
             logger.error(f"下单失败 {symbol}: {e}")
             return None
 
@@ -2139,8 +2168,12 @@ class LighterRest(LighterBase):
                 )
             except Exception as exc:
                 if self._is_definitive_mutation_exception(exc):
-                    logger.error(f"取消订单失败 {symbol}/{order_id}: {exc}")
-                    return False
+                    logger.error(
+                        f"取消订单失败 {symbol}/{order_id}: HTTP 429 rate limited"
+                    )
+                    raise RuntimeError(
+                        "order cancellation rate limited (HTTP 429)"
+                    ) from None
                 return await self._handle_ambiguous_cancellation(
                     symbol,
                     logical_order_id,
@@ -2149,6 +2182,13 @@ class LighterRest(LighterBase):
 
             if err:
                 error_msg = self.parse_error(err)
+                mutation_error = (
+                    err if isinstance(err, Exception) else RuntimeError(error_msg)
+                )
+                if self._is_definitive_mutation_exception(mutation_error):
+                    raise RuntimeError(
+                        "order cancellation rate limited (HTTP 429)"
+                    ) from None
                 logger.error(f"取消订单失败: {error_msg}")
                 return False
 
@@ -2162,6 +2202,10 @@ class LighterRest(LighterBase):
             try:
                 self._require_success_response(response, "order cancellation")
             except RuntimeError as exc:
+                if self._is_definitive_mutation_exception(exc):
+                    raise RuntimeError(
+                        "order cancellation rate limited (HTTP 429)"
+                    ) from None
                 logger.error(f"取消订单失败: {exc}")
                 return False
             if not tx or not getattr(response, 'tx_hash', None):
@@ -2181,6 +2225,13 @@ class LighterRest(LighterBase):
             )
 
         except Exception as e:
+            if self._is_definitive_mutation_exception(e):
+                logger.error(
+                    f"取消订单失败 {symbol}/{order_id}: HTTP 429 rate limited"
+                )
+                raise RuntimeError(
+                    "order cancellation rate limited (HTTP 429)"
+                ) from None
             logger.error(f"取消订单失败 {symbol}/{order_id}: {e}")
             return False
 

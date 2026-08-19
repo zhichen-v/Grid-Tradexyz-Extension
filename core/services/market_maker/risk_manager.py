@@ -153,6 +153,12 @@ class RiskManager:
         )
         buy_capacity = max(_ZERO, raw_buy_capacity)
         sell_capacity = max(_ZERO, raw_sell_capacity)
+        # Capacity is reported as room for an additional order.  Desired
+        # amounts, however, are targets for the existing one-order-per-side
+        # slot, so its current remaining amount is reusable after a confirmed
+        # cancel-before-replace.
+        buy_target_capacity = buy_capacity + live_buy
+        sell_target_capacity = sell_capacity + live_sell
         live_worst_long = position.signed_size + live_buy
         live_worst_short = position.signed_size - live_sell
 
@@ -219,24 +225,26 @@ class RiskManager:
 
         buy_amount = self._candidate_amount(
             requested_buy,
-            None if buy_reduce_only else buy_capacity,
+            None if buy_reduce_only else buy_target_capacity,
             metadata,
         )
         sell_amount = self._candidate_amount(
             requested_sell,
-            None if sell_reduce_only else sell_capacity,
+            None if sell_reduce_only else sell_target_capacity,
             metadata,
         )
-        worst_long = live_worst_long + (
+        target_buy = (
             buy_amount
             if buy_amount is not None and not buy_reduce_only
             else _ZERO
         )
-        worst_short = live_worst_short - (
+        target_sell = (
             sell_amount
             if sell_amount is not None and not sell_reduce_only
             else _ZERO
         )
+        worst_long = position.signed_size + max(live_buy, target_buy)
+        worst_short = position.signed_size - max(live_sell, target_sell)
 
         return RiskDecision(
             buy_amount=buy_amount,

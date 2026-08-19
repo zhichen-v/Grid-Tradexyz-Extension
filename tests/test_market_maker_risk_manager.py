@@ -101,13 +101,13 @@ class RiskManagerTests(unittest.TestCase):
         self.assertIsNone(short_decision.sell_amount)
         self.assertIn("absolute", long_decision.reason)
 
-    def test_live_bid_uses_all_buy_capacity(self) -> None:
+    def test_live_bid_uses_all_extra_capacity_but_keeps_slot_target(self) -> None:
         decision = self.evaluate(
             "0", (self.order(OrderSide.BUY, OrderSlotState.LIVE, "1"),)
         )
 
         self.assertEqual(decision.buy_capacity, Decimal("0"))
-        self.assertIsNone(decision.buy_amount)
+        self.assertEqual(decision.buy_amount, Decimal("0.2"))
         self.assertEqual(decision.worst_long, Decimal("1"))
         self.assertTrue(decision.allow_sell)
 
@@ -123,8 +123,8 @@ class RiskManagerTests(unittest.TestCase):
                     "0", (self.order(OrderSide.BUY, state, "0.9"),)
                 )
                 self.assertEqual(decision.buy_capacity, Decimal("0.1"))
-                self.assertEqual(decision.buy_amount, Decimal("0.1"))
-                self.assertEqual(decision.worst_long, Decimal("1.0"))
+                self.assertEqual(decision.buy_amount, Decimal("0.2"))
+                self.assertEqual(decision.worst_long, Decimal("0.9"))
 
     def test_uncertainty_flag_keeps_even_terminal_order_in_exposure(self) -> None:
         order = self.order(OrderSide.BUY, OrderSlotState.TERMINAL, "0.9")
@@ -132,7 +132,37 @@ class RiskManagerTests(unittest.TestCase):
         decision = self.evaluate("0", (order,))
 
         self.assertEqual(decision.buy_capacity, Decimal("0.1"))
-        self.assertEqual(decision.worst_long, Decimal("1.0"))
+        self.assertEqual(decision.buy_amount, Decimal("0.2"))
+        self.assertEqual(decision.worst_long, Decimal("0.9"))
+
+    def test_full_capacity_live_slots_keep_same_targets_across_cycles(self) -> None:
+        config = MarketMakerConfig(
+            symbol="BTC",
+            order_size=Decimal("0.2"),
+            max_position=Decimal("0.2"),
+        )
+        manager = RiskManager(config)
+        position = self.position("0")
+
+        initial = manager.evaluate(
+            position, (), self.metadata, now_monotonic=100.0
+        )
+        live = (
+            self.order(OrderSide.BUY, OrderSlotState.LIVE, "0.2"),
+            self.order(OrderSide.SELL, OrderSlotState.LIVE, "0.2"),
+        )
+        next_cycle = manager.evaluate(
+            position, live, self.metadata, now_monotonic=100.0
+        )
+
+        self.assertEqual(initial.buy_amount, Decimal("0.2"))
+        self.assertEqual(initial.sell_amount, Decimal("0.2"))
+        self.assertEqual(next_cycle.buy_capacity, Decimal("0"))
+        self.assertEqual(next_cycle.sell_capacity, Decimal("0"))
+        self.assertEqual(next_cycle.buy_amount, initial.buy_amount)
+        self.assertEqual(next_cycle.sell_amount, initial.sell_amount)
+        self.assertEqual(next_cycle.worst_long, Decimal("0.2"))
+        self.assertEqual(next_cycle.worst_short, Decimal("-0.2"))
 
     def test_reduce_only_live_order_does_not_increase_worst_case(self) -> None:
         order = self.order(OrderSide.BUY, OrderSlotState.LIVE, "1")

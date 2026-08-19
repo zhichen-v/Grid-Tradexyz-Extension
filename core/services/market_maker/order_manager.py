@@ -32,6 +32,63 @@ _UNCERTAIN_STATES = {
 }
 
 
+def _error_category(exc: BaseException) -> str:
+    marker = (
+        f"{type(exc).__name__} {exc}"
+        .lower()
+        .replace("_", "")
+        .replace(" ", "")
+    )
+    if "429" in marker or "ratelimit" in marker:
+        return "http_429"
+    return type(exc).__name__
+
+
+def _has_visible_fill(
+    order: OrderData,
+    *,
+    previous_remaining: Decimal | None = None,
+) -> bool:
+    """Return whether an exchange read proves any fill occurred."""
+    if order.status is OrderStatus.FILLED:
+        return True
+    try:
+        remaining = Decimal(str(order.remaining))
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+    if not remaining.is_finite() or remaining < 0:
+        return False
+
+    try:
+        filled = Decimal(str(order.filled))
+    except (ArithmeticError, TypeError, ValueError):
+        filled = None
+    if filled is not None and filled.is_finite() and filled > 0:
+        return True
+
+    try:
+        amount = Decimal(str(order.amount))
+    except (ArithmeticError, TypeError, ValueError):
+        amount = None
+    if amount is not None and amount.is_finite() and amount > remaining:
+        return True
+
+    try:
+        previous = (
+            Decimal(str(previous_remaining))
+            if previous_remaining is not None
+            else None
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        previous = None
+    return (
+        previous is not None
+        and previous.is_finite()
+        and previous >= 0
+        and 0 <= remaining < previous
+    )
+
+
 @dataclass(frozen=True)
 class ReconcileAction:
     side: OrderSide | None
@@ -40,6 +97,7 @@ class ReconcileAction:
     price: Decimal | None = None
     amount: Decimal | None = None
     reduce_only: bool = False
+    success: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +105,7 @@ class ReconcileResult:
     actions: tuple[ReconcileAction, ...]
     runtime_state: RuntimeState
     errors: tuple[str, ...] = ()
+    position_refresh_required: bool = False
 
 
 class MarketMakerOrderManager:
@@ -97,6 +156,15 @@ class MarketMakerOrderManager:
                 or order.cancellation_uncertain
             )
             for order in self._slots.values()
+        )
+
+    @property
+    def has_unknown_order_state(self) -> bool:
+        return bool(
+            self.pause_reason
+            and self.pause_reason.startswith(
+                ("unknown open order", "unknown open orders", "multiple open orders")
+            )
         )
 
     def get_unresolved_submissions(self) -> list[dict[str, Any]]:
@@ -163,18 +231,26 @@ class MarketMakerOrderManager:
         async with self._lock:
             actions: list[ReconcileAction] = []
             errors: list[str] = []
+            position_refresh_required = False
             if self._shutting_down:
                 return self._result(actions, ("order manager is stopping",))
 
-            await self._resolve_uncertain_locked()
+            resolved = await self._resolve_uncertain_locked()
+            position_refresh_required = any(
+                _has_visible_fill(order) for order in resolved
+            )
             blocking = self._blocking_reason()
             if blocking:
                 self._pause(blocking)
-                await self._cancel_confirmable_locked(
-                    "uncertain order state", actions, errors
+                position_refresh_required = (
+                    await self._cancel_confirmable_locked(
+                        "uncertain order state", actions, errors
+                    )
+                    or position_refresh_required
                 )
-                return self._result(actions, errors)
-
+                return self._result(
+                    actions, errors, position_refresh_required
+                )
             if (
                 desired.bid is not None
                 and desired.bid.side is not OrderSide.BUY
@@ -184,10 +260,15 @@ class MarketMakerOrderManager:
             ):
                 self._pause("desired quote side does not match its slot")
                 errors.append(self.pause_reason)
-                await self._cancel_confirmable_locked(
-                    "invalid desired quote", actions, errors
+                position_refresh_required = (
+                    await self._cancel_confirmable_locked(
+                        "invalid desired quote", actions, errors
+                    )
+                    or position_refresh_required
                 )
-                return self._result(actions, errors)
+                return self._result(
+                    actions, errors, position_refresh_required
+                )
 
             desired_by_side = {
                 OrderSide.BUY: desired.bid,
@@ -215,12 +296,15 @@ class MarketMakerOrderManager:
                 if live is None:
                     continue
                 if target is None:
-                    await self._cancel_locked(
-                        side,
-                        desired.reason or "side disabled",
-                        actions,
-                        errors,
-                        safety=True,
+                    position_refresh_required = (
+                        await self._cancel_locked(
+                            side,
+                            desired.reason or "side disabled",
+                            actions,
+                            errors,
+                            safety=True,
+                        )
+                        or position_refresh_required
                     )
                     continue
                 if live.state not in {
@@ -235,22 +319,29 @@ class MarketMakerOrderManager:
                 age_ms = (self._monotonic() - live.created_monotonic) * 1000
                 if not safety and age_ms < self.config.min_order_lifetime_ms:
                     continue
-                await self._cancel_locked(
-                    side,
-                    replace_reason,
-                    actions,
-                    errors,
-                    safety=safety,
+                position_refresh_required = (
+                    await self._cancel_locked(
+                        side,
+                        replace_reason,
+                        actions,
+                        errors,
+                        safety=safety,
+                    )
+                    or position_refresh_required
                 )
 
             blocking = self._blocking_reason()
             if blocking:
                 self._pause(blocking)
-                await self._cancel_confirmable_locked(
-                    "uncertain order state", actions, errors
+                position_refresh_required = (
+                    await self._cancel_confirmable_locked(
+                        "uncertain order state", actions, errors
+                    )
+                    or position_refresh_required
                 )
-                return self._result(actions, errors)
-
+                return self._result(
+                    actions, errors, position_refresh_required
+                )
             if not quote_allowed:
                 if risk.runtime_state not in quoting_states:
                     self.runtime_state = risk.runtime_state
@@ -258,7 +349,15 @@ class MarketMakerOrderManager:
                     self.runtime_state = desired.runtime_state
                 else:
                     self.runtime_state = RuntimeState.PAUSED_ERROR
-                return self._result(actions, errors)
+                return self._result(
+                    actions, errors, position_refresh_required
+                )
+            if errors:
+                return self._result(
+                    actions, errors, position_refresh_required
+                )
+            if position_refresh_required:
+                return self._result(actions, errors, True)
 
             # Risk-reducing creates have priority over risk-increasing creates.
             placements = sorted(
@@ -275,18 +374,30 @@ class MarketMakerOrderManager:
                 if validation_error:
                     errors.append(validation_error)
                     continue
-                await self._place_locked(target, actions, errors)
+                position_refresh_required = (
+                    await self._place_locked(target, actions, errors)
+                    or position_refresh_required
+                )
                 blocking = self._blocking_reason()
                 if blocking:
                     self._pause(blocking)
-                    await self._cancel_confirmable_locked(
-                        "uncertain order state", actions, errors
+                    position_refresh_required = (
+                        await self._cancel_confirmable_locked(
+                            "uncertain order state", actions, errors
+                        )
+                        or position_refresh_required
                     )
-                    return self._result(actions, errors)
+                    return self._result(
+                        actions, errors, position_refresh_required
+                    )
+                if errors:
+                    return self._result(
+                        actions, errors, position_refresh_required
+                    )
 
             if self.pause_reason is None:
                 self.runtime_state = desired.runtime_state
-            return self._result(actions, errors)
+            return self._result(actions, errors, position_refresh_required)
 
     async def handle_order_update(self, order: OrderData) -> None:
         async with self._lock:
@@ -304,9 +415,14 @@ class MarketMakerOrderManager:
         async with self._lock:
             return await self._resolve_uncertain_locked()
 
-    async def sync_open_orders(self) -> None:
+    async def sync_open_orders(self) -> bool:
         async with self._lock:
-            await self._resolve_uncertain_locked()
+            resolved = await self._resolve_uncertain_locked()
+            position_refresh_required = any(
+                order.symbol == self.config.symbol
+                and _has_visible_fill(order)
+                for order in resolved
+            )
             open_orders = self._active_symbol_orders(
                 await self.adapter.get_open_orders(self.config.symbol)
             )
@@ -317,16 +433,25 @@ class MarketMakerOrderManager:
                 matches = [
                     order
                     for order in open_orders
-                    if self._order_matches(slot, order)
+                    if order.side is side and self._order_matches(slot, order)
                 ]
                 if len(matches) > 1:
                     self._pause(f"multiple open orders match {side.value} slot")
                     continue
                 if matches:
                     matched_ids.add(id(matches[0]))
+                    position_refresh_required = (
+                        _has_visible_fill(
+                            matches[0], previous_remaining=slot.remaining
+                        )
+                        or position_refresh_required
+                    )
                     self._apply_order_update(side, matches[0])
                     continue
-                await self._resolve_missing_slot_locked(side, slot)
+                position_refresh_required = (
+                    await self._resolve_missing_slot_locked(side, slot)
+                    or position_refresh_required
+                )
 
             unknown = [order for order in open_orders if id(order) not in matched_ids]
             if unknown:
@@ -340,13 +465,18 @@ class MarketMakerOrderManager:
                 self.pause_reason = None
                 self.runtime_state = RuntimeState.SYNCING
             self._clear_resolved_uncertainty_pause()
+            return position_refresh_required
 
     async def cancel_managed_orders(self, reason: str) -> ReconcileResult:
         async with self._lock:
             actions: list[ReconcileAction] = []
             errors: list[str] = []
-            await self._cancel_confirmable_locked(reason, actions, errors)
-            return self._result(actions, errors)
+            position_refresh_required = await self._cancel_confirmable_locked(
+                reason, actions, errors
+            )
+            return self._result(
+                actions, errors, position_refresh_required
+            )
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -368,7 +498,8 @@ class MarketMakerOrderManager:
                     await self.adapter.get_open_orders(self.config.symbol)
                 )
                 if any(
-                    self._order_matches(managed, order)
+                    order.side is managed.side
+                    and self._order_matches(managed, order)
                     for managed in managed_before
                     for order in open_orders
                 ):
@@ -378,7 +509,8 @@ class MarketMakerOrderManager:
             if unresolved:
                 errors.append("adapter submissions remain unresolved after shutdown")
             elif not remaining and not any(
-                self._order_matches(managed, order)
+                order.side is managed.side
+                and self._order_matches(managed, order)
                 for managed in managed_before
                 for order in (
                     open_orders if not self.config.dry_run else ()
@@ -400,7 +532,7 @@ class MarketMakerOrderManager:
         desired: DesiredOrder,
         actions: list[ReconcileAction],
         errors: list[str],
-    ) -> None:
+    ) -> bool:
         operation = "would_place" if self.config.dry_run else "place"
         action = ReconcileAction(
             desired.side,
@@ -412,7 +544,7 @@ class MarketMakerOrderManager:
         )
         if self.config.dry_run:
             actions.append(action)
-            return
+            return False
         if not self._create_budget_available():
             actions.append(
                 ReconcileAction(
@@ -424,7 +556,7 @@ class MarketMakerOrderManager:
                     desired.reduce_only,
                 )
             )
-            return
+            return False
 
         now = self._monotonic()
         self._slots[desired.side] = ManagedOrder(
@@ -441,6 +573,7 @@ class MarketMakerOrderManager:
         )
         self._record_mutation()
         actions.append(action)
+        action_index = len(actions) - 1
         try:
             order = await self.adapter.create_order(
                 self.config.symbol,
@@ -453,32 +586,49 @@ class MarketMakerOrderManager:
                     "reduce_only": desired.reduce_only,
                 },
             )
+        except asyncio.CancelledError:
+            self._mark_submission_uncertain(
+                desired.side, "create task was cancelled before confirmation"
+            )
+            raise
         except Exception as exc:
-            self._mark_submission_uncertain(desired.side, str(exc))
-            errors.append(f"create outcome uncertain: {type(exc).__name__}")
-            return
+            category = _error_category(exc)
+            if category == "http_429":
+                actions[action_index] = replace(action, success=False)
+                self._slots[desired.side] = None
+                errors.append("create rejected: http_429")
+                return False
+            self._mark_submission_uncertain(desired.side, category)
+            errors.append(f"create outcome uncertain: {category}")
+            return False
         if order is None:
             self._mark_submission_uncertain(
                 desired.side, "adapter returned no order confirmation"
             )
             errors.append("create outcome uncertain: no order confirmation")
-            return
+            return False
+        position_refresh_required = _has_visible_fill(order)
         if (
             order.symbol != self.config.symbol
             or order.side is not desired.side
             or order.status is OrderStatus.UNKNOWN
+            or not any(
+                value is not None and str(value).strip()
+                for value in (order.id, order.client_id)
+            )
         ):
             self._mark_submission_uncertain(
                 desired.side, "adapter returned an invalid order confirmation"
             )
             errors.append("create outcome uncertain: invalid confirmation")
-            return
+            return position_refresh_required
         if order.status in _TERMINAL_STATUSES:
+            actions[action_index] = replace(action, success=False)
             self._slots[desired.side] = None
             errors.append(
                 f"create returned terminal status: {order.status.value}"
             )
-            return
+            return position_refresh_required
 
         self._apply_order_update(desired.side, order)
         if self._submission_uncertain(order):
@@ -487,6 +637,22 @@ class MarketMakerOrderManager:
                 slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
                 slot.submission_uncertain = True
             self._pause("order submission outcome is uncertain")
+            return position_refresh_required
+        slot = self._slots[desired.side]
+        if (
+            slot is None
+            or slot.state not in {
+                OrderSlotState.LIVE,
+                OrderSlotState.PARTIALLY_FILLED,
+                OrderSlotState.SUBMITTING,
+            }
+            or slot.submission_uncertain
+            or slot.cancellation_uncertain
+        ):
+            errors.append("create outcome uncertain: invalid confirmation")
+            return position_refresh_required
+        actions[action_index] = replace(action, success=True)
+        return position_refresh_required
 
     async def _cancel_locked(
         self,
@@ -496,10 +662,10 @@ class MarketMakerOrderManager:
         errors: list[str],
         *,
         safety: bool,
-    ) -> None:
+    ) -> bool:
         slot = self._slots[side]
         if slot is None:
-            return
+            return False
         operation = "would_cancel" if self.config.dry_run else "cancel"
         action = ReconcileAction(
             side,
@@ -511,20 +677,22 @@ class MarketMakerOrderManager:
         )
         if self.config.dry_run:
             actions.append(action)
-            return
+            return False
         if slot.order_id is None:
             slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
             slot.submission_uncertain = True
             self._pause("cannot cancel an order without a confirmed order id")
             errors.append(self.pause_reason or "missing order id")
-            return
+            return False
         if not safety and not self._mutation_budget_available():
             actions.append(
                 ReconcileAction(side, "blocked", "mutation budget exhausted")
             )
-            return
+            return False
 
         actions.append(action)
+        action_index = len(actions) - 1
+        previous_state = slot.state
         slot.state = OrderSlotState.CANCELING
         slot.updated_monotonic = self._monotonic()
         self._record_mutation()
@@ -532,27 +700,40 @@ class MarketMakerOrderManager:
             result = await self.adapter.cancel_order(
                 slot.order_id, self.config.symbol
             )
-        except Exception as exc:
+        except asyncio.CancelledError:
             self._mark_cancellation_uncertain(slot)
-            errors.append(f"cancel outcome uncertain: {type(exc).__name__}")
-            return
+            raise
+        except Exception as exc:
+            category = _error_category(exc)
+            if category == "http_429":
+                actions[action_index] = replace(action, success=False)
+                slot.state = previous_state
+                slot.updated_monotonic = self._monotonic()
+                errors.append("cancel rejected: http_429")
+                return False
+            self._mark_cancellation_uncertain(slot)
+            errors.append(f"cancel outcome uncertain: {category}")
+            return False
         if (
             self._cancellation_terminal(result)
             and result is not None
             and result.symbol == self.config.symbol
             and self._order_matches(slot, result)
         ):
+            actions[action_index] = replace(action, success=True)
             self._slots[side] = None
-            return
+            return True
         self._mark_cancellation_uncertain(slot)
         errors.append("cancel outcome is not terminal")
+        return False
 
     async def _cancel_confirmable_locked(
         self,
         reason: str,
         actions: list[ReconcileAction],
         errors: list[str],
-    ) -> None:
+    ) -> bool:
+        position_refresh_required = False
         for side in (OrderSide.BUY, OrderSide.SELL):
             slot = self._slots[side]
             if slot is None:
@@ -563,9 +744,13 @@ class MarketMakerOrderManager:
             }:
                 errors.append(f"{side.value} order state is uncertain")
                 continue
-            await self._cancel_locked(
-                side, reason, actions, errors, safety=True
+            position_refresh_required = (
+                await self._cancel_locked(
+                    side, reason, actions, errors, safety=True
+                )
+                or position_refresh_required
             )
+        return position_refresh_required
 
     async def _resolve_uncertain_locked(self) -> list[OrderData]:
         resolver = getattr(self.adapter, "resolve_unresolved_submissions", None)
@@ -588,7 +773,7 @@ class MarketMakerOrderManager:
 
     async def _resolve_missing_slot_locked(
         self, side: OrderSide, slot: ManagedOrder
-    ) -> None:
+    ) -> bool:
         history_getter = getattr(self.adapter, "get_order_history", None)
         history: Iterable[OrderData] = ()
         if callable(history_getter):
@@ -597,14 +782,17 @@ class MarketMakerOrderManager:
             (
                 order
                 for order in history
-                if self._order_matches(slot, order)
+                if order.side is side
+                and self._order_matches(slot, order)
                 and order.status in _TERMINAL_STATUSES
             ),
             None,
         )
         if terminal is not None:
             self._slots[side] = None
-            return
+            return _has_visible_fill(
+                terminal, previous_remaining=slot.remaining
+            )
         if slot.state in {
             OrderSlotState.CANCELING,
             OrderSlotState.UNCERTAIN_CANCELLATION,
@@ -614,6 +802,7 @@ class MarketMakerOrderManager:
             slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
             slot.submission_uncertain = True
             self._pause(f"{side.value} order disappeared without terminal proof")
+        return False
 
     async def _sync_for_shutdown_locked(self) -> None:
         open_orders = self._active_symbol_orders(
@@ -622,7 +811,10 @@ class MarketMakerOrderManager:
         for side, slot in tuple(self._slots.items()):
             if slot is None:
                 continue
-            if any(self._order_matches(slot, order) for order in open_orders):
+            if any(
+                order.side is side and self._order_matches(slot, order)
+                for order in open_orders
+            ):
                 continue
             await self._resolve_missing_slot_locked(side, slot)
 
@@ -799,13 +991,19 @@ class MarketMakerOrderManager:
         return None
 
     def _order_matches(self, slot: ManagedOrder, order: OrderData) -> bool:
-        identifiers = {value for value in (slot.order_id, slot.client_id) if value}
-        order_identifiers = {
-            str(value)
-            for value in (order.id, order.client_id)
-            if value is not None and str(value)
-        }
-        return bool(identifiers & order_identifiers)
+        order_id = str(order.id) if order.id is not None else None
+        client_id = (
+            str(order.client_id) if order.client_id is not None else None
+        )
+        order_id_matches = bool(
+            slot.order_id and order_id and slot.order_id == order_id
+        )
+        client_id_matches = bool(
+            slot.client_id and client_id and slot.client_id == client_id
+        )
+        return order.symbol == self.config.symbol and (
+            order_id_matches or client_id_matches
+        )
 
     def _active_symbol_orders(
         self, orders: Iterable[OrderData] | None
@@ -873,9 +1071,13 @@ class MarketMakerOrderManager:
         self,
         actions: list[ReconcileAction],
         errors: Iterable[str],
+        position_refresh_required: bool = False,
     ) -> ReconcileResult:
         result = ReconcileResult(
-            tuple(actions), self.runtime_state, tuple(errors)
+            tuple(actions),
+            self.runtime_state,
+            tuple(errors),
+            position_refresh_required,
         )
         self.last_result = result
         return result

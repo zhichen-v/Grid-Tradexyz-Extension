@@ -69,7 +69,18 @@ class LighterAdapter(ExchangeAdapter):
 
         # 初始化订阅管理器
         try:
-            config_dict = self._load_lighter_config()
+            extra_params = getattr(config, 'extra_params', {}) or {}
+            config_dict = (
+                self._load_lighter_config()
+                if extra_params.get('load_credentials_from_file', True)
+                else {
+                    'exchange_id': 'lighter',
+                    'subscription_mode': {
+                        'mode': 'predefined',
+                        'predefined': {'symbols': [], 'data_types': {}},
+                    },
+                }
+            )
 
             symbol_cache_service = self._get_symbol_cache_service()
 
