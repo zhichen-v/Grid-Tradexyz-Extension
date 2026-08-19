@@ -29,12 +29,16 @@ from .order_manager import (
     ReconcileAction,
     ReconcileResult,
 )
+from .coordinator import MarketMakerCoordinator
+from .metrics import MarketMakerMetrics
 
 __all__ = [
     "DesiredOrder",
     "DesiredQuotes",
     "ManagedOrder",
     "MarketMakerConfig",
+    "MarketMakerCoordinator",
+    "MarketMakerMetrics",
     "MarketMakerOrderManager",
     "MarketMakerStrategy",
     "MarketMetadata",
