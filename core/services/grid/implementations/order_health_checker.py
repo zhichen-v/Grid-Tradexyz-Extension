@@ -311,6 +311,23 @@ class OrderHealthChecker:
                     "_record_exchange_order_progress",
                     None,
                 )
+                is_uncertain = getattr(
+                    self.engine,
+                    "_is_submission_uncertain",
+                    None,
+                )
+                adopt_submission = getattr(
+                    self.engine,
+                    "_adopt_reconciled_grid_submission",
+                    None,
+                )
+                if (
+                    matched_order is not None
+                    and callable(is_uncertain)
+                    and is_uncertain(grid_order)
+                    and callable(adopt_submission)
+                ):
+                    adopt_submission(grid_order, matched_order)
                 if matched_order is not None and callable(record_progress):
                     record_progress(grid_order, matched_order)
                 self._clear_missing_order_tracking(alias_keys)

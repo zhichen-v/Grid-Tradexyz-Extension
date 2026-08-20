@@ -252,7 +252,9 @@ class GridEngineImpl(IGridEngine):
             if self._is_submission_uncertain(order):
                 if self._is_submission_acknowledged(order):
                     order.exchange_data["submission_acknowledged_at"] = time.time()
-                else:
+                elif not await self._resolve_uncertain_grid_submission_with_grace(
+                    order
+                ):
                     self._quarantine_uncertain_grid_submission(order)
             elif exchange_status == "filled":
                 self._schedule_deferred_fill_finalization(
@@ -2901,6 +2903,38 @@ class GridEngineImpl(IGridEngine):
             f"client_id={grid_order.order_id}",
             grid_order,
         )
+
+    async def _resolve_uncertain_grid_submission_with_grace(
+        self,
+        grid_order: GridOrder,
+    ) -> bool:
+        """Pause new mutations while an ambiguous submission gets exact read proof."""
+        resolver = getattr(self.exchange, "resolve_unresolved_submissions", None)
+        if not callable(resolver):
+            return False
+
+        owns_pause = not self._placements_paused
+        self.pause_placements()
+        resolved = False
+        for delay in (0.5, 1.0, 2.0):
+            await asyncio.sleep(delay)
+            try:
+                await self._resolve_unresolved_submissions_read_only()
+            except Exception as exc:
+                self.logger.warning(
+                    "Ambiguous submission grace lookup failed: "
+                    f"grid_id={grid_order.grid_id}, error={exc}"
+                )
+            if (
+                not self._is_submission_uncertain(grid_order)
+                or grid_order.status != GridOrderStatus.PENDING
+            ):
+                resolved = True
+                break
+
+        if owns_pause and resolved and not self._shutting_down:
+            self.resume_placements()
+        return resolved
 
     def _adopt_reconciled_grid_submission(
         self,

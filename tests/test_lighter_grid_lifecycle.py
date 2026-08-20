@@ -149,6 +149,39 @@ class LighterBatchPlacementTests(unittest.IsolatedAsyncioTestCase):
         sleep_mock.assert_awaited_once_with(0.3)
         exchange.get_open_orders.assert_awaited_once_with("BTC")
 
+    async def test_ambiguous_submission_gets_read_grace_before_fail_stop(self):
+        ambiguous = exchange_order(OrderStatus.PENDING, "0", "0.00020")
+        ambiguous.id = None
+        ambiguous.client_id = "client-101"
+        ambiguous.raw_data = {"submission_uncertain": True}
+        exact = exchange_order(OrderStatus.OPEN, "0", "0.00020")
+        exact.id = "101"
+        exact.client_id = ambiguous.client_id
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            create_order=AsyncMock(return_value=ambiguous),
+            resolve_unresolved_submissions=AsyncMock(return_value=[exact]),
+        )
+        engine = grid_engine(exchange)
+        engine.coordinator = SimpleNamespace(
+            _grid_level_locks={},
+            _request_fatal_stop=MagicMock(),
+        )
+        order = grid_order()
+
+        with patch(
+            "core.services.grid.implementations.grid_engine_impl.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            self.assertIs(await engine.place_order(order), order)
+
+        self.assertEqual(order.order_id, "101")
+        self.assertFalse(order.exchange_data["submission_uncertain"])
+        self.assertFalse(engine._placements_paused)
+        engine.coordinator._request_fatal_stop.assert_not_called()
+        sleep_mock.assert_awaited_once_with(0.5)
+        exchange.resolve_unresolved_submissions.assert_awaited_once_with()
+
 
 class GridStrategyStartupOrderingTests(unittest.TestCase):
     def test_initial_orders_nearest_to_market_are_placed_first(self):
@@ -598,6 +631,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
             config=SimpleNamespace(exchange_id="lighter"),
             create_order=AsyncMock(return_value=uncertain),
             get_order_history=AsyncMock(return_value=[]),
+            resolve_unresolved_submissions=AsyncMock(return_value=[]),
         )
         engine = grid_engine(exchange)
         order = grid_order()
@@ -608,7 +642,11 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         engine.coordinator = coordinator
         engine._restore_cancelled_grid_order = AsyncMock(return_value=False)
 
-        placed = await engine.place_order(order)
+        with patch(
+            "core.services.grid.implementations.grid_engine_impl.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            placed = await engine.place_order(order)
         await engine._sync_orders_from_exchange([])
         await engine._sync_orders_from_exchange([])
 
@@ -617,6 +655,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine._placements_paused)
         self.assertIn(order.grid_id, coordinator._grid_level_locks)
         coordinator._request_fatal_stop.assert_called_once()
+        self.assertEqual(exchange.resolve_unresolved_submissions.await_count, 3)
         exchange.create_order.assert_awaited_once()
         engine._restore_cancelled_grid_order.assert_not_awaited()
 

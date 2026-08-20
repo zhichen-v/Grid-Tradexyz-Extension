@@ -576,7 +576,7 @@ class OrderHealthCheckerIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unresolved, 1)
         self.assertNotIn(78, locks)
 
-    async def test_remote_client_id_keeps_local_order_open(self):
+    async def test_remote_client_id_adopts_exact_order_id(self):
         local_order = GridOrder(
             order_id="25471046",
             grid_id=4,
@@ -586,13 +586,17 @@ class OrderHealthCheckerIncidentTests(unittest.IsolatedAsyncioTestCase):
             status=GridOrderStatus.PENDING,
             created_at=datetime.now(),
         )
+        local_order.exchange_data = {"submission_uncertain": True}
         exchange = SimpleNamespace(get_order=AsyncMock())
+        adopt_submission = MagicMock()
         engine = SimpleNamespace(
             exchange=exchange,
             _pending_orders={"25471046": local_order},
             _expected_cancellations=set(),
             _order_callbacks=[],
             get_pending_orders=MagicMock(return_value=[local_order]),
+            _is_submission_uncertain=MagicMock(return_value=True),
+            _adopt_reconciled_grid_submission=adopt_submission,
         )
         checker = OrderHealthChecker.__new__(OrderHealthChecker)
         checker.engine = engine
@@ -601,12 +605,12 @@ class OrderHealthCheckerIncidentTests(unittest.IsolatedAsyncioTestCase):
         checker._missing_order_seen_at = {"25471046": 1.0}
         checker._build_grid_order_from_exchange_order = MagicMock()
 
-        unresolved = await checker._sync_orders_into_engine(
-            [SimpleNamespace(id=844424909730865, client_id=25471046)]
-        )
+        remote_order = SimpleNamespace(id=844424909730865, client_id=25471046)
+        unresolved = await checker._sync_orders_into_engine([remote_order])
 
         self.assertEqual(unresolved, 0)
         self.assertEqual(local_order.status, GridOrderStatus.PENDING)
+        adopt_submission.assert_called_once_with(local_order, remote_order)
         exchange.get_order.assert_not_awaited()
         checker._build_grid_order_from_exchange_order.assert_not_called()
 
