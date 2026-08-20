@@ -13,6 +13,35 @@ from core.services.grid.models import GridOrder, GridOrderSide, GridOrderStatus,
 
 
 class OrderHealthCheckerIncidentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gap_repair_defers_uncertain_batch_submissions(self):
+        orders = [
+            GridOrder(
+                order_id=f"missing-{grid_id}",
+                grid_id=grid_id,
+                side=GridOrderSide.BUY,
+                price=Decimal(price),
+                amount=Decimal("0.00020"),
+                status=GridOrderStatus.PENDING,
+                created_at=datetime.now(),
+            )
+            for grid_id, price in ((69, "72700"), (70, "72725"))
+        ]
+        engine = SimpleNamespace(
+            placement_epoch=0,
+            coordinator=None,
+            place_batch_orders=AsyncMock(return_value=orders),
+        )
+        checker = OrderHealthChecker.__new__(OrderHealthChecker)
+        checker.engine = engine
+        checker.logger = MagicMock()
+        checker._health_cycle_placement_epoch = 0
+
+        self.assertEqual(await checker._place_missing_orders(orders), 2)
+        engine.place_batch_orders.assert_awaited_once_with(
+            orders,
+            defer_uncertain=True,
+        )
+
     async def test_snapshot_failure_aborts_instead_of_becoming_empty_state(self):
         exchange = SimpleNamespace(
             get_open_orders=AsyncMock(side_effect=RuntimeError("429")),

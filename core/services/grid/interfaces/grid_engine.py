@@ -29,7 +29,11 @@ class IGridEngine(ABC):
         pass
     
     @abstractmethod
-    async def place_order(self, order: GridOrder) -> GridOrder:
+    async def place_order(
+        self,
+        order: GridOrder,
+        defer_uncertain: bool = False,
+    ) -> GridOrder:
         """
         下单
         
@@ -42,7 +46,11 @@ class IGridEngine(ABC):
         pass
     
     @abstractmethod
-    async def place_batch_orders(self, orders: List[GridOrder]) -> List[GridOrder]:
+    async def place_batch_orders(
+        self,
+        orders: List[GridOrder],
+        defer_uncertain: bool = False,
+    ) -> List[GridOrder]:
         """
         批量下单
         

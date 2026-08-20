@@ -131,6 +131,7 @@ class GridEngineImpl(IGridEngine):
         order: GridOrder,
         batch_mode: bool = False,
         allow_while_paused: bool = False,
+        defer_uncertain: bool = False,
     ) -> Optional[GridOrder]:
         """Serialize the exposure check through pending-order registration."""
         if self._requires_exposure_lock(order.side):
@@ -139,11 +140,13 @@ class GridEngineImpl(IGridEngine):
                     order,
                     batch_mode=batch_mode,
                     allow_while_paused=allow_while_paused,
+                    defer_uncertain=defer_uncertain,
                 )
         return await self._place_order_unlocked(
             order,
             batch_mode=batch_mode,
             allow_while_paused=allow_while_paused,
+            defer_uncertain=defer_uncertain,
         )
 
     async def _place_order_unlocked(
@@ -151,6 +154,7 @@ class GridEngineImpl(IGridEngine):
         order: GridOrder,
         batch_mode: bool = False,
         allow_while_paused: bool = False,
+        defer_uncertain: bool = False,
     ) -> Optional[GridOrder]:
         """Place a single limit order and track it locally."""
         if (
@@ -252,6 +256,16 @@ class GridEngineImpl(IGridEngine):
             if self._is_submission_uncertain(order):
                 if self._is_submission_acknowledged(order):
                     order.exchange_data["submission_acknowledged_at"] = time.time()
+                    if defer_uncertain:
+                        order.exchange_data["health_repair_deferred"] = True
+                elif defer_uncertain:
+                    order.exchange_data["health_repair_deferred"] = True
+                    self.logger.warning(
+                        "Health repair submission remains uncertain; retaining it "
+                        "for the next authoritative snapshot: "
+                        f"grid_id={order.grid_id}, side={order.side.value}, "
+                        f"price={order.price}, client_id={order.order_id}"
+                    )
                 elif not await self._resolve_uncertain_grid_submission_with_grace(
                     order
                 ):
@@ -385,6 +399,7 @@ class GridEngineImpl(IGridEngine):
         orders: List[GridOrder],
         max_retries: int = 2,
         allow_while_paused: bool = False,
+        defer_uncertain: bool = False,
     ) -> List[GridOrder]:
         """Place orders in batches, with retries for failed items."""
         if not orders:
@@ -402,7 +417,11 @@ class GridEngineImpl(IGridEngine):
 
         for start in range(0, total_orders, batch_size):
             batch = orders[start:start + batch_size]
-            results = await self._execute_batch(batch, allow_while_paused)
+            results = await self._execute_batch(
+                batch,
+                allow_while_paused,
+                defer_uncertain,
+            )
 
             for order, result in zip(batch, results):
                 if isinstance(result, GridOrder):
@@ -437,7 +456,11 @@ class GridEngineImpl(IGridEngine):
 
             retry_orders = [order for order, _ in failed_orders]
             failed_orders = []
-            results = await self._execute_batch(retry_orders, allow_while_paused)
+            results = await self._execute_batch(
+                retry_orders,
+                allow_while_paused,
+                defer_uncertain,
+            )
 
             for order, result in zip(retry_orders, results):
                 if isinstance(result, GridOrder):
@@ -1307,6 +1330,8 @@ class GridEngineImpl(IGridEngine):
                     continue
 
                 if self._is_submission_uncertain(grid_order):
+                    if grid_order.exchange_data.get("health_repair_deferred"):
+                        continue
                     acknowledged_at = grid_order.exchange_data.get(
                         "submission_acknowledged_at"
                     )
@@ -2001,6 +2026,7 @@ class GridEngineImpl(IGridEngine):
                 for order in self.get_pending_orders()
                 if self._is_submission_uncertain(order)
                 and self._is_submission_acknowledged(order)
+                and not order.exchange_data.get("health_repair_deferred")
             ]
             if not unresolved:
                 return
@@ -2542,6 +2568,7 @@ class GridEngineImpl(IGridEngine):
         self,
         orders: List[GridOrder],
         allow_while_paused: bool = False,
+        defer_uncertain: bool = False,
     ) -> List[Any]:
         """Execute one placement batch, serially when required by the exchange."""
         if self._supports_batch_mode():
@@ -2553,6 +2580,7 @@ class GridEngineImpl(IGridEngine):
                             order,
                             batch_mode=True,
                             allow_while_paused=allow_while_paused,
+                            defer_uncertain=defer_uncertain,
                         )
                     )
                 except Exception as exc:
@@ -2560,7 +2588,11 @@ class GridEngineImpl(IGridEngine):
             return results
 
         tasks = [
-            self.place_order(order, allow_while_paused=allow_while_paused)
+            self.place_order(
+                order,
+                allow_while_paused=allow_while_paused,
+                defer_uncertain=defer_uncertain,
+            )
             for order in orders
         ]
         return await asyncio.gather(*tasks, return_exceptions=True)
@@ -2953,6 +2985,7 @@ class GridEngineImpl(IGridEngine):
             grid_order.exchange_data = exchange_data
         exchange_data["submission_uncertain"] = False
         exchange_data["submission_reconciled"] = True
+        exchange_data.pop("health_repair_deferred", None)
         resolved = getattr(self, "_resolved_submission_client_ids", None)
         if resolved is None:
             resolved = set()

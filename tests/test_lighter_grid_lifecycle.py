@@ -182,6 +182,34 @@ class LighterBatchPlacementTests(unittest.IsolatedAsyncioTestCase):
         sleep_mock.assert_awaited_once_with(0.5)
         exchange.resolve_unresolved_submissions.assert_awaited_once_with()
 
+    async def test_health_repair_ambiguity_defers_without_stopping_grid(self):
+        ambiguous = exchange_order(OrderStatus.PENDING, "0", "0.00020")
+        ambiguous.id = None
+        ambiguous.client_id = "client-101"
+        ambiguous.raw_data = {"submission_uncertain": True}
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            create_order=AsyncMock(return_value=ambiguous),
+            resolve_unresolved_submissions=AsyncMock(return_value=[]),
+        )
+        engine = grid_engine(exchange)
+        engine.coordinator = SimpleNamespace(
+            _grid_level_locks={},
+            _request_fatal_stop=MagicMock(),
+        )
+        order = grid_order()
+
+        self.assertIs(
+            await engine.place_order(order, defer_uncertain=True),
+            order,
+        )
+
+        self.assertTrue(order.exchange_data["submission_uncertain"])
+        self.assertTrue(order.exchange_data["health_repair_deferred"])
+        self.assertFalse(engine._placements_paused)
+        engine.coordinator._request_fatal_stop.assert_not_called()
+        exchange.resolve_unresolved_submissions.assert_not_awaited()
+
 
 class GridStrategyStartupOrderingTests(unittest.TestCase):
     def test_initial_orders_nearest_to_market_are_placed_first(self):

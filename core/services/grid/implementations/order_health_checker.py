@@ -2375,7 +2375,10 @@ class OrderHealthChecker:
 
         if len(orders) == 1:
             try:
-                placed = await self.engine.place_order(orders[0])
+                placed = await self.engine.place_order(
+                    orders[0],
+                    defer_uncertain=True,
+                )
             except Exception:
                 self._clear_grid_lock_for_order(orders[0])
                 raise
@@ -2392,7 +2395,10 @@ class OrderHealthChecker:
             self._clear_grid_lock_for_order(orders[0])
             return 0
 
-        placed_orders = await self.engine.place_batch_orders(orders)
+        placed_orders = await self.engine.place_batch_orders(
+            orders,
+            defer_uncertain=True,
+        )
         placed_refs = {id(order) for order in placed_orders}
         for order in orders:
             if id(order) not in placed_refs:
