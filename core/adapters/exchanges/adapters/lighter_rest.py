@@ -2330,6 +2330,9 @@ class LighterRest(LighterBase):
 
         # 计算平均价格
         average_price = filled_quote / filled_amount if filled_amount > 0 else None
+        exchange_status = str(
+            getattr(order_info, 'status', 'unknown') or 'unknown'
+        ).strip().lower()
 
         return OrderData(
             # ✅ 使用真正的order_id（order_index的字符串形式）
@@ -2344,15 +2347,17 @@ class LighterRest(LighterBase):
             remaining=remaining_amount,
             cost=filled_quote,
             average=average_price,
-            status=self._parse_order_status(
-                getattr(order_info, 'status', 'unknown')),
+            status=self._parse_order_status(exchange_status),
             timestamp=self._parse_timestamp(
                 getattr(order_info, 'timestamp', None)) or datetime.now(),
             updated=None,
             fee=None,
             trades=[],
             params={},
-            raw_data={'order_info': order_info}
+            raw_data={
+                'order_info': order_info,
+                'post_only_canceled': exchange_status == 'canceled-post-only',
+            }
         )
 
     def _parse_order_side(self, is_ask: bool) -> OrderSide:

@@ -243,7 +243,8 @@ async def run_market_maker(
             await coordinator.start()
             if logger is not None:
                 logger.info(
-                    f"Market maker started: symbol={config.symbol} dry_run={config.dry_run}"
+                    f"Market maker started: symbol={config.symbol} "
+                    f"quote_mode={config.quote_mode} dry_run={config.dry_run}"
                 )
             while coordinator.running and not event.is_set():
                 try:

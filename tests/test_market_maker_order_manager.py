@@ -210,14 +210,20 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_initial_bid_and_ask_are_post_only(self) -> None:
-        result = await self.manager.reconcile(self.desired(), self.risk())
+        results = (
+            await self.manager.reconcile(self.desired(), self.risk()),
+            await self.manager.reconcile(self.desired(), self.risk()),
+        )
 
         self.assertEqual(self.adapter.create_order.await_count, 2)
-        self.assertEqual(
-            {action.operation for action in result.actions}, {"place"}
-        )
-        self.assertTrue(all(action.success is True for action in result.actions))
-        self.assertFalse(result.position_refresh_required)
+        for result in results:
+            self.assertEqual(
+                {action.operation for action in result.actions}, {"place"}
+            )
+            self.assertTrue(
+                all(action.success is True for action in result.actions)
+            )
+            self.assertFalse(result.position_refresh_required)
         for call in self.adapter.create_order.await_args_list:
             self.assertEqual(call.args[0], "BTC")
             self.assertEqual(call.args[2], OrderType.LIMIT)
@@ -244,6 +250,29 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.adapter.create_order.await_args.kwargs["params"],
             {"time_in_force": "POST_ONLY", "reduce_only": True},
+        )
+
+    async def test_unchanged_reduce_only_bid_is_not_safety_canceled(
+        self,
+    ) -> None:
+        desired = self.desired(
+            ask_price=None,
+            bid_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        risk = self.risk(
+            sell_amount=None,
+            buy_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+
+        await self.manager.reconcile(desired, risk)
+        await self.manager.reconcile(desired, risk)
+
+        self.adapter.create_order.assert_awaited_once()
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertTrue(
+            self.manager.slots[OrderSide.BUY].reduce_only
         )
 
     async def test_below_reprice_threshold_keeps_live_order(self) -> None:
@@ -430,6 +459,93 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.adapter.create_order.await_count, 2)
 
+    async def test_direct_post_only_terminal_stops_cycle_and_arms_cooldown(
+        self,
+    ) -> None:
+        attempts = 0
+
+        async def create(
+            _symbol, side, _order_type, amount, price, params
+        ):
+            del params
+            nonlocal attempts
+            attempts += 1
+            return exchange_order(
+                str(attempts),
+                side,
+                status=(
+                    OrderStatus.CANCELED
+                    if attempts == 1
+                    else OrderStatus.OPEN
+                ),
+                price=str(price),
+                amount=str(amount),
+                raw_data=(
+                    {"post_only_canceled": True}
+                    if attempts == 1
+                    else {}
+                ),
+            )
+
+        self.adapter.create_order.side_effect = create
+
+        result = await self.manager.reconcile(self.desired(), self.risk())
+
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.actions[0].reason, "post-only canceled")
+        self.assertFalse(any(self.manager.slots.values()))
+        count, generation = self.manager.consume_post_only_cancellations()
+        self.assertEqual(count, 1)
+        self.assertTrue(self.manager.post_only_book_refresh_required)
+
+        self.manager.acknowledge_post_only_book_refresh(generation)
+        await self.manager.reconcile(self.desired(), self.risk())
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+
+        self.clock.value += self.config.refresh_interval_ms / 1000
+        await self.manager.reconcile(self.desired(), self.risk())
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        await self.manager.reconcile(self.desired(), self.risk())
+        self.assertEqual(self.adapter.create_order.await_count, 3)
+
+    async def test_matched_post_only_terminal_blocks_create_but_allows_cancel(
+        self,
+    ) -> None:
+        await self.manager.reconcile(self.desired(), self.risk())
+        await self.manager.reconcile(self.desired(), self.risk())
+        await self.manager.handle_order_update(
+            exchange_order(
+                "foreign",
+                OrderSide.BUY,
+                status=OrderStatus.CANCELED,
+                raw_data={"post_only_canceled": True},
+            )
+        )
+        self.assertEqual(
+            self.manager.consume_post_only_cancellations()[0], 0
+        )
+
+        await self.manager.handle_order_update(
+            exchange_order(
+                "1",
+                OrderSide.BUY,
+                status=OrderStatus.CANCELED,
+                price="99.9",
+                raw_data={"post_only_canceled": True},
+            )
+        )
+        result = await self.manager.reconcile(
+            self.desired(ask_price=None), self.risk()
+        )
+
+        self.assertEqual(
+            self.manager.consume_post_only_cancellations()[0], 1
+        )
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.adapter.cancel_order.assert_awaited_once_with("2", "BTC")
+        self.assertEqual(result.errors, ())
+
     async def test_uncertain_submission_is_not_duplicated(self) -> None:
         self.adapter.create_order.side_effect = None
         self.adapter.create_order.return_value = exchange_order(
@@ -595,6 +711,23 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             self.manager.slots[OrderSide.BUY].state, OrderSlotState.LIVE
         )
 
+    async def test_market_quality_pause_cancels_live_quotes(self) -> None:
+        await self.manager.reconcile(self.desired(), self.risk())
+        await self.manager.reconcile(self.desired(), self.risk())
+
+        result = await self.manager.reconcile(
+            self.desired(
+                bid_price=None,
+                ask_price=None,
+                state=RuntimeState.PAUSED_MARKET,
+            ),
+            self.risk(),
+        )
+
+        self.assertEqual(result.runtime_state, RuntimeState.PAUSED_MARKET)
+        self.assertEqual(self.adapter.cancel_order.await_count, 2)
+        self.assertFalse(any(self.manager.slots.values()))
+
     async def test_cancel_task_cancellation_marks_outcome_uncertain(self) -> None:
         await self.manager.reconcile(
             self.desired(bid_price="99.9", ask_price=None), self.risk()
@@ -675,7 +808,113 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.manager.slots[OrderSide.BUY].order_id, "late-order"
         )
-        self.assertEqual(self.manager.runtime_state, RuntimeState.SYNCING)
+        self.assertEqual(
+            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
+        )
+
+    async def test_adapter_unresolved_submission_blocks_create_without_slot(
+        self,
+    ) -> None:
+        self.adapter.get_unresolved_submissions.return_value = [
+            {"client_order_id": "client-1"}
+        ]
+
+        result = await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+
+        self.adapter.resolve_unresolved_submissions.assert_awaited_once()
+        self.adapter.create_order.assert_not_awaited()
+        self.assertTrue(self.manager.has_uncertain_state)
+        self.assertEqual(result.runtime_state, RuntimeState.PAUSED_ORDER_STATE)
+
+    async def test_resolved_ambiguous_submission_does_not_auto_retry(self) -> None:
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = exchange_order(
+            "client-1",
+            OrderSide.BUY,
+            status=OrderStatus.PENDING,
+            price="99.9",
+            client_id="client-1",
+            params={"submission_uncertain": True},
+        )
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        self.adapter.resolve_unresolved_submissions.return_value = [
+            exchange_order(
+                "late-order",
+                OrderSide.BUY,
+                status=OrderStatus.CANCELED,
+                price="99.9",
+                client_id="client-1",
+            )
+        ]
+
+        await self.manager.resolve_unresolved_submissions()
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+
+        self.adapter.create_order.assert_awaited_once()
+        self.assertIsNone(self.manager.slots[OrderSide.BUY])
+        self.assertEqual(
+            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
+        )
+
+    async def test_submission_latch_survives_uncertain_cancel_resolution(
+        self,
+    ) -> None:
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = exchange_order(
+            "client-1",
+            OrderSide.BUY,
+            status=OrderStatus.PENDING,
+            price="99.9",
+            client_id="client-1",
+            params={"submission_uncertain": True},
+        )
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        self.adapter.resolve_unresolved_submissions.return_value = [
+            exchange_order(
+                "late-order",
+                OrderSide.BUY,
+                price="99.9",
+                remaining="0.1",
+                client_id="client-1",
+            )
+        ]
+        await self.manager.resolve_unresolved_submissions()
+
+        self.adapter.resolve_unresolved_submissions.return_value = []
+        self.adapter.cancel_order.side_effect = TimeoutError("response lost")
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        self.adapter.get_open_orders.return_value = []
+        self.adapter.get_order_history.return_value = [
+            exchange_order(
+                "late-order",
+                OrderSide.BUY,
+                status=OrderStatus.CANCELED,
+                price="99.9",
+                remaining="0.1",
+                client_id="client-1",
+            )
+        ]
+        await self.manager.sync_open_orders()
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+
+        self.adapter.create_order.assert_awaited_once()
+        self.assertIsNone(self.manager.slots[OrderSide.BUY])
+        self.assertTrue(self.manager.has_uncertain_state)
+        self.assertEqual(
+            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
+        )
 
     async def test_uncertain_submission_rejects_wrong_symbol(self) -> None:
         self.adapter.create_order.side_effect = None
@@ -740,9 +979,10 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.position_refresh_required)
+        self.adapter.cancel_order.assert_awaited_once_with("late-order", "BTC")
+        self.assertIsNone(self.manager.slots[OrderSide.BUY])
         self.assertEqual(
-            self.manager.slots[OrderSide.BUY].state,
-            OrderSlotState.PARTIALLY_FILLED,
+            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
         )
 
     async def test_uncertain_first_create_stops_second_side(self) -> None:
@@ -796,6 +1036,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         await self.manager.reconcile(self.desired(), self.risk())
+        await self.manager.reconcile(self.desired(), self.risk())
         self.clock.value += 2
 
         async def cancel(order_id, symbol):
@@ -824,6 +1065,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsafe_risk_cancels_even_if_desired_still_has_quotes(
         self,
     ) -> None:
+        await self.manager.reconcile(self.desired(), self.risk())
         await self.manager.reconcile(self.desired(), self.risk())
 
         await self.manager.reconcile(
@@ -969,6 +1211,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await manager.reconcile(self.desired(), self.risk())
         self.assertEqual(self.adapter.create_order.await_count, 1)
+        result = await manager.reconcile(self.desired(), self.risk())
         self.assertIn("blocked", {action.operation for action in result.actions})
 
         unsafe = self.risk(
@@ -1010,6 +1253,20 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(RuntimeError):
             await failing.shutdown()
+
+    async def test_shutdown_rejects_unknown_target_symbol_order(self) -> None:
+        unknown = exchange_order("foreign-1", OrderSide.BUY)
+        self.adapter.get_open_orders.side_effect = ([], [unknown])
+
+        with self.assertRaisesRegex(RuntimeError, "open orders remain active"):
+            await self.manager.shutdown()
+
+        self.assertEqual(
+            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
+        )
+        self.assertEqual(self.adapter.get_open_orders.await_count, 2)
+        self.adapter.cancel_order.assert_not_awaited()
+        self.adapter.cancel_all_orders.assert_not_awaited()
 
     async def test_shutdown_accepts_later_exact_terminal_proof(self) -> None:
         await self.manager.reconcile(

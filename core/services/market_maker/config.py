@@ -59,9 +59,11 @@ class MarketMakerConfig:
     exchange: str = "lighter"
     symbol: str = "BTC"
     order_size: Decimal = Decimal("0.00020")
+    quote_mode: str = "both"
     base_half_spread_ticks: int = 1
     max_inventory_skew_ticks: int = 4
     reprice_threshold_ticks: int = 1
+    max_raw_spread_bps: Decimal = Decimal("100")
     maker_fee_rate: Decimal = Decimal("0")
     min_profit_buffer_bps: Decimal = Decimal("0.5")
     max_position: Decimal = Decimal("0.00200")
@@ -88,6 +90,7 @@ class MarketMakerConfig:
     def __post_init__(self) -> None:
         for name in (
             "order_size",
+            "max_raw_spread_bps",
             "maker_fee_rate",
             "min_profit_buffer_bps",
             "max_position",
@@ -106,10 +109,19 @@ class MarketMakerConfig:
             raise ValueError("max_position must be positive")
         if self.order_size > self.max_position:
             raise ValueError("order_size cannot exceed max_position")
+        if (
+            not isinstance(self.quote_mode, str)
+            or self.quote_mode not in {"both", "bid_only", "ask_only"}
+        ):
+            raise ValueError(
+                "quote_mode must be 'both', 'bid_only', or 'ask_only'"
+            )
 
         self._validate_int("base_half_spread_ticks", minimum=1)
         self._validate_int("max_inventory_skew_ticks", minimum=0)
         self._validate_int("reprice_threshold_ticks", minimum=1)
+        if self.max_raw_spread_bps <= 0:
+            raise ValueError("max_raw_spread_bps must be positive")
         if self.maker_fee_rate < 0:
             raise ValueError("maker_fee_rate cannot be negative")
         if self.min_profit_buffer_bps < 0:

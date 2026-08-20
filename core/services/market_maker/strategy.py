@@ -181,6 +181,16 @@ class MarketMakerStrategy:
             )
 
         reference = (external_bid + external_ask) / _TWO
+        raw_spread_bps = (
+            (external_ask - external_bid) / reference * _TEN_THOUSAND
+        )
+        if raw_spread_bps > self.config.max_raw_spread_bps:
+            return self._no_quotes(
+                RuntimeState.PAUSED_MARKET,
+                "external spread "
+                f"{raw_spread_bps} bps exceeds "
+                f"max_raw_spread_bps={self.config.max_raw_spread_bps}",
+            )
         inventory_ratio = max(
             -_ONE,
             min(_ONE, position.signed_size / self.config.max_position),

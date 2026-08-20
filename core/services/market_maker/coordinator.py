@@ -370,16 +370,6 @@ class MarketMakerCoordinator:
             self.metrics.increment("ignored_other_symbol_orders")
             return
         self._pending_orders.append(order)
-        marker = " ".join(
-            str(value)
-            for value in (
-                (order.params or {}).get("reason"),
-                (order.raw_data or {}).get("reason"),
-            )
-            if value
-        ).lower()
-        if order.status is OrderStatus.CANCELED and "post" in marker:
-            self.metrics.increment("post_only_cancellations")
         try:
             filled = Decimal(str(order.filled))
             if (filled.is_finite() and filled > 0) or order.status is OrderStatus.FILLED:
@@ -423,6 +413,8 @@ class MarketMakerCoordinator:
                 await self.order_manager.handle_order_update(
                     self._pending_orders.popleft()
                 )
+            if not await self._refresh_after_post_only_cancellations():
+                return
 
             if self._position_refresh_required:
                 if not await self._refresh_position_after_order_update():
@@ -454,6 +446,15 @@ class MarketMakerCoordinator:
                     RuntimeState.PAUSED_EXCHANGE, "exchange is unhealthy"
                 )
                 return
+            if self._state in {
+                RuntimeState.PAUSED_DATA,
+                RuntimeState.PAUSED_POSITION,
+            }:
+                if not await self._recover_from_error_pause(
+                    reset_errors=False
+                ):
+                    return
+                now = self._monotonic()
             if self._market is None:
                 await self._fail_closed(
                     RuntimeState.PAUSED_DATA, "order book snapshot is unavailable"
@@ -549,6 +550,8 @@ class MarketMakerCoordinator:
                 self._position_refresh_required = True
                 if not await self._refresh_position_after_order_update():
                     return
+            if not await self._refresh_after_post_only_cancellations():
+                return
             if result.errors:
                 self.metrics.increment("reconciliation_failure")
                 error_reason = "; ".join(result.errors)
@@ -586,9 +589,20 @@ class MarketMakerCoordinator:
     async def poll_position_once(self) -> bool:
         try:
             positions = await self.adapter.get_positions([self.config.symbol])
-            self._position = self._position_from_rest(positions)
-            if self._position is None:
+            candidate = self._position_from_rest(positions)
+            if candidate is None:
                 raise RuntimeError("position REST response is unavailable")
+            if (
+                self._position is not None
+                and candidate.signed_size != self._position.signed_size
+            ):
+                await self._fail_closed(
+                    RuntimeState.PAUSED_POSITION,
+                    "position changed without a confirmed order fill; "
+                    "full REST resync is required",
+                )
+                return False
+            self._position = candidate
         except Exception as exc:
             count = await self._record_error(
                 f"position poll failed: {exc}", source="position"
@@ -633,10 +647,15 @@ class MarketMakerCoordinator:
                         "position refresh failed after terminal fill",
                     )
                 return False
-        if getattr(self.order_manager, "pause_reason", None):
+        if not await self._refresh_after_post_only_cancellations():
+            return False
+        pause_reason = getattr(self.order_manager, "pause_reason", None)
+        if pause_reason or getattr(
+            self.order_manager, "has_uncertain_state", False
+        ):
             await self._fail_closed(
                 RuntimeState.PAUSED_ORDER_STATE,
-                self.order_manager.pause_reason,
+                pause_reason or "order state is uncertain",
             )
             return False
         if self._state is RuntimeState.PAUSED_ORDER_STATE:
@@ -783,7 +802,9 @@ class MarketMakerCoordinator:
         self.metrics.increment("position_refresh_after_order_update")
         return True
 
-    async def _recover_from_error_pause(self) -> bool:
+    async def _recover_from_error_pause(
+        self, *, reset_errors: bool = True
+    ) -> bool:
         """Require cooldown plus fresh health/data/order truth before quoting."""
         try:
             health = await self.adapter.health_check()
@@ -807,8 +828,13 @@ class MarketMakerCoordinator:
                         "position REST response is unavailable after order sync"
                     )
                 self._position = position
-            if getattr(self.order_manager, "pause_reason", None):
-                raise RuntimeError(self.order_manager.pause_reason)
+            pause_reason = getattr(self.order_manager, "pause_reason", None)
+            if pause_reason or getattr(
+                self.order_manager, "has_uncertain_state", False
+            ):
+                raise RuntimeError(
+                    pause_reason or "order state is uncertain"
+                )
         except Exception as exc:
             self._error_paused_until = (
                 self._monotonic() + self.config.error_cooldown_seconds
@@ -819,10 +845,16 @@ class MarketMakerCoordinator:
             )
             return False
         self._exchange_healthy = True
-        for source in self._error_streaks:
+        recovered_sources = (
+            self._error_streaks
+            if reset_errors
+            else ("health", "position", "orders")
+        )
+        for source in recovered_sources:
             self._error_streaks[source] = 0
-        self.metrics.consecutive_errors = 0
-        self._error_paused_until = None
+        self.metrics.consecutive_errors = max(self._error_streaks.values())
+        if reset_errors:
+            self._error_paused_until = None
         self._transition(RuntimeState.SYNCING)
         return True
 
@@ -902,7 +934,42 @@ class MarketMakerCoordinator:
         book = await self.adapter.get_orderbook(self.config.symbol)
         if book is None:
             raise RuntimeError("order book REST response is unavailable")
+        book = self._normalize_market(book)
         await self.on_orderbook(book)
+
+    async def _refresh_after_post_only_cancellations(self) -> bool:
+        consumer = getattr(
+            self.order_manager, "consume_post_only_cancellations", None
+        )
+        if not callable(consumer):
+            return True
+
+        event_count, generation = consumer()
+        refresh_required = getattr(
+            self.order_manager, "post_only_book_refresh_required", False
+        ) is True
+        if event_count:
+            self.metrics.increment("post_only_cancellations", event_count)
+        if not refresh_required:
+            return True
+
+        try:
+            await self._refresh_market_once()
+        except Exception:
+            await self._fail_closed(
+                RuntimeState.PAUSED_DATA,
+                "fresh order book is unavailable after post-only cancellation",
+            )
+            return False
+
+        acknowledge = getattr(
+            self.order_manager,
+            "acknowledge_post_only_book_refresh",
+            None,
+        )
+        if callable(acknowledge):
+            acknowledge(generation)
+        return True
 
     async def _quote_loop(self) -> None:
         timeout = self.config.refresh_interval_ms / 1000

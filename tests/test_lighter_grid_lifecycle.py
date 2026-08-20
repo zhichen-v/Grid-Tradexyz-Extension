@@ -13,6 +13,7 @@ from core.adapters.exchanges.models import (
     OrderSide,
     OrderStatus,
     OrderType,
+    PositionSide,
 )
 from core.services.grid.implementations.grid_engine_impl import GridEngineImpl
 from core.services.grid.coordinator.grid_coordinator import GridCoordinator
@@ -1217,7 +1218,7 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sdk_stream_normal_exit_schedules_reconnect(self):
         websocket = object.__new__(LighterWebSocket)
-        websocket.ws_client = SimpleNamespace(run=lambda: None)
+        websocket.ws_client = SimpleNamespace(run_async=AsyncMock())
         websocket._connected = True
         websocket._stopping_sdk_ws = False
         websocket._explicit_stop = False
@@ -1338,6 +1339,63 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed.status, OrderStatus.OPEN)
         self.assertEqual(parsed.filled, Decimal("0.00019"))
         self.assertEqual(parsed.remaining, Decimal("0.00001"))
+
+    def test_direct_parser_marks_exact_post_only_cancellation(self):
+        websocket = object.__new__(LighterWebSocket)
+        websocket._markets_cache = {1: {"symbol": "BTC"}}
+
+        parsed = websocket._parse_order_from_direct_ws({
+            "order_index": 101,
+            "client_order_index": 202,
+            "market_index": 1,
+            "initial_base_amount": "0.00020",
+            "remaining_base_amount": "0.00020",
+            "filled_base_amount": "0",
+            "filled_quote_amount": "0",
+            "price": "64000",
+            "is_ask": False,
+            "status": "canceled-post-only",
+            "type": "limit",
+        })
+
+        self.assertEqual(parsed.status, OrderStatus.CANCELED)
+        self.assertIs(parsed.raw_data["post_only_canceled"], True)
+
+    def test_position_parser_applies_sdk_sign_field(self):
+        websocket = object.__new__(LighterWebSocket)
+        websocket._markets_cache = {1: {"symbol": "BTC"}}
+        payload = {
+            "position": "0.00020",
+            "avg_entry_price": "68000",
+            "sign": -1,
+        }
+
+        short = websocket._parse_positions({"1": payload})[0]
+        payload["sign"] = 1
+        long = websocket._parse_positions({"1": payload})[0]
+
+        self.assertEqual(short.side, PositionSide.SHORT)
+        self.assertEqual(short.size, Decimal("0.00020"))
+        self.assertEqual(long.side, PositionSide.LONG)
+        self.assertEqual(long.size, Decimal("0.00020"))
+
+    def test_position_parser_rejects_invalid_sdk_sign(self):
+        websocket = object.__new__(LighterWebSocket)
+        websocket._markets_cache = {1: {"symbol": "BTC"}}
+
+        with self.assertLogs(
+            "core.adapters.exchanges.adapters.lighter_websocket",
+            level="ERROR",
+        ):
+            parsed = websocket._parse_positions({
+                "1": {
+                    "position": "0.00020",
+                    "avg_entry_price": "68000",
+                    "sign": 0,
+                }
+            })
+
+        self.assertEqual(parsed, [])
 
 
 class LighterRateLimitTests(unittest.IsolatedAsyncioTestCase):
@@ -2002,6 +2060,30 @@ class LighterRestOrderParsingTests(unittest.TestCase):
 
         self.assertEqual(parsed.id, "101")
         self.assertEqual(parsed.client_id, "202")
+
+    def test_parser_marks_exact_post_only_cancellation(self):
+        rest = object.__new__(LighterRest)
+        order_info = SimpleNamespace(
+            order_index=101,
+            order_id="101",
+            client_order_index=202,
+            client_order_id="202",
+            initial_base_amount="0.00020",
+            filled_base_amount="0",
+            remaining_base_amount="0.00020",
+            price="64000",
+            filled_quote_amount="0",
+            is_ask=False,
+            type="limit",
+            status="canceled-post-only",
+            timestamp=None,
+        )
+
+        parsed = rest._parse_order(order_info, "BTC")
+
+        self.assertEqual(parsed.status, OrderStatus.CANCELED)
+        self.assertIs(parsed.raw_data["post_only_canceled"], True)
+        self.assertIs(parsed.raw_data["order_info"], order_info)
 
 
 class LighterAdapterHistoryTests(unittest.IsolatedAsyncioTestCase):

@@ -223,6 +223,11 @@ class RiskManager:
                 elif position.signed_size < 0:
                     requested_sell *= multiplier
 
+        if self.config.quote_mode == "bid_only":
+            requested_sell = None
+        elif self.config.quote_mode == "ask_only":
+            requested_buy = None
+
         buy_amount = self._candidate_amount(
             requested_buy,
             None if buy_reduce_only else buy_target_capacity,

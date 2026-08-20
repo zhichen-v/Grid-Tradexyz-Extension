@@ -6,6 +6,7 @@ import logging
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -24,7 +25,10 @@ from core.adapters.exchanges.models import (
     OrderType,
 )
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
+from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
 from core.services.market_maker.config import MarketMakerConfig
+from core.services.market_maker.coordinator import MarketMakerCoordinator
+from core.services.market_maker.models import RuntimeState
 
 
 def _order(
@@ -66,6 +70,8 @@ class FakeLighterAdapter:
         self.active: dict[str, OrderData] = {}
         self.history: list[OrderData] = []
         self._next_id = 0
+        self.stop_event: asyncio.Event | None = None
+        self.stop_after_creates: int | None = None
 
     async def connect(self) -> bool:
         self.events.append(("connect",))
@@ -150,6 +156,12 @@ class FakeLighterAdapter:
         self.events.append(("create", order_id, side))
         order = _order(order_id, side, price, amount, OrderStatus.OPEN, dict(params))
         self.active[order_id] = order
+        if (
+            self.stop_event is not None
+            and self.stop_after_creates is not None
+            and len(self.create_calls) >= self.stop_after_creates
+        ):
+            self.stop_event.set()
         return order
 
     async def cancel_order(
@@ -189,17 +201,22 @@ class FakeLighterAdapter:
 
 
 class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    def config(self, *, dry_run: bool) -> MarketMakerConfig:
+    def config(
+        self, *, dry_run: bool, quote_mode: str = "both"
+    ) -> MarketMakerConfig:
         return MarketMakerConfig(
             symbol="BTC",
             order_size=Decimal("0.001"),
             min_profit_buffer_bps=Decimal("0"),
             max_position=Decimal("0.010"),
+            max_raw_spread_bps=Decimal("500"),
             min_order_lifetime_ms=1,
+            refresh_interval_ms=1,
             dry_run=dry_run,
+            quote_mode=quote_mode,
         )
 
-    async def run_fake(self, *, dry_run: bool):
+    async def run_fake(self, *, dry_run: bool, quote_mode: str = "both"):
         adapter = FakeLighterAdapter()
         factory_in_loop = False
 
@@ -211,9 +228,13 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             return adapter
 
         stop = asyncio.Event()
-        stop.set()
+        if dry_run:
+            stop.set()
+        else:
+            adapter.stop_event = stop
+            adapter.stop_after_creates = 2 if quote_mode == "both" else 1
         coordinator = await entrypoint.run_market_maker(
-            self.config(dry_run=dry_run),
+            self.config(dry_run=dry_run, quote_mode=quote_mode),
             {
                 "network": "robinhood_testnet",
                 "testnet": True,
@@ -290,6 +311,44 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(last_cancel, final_empty_query)
         self.assertLess(final_empty_query, unsubscribe)
 
+    async def test_live_fake_single_side_places_and_cancels_one_slot(self) -> None:
+        for quote_mode, expected_side in (
+            ("bid_only", OrderSide.BUY),
+            ("ask_only", OrderSide.SELL),
+        ):
+            with self.subTest(quote_mode=quote_mode):
+                adapter, _, _ = await self.run_fake(
+                    dry_run=False,
+                    quote_mode=quote_mode,
+                )
+
+                self.assertEqual(
+                    [call[1] for call in adapter.create_calls],
+                    [expected_side],
+                )
+                self.assertEqual(
+                    adapter.create_calls[0][5],
+                    {"time_in_force": "POST_ONLY", "reduce_only": False},
+                )
+                self.assertEqual(len(adapter.cancel_calls), 1)
+                self.assertTrue(adapter.cancel_responses[0].params["cancel_terminal"])
+                self.assertEqual(adapter.active, {})
+
+    async def test_dry_run_single_side_plans_one_slot_without_mutation(self) -> None:
+        for quote_mode in ("bid_only", "ask_only"):
+            with self.subTest(quote_mode=quote_mode):
+                adapter, coordinator, _ = await self.run_fake(
+                    dry_run=True,
+                    quote_mode=quote_mode,
+                )
+
+                self.assertEqual(coordinator.metrics.counters["would_place"], 1)
+                self.assertEqual(adapter.create_calls, [])
+                self.assertEqual(adapter.cancel_calls, [])
+                self.assertNotIn(
+                    "cancel_all", [event[0] for event in adapter.events]
+                )
+
     async def test_dry_run_performs_zero_exchange_mutations(self) -> None:
         adapter, _, _ = await self.run_fake(dry_run=True)
 
@@ -298,8 +357,98 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cancel_all", [event[0] for event in adapter.events])
         self.assertEqual(adapter.events[-2:], [("unsubscribe",), ("disconnect",)])
 
+    async def test_wide_market_pauses_once_and_tight_book_recovers_without_rest_churn(
+        self,
+    ) -> None:
+        adapter = FakeLighterAdapter()
+        config = self.config(dry_run=False, quote_mode="bid_only")
+        config = replace(
+            config,
+            max_raw_spread_bps=Decimal("100"),
+            position_poll_interval_seconds=60,
+            order_sync_interval_seconds=60,
+            health_check_interval_seconds=60,
+        )
+        coordinator = MarketMakerCoordinator(adapter, config)
+
+        tight = OrderBookData(
+            symbol="BTC",
+            bids=[OrderBookLevel(Decimal("100"), Decimal("1"))],
+            asks=[OrderBookLevel(Decimal("101"), Decimal("1"))],
+            timestamp=datetime.now(timezone.utc),
+            nonce=2,
+        )
+        wide = await adapter.get_orderbook("BTC")
+
+        try:
+            await coordinator.start()
+            self.assertEqual(coordinator.state, RuntimeState.PAUSED_MARKET)
+            self.assertEqual(adapter.create_calls, [])
+
+            await coordinator.on_orderbook(tight)
+            await coordinator.run_one_cycle(force=True)
+            self.assertEqual(coordinator.state, RuntimeState.ACTIVE)
+            self.assertEqual(len(adapter.create_calls), 1)
+
+            await coordinator.on_orderbook(wide)
+            await coordinator.run_one_cycle(force=True)
+            self.assertEqual(coordinator.state, RuntimeState.PAUSED_MARKET)
+            self.assertEqual(len(adapter.cancel_calls), 1)
+
+            reads_before = [
+                event
+                for event in adapter.events
+                if event[0] in {"health", "book", "positions", "open_orders"}
+            ]
+            await coordinator.on_orderbook(wide)
+            await coordinator.run_one_cycle(force=True)
+            reads_after = [
+                event
+                for event in adapter.events
+                if event[0] in {"health", "book", "positions", "open_orders"}
+            ]
+            self.assertEqual(reads_after, reads_before)
+            self.assertEqual(len(adapter.cancel_calls), 1)
+            self.assertEqual(len(adapter.create_calls), 1)
+
+            await coordinator.on_orderbook(tight)
+            await coordinator.run_one_cycle(force=True)
+            self.assertEqual(coordinator.state, RuntimeState.ACTIVE)
+            self.assertEqual(len(adapter.create_calls), 2)
+        finally:
+            await coordinator.stop()
+
 
 class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    def test_post_only_maps_to_lighter_sdk_constant(self) -> None:
+        import lighter
+
+        rest = object.__new__(LighterRest)
+        rest._convert_base_amount = Mock(return_value=2)
+        rest._next_client_order_index = Mock(return_value=7)
+
+        params = rest._convert_limit_order_params(
+            {
+                "price_decimals": 1,
+                "price_multiplier": Decimal("10"),
+                "market_index": 1,
+            },
+            Decimal("0.00020"),
+            Decimal("65000.0"),
+            "buy",
+            time_in_force="POST_ONLY",
+            reduce_only=False,
+        )
+
+        self.assertEqual(
+            params["time_in_force"],
+            lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,
+        )
+        self.assertEqual(
+            params["order_type"], lighter.SignerClient.ORDER_TYPE_LIMIT
+        )
+        self.assertFalse(params["is_ask"])
+
     async def test_order_submission_429_is_sanitized_and_propagated(self) -> None:
         rest = object.__new__(LighterRest)
         rest._validate_order_preconditions = Mock(return_value=True)
@@ -338,6 +487,115 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
             await rest.cancel_order("BTC", "1")
 
         self.assertNotIn("test-secret-payload", str(raised.exception))
+
+
+class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sdk_ws_stop_cancels_connecting_async_client(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        class Client:
+            ws = None
+
+            @staticmethod
+            async def run_async() -> None:
+                started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+        websocket = object.__new__(LighterWebSocket)
+        websocket.ws_client = Client()
+        websocket._ws_task = asyncio.create_task(websocket._run_ws_client())
+        websocket._stopping_sdk_ws = False
+        websocket._connected = True
+        websocket._explicit_stop = True
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+
+        await asyncio.wait_for(
+            websocket._stop_sdk_ws_client(), timeout=0.2
+        )
+
+        self.assertTrue(cancelled.is_set())
+        self.assertIsNone(websocket._ws_task)
+        self.assertIsNone(websocket.ws_client)
+
+    async def test_sdk_ws_stop_awaits_connected_async_close(self) -> None:
+        closed = asyncio.Event()
+
+        class Connection:
+            @staticmethod
+            async def close() -> None:
+                closed.set()
+
+        class Client:
+            ws = Connection()
+
+            @staticmethod
+            async def run_async() -> None:
+                await closed.wait()
+
+        websocket = object.__new__(LighterWebSocket)
+        websocket.ws_client = Client()
+        websocket._ws_task = asyncio.create_task(websocket._run_ws_client())
+        websocket._stopping_sdk_ws = False
+        websocket._connected = True
+        websocket._explicit_stop = True
+
+        await asyncio.wait_for(
+            websocket._stop_sdk_ws_client(), timeout=0.2
+        )
+
+        self.assertTrue(closed.is_set())
+        self.assertIsNone(websocket._ws_task)
+        self.assertIsNone(websocket.ws_client)
+
+    async def test_sdk_ws_stop_cancellation_does_not_orphan_stream(self) -> None:
+        close_started = asyncio.Event()
+        stream_cancelled = asyncio.Event()
+
+        class Connection:
+            @staticmethod
+            async def close() -> None:
+                close_started.set()
+                await asyncio.Future()
+
+        class Client:
+            ws = Connection()
+
+            @staticmethod
+            async def run_async() -> None:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    stream_cancelled.set()
+                    raise
+
+        websocket = object.__new__(LighterWebSocket)
+        websocket.ws_client = Client()
+        stream_task = asyncio.create_task(websocket._run_ws_client())
+        websocket._ws_task = stream_task
+        websocket._stopping_sdk_ws = False
+        websocket._connected = True
+        websocket._explicit_stop = True
+        stop_task = asyncio.create_task(websocket._stop_sdk_ws_client())
+
+        try:
+            await asyncio.wait_for(close_started.wait(), timeout=0.2)
+            stop_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await stop_task
+
+            self.assertTrue(stream_task.done())
+            self.assertTrue(stream_cancelled.is_set())
+            self.assertIsNone(websocket._ws_task)
+            self.assertIsNone(websocket.ws_client)
+        finally:
+            if not stream_task.done():
+                stream_task.cancel()
+                await stream_task
 
 
 class CliAndWalletProfileTests(unittest.TestCase):

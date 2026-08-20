@@ -13,6 +13,7 @@ class RuntimeState(Enum):
     SYNCING = "syncing"
     ACTIVE = "active"
     RISK_REDUCTION = "risk_reduction"
+    PAUSED_MARKET = "paused_market"
     PAUSED_DATA = "paused_data"
     PAUSED_POSITION = "paused_position"
     PAUSED_EXCHANGE = "paused_exchange"

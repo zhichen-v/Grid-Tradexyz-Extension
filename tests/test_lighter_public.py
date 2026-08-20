@@ -6,7 +6,6 @@ from decimal import Decimal
 from datetime import datetime
 from importlib.metadata import version
 from inspect import signature
-import threading
 from types import SimpleNamespace
 
 import lighter
@@ -68,26 +67,26 @@ async def check_client_lifecycle() -> None:
     })
     assert blank_override_client.ws_url == robinhood_profile.ws_url
 
-    started = threading.Event()
-    stopped = threading.Event()
+    started = asyncio.Event()
+    stopped = asyncio.Event()
 
     class FakeConnection:
-        def close(self):
+        async def close(self):
             stopped.set()
 
     class BlockingWsClient:
         def __init__(self):
             self.ws = FakeConnection()
 
-        def run(self):
+        async def run_async(self):
             started.set()
-            stopped.wait(timeout=5)
+            await stopped.wait()
 
     ws_client = LighterWebSocket({"testnet": False})
     await ws_client.connect()
     ws_client.ws_client = BlockingWsClient()
     ws_client._ws_task = asyncio.create_task(ws_client._run_ws_client())
-    assert await asyncio.to_thread(started.wait, 2)
+    await asyncio.wait_for(started.wait(), timeout=2)
     await ws_client.disconnect()
     assert stopped.is_set() and ws_client._ws_task is None
 

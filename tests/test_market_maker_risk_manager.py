@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 
 from core.adapters.exchanges.models import OrderSide
@@ -61,6 +62,35 @@ class RiskManagerTests(unittest.TestCase):
         self.assertEqual(decision.sell_amount, Decimal("0.2"))
         self.assertEqual(decision.worst_long, Decimal("0.2"))
         self.assertEqual(decision.worst_short, Decimal("-0.2"))
+
+    def test_single_side_mode_limits_targets_and_worst_exposure(self) -> None:
+        for quote_mode, expected_buy, expected_sell, worst_long, worst_short in (
+            ("bid_only", Decimal("0.2"), None, Decimal("0.2"), Decimal("0")),
+            ("ask_only", None, Decimal("0.2"), Decimal("0"), Decimal("-0.2")),
+        ):
+            with self.subTest(quote_mode=quote_mode):
+                manager = RiskManager(replace(self.config, quote_mode=quote_mode))
+                decision = manager.evaluate(
+                    self.position("0"), (), self.metadata, now_monotonic=100.0
+                )
+
+                self.assertEqual(decision.buy_amount, expected_buy)
+                self.assertEqual(decision.sell_amount, expected_sell)
+                self.assertEqual(decision.worst_long, worst_long)
+                self.assertEqual(decision.worst_short, worst_short)
+
+    def test_single_side_mode_does_not_fallback_in_hard_zone(self) -> None:
+        cases = (("bid_only", "0.8"), ("ask_only", "-0.8"))
+        for quote_mode, size in cases:
+            with self.subTest(quote_mode=quote_mode):
+                manager = RiskManager(replace(self.config, quote_mode=quote_mode))
+                decision = manager.evaluate(
+                    self.position(size), (), self.metadata, now_monotonic=100.0
+                )
+
+                self.assertIsNone(decision.buy_amount)
+                self.assertIsNone(decision.sell_amount)
+                self.assertEqual(decision.runtime_state, RuntimeState.RISK_REDUCTION)
 
     def test_soft_long_scales_only_risk_increasing_buy(self) -> None:
         decision = self.evaluate("0.65")

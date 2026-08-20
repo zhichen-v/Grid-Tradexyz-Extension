@@ -5,7 +5,7 @@ Lighter交易所适配器 - WebSocket模块
 """
 
 from typing import Dict, Any, Optional, List, Callable
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 import asyncio
 import logging
@@ -628,7 +628,7 @@ class LighterWebSocket(LighterBase):
                 on_account_update=self._on_account_update,
             )
 
-            # 在单独的线程中运行（因为lighter的WsClient是同步的）
+            # 使用SDK原生异步串流，确保连接建立中也能被取消。
             self._ws_task = asyncio.create_task(self._run_ws_client())
 
             logger.info(
@@ -638,38 +638,38 @@ class LighterWebSocket(LighterBase):
             logger.error(f"创建WebSocket客户端失败: {e}")
 
     async def _stop_sdk_ws_client(self):
-        """Close the sync SDK socket before awaiting its executor task."""
+        """Close and cancel the SDK WebSocket task without leaking a worker thread."""
         client = self.ws_client
         task = self._ws_task
         self._stopping_sdk_ws = True
+        if task and not task.done():
+            task.cancel()
         try:
             connection = getattr(client, "ws", None) if client else None
             if connection is not None:
                 try:
-                    await asyncio.to_thread(connection.close)
+                    await connection.close()
                 except Exception as e:
                     logger.warning(f"关闭SDK WebSocket连接失败: {e}")
-
-            if task and not task.done():
-                try:
-                    await asyncio.wait_for(task, timeout=5)
-                except asyncio.TimeoutError:
+        finally:
+            try:
+                if task and not task.done():
                     task.cancel()
+                if task:
                     try:
                         await task
                     except asyncio.CancelledError:
                         pass
-        finally:
-            self._ws_task = None
-            self.ws_client = None
-            self._stopping_sdk_ws = False
+            finally:
+                self._ws_task = None
+                self.ws_client = None
+                self._stopping_sdk_ws = False
 
     async def _run_ws_client(self):
-        """在异步任务中运行同步的WsClient"""
+        """运行SDK原生异步WebSocket串流。"""
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.ws_client.run)
-            logger.warning("⚠️ WebSocket客户端run()方法退出了")
+            await self.ws_client.run_async()
+            logger.warning("⚠️ WebSocket客户端run_async()方法退出了")
             if self._connected and not self._stopping_sdk_ws:
                 self._schedule_reconnect()
         except asyncio.CancelledError:
@@ -1133,10 +1133,39 @@ class LighterWebSocket(LighterBase):
                 market_index = int(market_index_str)
                 symbol = self._get_symbol_from_market_index(market_index)
 
-                position_size = self._safe_decimal(
-                    position_info.get("position", 0))
-                if position_size == 0:
+                try:
+                    raw_position_size = Decimal(
+                        str(position_info.get("position", 0))
+                    )
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"invalid position size for {symbol}"
+                    ) from exc
+                if not raw_position_size.is_finite():
+                    raise ValueError(f"invalid position size for {symbol}")
+                if raw_position_size == 0:
                     continue
+
+                # SDK 1.1.2 sends a positive magnitude and a separate sign.
+                # Keep compatibility with older signed payloads only when the
+                # sign field is absent, matching the authenticated REST parser.
+                sign_raw = position_info.get("sign")
+                if sign_raw is None:
+                    position_size = raw_position_size
+                else:
+                    try:
+                        position_sign = int(sign_raw)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"invalid position sign for {symbol}"
+                        ) from exc
+                    if position_sign not in {-1, 1}:
+                        raise ValueError(f"invalid position sign for {symbol}")
+                    if raw_position_size < 0:
+                        raise ValueError(
+                            f"negative position magnitude for {symbol}"
+                        )
+                    position_size = raw_position_size * position_sign
 
                 liquidation_raw = position_info.get("liquidation_price")
                 liquidation_price = (
@@ -1691,8 +1720,10 @@ class LighterWebSocket(LighterBase):
             is_ask = order_info.get("is_ask", False)
             side = OrderSide.SELL if is_ask else OrderSide.BUY
 
-            status = self._parse_direct_order_status(
-                order_info.get("status"))
+            exchange_status = str(
+                order_info.get("status") or "unknown"
+            ).strip().lower()
+            status = self._parse_direct_order_status(exchange_status)
 
             # 创建OrderData
             return OrderData(
@@ -1713,7 +1744,12 @@ class LighterWebSocket(LighterBase):
                 fee=None,
                 trades=[],
                 params={},
-                raw_data=order_info
+                raw_data={
+                    **order_info,
+                    "post_only_canceled": (
+                        exchange_status == "canceled-post-only"
+                    ),
+                }
             )
 
         except Exception as e:

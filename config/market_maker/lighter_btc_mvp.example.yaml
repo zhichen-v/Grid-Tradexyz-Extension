@@ -6,11 +6,15 @@ market_maker:
 
   # 金融數值以字串保存，避免 YAML 先轉成浮點數。
   order_size: "0.00020"
+  # Step B 使用 bid_only 或 ask_only；Step C 使用 both。
+  quote_mode: "both"
 
   # 單邊距離；完整 Bid-Ask spread 約為兩倍此值。
   base_half_spread_ticks: 1
   max_inventory_skew_ticks: 4
   reprice_threshold_ticks: 1
+  # External BBO 過寬時 midpoint 不可信，停止報價並撤單。
+  max_raw_spread_bps: "100"
 
   # Live 前依實際帳戶 tier 核對 maker fee；不可假設永遠為零。
   maker_fee_rate: "0"

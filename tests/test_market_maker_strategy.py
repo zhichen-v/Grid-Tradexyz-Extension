@@ -135,6 +135,40 @@ class MarketMakerStrategyTests(unittest.TestCase):
         self.assertLessEqual(high_bid.price, self.market.best_ask - Decimal("0.1"))
         self.assertGreaterEqual(low_ask.price, self.market.best_bid + Decimal("0.1"))
 
+    def test_raw_spread_guard_allows_boundary_and_pauses_above_it(self) -> None:
+        strategy = MarketMakerStrategy(
+            MarketMakerConfig(
+                symbol="BTC",
+                order_size=Decimal("0.2"),
+                max_position=Decimal("1"),
+                max_raw_spread_bps=Decimal("100"),
+                min_profit_buffer_bps=Decimal("0"),
+            )
+        )
+
+        for bid, ask, expected_state in (
+            ("99.6", "100.4", RuntimeState.ACTIVE),
+            ("99.5", "100.5", RuntimeState.ACTIVE),
+            ("99.4", "100.6", RuntimeState.PAUSED_MARKET),
+        ):
+            with self.subTest(bid=bid, ask=ask):
+                quotes = strategy.calculate_quotes(
+                    self.make_market(Decimal(bid), Decimal(ask)),
+                    self.position("0"),
+                    self.metadata,
+                    self.risk,
+                    now_monotonic=100.0,
+                )
+
+                self.assertEqual(quotes.runtime_state, expected_state)
+                if expected_state is RuntimeState.PAUSED_MARKET:
+                    self.assertIsNone(quotes.bid)
+                    self.assertIsNone(quotes.ask)
+                    self.assertIn("spread", quotes.reason)
+                else:
+                    self.assertIsNotNone(quotes.bid)
+                    self.assertIsNotNone(quotes.ask)
+
     def test_decimal_tick_rounding_is_outward(self) -> None:
         metadata = MarketMetadata(
             symbol="BTC",

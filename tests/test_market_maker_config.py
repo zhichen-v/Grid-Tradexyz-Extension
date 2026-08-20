@@ -93,6 +93,28 @@ market_maker:
                 "market_maker:\n  startup_open_order_policy: []\n"
             )
 
+    def test_quote_mode_accepts_slots_and_rejects_other_values(self) -> None:
+        for quote_mode in ("both", "bid_only", "ask_only"):
+            with self.subTest(quote_mode=quote_mode):
+                self.assertEqual(
+                    MarketMakerConfig(quote_mode=quote_mode).quote_mode,
+                    quote_mode,
+                )
+        for quote_mode in ("bid", "ask", "buy", "sell", "", None, 1, []):
+            with self.subTest(quote_mode=quote_mode):
+                with self.assertRaisesRegex(ValueError, "quote_mode"):
+                    MarketMakerConfig(quote_mode=quote_mode)  # type: ignore[arg-type]
+
+    def test_max_raw_spread_bps_is_positive_decimal(self) -> None:
+        self.assertEqual(
+            MarketMakerConfig(max_raw_spread_bps="12.5").max_raw_spread_bps,
+            Decimal("12.5"),
+        )
+        for value in ("0", "-1", "NaN"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "max_raw_spread_bps"):
+                    MarketMakerConfig(max_raw_spread_bps=value)
+
     def test_validates_order_size_against_market_metadata(self) -> None:
         config = MarketMakerConfig(symbol="BTC", order_size=Decimal("0.00020"))
         metadata = MarketMetadata(

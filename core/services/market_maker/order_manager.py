@@ -89,6 +89,13 @@ def _has_visible_fill(
     )
 
 
+def _is_post_only_cancellation(order: OrderData) -> bool:
+    return (
+        order.status is OrderStatus.CANCELED
+        and (order.raw_data or {}).get("post_only_canceled") is True
+    )
+
+
 @dataclass(frozen=True)
 class ReconcileAction:
     side: OrderSide | None
@@ -129,6 +136,11 @@ class MarketMakerOrderManager:
             OrderSide.SELL: None,
         }
         self._mutation_timestamps: deque[float] = deque()
+        self._submission_ambiguity_latched = False
+        self._post_only_event_generation = 0
+        self._post_only_refreshed_generation = 0
+        self._pending_post_only_cancellations = 0
+        self._post_only_create_not_before = 0.0
         self.runtime_state = RuntimeState.SYNCING
         self.pause_reason: str | None = None
         self._shutting_down = False
@@ -148,14 +160,18 @@ class MarketMakerOrderManager:
 
     @property
     def has_uncertain_state(self) -> bool:
-        return any(
-            order is not None
-            and (
-                order.state in _UNCERTAIN_STATES
-                or order.submission_uncertain
-                or order.cancellation_uncertain
+        return (
+            self._submission_ambiguity_latched
+            or bool(self.get_unresolved_submissions())
+            or any(
+                order is not None
+                and (
+                    order.state in _UNCERTAIN_STATES
+                    or order.submission_uncertain
+                    or order.cancellation_uncertain
+                )
+                for order in self._slots.values()
             )
-            for order in self._slots.values()
         )
 
     @property
@@ -172,6 +188,26 @@ class MarketMakerOrderManager:
         if not callable(getter):
             return []
         return list(getter())
+
+    @property
+    def post_only_book_refresh_required(self) -> bool:
+        return (
+            self._post_only_refreshed_generation
+            < self._post_only_event_generation
+        )
+
+    def consume_post_only_cancellations(self) -> tuple[int, int]:
+        count = self._pending_post_only_cancellations
+        self._pending_post_only_cancellations = 0
+        return count, self._post_only_event_generation
+
+    def acknowledge_post_only_book_refresh(self, generation: int) -> None:
+        confirmed_generation = min(
+            max(0, int(generation)), self._post_only_event_generation
+        )
+        self._post_only_refreshed_generation = max(
+            self._post_only_refreshed_generation, confirmed_generation
+        )
 
     async def initialize(self) -> None:
         async with self._lock:
@@ -358,6 +394,11 @@ class MarketMakerOrderManager:
                 )
             if position_refresh_required:
                 return self._result(actions, errors, True)
+            if self._post_only_create_blocked():
+                self.runtime_state = RuntimeState.SYNCING
+                return self._result(
+                    actions, errors, position_refresh_required
+                )
 
             # Risk-reducing creates have priority over risk-increasing creates.
             placements = sorted(
@@ -374,10 +415,16 @@ class MarketMakerOrderManager:
                 if validation_error:
                     errors.append(validation_error)
                     continue
+                action_start = len(actions)
                 position_refresh_required = (
                     await self._place_locked(target, actions, errors)
                     or position_refresh_required
                 )
+                if self._post_only_create_blocked():
+                    self.runtime_state = RuntimeState.SYNCING
+                    return self._result(
+                        actions, errors, position_refresh_required
+                    )
                 blocking = self._blocking_reason()
                 if blocking:
                     self._pause(blocking)
@@ -391,6 +438,18 @@ class MarketMakerOrderManager:
                         actions, errors, position_refresh_required
                     )
                 if errors:
+                    return self._result(
+                        actions, errors, position_refresh_required
+                    )
+
+                if any(
+                    action.operation == "place"
+                    for action in actions[action_start:]
+                ):
+                    # Return after one live create attempt so order updates
+                    # queued while awaiting the adapter are applied first.
+                    if self.pause_reason is None:
+                        self.runtime_state = desired.runtime_state
                     return self._result(
                         actions, errors, position_refresh_required
                     )
@@ -486,7 +545,7 @@ class MarketMakerOrderManager:
             self.runtime_state = RuntimeState.STOPPING
             actions: list[ReconcileAction] = []
             errors: list[str] = []
-            managed_before = self.snapshot()
+            open_orders: list[OrderData] = []
             await self._resolve_uncertain_locked()
             if self.config.cancel_on_shutdown:
                 await self._cancel_confirmable_locked(
@@ -497,27 +556,17 @@ class MarketMakerOrderManager:
                 open_orders = self._active_symbol_orders(
                     await self.adapter.get_open_orders(self.config.symbol)
                 )
-                if any(
-                    order.side is managed.side
-                    and self._order_matches(managed, order)
-                    for managed in managed_before
-                    for order in open_orders
-                ):
-                    errors.append("managed orders remain active after shutdown")
+                if open_orders:
+                    errors.append(
+                        "target symbol open orders remain active after shutdown"
+                    )
             remaining = [order for order in self._slots.values() if order is not None]
             unresolved = self.get_unresolved_submissions()
             if unresolved:
                 errors.append("adapter submissions remain unresolved after shutdown")
-            elif not remaining and not any(
-                order.side is managed.side
-                and self._order_matches(managed, order)
-                for managed in managed_before
-                for order in (
-                    open_orders if not self.config.dry_run else ()
-                )
-            ):
+            elif not remaining and not open_orders:
                 # Earlier cancel errors are provisional once exact REST state
-                # proves every managed order terminal and no mutation is unresolved.
+                # proves the target symbol empty and no mutation is unresolved.
                 errors.clear()
             if errors or remaining:
                 self.runtime_state = RuntimeState.PAUSED_ORDER_STATE
@@ -623,8 +672,19 @@ class MarketMakerOrderManager:
             errors.append("create outcome uncertain: invalid confirmation")
             return position_refresh_required
         if order.status in _TERMINAL_STATUSES:
-            actions[action_index] = replace(action, success=False)
+            actions[action_index] = replace(
+                action,
+                reason=(
+                    "post-only canceled"
+                    if _is_post_only_cancellation(order)
+                    else action.reason
+                ),
+                success=False,
+            )
             self._slots[desired.side] = None
+            if _is_post_only_cancellation(order):
+                self._record_post_only_cancellation()
+                return position_refresh_required
             errors.append(
                 f"create returned terminal status: {order.status.value}"
             )
@@ -632,6 +692,7 @@ class MarketMakerOrderManager:
 
         self._apply_order_update(desired.side, order)
         if self._submission_uncertain(order):
+            self._submission_ambiguity_latched = True
             slot = self._slots[desired.side]
             if slot is not None:
                 slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
@@ -755,13 +816,16 @@ class MarketMakerOrderManager:
     async def _resolve_uncertain_locked(self) -> list[OrderData]:
         resolver = getattr(self.adapter, "resolve_unresolved_submissions", None)
         resolved: list[OrderData] = []
-        if callable(resolver) and any(
-            order is not None
-            and (
-                order.state is OrderSlotState.UNCERTAIN_SUBMISSION
-                or order.submission_uncertain
+        if callable(resolver) and (
+            self.get_unresolved_submissions()
+            or any(
+                order is not None
+                and (
+                    order.state is OrderSlotState.UNCERTAIN_SUBMISSION
+                    or order.submission_uncertain
+                )
+                for order in self._slots.values()
             )
-            for order in self._slots.values()
         ):
             resolved = list(await resolver())
             for order in resolved:
@@ -789,6 +853,8 @@ class MarketMakerOrderManager:
             None,
         )
         if terminal is not None:
+            if _is_post_only_cancellation(terminal):
+                self._record_post_only_cancellation()
             self._slots[side] = None
             return _has_visible_fill(
                 terminal, previous_remaining=slot.remaining
@@ -828,6 +894,8 @@ class MarketMakerOrderManager:
             self._pause(f"{side.value} order status is unknown")
             return
         if order.status in _TERMINAL_STATUSES:
+            if _is_post_only_cancellation(order):
+                self._record_post_only_cancellation()
             self._slots[side] = None
             self._clear_resolved_uncertainty_pause()
             return
@@ -901,9 +969,10 @@ class MarketMakerOrderManager:
     def _clear_resolved_uncertainty_pause(self) -> None:
         if self.has_uncertain_state or not self.pause_reason:
             return
+        # Submission ambiguity stays latched until restart; clearing it here
+        # can create a new client id after late terminal proof.
         if self.pause_reason.startswith(
             (
-                "order submission outcome is uncertain",
                 "order cancellation outcome is uncertain",
                 "cannot cancel an order without",
                 "buy order status is unknown",
@@ -981,6 +1050,8 @@ class MarketMakerOrderManager:
     def _blocking_reason(self) -> str | None:
         if self.pause_reason:
             return self.pause_reason
+        if self._submission_ambiguity_latched:
+            return "order submission ambiguity is latched until restart"
         for side, order in self._slots.items():
             if order is None:
                 continue
@@ -988,6 +1059,8 @@ class MarketMakerOrderManager:
                 return f"{side.value} slot is {order.state.value}"
             if order.submission_uncertain or order.cancellation_uncertain:
                 return f"{side.value} order outcome is uncertain"
+        if self.get_unresolved_submissions():
+            return "adapter submissions remain unresolved"
         return None
 
     def _order_matches(self, slot: ManagedOrder, order: OrderData) -> bool:
@@ -1034,6 +1107,7 @@ class MarketMakerOrderManager:
         return flag is True or order.status in _TERMINAL_STATUSES
 
     def _mark_submission_uncertain(self, side: OrderSide, reason: str) -> None:
+        self._submission_ambiguity_latched = True
         slot = self._slots[side]
         if slot is not None:
             slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
@@ -1046,6 +1120,22 @@ class MarketMakerOrderManager:
         slot.cancellation_uncertain = True
         slot.updated_monotonic = self._monotonic()
         self._pause("order cancellation outcome is uncertain")
+
+    def _record_post_only_cancellation(self) -> None:
+        self._post_only_event_generation += 1
+        self._pending_post_only_cancellations += 1
+        cooldown = self.config.refresh_interval_ms / 1000
+        self._post_only_create_not_before = max(
+            self._post_only_create_not_before,
+            self._monotonic() + cooldown,
+        )
+        self.runtime_state = RuntimeState.SYNCING
+
+    def _post_only_create_blocked(self) -> bool:
+        return (
+            self.post_only_book_refresh_required
+            or self._monotonic() < self._post_only_create_not_before
+        )
 
     def _mutation_budget_available(self) -> bool:
         self._purge_mutations()
