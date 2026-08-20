@@ -2497,13 +2497,16 @@ class GridEngineImpl(IGridEngine):
     ) -> List[Any]:
         """Execute one placement batch, serially when required by the exchange."""
         if self._supports_batch_mode():
+            # Lighter still needs serialized submissions for nonce safety, but
+            # must query each exchange order index before placing the next order.
+            batch_mode = str(self.config.exchange).lower() != "lighter"
             results = []
             for order in orders:
                 try:
                     results.append(
                         await self.place_order(
                             order,
-                            batch_mode=True,
+                            batch_mode=batch_mode,
                             allow_while_paused=allow_while_paused,
                         )
                     )

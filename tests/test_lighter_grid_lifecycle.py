@@ -94,6 +94,25 @@ def grid_engine(exchange=None) -> GridEngineImpl:
     return engine
 
 
+class LighterBatchPlacementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_serial_batch_keeps_lighter_order_index_lookup_enabled(self):
+        for exchange, expected_batch_mode in (
+            ("lighter", False),
+            ("tradexyz", True),
+        ):
+            with self.subTest(exchange=exchange):
+                engine = grid_engine()
+                engine.config.exchange = exchange
+                engine.place_order = AsyncMock(side_effect=lambda order, **_: order)
+                order = grid_order()
+
+                self.assertEqual(await engine._execute_batch([order]), [order])
+                self.assertEqual(
+                    engine.place_order.await_args.kwargs["batch_mode"],
+                    expected_batch_mode,
+                )
+
+
 class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_updates_finalize_once_with_full_logical_amount(self):
         engine = grid_engine()
