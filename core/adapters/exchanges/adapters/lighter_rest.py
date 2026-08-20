@@ -310,16 +310,49 @@ class LighterRest(LighterBase):
         return [dict(item) for item in registry.values()]
 
     async def resolve_unresolved_submissions(self) -> List[OrderData]:
-        """Resolve registered intents using reads only and return exact matches."""
+        """Resolve registered intents with bounded bulk snapshots."""
         registry = list(getattr(self, "_unresolved_submissions", {}).values())
-        resolved: List[OrderData] = []
+        pending_by_symbol: Dict[str, Dict[str, int]] = {}
         for item in registry:
-            order = await self._reconcile_order_submission(
-                item["symbol"],
-                int(item["client_order_id"]),
-            )
-            if order is not None:
-                resolved.append(order)
+            client_order_id = int(item["client_order_id"])
+            pending_by_symbol.setdefault(item["symbol"], {})[
+                str(client_order_id)
+            ] = client_order_id
+
+        resolved: List[OrderData] = []
+        for attempt in range(self.MUTATION_RECONCILIATION_ATTEMPTS):
+            for symbol, pending in pending_by_symbol.items():
+                for source, fetch in (
+                    ("open", self.get_open_orders),
+                    ("history", self.get_order_history),
+                ):
+                    if not pending:
+                        break
+                    try:
+                        orders = await fetch(symbol)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to reconcile ambiguous order submissions: "
+                            f"symbol={symbol}, source={source}, error={exc}"
+                        )
+                        continue
+
+                    for order in orders:
+                        client_id = str(getattr(order, "client_id", "") or "")
+                        if client_id not in pending:
+                            continue
+                        self._clear_unresolved_submission(pending.pop(client_id))
+                        resolved.append(order)
+                        logger.warning(
+                            "Reconciled ambiguous order submission by client id: "
+                            f"client_order_id={client_id}, order_id={order.id}, "
+                            f"source={source}"
+                        )
+
+            if not any(pending_by_symbol.values()):
+                break
+            if attempt + 1 < self.MUTATION_RECONCILIATION_ATTEMPTS:
+                await asyncio.sleep(self.MUTATION_RECONCILIATION_DELAY)
         return resolved
 
     async def _reconcile_order_submission(

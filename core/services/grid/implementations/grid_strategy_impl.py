@@ -70,6 +70,8 @@ class GridStrategyImpl(IGridStrategy):
             )
 
         all_orders = self._create_all_initial_orders()
+        if current_price is not None:
+            all_orders.sort(key=lambda order: abs(order.price - current_price))
 
         self.logger.info(f"Built {len(all_orders)} initial grid orders")
 

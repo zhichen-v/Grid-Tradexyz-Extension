@@ -250,7 +250,10 @@ class GridEngineImpl(IGridEngine):
                 raise RuntimeError(reason)
 
             if self._is_submission_uncertain(order):
-                self._quarantine_uncertain_grid_submission(order)
+                if self._is_submission_acknowledged(order):
+                    order.exchange_data["submission_acknowledged_at"] = time.time()
+                else:
+                    self._quarantine_uncertain_grid_submission(order)
             elif exchange_status == "filled":
                 self._schedule_deferred_fill_finalization(
                     order,
@@ -460,7 +463,6 @@ class GridEngineImpl(IGridEngine):
                 f"success={len(successful_orders)}/{total_orders} ({success_rate:.1f}%)"
             )
 
-        await asyncio.sleep(3)
         await self._sync_order_status_after_batch()
         return successful_orders
 
@@ -538,20 +540,31 @@ class GridEngineImpl(IGridEngine):
         # already crossed that gate to finish before taking the cancel snapshot.
         await self._placements_drained.wait()
 
-        pending_orders = self.get_pending_orders()
-        expected_keys = set(self._pending_orders.keys())
-        self._expected_cancellations.update(expected_keys)
-
+        initial_pending_count = len(self.get_pending_orders())
+        expected_keys: set[str] = set()
         try:
+            _, resolved_filled = await self._resolve_unresolved_submissions_read_only()
+            if resolved_filled:
+                self._shutdown_fill_incident = (
+                    "Previously uncertain submissions resolved as filled: "
+                    + ", ".join(resolved_filled)
+                )
+
+            pending_orders = self.get_pending_orders()
+            expected_keys = set(self._pending_orders.keys())
+            self._expected_cancellations.update(expected_keys)
+
             cancelled_orders = await self.exchange.cancel_all_orders(self.config.symbol)
             remaining_orders = await self.exchange.get_open_orders(self.config.symbol)
             if remaining_orders:
                 raise RuntimeError(
                     f"{len(remaining_orders)} orders remain open after cancel-all"
                 )
-            resolved_active, resolved_filled = (
-                await self._resolve_unresolved_submissions_read_only()
-            )
+            resolved_active, resolved_filled = ([], [])
+            if self._unresolved_submission_descriptions():
+                resolved_active, resolved_filled = (
+                    await self._resolve_unresolved_submissions_read_only()
+                )
             if resolved_active:
                 raise RuntimeError(
                     "Previously uncertain submissions resolved as active after the "
@@ -613,7 +626,9 @@ class GridEngineImpl(IGridEngine):
             self.logger.error(f"Cancel-all failed: {exc}")
             raise
 
-        cancelled_count = len(cancelled_orders) if cancelled_orders else len(pending_orders)
+        cancelled_count = (
+            len(cancelled_orders) if cancelled_orders else initial_pending_count
+        )
         self._pending_orders.clear()
         self._expected_cancellations.difference_update(expected_keys)
         self.logger.info(f"All open orders cancelled: count={cancelled_count}")
@@ -1269,28 +1284,38 @@ class GridEngineImpl(IGridEngine):
                 processed_objects.add(object_id)
 
                 aliases = self._pending_keys_for_order(grid_order)
-                if self._is_submission_uncertain(grid_order):
-                    self._quarantine_uncertain_grid_submission(grid_order)
-                if any(alias in exchange_keys for alias in aliases):
-                    matched_order = next(
-                        (
-                            exchange_orders_by_key[alias]
-                            for alias in aliases
-                            if alias in exchange_orders_by_key
-                        ),
-                        None,
-                    )
-                    if matched_order is not None:
-                        if self._is_submission_uncertain(grid_order):
-                            self._adopt_reconciled_grid_submission(
-                                grid_order,
-                                matched_order,
-                            )
-                        self._record_exchange_order_progress(
+                matched_order = next(
+                    (
+                        exchange_orders_by_key[alias]
+                        for alias in aliases
+                        if alias in exchange_orders_by_key
+                    ),
+                    None,
+                )
+                if matched_order is not None:
+                    if self._is_submission_uncertain(grid_order):
+                        self._adopt_reconciled_grid_submission(
                             grid_order,
                             matched_order,
                         )
+                    self._record_exchange_order_progress(
+                        grid_order,
+                        matched_order,
+                    )
                     continue
+
+                if self._is_submission_uncertain(grid_order):
+                    acknowledged_at = grid_order.exchange_data.get(
+                        "submission_acknowledged_at"
+                    )
+                    if (
+                        self._is_submission_acknowledged(grid_order)
+                        and isinstance(acknowledged_at, (int, float))
+                        and time.time() - acknowledged_at
+                        < self._missing_order_resolution_timeout
+                    ):
+                        continue
+                    self._quarantine_uncertain_grid_submission(grid_order)
 
                 if any(alias in self._expected_cancellations for alias in aliases):
                     if not self._is_uncertain_cancel(*aliases):
@@ -1955,12 +1980,33 @@ class GridEngineImpl(IGridEngine):
         await self._restore_cancelled_grid_order(grid_order, grid_order.order_id)
 
     async def _sync_order_status_after_batch(self):
-        """Refresh pending-order state after batch placement."""
-        try:
-            exchange_orders = await self.exchange.get_open_orders(self.config.symbol)
-            await self._sync_orders_from_exchange(exchange_orders)
-        except Exception as exc:
-            self.logger.warning(f"Post-batch order sync failed: {exc}")
+        """Resolve acknowledged batch submissions with bounded bulk snapshots."""
+        unresolved = []
+        last_error = None
+        for delay in (0.3, 0.5, 1.0, 2.0, 4.0):
+            await asyncio.sleep(delay)
+            try:
+                exchange_orders = await self.exchange.get_open_orders(
+                    self.config.symbol
+                )
+                await self._sync_orders_from_exchange(exchange_orders)
+                last_error = None
+            except Exception as exc:
+                last_error = exc
+
+            unresolved = [
+                order
+                for order in self.get_pending_orders()
+                if self._is_submission_uncertain(order)
+                and self._is_submission_acknowledged(order)
+            ]
+            if not unresolved:
+                return
+
+        if last_error is not None:
+            self.logger.warning(f"Post-batch order sync failed: {last_error}")
+        for order in unresolved:
+            self._quarantine_uncertain_grid_submission(order)
 
     def _find_cached_order(self, *candidates: Optional[str]) -> Tuple[Optional[str], Optional[GridOrder]]:
         """Find a cached order by any known alias key."""
@@ -2497,16 +2543,13 @@ class GridEngineImpl(IGridEngine):
     ) -> List[Any]:
         """Execute one placement batch, serially when required by the exchange."""
         if self._supports_batch_mode():
-            # Lighter still needs serialized submissions for nonce safety, but
-            # must query each exchange order index before placing the next order.
-            batch_mode = str(self.config.exchange).lower() != "lighter"
             results = []
             for order in orders:
                 try:
                     results.append(
                         await self.place_order(
                             order,
-                            batch_mode=batch_mode,
+                            batch_mode=True,
                             allow_while_paused=allow_while_paused,
                         )
                     )
@@ -3383,6 +3426,15 @@ class GridEngineImpl(IGridEngine):
         return bool(
             isinstance(exchange_data, dict)
             and exchange_data.get("submission_uncertain")
+        )
+
+    @staticmethod
+    def _is_submission_acknowledged(grid_order: GridOrder) -> bool:
+        """Return whether Lighter accepted the mutation but has not exposed its ID."""
+        exchange_data = getattr(grid_order, "exchange_data", {}) or {}
+        return bool(
+            isinstance(exchange_data, dict)
+            and exchange_data.get("submission_acknowledged")
         )
 
     def _build_tradexyz_fill_event_key(

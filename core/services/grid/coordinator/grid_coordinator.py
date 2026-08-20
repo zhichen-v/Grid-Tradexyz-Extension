@@ -1399,6 +1399,13 @@ class GridCoordinator:
             shutdown_errors.append(f"position monitor: {exc}")
             self.logger.error(f"Failed to stop position monitor: {exc}")
 
+        # Stop health checks and polling before shutdown cancellation starts.
+        try:
+            await self.engine.stop()
+        except Exception as exc:
+            shutdown_errors.append(f"engine stop: {exc}")
+            self.logger.error(f"Failed to stop grid engine: {exc}")
+
         try:
             # 取消所有挂单；保留持仓是原有的 Ctrl+C 语意
             cancelled_count = await self._cancel_all_orders_with_retry()
@@ -1406,13 +1413,6 @@ class GridCoordinator:
         except Exception as exc:
             shutdown_errors.append(f"order cancellation: {exc}")
             self.logger.error(f"Failed to verify open-order cancellation: {exc}")
-
-        # 即使監控或撤單失敗，也必須停止背景任務和引擎。
-        try:
-            await self.engine.stop()
-        except Exception as exc:
-            shutdown_errors.append(f"engine stop: {exc}")
-            self.logger.error(f"Failed to stop grid engine: {exc}")
 
         try:
             self.state.stop()

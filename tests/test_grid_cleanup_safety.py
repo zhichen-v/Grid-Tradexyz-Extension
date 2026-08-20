@@ -495,6 +495,15 @@ class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_coordinator_stop_stops_engine_when_cancel_fails(self):
+        events = []
+
+        async def stop_engine():
+            events.append("stop")
+
+        async def cancel_orders():
+            events.append("cancel")
+            raise RuntimeError("cancel failed")
+
         coordinator = GridCoordinator.__new__(GridCoordinator)
         coordinator.logger = MagicMock()
         coordinator._running = True
@@ -504,8 +513,8 @@ class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
         coordinator.position_monitor = SimpleNamespace(stop_monitoring=AsyncMock())
         coordinator.engine = SimpleNamespace(
             begin_shutdown=MagicMock(),
-            cancel_all_orders=AsyncMock(side_effect=RuntimeError("cancel failed")),
-            stop=AsyncMock(),
+            cancel_all_orders=AsyncMock(side_effect=cancel_orders),
+            stop=AsyncMock(side_effect=stop_engine),
         )
         coordinator.state = SimpleNamespace(stop=MagicMock())
 
@@ -518,6 +527,7 @@ class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(coordinator.engine.cancel_all_orders.await_count, 5)
         coordinator.engine.stop.assert_awaited_once_with()
+        self.assertEqual(events[:2], ["stop", "cancel"])
         coordinator.state.stop.assert_called_once_with()
 
     async def test_monitor_stop_error_does_not_skip_exchange_cancellation(self):

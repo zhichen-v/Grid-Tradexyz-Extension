@@ -16,6 +16,7 @@ from core.adapters.exchanges.models import (
     PositionSide,
 )
 from core.services.grid.implementations.grid_engine_impl import GridEngineImpl
+from core.services.grid.implementations.grid_strategy_impl import GridStrategyImpl
 from core.services.grid.coordinator.grid_coordinator import GridCoordinator
 from core.services.grid.coordinator.position_monitor import PositionMonitor
 from core.services.grid.models import (
@@ -95,11 +96,8 @@ def grid_engine(exchange=None) -> GridEngineImpl:
 
 
 class LighterBatchPlacementTests(unittest.IsolatedAsyncioTestCase):
-    async def test_serial_batch_keeps_lighter_order_index_lookup_enabled(self):
-        for exchange, expected_batch_mode in (
-            ("lighter", False),
-            ("tradexyz", True),
-        ):
+    async def test_serial_batch_uses_fast_ack_mode_for_supported_exchanges(self):
+        for exchange in ("lighter", "tradexyz"):
             with self.subTest(exchange=exchange):
                 engine = grid_engine()
                 engine.config.exchange = exchange
@@ -109,8 +107,75 @@ class LighterBatchPlacementTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await engine._execute_batch([order]), [order])
                 self.assertEqual(
                     engine.place_order.await_args.kwargs["batch_mode"],
-                    expected_batch_mode,
+                    True,
                 )
+
+    async def test_acknowledged_submission_waits_for_exact_snapshot(self):
+        acknowledged = exchange_order(OrderStatus.PENDING, "0", "0.00020")
+        acknowledged.id = None
+        acknowledged.client_id = "client-101"
+        acknowledged.raw_data = {
+            "submission_uncertain": True,
+            "submission_acknowledged": True,
+        }
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            create_order=AsyncMock(return_value=acknowledged),
+        )
+        engine = grid_engine(exchange)
+        engine.coordinator = SimpleNamespace(
+            _grid_level_locks={},
+            _request_fatal_stop=MagicMock(),
+        )
+        order = grid_order()
+
+        self.assertIs(await engine.place_order(order, batch_mode=True), order)
+        self.assertFalse(engine._placements_paused)
+        engine.coordinator._request_fatal_stop.assert_not_called()
+
+        exact = exchange_order(OrderStatus.OPEN, "0", "0.00020")
+        exact.id = "101"
+        exact.client_id = "client-101"
+        exchange.get_open_orders = AsyncMock(return_value=[exact])
+        with patch(
+            "core.services.grid.implementations.grid_engine_impl.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            await engine._sync_order_status_after_batch()
+
+        self.assertEqual(order.order_id, "101")
+        self.assertFalse(order.exchange_data["submission_uncertain"])
+        self.assertFalse(engine._placements_paused)
+        sleep_mock.assert_awaited_once_with(0.3)
+        exchange.get_open_orders.assert_awaited_once_with("BTC")
+
+
+class GridStrategyStartupOrderingTests(unittest.TestCase):
+    def test_initial_orders_nearest_to_market_are_placed_first(self):
+        strategy = GridStrategyImpl()
+        strategy._calculate_grid_prices = MagicMock(return_value=[])
+        orders = [grid_order() for _ in range(3)]
+        for order, price in zip(
+            orders,
+            (Decimal("71000"), Decimal("72250"), Decimal("72000")),
+        ):
+            order.price = price
+        strategy._create_all_initial_orders = MagicMock(return_value=orders)
+        config = SimpleNamespace(
+            is_follow_mode=lambda: False,
+            grid_type=GridType.LONG,
+            lower_price=Decimal("71000"),
+            upper_price=Decimal("74000"),
+            grid_interval=Decimal("25"),
+            grid_count=120,
+        )
+
+        placed = strategy.initialize(config, Decimal("72280"))
+
+        self.assertEqual(
+            [order.price for order in placed],
+            [Decimal("72250"), Decimal("72000"), Decimal("71000")],
+        )
 
 
 class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
@@ -587,7 +652,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.get_pending_orders(), [order])
         self.assertEqual(engine._expected_cancellations, set())
 
-    async def test_cancel_all_retries_when_resolver_finds_late_active_order(self):
+    async def test_cancel_all_retries_when_resolved_order_lacks_cancel_proof(self):
         late_active = exchange_order(OrderStatus.OPEN, "0", "0.00020")
         late_active.id = "late-original"
         late_active.client_id = "client-uncertain"
@@ -615,7 +680,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         order.exchange_data = {"submission_uncertain": True}
         engine._register_pending_order(order, order.order_id)
 
-        with self.assertRaisesRegex(RuntimeError, "resolved as active"):
+        with self.assertRaisesRegex(RuntimeError, "lacks exact terminal proof"):
             await engine.cancel_all_orders()
 
         self.assertEqual(order.order_id, "late-original")
@@ -625,6 +690,46 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         exchange.resolve_unresolved_submissions.return_value = []
         self.assertEqual(await engine.cancel_all_orders(), 1)
         self.assertEqual(exchange.cancel_all_orders.await_count, 2)
+        self.assertEqual(engine.get_pending_orders(), [])
+
+    async def test_cancel_all_resolves_acknowledged_id_before_cancelling(self):
+        active = exchange_order(OrderStatus.OPEN, "0", "0.00020")
+        active.id = "exact-101"
+        active.client_id = "client-101"
+        cancelled = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
+        cancelled.id = active.id
+        cancelled.client_id = active.client_id
+        events = []
+
+        async def resolve_submissions():
+            events.append("resolve")
+            return [active] if events.count("resolve") == 1 else []
+
+        async def cancel_all(_symbol):
+            events.append("cancel")
+            self.assertEqual(order.order_id, active.id)
+            return [cancelled]
+
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            cancel_all_orders=AsyncMock(side_effect=cancel_all),
+            get_open_orders=AsyncMock(return_value=[]),
+            resolve_unresolved_submissions=AsyncMock(
+                side_effect=resolve_submissions
+            ),
+            get_unresolved_submissions=MagicMock(return_value=[]),
+        )
+        engine = grid_engine(exchange)
+        order = grid_order()
+        order.order_id = "client-101"
+        order.exchange_data = {
+            "submission_uncertain": True,
+            "submission_acknowledged": True,
+        }
+        engine._register_pending_order(order, order.order_id)
+
+        self.assertEqual(await engine.cancel_all_orders(), 1)
+        self.assertEqual(events, ["resolve", "cancel"])
         self.assertEqual(engine.get_pending_orders(), [])
 
     async def test_cancel_all_accepts_late_terminal_submission_proof(self):
@@ -1663,6 +1768,33 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         resolved = await rest.resolve_unresolved_submissions()
 
         self.assertEqual(resolved, [found])
+        self.assertEqual(rest.get_unresolved_submissions(), [])
+
+    async def test_unresolved_submissions_share_one_bulk_open_snapshot(self):
+        rest = self._rest()
+        client_ids = (self.CLIENT_ID, self.CLIENT_ID + 1)
+        for client_id in client_ids:
+            rest._register_unresolved_submission(
+                client_id,
+                "BTC",
+                "limit",
+                "buy",
+                Decimal("0.00020"),
+                Decimal("64000"),
+            )
+
+        found = []
+        for order_id, client_id in enumerate(client_ids, start=101):
+            order = exchange_order(OrderStatus.OPEN, "0", "0.00020")
+            order.id = str(order_id)
+            order.client_id = str(client_id)
+            found.append(order)
+        rest.get_open_orders = AsyncMock(return_value=found)
+        rest.get_order_history = AsyncMock(return_value=[])
+
+        self.assertEqual(await rest.resolve_unresolved_submissions(), found)
+        rest.get_open_orders.assert_awaited_once_with("BTC")
+        rest.get_order_history.assert_not_awaited()
         self.assertEqual(rest.get_unresolved_submissions(), [])
 
     async def test_unresolved_submission_rejects_order_id_namespace_collision(self):
