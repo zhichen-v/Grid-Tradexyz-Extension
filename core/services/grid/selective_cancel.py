@@ -99,9 +99,8 @@ async def engine_cancel_orders(engine: Any, order_ids: Sequence[Any]) -> Any:
         engine._expected_cancellations.update(aliases[order_id])
 
     engine.logger.warning(
-        "Using Lighter selective cancellation route: version=%s owned_orders=%d",
-        PATCH_VERSION,
-        len(ids),
+        f"Using Lighter selective cancellation route: "
+        f"version={PATCH_VERSION} owned_orders={len(ids)}"
     )
     report = await cancel_many(ids, engine.config.symbol)
     terminals = getattr(report, "terminal_orders", {}) or {}
@@ -139,8 +138,7 @@ async def engine_cancel_all_owned(engine: Any) -> int:
         return await engine._legacy_cancel_all_orders()
 
     engine.logger.warning(
-        "Lighter shutdown cancellation route active: version=%s",
-        PATCH_VERSION,
+        f"Lighter shutdown cancellation route active: version={PATCH_VERSION}"
     )
 
     drain_timeout = max(1.0, _config(engine, "cancel_drain_timeout", 10.0, float))
@@ -181,8 +179,8 @@ async def engine_cancel_all_owned(engine: Any) -> int:
         return 0
 
     engine.logger.warning(
-        "Lighter shutdown will selectively cancel %d strategy-owned orders",
-        len(ids),
+        f"Lighter shutdown will selectively cancel {len(ids)} "
+        "strategy-owned orders"
     )
     report = await engine.cancel_orders(ids)
 
@@ -206,8 +204,8 @@ async def engine_cancel_all_owned(engine: Any) -> int:
 
     cancelled = len(_set(report, "cancelled"))
     engine.logger.warning(
-        "Lighter selective shutdown cancellation completed: cancelled=%d",
-        cancelled,
+        f"Lighter selective shutdown cancellation completed: "
+        f"cancelled={cancelled}"
     )
     return cancelled
 
@@ -255,7 +253,7 @@ async def ops_cancel_all(
             return True
         except Exception as exc:
             report = getattr(ops.engine, "_last_selective_cancel_report", None)
-            ops.logger.error("selective Lighter cancellation failed: %s", exc)
+            ops.logger.error(f"selective Lighter cancellation failed: {exc}")
             if (
                 _set(report, "uncertain")
                 or _set(report, "still_open")
@@ -362,8 +360,8 @@ async def coordinator_stop_guarded(coordinator: Any) -> None:
                 current.uncancel()
             coordinator.logger.warning(
                 "Shutdown cleanup is still running; additional Ctrl+C was ignored. "
-                "The process will exit after selective cancellation or the %.1fs timeout.",
-                timeout,
+                f"The process will exit after selective cancellation or the "
+                f"{timeout:.1f}s timeout."
             )
         except asyncio.TimeoutError:
             task.cancel()
