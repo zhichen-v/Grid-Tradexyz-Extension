@@ -27,8 +27,10 @@ from .edgex import EdgeXAdapter
 from .lighter import LighterAdapter
 from .tradexyz import TradeXYZAdapter
 from .lighter_selective_cancel import install_lighter_selective_cancel
+from .lighter_selective_cancel_v3 import install_lighter_selective_cancel_v3
 
 install_lighter_selective_cancel()
+install_lighter_selective_cancel_v3()
 
 __all__ = [
     'HyperliquidAdapter',
