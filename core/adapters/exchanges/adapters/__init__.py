@@ -32,9 +32,11 @@ from .lighter_selective_cancel_v3 import (
     PATCH_VERSION as LIGHTER_SELECTIVE_CANCEL_VERSION,
     install_lighter_selective_cancel_v3,
 )
+from .lighter_disconnect_guard import install_lighter_disconnect_guard
 
 install_lighter_selective_cancel()
 install_lighter_selective_cancel_v3()
+install_lighter_disconnect_guard()
 # Prevent a later compatibility installer call from downgrading v3 back to the
 # original selective-cancel implementation.
 _lighter_selective_cancel.PATCH_VERSION = LIGHTER_SELECTIVE_CANCEL_VERSION
