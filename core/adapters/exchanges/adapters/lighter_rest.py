@@ -2039,6 +2039,23 @@ class LighterRest(LighterBase):
                     f"⚠️ 查询订单失败 (尝试 {attempt+1}/{max_retries}): {e}"
                 )
 
+        # 快市時訂單可能在 open orders 查詢窗口內就成交，已不在掛單列表；
+        # 改從歷史訂單依 client_order_id 反查真正的 order_index。
+        if client_order_id is not None:
+            try:
+                history_orders = await self.get_order_history(symbol, limit=100)
+                for order in history_orders:
+                    if self._order_matches_client_id(order, client_order_id):
+                        logger.info(
+                            f"✅ 从历史订单查到 order_index: {order.id} "
+                            f"(client_order_id={client_order_id})"
+                        )
+                        return order.id
+            except Exception as exc:
+                logger.warning(
+                    f"⚠️ 查询历史订单失败 (client_order_id={client_order_id}): {exc}"
+                )
+
         # 所有重试都失败
         logger.warning(
             f"❌ 无法获取 order_index ({side} {amount}@{price})，"

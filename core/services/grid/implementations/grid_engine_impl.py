@@ -1569,6 +1569,9 @@ class GridEngineImpl(IGridEngine):
         if not grid_order:
             return
 
+        if self._is_submission_uncertain(grid_order):
+            self._adopt_reconciled_grid_submission(grid_order, update_data)
+
         self._record_exchange_order_progress(grid_order, update_data)
 
         if status in {"FILLED", "CLOSED"}:

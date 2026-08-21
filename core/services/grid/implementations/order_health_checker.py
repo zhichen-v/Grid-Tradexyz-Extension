@@ -30,7 +30,8 @@ class PositionHealthResult:
 class OrderHealthChecker:
     """Keep exchange orders, local cache, and exposure aligned."""
 
-    RECENT_FILL_COOLDOWN_SECONDS = 15
+    RECENT_FILL_COOLDOWN_SECONDS = 5
+    GAP_REPAIR_FORCE_AFTER_SKIPS = 3
     TP_ONLY_MISMATCH_WARNING_CYCLES = 4
     TP_ONLY_MISMATCH_WARNING_SECONDS = 60.0
     ORDER_HISTORY_LIMIT = 100
@@ -41,7 +42,8 @@ class OrderHealthChecker:
         self.reserve_manager = reserve_manager
         self.logger = get_logger(__name__)
         self._missing_order_seen_at: Dict[str, float] = {}
-        self._missing_grid_seen_at: Dict[Tuple[str, str], float] = {}
+        self._missing_grid_seen_at: Dict[Tuple[int, str], float] = {}
+        self._gap_repair_skip_count = 0
         self._missing_order_resolution_timeout = float(
             getattr(self.engine, "_missing_order_resolution_timeout", 20.0)
         )
@@ -117,21 +119,42 @@ class OrderHealthChecker:
                             f"keys={self._summarize_order_price_keys(blocked_missing_orders)}"
                         )
                     if repairable_missing_orders:
-                        if self._should_delay_gap_repair_for_recent_fill(
+                        should_delay = self._should_delay_gap_repair_for_recent_fill(
                             repairable_missing_orders,
                             cleanup_count,
-                        ):
+                            exchange_orders,
+                        )
+                        forced = (
+                            should_delay
+                            and self._gap_repair_skip_count >= self.GAP_REPAIR_FORCE_AFTER_SKIPS
+                        )
+                        if forced:
+                            should_delay = False
+                        if should_delay:
+                            self._gap_repair_skip_count += 1
                             self.logger.info(
                                 f"Skip gap repair because a fill happened within the last "
-                                f"{self.RECENT_FILL_COOLDOWN_SECONDS} seconds"
+                                f"{self.RECENT_FILL_COOLDOWN_SECONDS} seconds "
+                                f"(skip_count={self._gap_repair_skip_count}/"
+                                f"{self.GAP_REPAIR_FORCE_AFTER_SKIPS})"
                             )
                         else:
-                            if cleanup_count and self._has_recent_fill():
+                            self._gap_repair_skip_count = 0
+                            if forced:
+                                self.logger.info(
+                                    "Forcing gap repair after consecutive recent-fill skips: "
+                                    f"repaired={len(repairable_missing_orders)}, "
+                                    f"keys={self._summarize_order_price_keys(repairable_missing_orders)}"
+                                )
+                            elif cleanup_count and self._has_recent_fill():
                                 self.logger.info(
                                     "Bypass recent-fill cooldown for gap repair because this "
                                     f"cycle already removed duplicate orders: repaired={len(repairable_missing_orders)}"
                                 )
-                            elif self._has_persistent_missing_orders(repairable_missing_orders):
+                            elif self._has_persistent_missing_orders(
+                                repairable_missing_orders,
+                                exchange_orders,
+                            ):
                                 self.logger.info(
                                     "Bypass recent-fill cooldown for persistent missing grid orders: "
                                     f"repaired={len(repairable_missing_orders)}, "
@@ -143,12 +166,14 @@ class OrderHealthChecker:
                             if placed_count:
                                 exchange_orders, positions = await self._fetch_orders_and_positions()
                                 unresolved_orders = await self._sync_orders_into_engine(exchange_orders)
-                    elif unresolved_orders:
-                        consistency_deferred = True
-                        self.logger.info(
-                            "Skip gap repair and position repair because some missing orders "
-                            f"still have unresolved final status: count={unresolved_orders}"
-                        )
+                    else:
+                        self._gap_repair_skip_count = 0
+                        if unresolved_orders:
+                            consistency_deferred = True
+                            self.logger.info(
+                                "Skip gap repair and position repair because some missing orders "
+                                f"still have unresolved final status: count={unresolved_orders}"
+                            )
 
                     if not unresolved_orders and self._should_repair_position():
                         if await self._repair_position_if_confirmed(
@@ -1692,9 +1717,13 @@ class OrderHealthChecker:
             if key in self._missing_order_seen_at:
                 del self._missing_order_seen_at[key]
 
+    def _grid_slot_key(self, order: GridOrder) -> Tuple[int, str]:
+        """Return one grid-id/side key for persistent gap tracking."""
+        return (order.grid_id, order.side.value.lower())
+
     def _update_missing_grid_tracking(self, missing_orders: List[GridOrder]) -> None:
         """Track which inferred grid gaps persist across health-check cycles."""
-        current_keys = {self._order_price_key(order) for order in missing_orders}
+        current_keys = {self._grid_slot_key(order) for order in missing_orders}
         now = time.time()
         for key in current_keys:
             self._missing_grid_seen_at.setdefault(key, now)
@@ -1703,27 +1732,46 @@ class OrderHealthChecker:
         for key in stale_keys:
             del self._missing_grid_seen_at[key]
 
-    def _has_persistent_missing_orders(self, missing_orders: List[GridOrder]) -> bool:
-        """Return whether any missing grid gap has persisted for at least one cooldown window."""
+    def _has_persistent_missing_orders(
+        self,
+        missing_orders: List[GridOrder],
+        exchange_orders: List[OrderData],
+    ) -> bool:
+        """Return whether any missing gap is persistent and safe to repair.
+
+        A gap is eligible once it has been observed for at least one cooldown
+        window. Base-side gaps additionally require the grid slot to be neither
+        locked nor protected by a live reverse order, so a filled-and-reversing
+        grid is not re-entered as a duplicate.
+        """
         now = time.time()
+        base_side = self._base_side_for_grid_type()
+        protected = self._get_local_protected_base_grid_ids()
+        protected.update(self._get_exchange_protected_base_grid_ids(exchange_orders))
         for order in missing_orders:
-            key = self._order_price_key(order)
-            first_seen = self._missing_grid_seen_at.get(key)
-            if first_seen is not None and (now - first_seen) >= self.RECENT_FILL_COOLDOWN_SECONDS:
-                return True
+            first_seen = self._missing_grid_seen_at.get(self._grid_slot_key(order))
+            if first_seen is None or (now - first_seen) < self.RECENT_FILL_COOLDOWN_SECONDS:
+                continue
+            if order.side == base_side:
+                if self._is_grid_locked(order.grid_id):
+                    continue
+                if order.grid_id in protected:
+                    continue
+            return True
         return False
 
     def _should_delay_gap_repair_for_recent_fill(
         self,
         missing_orders: List[GridOrder],
         cleanup_count: int,
+        exchange_orders: List[OrderData],
     ) -> bool:
         """Return whether gap repair should still respect the recent-fill cooldown."""
         if not missing_orders or not self._has_recent_fill():
             return False
         if cleanup_count:
             return False
-        if self._has_persistent_missing_orders(missing_orders):
+        if self._has_persistent_missing_orders(missing_orders, exchange_orders):
             return False
         return True
 
