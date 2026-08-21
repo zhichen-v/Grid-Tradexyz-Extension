@@ -12,8 +12,10 @@ from .position_monitor import PositionMonitor
 from .balance_monitor import BalanceMonitor
 from .scalping_operations import ScalpingOperations
 from ..selective_cancel import install_coordinator_selective_cancel
+from ..selective_cancel_v3 import install_grid_selective_cancel_v3
 
 install_coordinator_selective_cancel()
+install_grid_selective_cancel_v3()
 
 __all__ = [
     "GridCoordinator", "OrderVerificationUtils", "OrderOperations",
