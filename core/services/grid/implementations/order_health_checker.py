@@ -1075,8 +1075,14 @@ class OrderHealthChecker:
                 )
             )
         if abs(tracker_position - actual_position) > tolerance:
-            structural_issues.append(
-                f"tracker_position={tracker_position} != exchange_position={actual_position}"
+            # The tracker is a best-effort estimate derived from WebSocket fill events
+            # and legitimately lags the authoritative REST position snapshot by ~1 fill
+            # during fast moves. It is not consulted for any repair decision, so this
+            # mismatch is expected noise: log it at DEBUG instead of surfacing a
+            # "runtime consistency issue" warning on every health-check cycle.
+            self.logger.debug(
+                f"tracker_position={tracker_position} != exchange_position={actual_position} "
+                "(expected: tracker lags REST snapshot during fast fills)"
             )
         if abs(state_position - actual_position) > tolerance:
             structural_issues.append(
