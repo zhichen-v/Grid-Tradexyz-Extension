@@ -1,5 +1,9 @@
 """Grid coordinator package exports."""
 
+from ..signal_guard import install_cleanup_safe_sigint_guard
+
+install_cleanup_safe_sigint_guard()
+
 from .grid_coordinator import GridCoordinator
 from .verification_utils import OrderVerificationUtils
 from .order_operations import OrderOperations
