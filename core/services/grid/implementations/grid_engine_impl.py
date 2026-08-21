@@ -383,6 +383,12 @@ class GridEngineImpl(IGridEngine):
                     f"verification is required: side={side.value}, amount={amount}, "
                     f"reduce_only={reduce_only}, client_id={order_id}"
                 )
+                if reduce_only:
+                    self.logger.warning(
+                        "Defer uncertain reduce-only market order reconciliation "
+                        f"to the next health check: {reason}"
+                    )
+                    return
                 self._fail_closed_submission(reason)
                 raise RuntimeError(reason)
             self.logger.info(
