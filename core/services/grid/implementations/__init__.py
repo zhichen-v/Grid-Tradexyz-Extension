@@ -1,16 +1,10 @@
-"""
-Grid trading implementation exports.
-
-This package exposes the concrete strategy, engine, and position tracker
-implementations used by the grid runtime.
-"""
+"""Grid trading implementation exports."""
 
 from .grid_strategy_impl import GridStrategyImpl
 from .grid_engine_impl import GridEngineImpl
 from .position_tracker_impl import PositionTrackerImpl
+from ..selective_cancel import install_grid_selective_cancel
 
-__all__ = [
-    "GridStrategyImpl",
-    "GridEngineImpl",
-    "PositionTrackerImpl",
-]
+install_grid_selective_cancel()
+
+__all__ = ["GridStrategyImpl", "GridEngineImpl", "PositionTrackerImpl"]
