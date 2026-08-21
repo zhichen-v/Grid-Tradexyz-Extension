@@ -9,6 +9,7 @@ Lighter交易所适配器
 import asyncio
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from decimal import Decimal
 import yaml
@@ -22,6 +23,41 @@ from ..models import *
 from ..subscription_manager import create_subscription_manager, DataType
 from .lighter_rest import LighterRest
 from .lighter_websocket import LighterWebSocket
+
+
+def _read_env_file(path: Path) -> Dict[str, str]:
+    """Read KEY=VALUE lines from a .env file (skips comments and blank lines)."""
+    values: Dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def _env_auth_fill_in(env_path: Path = Path(".env")) -> Dict[str, Any]:
+    """Non-empty LIGHTER_* auth values from .env, keyed by auth field name."""
+    env_values = _read_env_file(env_path)
+    mapping = {
+        "LIGHTER_NETWORK": "network",
+        "LIGHTER_API_KEY_PRIVATE_KEY": "api_key_private_key",
+        "LIGHTER_ACCOUNT_INDEX": "account_index",
+        "LIGHTER_API_KEY_INDEX": "api_key_index",
+        "LIGHTER_EXPECTED_L1_ADDRESS": "expected_l1_address",
+    }
+    return {
+        field: env_values[env_key]
+        for env_key, field in mapping.items()
+        if env_values.get(env_key, "").strip()
+    }
+
 
 
 class LighterAdapter(ExchangeAdapter):
@@ -193,6 +229,23 @@ class LighterAdapter(ExchangeAdapter):
                 config = yaml.safe_load(f)
                 if self.logger:
                     self.logger.info(f"✅ 加载Lighter配置文件: {config_path}")
+
+                # .env 填空：YAML 留空的 auth 欄位由 .env 的非空值補上。
+                fill_in = _env_auth_fill_in()
+                if fill_in:
+                    api_config = config.get('api_config') or {}
+                    auth = dict(api_config.get('auth') or {})
+                    for field, value in fill_in.items():
+                        if field == "network":
+                            if not str(api_config.get('network') or '').strip():
+                                api_config = {**api_config, 'network': value}
+                        elif not str(auth.get(field) or '').strip():
+                            auth[field] = value
+                    config = {
+                        **config,
+                        'api_config': {**api_config, 'auth': auth},
+                    }
+
                 return config
         except FileNotFoundError:
             if self.logger:

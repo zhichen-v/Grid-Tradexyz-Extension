@@ -292,7 +292,7 @@ Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet�
 - BTC position 仍為 short `0.00020`，entry `68786.9`、cross margin、leverage `5`。
 - 不需為了計算手動 flatten；恢復時必須以 authenticated REST 的實際 position 作為風控真值。若操作者另行改變倉位，恢復前重新 preflight。
 
-### 12.4 目前安全設定
+### 12.4 Step C 完成時安全設定（歷史基線）
 
 `config/market_maker/test_lighter_btc_mvp.yaml` 在交接時維持：
 
@@ -311,7 +311,7 @@ Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet�
 - `unknown_order_policy: pause`
 - `cancel_on_shutdown: true`
 
-Safe config SHA-256：`f23b0e02a1de7804e1a8818d47a5e5e3a0859286ab6cd83be93b24573cb42278`。
+Step C validated baseline config SHA-256：`f23b0e02a1de7804e1a8818d47a5e5e3a0859286ab6cd83be93b24573cb42278`。後續尚未驗證的高換手候選設定見第 12.10 節；不得把候選值誤記為此 baseline 已通過。
 
 Fee rate 目前以保守值 `maker_fee_rate: 0.00050`（`5 bps`）設定。2026-08-20 以 authenticated `accountLimits` 及官方 authenticated trade export 交叉驗證 account `5957`：近 7 日 BTC 的 `667/667` 筆 maker fills 均符合 `Trade Value × 0.000120`，`29/29` 筆 taker fills 均符合 `Trade Value × 0.000350`（依 CSV 顯示精度四捨五入，mismatch `0`）。因此本次可驗證的實際費率為 maker `0.000120`（`1.2 bps`）、taker `0.000350`（`3.5 bps`）；設定值 `5 bps` 是刻意保守的策略假設，不得誤記為實際收費率。Tier/profile/stake 改變或再次 live 前仍須重新核對；績效後驗應使用 export 的實際 `Fee`。
 
@@ -445,3 +445,17 @@ Step C live 於 21:55:44.673 啟動：
 - 因此目前沒有 unresolved cancellation、open order 或殘留 position；停機警告保留為後續長時間觀察項目，不得誤寫成從未發生 ambiguity。
 
 依本指南第 10 節「不得有未解決 uncertainty」的判準，Step C 的雙邊 create、每側一張、POST_ONLY/no-cross、exposure cap、30 分鐘穩定性、shutdown reconciliation 與 authenticated postflight 均通過，判定 **GO（附 documented shutdown observation）**。作業在 Step C 後停止，未進入 Step D/E。Config 已恢復 `dry_run: true`，SHA-256 為 `f23b0e02a1de7804e1a8818d47a5e5e3a0859286ab6cd83be93b24573cb42278`。
+
+### 12.10 高換手長時間測試候選（尚未驗證）
+
+操作者準備自行執行較多成交、長時間的本地測試。為維持最小單量與既有 exposure cap，`config/market_maker/test_lighter_btc_mvp.yaml` 只調整成交機會與換價節奏：
+
+- `base_half_spread_ticks: 4000 → 500`
+- `reprice_threshold_ticks: 1000 → 250`
+- `max_raw_spread_bps: 100 → 30`
+- `min_order_lifetime_ms: 60000 → 30000`
+- `max_mutations_per_minute: 2 → 8`
+
+`order_size=0.00020`、`max_position=0.00040`、`quote_mode=both`、`refresh_interval_ms=5000`、保守 `maker_fee_rate=0.00050` 與所有 POST_ONLY/fail-closed/shutdown 欄位均不變；`dry_run` 維持 `true`。Candidate SHA-256：`61e28a7586021c52d26fa17860ea05ce5d7cb77769cc63609a6727f6f5e024ac`。
+
+此候選同時調整一組互相耦合的 spread/reprice/lifetime/mutation 參數，因此視為新的 exact-config profile，**目前不是 GO，也不是第 12.4 節 baseline 的直接延續**。Live 前必須重新完成 30 分鐘 exact-config dry-run、authenticated preflight、account/BTC 獨占與 open orders `0` 確認。程式沒有日損或 PnL stop；操作者必須另行決定測試時長與最大可承擔損失。只有上述 gate 全部通過後，才可由操作者把 `dry_run` 改為 `false`；停止後須立即恢復 `true`，並驗證 BTC/account open orders `0`、每筆 cancel terminal 與實際 position。不得為追求成交再放寬 `max_raw_spread_bps`，也不得在同一輪提高 `order_size` 或 `max_position`。

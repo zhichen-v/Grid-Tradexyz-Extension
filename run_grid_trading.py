@@ -403,6 +403,12 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
         api_key = api_key or api_secret
         api_secret = api_secret or api_key
 
+    # Lighter 的 .env 使用 LIGHTER_API_KEY_PRIVATE_KEY 命名（與 wallet profile 一致）。
+    if exchange_name == "lighter":
+        lighter_private_key = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY")
+        api_key = api_key or lighter_private_key
+        api_secret = api_secret or lighter_private_key
+
     # TradeXYZ additionally supports HL_AGENT_KEY / HL_WALLET_ADDRESS.
     # A named wallet profile is explicit and overrides any stale shell vars.
     if exchange_name == "tradexyz":
