@@ -251,7 +251,7 @@ Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet�
 
 ## 12. Phase 8 本地驗證紀錄與交接（2026-08-20 起）
 
-> **目前狀態：STOPPED / 2026-08-23 Step D 首次 live 為 NO-GO；事故修復與其 30 分鐘 T3 revalidation 已 GO，但 Step D live retry 尚未授權、尚未執行，Step E 未開始。** 2026-08-20 的 Phase 8 Step B、Step C live GO 仍是歷史基線；fast-fill submission uncertainty 與第一輪 T3 見第 12.11 節，首次 Step D live 與安全收尾見第 12.12 節，後續 cancellation/risk-reduction 修復與第二輪 T3 見第 12.13 節。最新 authenticated postflight 為 Market Maker 程序 `0`、BTC/account open orders `0`、BTC position `0`，USDG total/free `299.854529`、used `0`；config 維持 `dry_run: true`。VPS 同步與測試仍不在本階段範圍。
+> **目前狀態：STOPPED / 2026-08-23 Step D 修復後 live retry 於約 `28m55s` 再次判定 NO-GO；Step E 未開始。** 第 12.13 節的 cancellation/risk-reduction 修復已 commit/push 且完成 30 分鐘 T3 revalidation；live retry 中 risk-reduction reduce-only 行為正常，但沒有耗盡當時的一般 mutation budget，故 emergency budget 本身仍只有 deterministic proof。另有兩次 cancellation terminal visibility 超出既有 bounded window，詳見第 12.14 節。最新兩次 fresh authenticated postflight 均為 Market Maker 程序 `0`、BTC/account open orders `0`、BTC position `0`，USDG total/free `299.882680`、used `0`；config 已恢復 `dry_run: true`。VPS 同步與測試仍不在本階段範圍。
 
 ### 12.1 本輪完成項目
 
@@ -332,20 +332,20 @@ Fee rate 目前以保守值 `maker_fee_rate: 0.00050`（`5 bps`）設定。2026-
 
 ### 12.5 尚未完成
 
-1. **Step D 小額長時間**：首次 live 於約 `5m15s` 提前停止並判定 **NO-GO**，沒有完成原授權的 `2h` 長時間 gate。第 12.13 節已完成 cancellation/risk-reduction 修復、離線驗證與 `30m` T3 dry-run；尚待 review/commit/push 本輪 patch、fresh live 授權，以及重新執行完整 Step D。
+1. **Step D 小額長時間**：首次 live 於約 `5m15s`、修復後 retry 於約 `28m55s` 均提前停止並判定 **NO-GO**，仍未完成原授權的 `2h` 長時間 gate。第二輪的 risk-reduction reduce-only 行為正常，但沒有實際耗盡當時的一般 mutation budget，不能算 emergency budget live proof；cancellation-only bounded confirmation 仍須修正、重新做離線/T3 驗證並取得 fresh live 授權。
 2. **Step E 逐步調參**：未開始且目前被 Step D NO-GO 阻擋。只有 Step D 明確 GO 後才能一次變更一項參數，並各自重做 dry-run、live 觀察、停止與 authenticated postflight。
-3. **Live proof**：第 12.13 節的 deterministic tests 已重現並修正 stale-active cancellation false-positive，dry-run 也無 fault；但不得在主網刻意製造 ambiguity。修復後的 cancel terminal resolution 與 emergency reduce-only create 仍須在自然發生時由 Step D live evidence 驗證，不能以 dry-run 取代。
+3. **Live proof**：第 12.14 節自然驗證 position-cap 下只報 reduce-only side 並正常回到 flat，但當時累積 mutation 尚低於 `8/min`，所以沒有觸發 emergency budget；該額外額度仍只有 deterministic regression proof。既有 `2 attempts / 0.25s` cancellation resolver 對偶發 inactive-history propagation lag 也仍不足。不得在主網刻意製造 ambiguity 或 budget exhaustion，也不得用 blind signer retry 掩蓋 read-after-write timing。
 4. **VPS 同步與測試**：不在本次作業範圍，未執行。
 
 ### 12.6 恢復作業順序
 
-1. Review 第 12.13 節的本地 patch 與驗證證據；確認只包含 shared Lighter cancellation resolver、Market Maker order manager、測試與本文件後，另行 commit/push。不得把尚未 commit 的 working tree 誤認為遠端 branch 已包含修復。
-2. Live 前重新確認沒有其他手動或自動 BTC 策略，測試 subaccount/symbol 仍為獨占；config 必須先維持 `dry_run: true`，並以 authenticated read-only preflight 驗證 network/wallet ownership、metadata、實際 position 與 BTC/account open orders `0`。
-3. 重新核對目前測試 subaccount 的 fee、funding、margin mode/leverage、tick/step/minimum 與權益；歷史 account `5957` 的 2026-08-20 費率證據不得直接套用。Book/position/WS/REST 必須健康，且 raw-spread gate 必須滿足現行 exact config。
-4. 因既有 `logs/market_maker.log` 達 line limit 會 reset，長時間 live 另啟不包裝主 PTY、且不執行 mutation 的 checkpoint/console 保存；先確認其可跨 reset 保留 status、severity 與 CPU/RSS，並可獨立停止。
-5. 取得操作者對 Step D live retry 的 **fresh 明確授權**後，才將執行用設定改為 `dry_run: false`；命令必須直接在 PTY 執行，不得加 `ForEach-Object`、pipe、redirection 或其他會攔截 Ctrl+C 的包裝。
-6. Step D 按第 11 節執行數小時；任何 fill、position drift、post-only cancel、ambiguous/unknown state、stale、429、資源異常或 invariant failure 都須記錄並依 gate 停止。
-7. 停止後必須以 authenticated REST/交易所介面確認 BTC/account open orders `0`、實際 position，以及每筆 cancel 的 terminal proof；只有完整 Step D 明確 GO 才能進 Step E。
+1. 限定在 cancellation confirmation 路徑做最小修復：新增 cancellation-only read window，不放大 submission 共用常數；建議起點為 `4 attempts / 0.5s`。Signer cancel 仍只能送一次，只有 exact cancellation terminal 才能回傳成功，`FILLED` 不得偽裝為 cancel success。
+2. 新增 deterministic delayed-visibility regression：前兩輪 history 尚無 terminal、第三輪才出現 exact `CANCELED`，並斷言 signer cancel 僅一次；保留 window exhaust 後 fail-closed 且不重送的測試。完成 Market Maker/Lighter slices、完整 suite 歸因、compile 與 diff check。
+3. 此變更屬 order lifecycle T3；review/commit/push 後重新跑完整 `30m` exact-config dry-run與 authenticated flat postflight。沒有致命衝突不得修改 grid production code。
+4. Live 前重新確認沒有其他手動或自動 BTC 策略，測試 subaccount/symbol 仍為獨占；config 必須先維持 `dry_run: true`，並以 authenticated read-only preflight 驗證 network/wallet ownership、metadata、fee/funding、`1x cross`、權益、實際 position 與 BTC/account open orders `0`。
+5. 沿用第 12.14 節已驗證的兩組獨立 read-only 稽核；主程序仍以 direct PTY 啟動，不加 pipe、redirection 或會攔截 Ctrl+C 的包裝。
+6. 取得操作者對 Step D live retry 的 **fresh 明確授權**後，才將執行用設定改為 `dry_run: false`；依原 `2h / 5 USDG / 1x cross` 邊界執行，任何 ambiguous/unknown、loss gate、repeated stale/429、資源或 invariant fault 都立即停止。
+7. 停止後必須以至少兩次 fresh authenticated read 確認 BTC/account open orders `0`、實際 position，以及每筆 uncertain cancel 的 exact terminal proof；config 立即恢復 `dry_run: true`。只有完整 Step D 明確 GO 才能進 Step E。
 8. Step E 每次只改一項參數，並重新執行相稱的 dry-run、live 觀察與 postflight。VPS 導入需另立作業範圍，不得由本節的本地 GO 自動推定。
 
 ### 12.7 Flat-account 恢復作業紀錄（2026-08-20 晚間）
@@ -571,7 +571,7 @@ Live 於 19:14:37 以 direct PTY 啟動；startup authenticated REST 精確證�
 
 第 12.12 節另一路徑的根因是 safety cancel 可以越過一般 mutation budget，但仍會記錄該次 mutation；緊接著唯一能降風險的 reduce-only create 又被同一個一般 budget 擋住。Market Maker order manager 現在只在 runtime 已是 `RISK_REDUCTION` 且 desired order 明確為 `reduce_only` 時，允許一般 budget 之外最多一筆 emergency create；此額外額度每 `60s` 最多一次，在 await adapter 前即消耗 cooldown，且仍記錄一般 mutation。普通報價、非 reduce-only 訂單、非 risk-reduction runtime 都不能使用；ambiguous/failed attempt 也不會立刻重送。
 
-沒有修改 grid production code。Shared Lighter adapter 保留既有 `2` 次、間隔 `0.25s` 的 bounded window；對舊 stale-active 提前返回路徑，read-only 查詢由 `1 open + 0 history` 最多變為 `2 open + 2 history`，不增加 signer mutation。`tests/test_lighter_grid_lifecycle.py` 只更新舊測試對 authenticated history read 次數的預期。其餘 production 變更限於 Market Maker order manager。本節修復目前仍是本機 working-tree patch，尚未 commit/push；遠端 branch 最新仍是第 12.11 節的 commit。
+沒有修改 grid production code。Shared Lighter adapter 保留既有 `2` 次、間隔 `0.25s` 的 bounded window；對舊 stale-active 提前返回路徑，read-only 查詢由 `1 open + 0 history` 最多變為 `2 open + 2 history`，不增加 signer mutation。`tests/test_lighter_grid_lifecycle.py` 只更新舊測試對 authenticated history read 次數的預期。其餘 production 變更限於 Market Maker order manager。本節修復已以 commit `6ba1cd6e070e5bffd3dbf73aea86f9fb305e75a7` push 至 `feat/lighter-market-maker-mvp`，local/remote SHA 已精確一致；修復後 live retry 的獨立結果見第 12.14 節。
 
 #### Deterministic regression 與離線結果
 
@@ -604,4 +604,51 @@ Live 於 19:14:37 以 direct PTY 啟動；startup authenticated REST 精確證�
 
 `logs/market_maker.log` 的既有 `1000` 行 line-limit 在本輪接近結束時整檔 reset，停止後只保留最後 `8` 筆 status 與 operator-stop line；因此無法從單一檔案重建全期間精確 state 樣本分布或 raw-spread min/max。獨立即時 checkpoint 已持續確認前後段 counters 與狀態，最終累積 counters 完整且全為安全結果，故本輪 T3 判定不受影響；但 Step D 長時間 live 必須另行保存不包裝主 PTY 的 read-only checkpoint/console 稽核紀錄，不能只依賴此 line-limited 檔案。
 
-停止後連續兩次 fresh authenticated read-only postflight 均通過：Robinhood mainnet 與 wallet ownership PASS、positions `0`、BTC/account open orders `0`、USDG total/free `299.854529 / 299.854529`、used `0`。Config 仍為 `dry_run: true` 且 SHA-256 未變。因此本輪判定 **事故修復與 T3 dry-run software/safety gate GO**；這只解除第 12.12 節的本地修復/revalidation blocker，不會覆蓋首次 Step D live 的 NO-GO，也不等於修復後 live GO。下一步必須先 review/commit/push 本輪 patch，再取得 fresh Step D live retry 授權；Step D 完整 GO 前不得開始 Step E，VPS 仍不在本階段範圍。
+停止後連續兩次 fresh authenticated read-only postflight 均通過：Robinhood mainnet 與 wallet ownership PASS、positions `0`、BTC/account open orders `0`、USDG total/free `299.854529 / 299.854529`、used `0`。Config 仍為 `dry_run: true` 且 SHA-256 未變。因此本輪判定 **事故修復與 T3 dry-run software/safety gate GO**；這只解除第 12.12 節的本地修復/revalidation blocker，不會覆蓋首次 Step D live 的 NO-GO，也不等於修復後 live GO。Patch 後續已 review/commit/push，並依 fresh 授權執行 live retry；該輪仍為 NO-GO，見第 12.14 節。Step D 完整 GO 前不得開始 Step E，VPS 仍不在本階段範圍。
+
+### 12.14 Step D 修復後 live retry 提前停止：NO-GO（2026-08-23）
+
+#### 授權、版本與 preflight
+
+操作者授權以原邊界重跑：最長 `2h`、相對 live 啟動基準最大損失 `5 USDG`、BTC `1x cross`。執行版本為已 push 的 commit `6ba1cd6e070e5bffd3dbf73aea86f9fb305e75a7`；config 的 dry/live SHA-256 分別為 `5e03d60a07f25baf4cbf267f7afc1a319edefea0dc85baffde6ef73ab880bac1` 與 `940bf2365114f64e5ebbf0e10a737b9437c51272c2e57e5dcfed6159f80ef68c`，兩者只差 `dry_run`。
+
+Authenticated preflight 通過 Robinhood mainnet、signer/wallet ownership、market metadata 與帳戶獨占；Market Maker 程序 `0`、BTC/account open orders `0`、BTC position `0`，BTC 精確為 `1x cross`，USDG total/free `299.854529 / 299.854529`、used `0`。當時 raw BBO spread 約 `1.4515 bps < 30 bps`，market active；沒有送出 preflight mutation。
+
+為避免 line-limited 主 log reset 遺失長時間證據，live 主程序維持 direct PTY，另啟兩個完全 read-only、可獨立停止的監控：
+
+- Account/risk audit：`logs/step_d_audit/risk-20260823T124133Z.jsonl`，SHA-256 `2cf197b43ab6f97fff4ff2b52572500168aeea9f2cecb685bbe62df602d11536`。
+- Runtime/log/resource audit：`logs/step_d_audit/runtime-20260823-204234.log`，SHA-256 `ed724ec9345b6ac0fe745527f5f488b380ad98fc28df74fd122b0b40df2b3056`。
+
+兩份 audit 均受 ignore 保護，不納入 branch；沒有記錄 key 或 account ID。Runtime audit 為保留 order-lifecycle 原始證據而含本輪訂單識別碼，因此只留本機，文件與交接摘要不得複製其值。
+
+#### Live 結果與 risk-reduction 證據
+
+Live 於 20:43:56 以 direct PTY 啟動；21:12:55 在第二次 cancellation uncertainty 後依 gate 提前停止：
+
+| 項目 | 最後／累積結果 |
+|---|---|
+| Runtime / cycles | 最後 status uptime `1734.797s`（約 `28m55s`）；`355` cycles、`353` successful、`2` failed |
+| 狀態樣本 | `ACTIVE=67`、`RISK_REDUCTION=99`、`SYNCING=4`、`PAUSED_DATA=3`；三筆短暫 stale-book 樣本自行恢復，不是本輪停止原因 |
+| Create / cancel | create `22/22`；cancel `11/9`；post-only cancellations `7` |
+| Fills / position | full fills `4`；position 觀察路徑為 `0 → LONG 0.00020 → LONG 0.00040 → LONG 0.00020 → 0`；最大 utilization `1`，未超過 `0.00040` cap |
+| Market | 保存 status 的 raw spread 約 `1.5648–24.7742 bps`，全程低於 `30 bps` guard |
+| Fault counters | ambiguous submissions `0`、ambiguous cancellations `2`、unknown orders `0`、reconciliation failures `0`、HTTP 429 `0`、WS reconnect `0` |
+| Resources | worker RSS 約 `132.58–135.05 MiB`、threads `14–24`、CPU 累積約 `1.469 → 29.5s`；未見 busy loop 或無界成長 |
+
+Position 首次到達 `LONG 0.00040` cap 後，runtime 正確維持 `RISK_REDUCTION`，只保留／建立 `SELL 0.00020 / reduce-only`；該狀態下 `mutation_limiter_blocks` 始終為 `0`，後續成交把 position 依序降回 `0.00020` 與 `0`。不過進入 risk reduction 並建立該 reduce-only order 時，累積 create/cancel mutation 僅為 `5 + 2 = 7`，仍低於 `8/min` normal budget；因此本輪只證明 risk-reduction side/reduce-only 行為正常，**不能**宣稱 emergency budget 已被 live 觸發，該額外額度仍只有 deterministic regression proof。最終 `mutation_limiter_blocks=32` 全部發生於回到 flat `ACTIVE` 後的一般雙邊換價，符合 normal budget，不能誤歸因為 risk-reduction regression。
+
+#### Cancellation NO-GO 根因邊界
+
+本輪有 `9` 次 cancellation acknowledgement 經既有 resolver 成功確認 complete，但另有兩個不同 target 在 `2 attempts / 0.25s` window 內沒有取得 terminal proof；兩者各只增加一次 cancel mutation attempt，沒有 signer 重送，也沒有 replacement、429、read exception、fill race 或 history pagination 排除。這兩次造成 `2` failed cycles 與 `ambiguous_cancellations=2`，已直接符合停止條件。
+
+停止後以 exact authenticated inactive history 反查，兩筆都唯一為 `CANCELED / filled=0 / remaining=0`；交易所 terminal timestamp 分別約早於本地 uncertainty error `1.54s` 與 `1.32s`。這證明帳本最終沒有未解決訂單，但不證明 terminal endpoint 在 bounded snapshots 當下已可見；根因邊界是偶發 cancel-terminal visibility/propagation lag 超過現行 read window。第 12.13 節的 stale-active early-return 修復有效但不充分，不能把本輪改判為 GO。
+
+下一個最小修復是 cancellation-only bounded read window（建議先驗證 `4 attempts / 0.5s`），不放寬 submission resolver、不重送 signer mutation、不接受非 cancellation-terminal status。必須先以「第三輪才看見 exact `CANCELED`」的 deterministic test 與 window-exhaust test 證明，再依第 12.6 節重做完整 T3 與 fresh live authorization。
+
+#### 停止與 postflight
+
+單次 operator interrupt 後，應用完成取消訂閱、Lighter disconnect 並寫出 normal operator-stop marker；主程序與兩個獨立監控皆已停止。Risk audit 共 `132` 個 snapshots，權益 min/max 為 `299.840322 / 299.886275`；相對啟動基準的最大觀察損失 `0.014207 USDG`，遠低於 `5 USDG` hard stop，且沒有 monitor fault。
+
+停止後兩次 fresh authenticated read 均證明 BTC position `0`、BTC/account open orders `0`、USDG total/free `299.882680 / 299.882680`、used `0`；相對 live 啟動基準為 `+0.028151 USDG`。因此不需要也沒有送出人工 reduce-only IOC。Config 已立即恢復 `dry_run: true`，SHA-256 回到 `5e03d60a07f25baf4cbf267f7afc1a319edefea0dc85baffde6ef73ab880bac1`。
+
+本輪 Step D 判定 **NO-GO / STOPPED EARLY**，不是帳戶殘留風險事故；Step E **NOT STARTED**。作業依先前指示在 NO-GO 後暫停，未修改 grid production code，亦未進行 VPS 同步或測試。
