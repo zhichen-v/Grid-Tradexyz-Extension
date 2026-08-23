@@ -124,6 +124,21 @@ uv run python run_market_maker.py config/market_maker/lighter_btc_mvp.example.ya
 
 任一項失敗即為 **NO-GO**：停止、保留 log、修正並重新完整跑滿 30 分鐘。未通過不得進入 live rollout。
 
+### 5.1 風險分級 revalidation（2026-08-23 起適用）
+
+第 5 節的 30 分鐘 gate 是完整的 T3 gate。為避免每個不影響交易語意的小改動都重跑 30 分鐘，只有在最新 Market Maker runtime、adapter、設定與帳戶組合已建立一次綠色 T3 baseline 後，才可依下表縮短後續 revalidation。Tier 依實際行為影響判定，不依 commit 名稱或修改行數判定；無法證明屬於較低層級時一律向上選擇。
+
+| Tier | 最短連線 dry-run | 適用範圍 | 額外通過條件 |
+|---|---:|---|---|
+| T0 | 0 分鐘 | 純文件、註解、測試或不進入 runtime 的工具；或已證明 loader 解析結果完全相同的格式調整。 | 執行受影響的離線測試；不得改變 runtime/config fingerprint。 |
+| T1 | 5 分鐘 | 純 log、metrics、redaction 等觀測性變更，且已證明不改變 branch、timing、錯誤處理、帳戶、quote、risk 或 order state。 | 至少 50 個 successful cycles、failed cycle `0`；每條受影響的週期性讀取路徑至少 3 筆樣本。 |
+| T2 | 15 分鐘 | 非交易 operational plumbing，且已證明 parsed data、freshness、state transition、mutation、shutdown 語意均不變。 | 至少 150 個 successful cycles、failed cycle `0`；受影響週期性路徑至少 10 筆樣本。 |
+| T3 | 30 分鐘 | 策略/定價/費率、風控/曝險、create/cancel/reprice、post-only、rate limit、submission ambiguity、history/client ID reconciliation、position/WS/REST/coordinator state、parser、adapter/SDK/profile/account/network、shutdown、任何交易設定，或事故修復。 | 完整執行第 5 節 gate；事故路徑另須有 deterministic regression test。 |
+
+所有會執行的 Market Maker 程式改動，都先跑受影響的 targeted tests、六個 `test_market_maker_*.py` 模組、相關 Lighter/preflight/shutdown safety slice，再跑完整 `unittest discover`。T1 至 T3 開始前均須保存 code diff/commit、exact-config SHA-256、SDK/network/profile、read-only signer/wallet ownership、帳戶與 BTC 獨占、程序數 `0`、open orders `0`、實際 position/balance、metadata/fee/funding/margin；dry-run 必須同時保留檔案 `dry_run: true` 與 CLI `--dry-run`。停止後再確認程序 `0`、account/BTC open orders `0`、position 與 fill 數未變、真實 create/cancel/cancel-all `0`，並保存 log 與 CPU/RSS 樣本。
+
+Gate 綁定最後候選的 code/config/account fingerprint；可先合併同一批小修改，最後只跑一次相稱 gate，不必每個 commit 各跑一次。任一 safety invariant、reconciliation、unknown/uncertainty、mutation、正常停止或 postflight 證據失敗，都判定 **NO-GO**；修正後回到 T3。不得刻意在 Robinhood 主網製造斷網或不確定送單來驗證事故路徑，該路徑使用 deterministic fake/Mock 測試。
+
 ## 6. Live start
 
 Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet；若只能 live，使用專用 sub-account 與交易所允許的最小安全資金/數量。
@@ -236,7 +251,7 @@ Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet�
 
 ## 12. Phase 8 本地驗證紀錄與交接（2026-08-20）
 
-> **目前狀態：STOPPED / Phase 8 Step B、Step C GO（附 shutdown observation）。** 2026-08-20 晚間已完成殘留倉位處置、direct-PTY Step B clean retry，以及 Step C 雙邊極小額 30 分鐘 live。獨立 authenticated postflight 為 Market Maker 程序 `0`、BTC/account open orders `0`、BTC position `0`；config 已恢復 `dry_run: true`。Step C shutdown 的兩筆 cancel acknowledgement 曾短暫缺少 terminal proof，但程式沒有盲目重送，reconciliation 與後續 history 均精確證明兩張單為 `CANCELED / filled=0`，目前沒有未解決 uncertainty。Step D/E 尚未開始；VPS 同步與測試仍不在本階段範圍。
+> **目前狀態：STOPPED / 2026-08-23 最新 Market Maker ambiguity 修復版 exact-config dry-run GO；live 高換手測試尚未授權、未執行。** 2026-08-20 的 Phase 8 Step B、Step C live GO 仍是歷史基線；其後發生的 fast-fill submission uncertainty、修復、測試子帳戶切換與最新驗證見第 12.11 節。最新 authenticated postflight 為 Market Maker 程序 `0`、BTC open orders `0`、BTC position `0`，config 維持 `dry_run: true`。Step D/E 尚未開始；VPS 同步與測試仍不在本階段範圍。
 
 ### 12.1 本輪完成項目
 
@@ -327,7 +342,7 @@ Fee rate 目前以保守值 `maker_fee_rate: 0.00050`（`5 bps`）設定。2026-
 1. 確認沒有其他手動或自動 BTC 策略，且 account/symbol 仍為獨占。
 2. 確認 config 仍為 `dry_run: true`，先執行 authenticated read-only preflight，記錄 account、network、metadata、實際 position 與 BTC/account open orders `0`。
 3. 重新核對 fee、funding、margin、tick/step/minimum；raw spread 必須 `<= 100 bps`，且 `$400` half-spread 算出的 targets 仍須位於 external same-side BBO 外側；book/position/WS/REST 必須健康。Account `5957` 的 2026-08-20 verified maker/taker rate 為 `1.2 / 3.5 bps`，但不得假設未來仍不變。
-4. 若程式或已驗證的交易／風控參數在本交接後改動，先重跑完整離線測試與 30 分鐘 exact-config dry-run；本輪 5 分鐘 targeted calibration 不得當成後續縮短一般 gate 的先例。
+4. 若程式或已驗證的交易／風控參數在本交接後改動，先跑相應離線測試，再依第 5.1 節 T0–T3 風險分級決定 `0 / 5 / 15 / 30` 分鐘 exact-config dry-run；事故修復、下單生命週期、風控或策略語意變更仍屬 T3，不能降級。
 5. 取得操作者對 Step D live 的新授權後，才將 live 執行所用設定明確改為 `dry_run: false`；命令必須直接在 PTY 執行，不得加 `ForEach-Object`、pipe、redirection 或其他會攔截 Ctrl+C 的包裝。
 6. Step D 按第 11 節執行數小時；任何 fill、position drift、post-only cancel、ambiguous/unknown state、stale、429、資源異常或 invariant failure 都須記錄並依 gate 停止。
 7. 停止後必須以 authenticated REST/交易所介面確認 BTC/account open orders `0`、實際 position，以及每筆 cancel 的 terminal proof；只有明確 GO 才能進 Step E。
@@ -446,7 +461,7 @@ Step C live 於 21:55:44.673 啟動：
 
 依本指南第 10 節「不得有未解決 uncertainty」的判準，Step C 的雙邊 create、每側一張、POST_ONLY/no-cross、exposure cap、30 分鐘穩定性、shutdown reconciliation 與 authenticated postflight 均通過，判定 **GO（附 documented shutdown observation）**。作業在 Step C 後停止，未進入 Step D/E。Config 已恢復 `dry_run: true`，SHA-256 為 `f23b0e02a1de7804e1a8818d47a5e5e3a0859286ab6cd83be93b24573cb42278`。
 
-### 12.10 高換手長時間測試候選（尚未驗證）
+### 12.10 高換手長時間測試候選（dry-run GO；live 尚未授權）
 
 操作者準備自行執行較多成交、長時間的本地測試。為維持最小單量與既有 exposure cap，`config/market_maker/test_lighter_btc_mvp.yaml` 只調整成交機會與換價節奏：
 
@@ -456,6 +471,47 @@ Step C live 於 21:55:44.673 啟動：
 - `min_order_lifetime_ms: 60000 → 30000`
 - `max_mutations_per_minute: 2 → 8`
 
-`order_size=0.00020`、`max_position=0.00040`、`quote_mode=both`、`refresh_interval_ms=5000`、保守 `maker_fee_rate=0.00050` 與所有 POST_ONLY/fail-closed/shutdown 欄位均不變；`dry_run` 維持 `true`。Candidate SHA-256：`61e28a7586021c52d26fa17860ea05ce5d7cb77769cc63609a6727f6f5e024ac`。
+`order_size=0.00020`、`max_position=0.00040`、`quote_mode=both`、`refresh_interval_ms=5000`、保守 `maker_fee_rate=0.00050` 與所有 POST_ONLY/fail-closed/shutdown 欄位均不變；`dry_run` 維持 `true`。2026-08-23 最新 exact-config SHA-256：`5e03d60a07f25baf4cbf267f7afc1a319edefea0dc85baffde6ef73ab880bac1`。
 
-此候選同時調整一組互相耦合的 spread/reprice/lifetime/mutation 參數，因此視為新的 exact-config profile，**目前不是 GO，也不是第 12.4 節 baseline 的直接延續**。Live 前必須重新完成 30 分鐘 exact-config dry-run、authenticated preflight、account/BTC 獨占與 open orders `0` 確認。程式沒有日損或 PnL stop；操作者必須另行決定測試時長與最大可承擔損失。只有上述 gate 全部通過後，才可由操作者把 `dry_run` 改為 `false`；停止後須立即恢復 `true`，並驗證 BTC/account open orders `0`、每筆 cancel terminal 與實際 position。不得為追求成交再放寬 `max_raw_spread_bps`，也不得在同一輪提高 `order_size` 或 `max_position`。
+此候選同時調整一組互相耦合的 spread/reprice/lifetime/mutation 參數，因此視為新的 exact-config profile，不是第 12.4 節 baseline 的直接延續。第 12.11 節已完成其修復版 30 分鐘 T3 dry-run、authenticated preflight/postflight、帳戶獨占與零 mutation 驗證，故 **dry-run software/safety gate 為 GO**；這不代表 live GO。程式沒有日損或 PnL stop；操作者仍須另行決定測試時長與最大可承擔損失，並重新授權 live。只有 live preflight 再次通過後，才可由操作者把 `dry_run` 改為 `false`；停止後須立即恢復 `true`，並驗證 BTC/account open orders `0`、每筆 cancel terminal 與實際 position。不得為追求成交再放寬 `max_raw_spread_bps`，也不得在同一輪提高 `order_size` 或 `max_position`。
+
+### 12.11 Fast-fill uncertainty 修復、測試子帳戶切換與 T3 revalidation（2026-08-23）
+
+#### 事故與根因邊界
+
+2026-08-20 23:37 的高換手測試中，一張最小量 `SELL 0.00020` 在 submission 後快速成交；active-order 查詢當下已找不到該單，submission resolver 因而無法立即證明結果。系統正確 fail-closed 進入 `PAUSED_ORDER_STATE`，沒有在不確定狀態下盲目補單，但暴露兩個 Market Maker 問題：submission uncertainty latch 在 exact reconciliation 已解決後仍可能維持到程序結束，以及 paused status 可能沿用先前的 position/live-order 快照。當時 status 為 `8/9` successful cycles、`ambiguous_submissions=1`、`reconciliation_failure=1`；這是 **NO-GO 事故紀錄**，不能以「沒有重複下單」直接視為通過。
+
+後續 grid/shared adapter 更新已在目前基線提供「active lookup miss 後，以 exact client order ID 查 inactive history」的 resolver fallback。本輪沒有修改 grid 或 shared Lighter adapter；只在 Market Maker 邊界完成以下最小修復與回歸證明：
+
+- `MarketMakerOrderManager` 只有在 adapter unresolved registry 與所有 MM slots 都不再含 submission uncertainty 時，才清除 latch 與對應 pause；任何 unresolved cancel、錯誤／缺少 client ID 仍維持 fail-closed。
+- Exact active/history reconciliation 證明 `OPEN/PARTIAL` 時採納同一張單；證明 `FILLED` 時先強制刷新 position，且同一 cycle 不建立 replacement，避免快速成交後重複下單。
+- `MarketMakerCoordinator.emit_status_once()` 在輸出前重新讀取 book、position 與 live-order snapshot，使 paused 狀態也反映當下真值。
+- 新增 fast-fill active-miss → exact inactive-history、OPEN、PARTIAL、FILLED、independent uncertain-cancel 與 paused-status freshness 回歸測試。
+
+#### 子帳戶與離線驗證
+
+本機 Lighter YAML 中原本會覆蓋 `.env` 的舊 account/API-key index 已改為 `null`，使兩者一致由測試子帳戶環境變數載入；識別碼與 key 不寫入本文件。`config/exchanges/lighter_config.yaml` 與 `config/market_maker/test_lighter_btc_mvp.yaml` 都受 `.gitignore` 保護，故這些本機 account/config 值不會隨 branch commit/push。Authenticated read-only preflight 通過 Robinhood mainnet profile、signer/wallet ownership、BTC metadata 與帳戶獨占：USDG total/free `300 / 300`、used `0`、positions `0`、BTC open orders `0`，且沒有 mutation。初始化仍會輸出既存的 `SymbolConversionService.get_instance` cache warning，但 authenticated reads 全部成功；依本輪「不碰 grid/shared 除非致命衝突」的範圍只列為後續維護項。
+
+離線結果：
+
+- 六個 Market Maker 模組：`178 tests / OK`。
+- 相關 Lighter/preflight/shutdown safety slice：`34 tests / OK`。
+- `compileall` 與 `git diff --check`：PASS。
+- 完整 `unittest discover`：`401 tests`，其中 `8 failures + 4 errors`；在乾淨的基準 commit `2de97c4` 重跑相同模組得到完全相同的 `test_lighter_authenticated_queries: 0F/1E`、`test_lighter_grid_lifecycle: 8F/3E`。因此這 12 筆是後續 grid selective-cancel 基線問題，不是本輪 Market Maker regression；本輪未修改任何 grid 程式碼。
+
+#### Exact-config 30 分鐘 dry-run
+
+因本輪改動涉及 submission ambiguity/order lifecycle，依第 5.1 節歸類為 T3，仍執行完整 30 分鐘；這一輪建立綠色基準後，後續小改動才可依 T0–T2 縮短。使用第 12.10 節設定，檔案 `dry_run: true` 且 CLI 加 `--dry-run`，觀察期間為 2026-08-23 18:23:35 至 18:54:05（Asia/Taipei）。
+
+| 項目 | 結果 |
+|---|---|
+| Exact config | SHA-256 `5e03d60a07f25baf4cbf267f7afc1a319edefea0dc85baffde6ef73ab880bac1` |
+| 執行時間／停止 | 最後 status uptime `1823.062s`；單次 operator interrupt 後取消訂閱、斷線並寫出 normal operator-stop marker；程序數 `0` |
+| Cycles / 狀態 | `359/359` 成功、failed `0`、consecutive errors `0`；最後為 `ACTIVE`，pause reason `None` |
+| Position / exposure | position `0`、live orders `0`；worst exposure `±0.00020`，max-position utilization `0.5`，未超過 `±0.00040` cap |
+| Market / quote | 最後 raw spread `28.82197 bps < 30 bps` guard；雙邊 target 存在，quote spread 約 `13.00630 bps` |
+| Mutation / fill | `would_place=718` 僅為模擬；create/cancel attempts、partial/full fills 全部 `0` |
+| Faults | ambiguous submission/cancellation、reconciliation failure、unknown orders、HTTP 429、WS reconnect 全部 `0`；reconciliation success `359` |
+| Resources | 樣本 RSS 約 `131.99 → 133.84 MiB`；threads `16 → 25`、保存峰值 `26`；CPU `4.5 → 36.734s`，未見 busy loop 或無界成長 |
+
+停止後 authenticated read-only postflight：USDG total/free 仍為 `300 / 300`、used `0`，BTC positions `0`、open orders `0`，Market Maker 程序 `0`。因此本輪判定 **修復版 dry-run software/safety gate GO**。本輪沒有 live mutation；高換手 live、Step D/E 與 VPS 均未執行，需另行授權。Repo 位於 `feat/lighter-market-maker-mvp`，本節所述修復目前仍是未 commit 的 working-tree 變更，交接時不得誤認為已 push。

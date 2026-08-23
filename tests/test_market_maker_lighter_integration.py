@@ -420,6 +420,43 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fast_fill_order_index_falls_back_to_exact_history(
+        self,
+    ) -> None:
+        rest = object.__new__(LighterRest)
+        rest.get_open_orders = AsyncMock(return_value=[])
+        filled = replace(
+            _order(
+                "987",
+                OrderSide.SELL,
+                Decimal("72444.6"),
+                Decimal("0.00020"),
+                OrderStatus.FILLED,
+            ),
+            client_id="42",
+            filled=Decimal("0.00020"),
+            remaining=Decimal("0"),
+        )
+        rest.get_order_history = AsyncMock(return_value=[filled])
+
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            order_id = await rest._query_order_index(
+                "BTC",
+                "sell",
+                Decimal("72444.6"),
+                Decimal("0.00020"),
+                client_order_id=42,
+                max_retries=3,
+                retry_delay=0,
+            )
+
+        self.assertEqual(order_id, "987")
+        self.assertEqual(rest.get_open_orders.await_count, 3)
+        rest.get_order_history.assert_awaited_once_with("BTC", limit=100)
+
     def test_post_only_maps_to_lighter_sdk_constant(self) -> None:
         import lighter
 

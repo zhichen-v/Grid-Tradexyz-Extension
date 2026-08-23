@@ -1547,6 +1547,41 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["max_position_utilization"], Decimal("0.2"))
         self.assertEqual(snapshot["counters"]["reconciliation_success"], 1)
 
+    async def test_paused_status_uses_current_position_and_live_orders(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        manager.snapshot.return_value = (
+            SimpleNamespace(
+                side=OrderSide.SELL,
+                price=Decimal("100.1"),
+                remaining=Decimal("0.2"),
+            ),
+        )
+        coordinator = self.prepare_running(order_manager=manager)
+        coordinator._transition(
+            RuntimeState.PAUSED_ORDER_STATE,
+            "order submission outcome is uncertain",
+        )
+        self.now = 110.0
+        coordinator._market = self.market(received=109.0)
+        coordinator._position = self.position(
+            received=108.0,
+            signed_size=Decimal("-0.4"),
+        )
+        coordinator.metrics.signed_position = Decimal("-0.2")
+        coordinator.metrics.live_ask = Decimal("999")
+
+        snapshot = await coordinator.emit_status_once()
+
+        self.assertEqual(snapshot["signed_position"], Decimal("-0.4"))
+        self.assertEqual(snapshot["book_age_seconds"], 1.0)
+        self.assertEqual(snapshot["position_age_seconds"], 2.0)
+        self.assertIsNone(snapshot["live_bid"])
+        self.assertEqual(snapshot["live_ask"], Decimal("100.1"))
+        self.assertEqual(snapshot["live_sell_remaining"], Decimal("0.2"))
+        manager.reconcile.assert_not_awaited()
+
     async def test_mutation_success_metrics_are_per_action(self) -> None:
         coordinator = self.prepare_running()
         coordinator.order_manager.reconcile.return_value = SimpleNamespace(

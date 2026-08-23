@@ -731,7 +731,22 @@ class MarketMakerCoordinator:
         return True
 
     async def emit_status_once(self) -> dict[str, Any]:
-        snapshot = self.metrics.snapshot(self._monotonic())
+        now = self._monotonic()
+        orders = (
+            self.order_manager.snapshot()
+            if self.order_manager is not None
+            else ()
+        )
+        if self.metadata is not None:
+            self._update_market_metrics(now, orders)
+        elif self._position is not None:
+            self.metrics.position_age_seconds = max(
+                0.0, now - self._position.received_monotonic
+            )
+        if self._position is not None:
+            self.metrics.signed_position = self._position.signed_size
+        self._update_live_metrics(orders)
+        snapshot = self.metrics.snapshot(now)
         if self._status_callback is None:
             logger.info("market_maker_status %s", snapshot)
         else:

@@ -777,7 +777,9 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             OrderSlotState.UNCERTAIN_SUBMISSION,
         )
 
-    async def test_uncertain_submission_adopts_exact_client_id(self) -> None:
+    async def test_uncertain_submission_adopts_exact_open_and_unpauses(
+        self,
+    ) -> None:
         self.adapter.create_order.side_effect = None
         self.adapter.create_order.return_value = exchange_order(
             "client-1",
@@ -808,9 +810,10 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.manager.slots[OrderSide.BUY].order_id, "late-order"
         )
-        self.assertEqual(
-            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
-        )
+        self.assertEqual(self.manager.runtime_state, RuntimeState.SYNCING)
+        self.assertIsNone(self.manager.pause_reason)
+        self.assertFalse(self.manager.has_uncertain_state)
+        self.adapter.create_order.assert_awaited_once()
 
     async def test_adapter_unresolved_submission_blocks_create_without_slot(
         self,
@@ -828,7 +831,9 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.manager.has_uncertain_state)
         self.assertEqual(result.runtime_state, RuntimeState.PAUSED_ORDER_STATE)
 
-    async def test_resolved_ambiguous_submission_does_not_auto_retry(self) -> None:
+    async def test_resolved_filled_submission_refreshes_before_next_create(
+        self,
+    ) -> None:
         self.adapter.create_order.side_effect = None
         self.adapter.create_order.return_value = exchange_order(
             "client-1",
@@ -845,24 +850,29 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             exchange_order(
                 "late-order",
                 OrderSide.BUY,
-                status=OrderStatus.CANCELED,
+                status=OrderStatus.FILLED,
                 price="99.9",
+                remaining="0",
                 client_id="client-1",
             )
         ]
 
-        await self.manager.resolve_unresolved_submissions()
-        await self.manager.reconcile(
+        result = await self.manager.reconcile(
             self.desired(bid_price="99.9", ask_price=None), self.risk()
         )
 
         self.adapter.create_order.assert_awaited_once()
         self.assertIsNone(self.manager.slots[OrderSide.BUY])
-        self.assertEqual(
-            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
-        )
+        self.assertTrue(result.position_refresh_required)
+        self.assertFalse(self.manager.has_uncertain_state)
+        self.assertEqual(self.manager.runtime_state, RuntimeState.SYNCING)
 
-    async def test_submission_latch_survives_uncertain_cancel_resolution(
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+
+    async def test_resolved_submission_does_not_mask_uncertain_cancel(
         self,
     ) -> None:
         self.adapter.create_order.side_effect = None
@@ -887,12 +897,19 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
         await self.manager.resolve_unresolved_submissions()
+        self.assertFalse(self.manager.has_uncertain_state)
 
+        self.clock.value += 2
         self.adapter.resolve_unresolved_submissions.return_value = []
         self.adapter.cancel_order.side_effect = TimeoutError("response lost")
         await self.manager.reconcile(
-            self.desired(bid_price="99.9", ask_price=None), self.risk()
+            self.desired(bid_price="99.8", ask_price=None), self.risk()
         )
+        self.assertTrue(self.manager.has_uncertain_state)
+        self.assertIn(
+            "cancellation outcome is uncertain", self.manager.pause_reason
+        )
+
         self.adapter.get_open_orders.return_value = []
         self.adapter.get_order_history.return_value = [
             exchange_order(
@@ -904,17 +921,13 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
                 client_id="client-1",
             )
         ]
-        await self.manager.sync_open_orders()
-        await self.manager.reconcile(
-            self.desired(bid_price="99.9", ask_price=None), self.risk()
-        )
+        refresh_required = await self.manager.sync_open_orders()
 
         self.adapter.create_order.assert_awaited_once()
         self.assertIsNone(self.manager.slots[OrderSide.BUY])
-        self.assertTrue(self.manager.has_uncertain_state)
-        self.assertEqual(
-            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
-        )
+        self.assertTrue(refresh_required)
+        self.assertFalse(self.manager.has_uncertain_state)
+        self.assertEqual(self.manager.runtime_state, RuntimeState.SYNCING)
 
     async def test_uncertain_submission_rejects_wrong_symbol(self) -> None:
         self.adapter.create_order.side_effect = None
@@ -948,7 +961,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             OrderSlotState.UNCERTAIN_SUBMISSION,
         )
 
-    async def test_resolved_partial_submission_requires_position_refresh(
+    async def test_resolved_partial_submission_is_adopted_before_refresh(
         self,
     ) -> None:
         self.adapter.create_order.side_effect = None
@@ -979,11 +992,16 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.position_refresh_required)
-        self.adapter.cancel_order.assert_awaited_once_with("late-order", "BTC")
-        self.assertIsNone(self.manager.slots[OrderSide.BUY])
+        self.adapter.cancel_order.assert_not_awaited()
         self.assertEqual(
-            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
+            self.manager.slots[OrderSide.BUY].state,
+            OrderSlotState.PARTIALLY_FILLED,
         )
+        self.assertEqual(
+            self.manager.slots[OrderSide.BUY].order_id, "late-order"
+        )
+        self.assertFalse(self.manager.has_uncertain_state)
+        self.assertEqual(self.manager.runtime_state, RuntimeState.SYNCING)
 
     async def test_uncertain_first_create_stops_second_side(self) -> None:
         self.adapter.create_order.side_effect = None

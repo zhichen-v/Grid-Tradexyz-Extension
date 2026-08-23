@@ -967,12 +967,22 @@ class MarketMakerOrderManager:
                 current.state = OrderSlotState.UNCERTAIN_SUBMISSION
 
     def _clear_resolved_uncertainty_pause(self) -> None:
+        if self._submission_ambiguity_latched:
+            submission_unresolved = bool(self.get_unresolved_submissions()) or any(
+                order is not None
+                and (
+                    order.state is OrderSlotState.UNCERTAIN_SUBMISSION
+                    or order.submission_uncertain
+                )
+                for order in self._slots.values()
+            )
+            if not submission_unresolved:
+                self._submission_ambiguity_latched = False
         if self.has_uncertain_state or not self.pause_reason:
             return
-        # Submission ambiguity stays latched until restart; clearing it here
-        # can create a new client id after late terminal proof.
         if self.pause_reason.startswith(
             (
+                "order submission outcome is uncertain",
                 "order cancellation outcome is uncertain",
                 "cannot cancel an order without",
                 "buy order status is unknown",
