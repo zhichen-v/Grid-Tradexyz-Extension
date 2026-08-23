@@ -1248,6 +1248,48 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.adapter.cancel_order.assert_awaited_once()
 
+    async def test_budget_allows_one_emergency_risk_reducing_create(self) -> None:
+        manager = self.make_manager(
+            MarketMakerConfig(
+                symbol="BTC",
+                order_size=Decimal("0.2"),
+                max_position=Decimal("1"),
+                min_profit_buffer_bps=Decimal("0"),
+                max_mutations_per_minute=1,
+                dry_run=False,
+            )
+        )
+        await manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        desired = self.desired(
+            bid_price=None,
+            ask_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        risk = self.risk(
+            buy_amount=None,
+            sell_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+
+        await manager.reconcile(desired, risk)
+        result = await manager.reconcile(desired, risk)
+
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.assertTrue(
+            self.adapter.create_order.await_args.kwargs["params"]["reduce_only"]
+        )
+        self.assertNotIn("blocked", {action.operation for action in result.actions})
+
+        await manager.handle_order_update(
+            exchange_order("2", OrderSide.SELL, status=OrderStatus.CANCELED)
+        )
+        result = await manager.reconcile(desired, risk)
+
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.assertIn("blocked", {action.operation for action in result.actions})
+
     async def test_shutdown_success_and_failure_are_explicit(self) -> None:
         await self.manager.reconcile(
             self.desired(bid_price="99.9", ask_price=None), self.risk()

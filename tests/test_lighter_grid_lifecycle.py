@@ -2205,7 +2205,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first)
         self.assertFalse(second)
         rest.signer_client.cancel_order.assert_awaited_once()
-        self.assertEqual(rest.get_order_history.await_count, 1)
+        self.assertEqual(rest.get_order_history.await_count, 4)
 
     async def test_ambiguous_cancel_succeeds_only_on_exact_terminal_history(self):
         rest = self._rest()

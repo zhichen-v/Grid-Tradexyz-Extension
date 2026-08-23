@@ -114,6 +114,25 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "inactive orders query failed"):
             await rest.get_order("missing", "BTC")
 
+    async def test_cancel_reconciliation_outlasts_stale_active_snapshot(self):
+        rest = self.make_rest()
+        rest.MUTATION_RECONCILIATION_ATTEMPTS = 2
+        rest.MUTATION_RECONCILIATION_DELAY = 0
+        active = SimpleNamespace(id="123", client_id="client-123")
+        canceled = SimpleNamespace(
+            id="123",
+            client_id="client-123",
+            status=OrderStatus.CANCELED,
+        )
+        rest.get_open_orders = AsyncMock(side_effect=([active], []))
+        rest.get_order_history = AsyncMock(side_effect=([], [canceled]))
+
+        result = await rest._reconcile_cancellation("BTC", "123")
+
+        self.assertIs(result, True)
+        self.assertEqual(rest.get_open_orders.await_count, 2)
+        self.assertEqual(rest.get_order_history.await_count, 2)
+
     async def test_positions_requires_signer(self):
         rest = self.make_rest()
         rest.signer_client = None

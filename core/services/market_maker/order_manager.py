@@ -141,6 +141,7 @@ class MarketMakerOrderManager:
         self._post_only_refreshed_generation = 0
         self._pending_post_only_cancellations = 0
         self._post_only_create_not_before = 0.0
+        self._risk_reducing_create_not_before = 0.0
         self.runtime_state = RuntimeState.SYNCING
         self.pause_reason: str | None = None
         self._shutting_down = False
@@ -417,7 +418,14 @@ class MarketMakerOrderManager:
                     continue
                 action_start = len(actions)
                 position_refresh_required = (
-                    await self._place_locked(target, actions, errors)
+                    await self._place_locked(
+                        target,
+                        actions,
+                        errors,
+                        risk_reduction=(
+                            risk.runtime_state is RuntimeState.RISK_REDUCTION
+                        ),
+                    )
                     or position_refresh_required
                 )
                 if self._post_only_create_blocked():
@@ -581,6 +589,8 @@ class MarketMakerOrderManager:
         desired: DesiredOrder,
         actions: list[ReconcileAction],
         errors: list[str],
+        *,
+        risk_reduction: bool,
     ) -> bool:
         operation = "would_place" if self.config.dry_run else "place"
         action = ReconcileAction(
@@ -594,7 +604,15 @@ class MarketMakerOrderManager:
         if self.config.dry_run:
             actions.append(action)
             return False
-        if not self._create_budget_available():
+        now = self._monotonic()
+        normal_budget_available = self._create_budget_available()
+        emergency_budget_available = (
+            not normal_budget_available
+            and risk_reduction
+            and desired.reduce_only
+            and now >= self._risk_reducing_create_not_before
+        )
+        if not normal_budget_available and not emergency_budget_available:
             actions.append(
                 ReconcileAction(
                     desired.side,
@@ -606,8 +624,9 @@ class MarketMakerOrderManager:
                 )
             )
             return False
+        if emergency_budget_available:
+            self._risk_reducing_create_not_before = now + 60
 
-        now = self._monotonic()
         self._slots[desired.side] = ManagedOrder(
             side=desired.side,
             state=OrderSlotState.SUBMITTING,

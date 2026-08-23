@@ -477,6 +477,7 @@ class LighterRest(LighterBase):
     ) -> Optional[bool]:
         """Resolve cancellation only from an exact active or terminal-history match."""
         target = str(order_id)
+        active_seen = False
 
         def matches(order: OrderData) -> bool:
             return target in {
@@ -494,7 +495,7 @@ class LighterRest(LighterBase):
                 )
             else:
                 if any(matches(order) for order in active_orders):
-                    return False
+                    active_seen = True
 
             try:
                 history = await self.get_order_history(symbol)
@@ -519,7 +520,7 @@ class LighterRest(LighterBase):
 
             if attempt + 1 < self.MUTATION_RECONCILIATION_ATTEMPTS:
                 await asyncio.sleep(self.MUTATION_RECONCILIATION_DELAY)
-        return None
+        return False if active_seen else None
 
     async def _handle_ambiguous_cancellation(
         self,
