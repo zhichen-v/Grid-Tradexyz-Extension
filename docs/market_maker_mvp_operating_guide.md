@@ -251,7 +251,7 @@ Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet�
 
 ## 12. Phase 8 本地驗證紀錄與交接（2026-08-20 起）
 
-> **目前狀態：STOPPED / 操作者已明確接受跳過未完成的 Step D prerequisite，直接進入 Step E；E0 fee-truth 校準與 E1 `250-tick` half-spread 的完整 T3 dry-run 已 GO，E1 live 尚未啟動。** 第 12.14 節的 Step D live retry 歷史判定仍為 NO-GO，不得回寫成 GO；cancellation 修復見第 12.15 節，新的 Step E 目標、風險邊界與結果見第 12.16 節。最新兩次 fresh authenticated postflight 均為 Market Maker 程序 `0`、BTC/account open orders `0`、BTC position `0`，USDG total/free `299.882680`、used `0`；BTC 維持 `1x cross`，config 為 `dry_run: true`。VPS 同步與測試仍不在本階段範圍。
+> **目前狀態：STOPPED / Step E E1 `250-tick` half-spread 的完整 T3 dry-run 已 GO，但首次 E1 live 發生 account-wide／BTC 掛單讀值不一致，且 monitor hard stop 未即時傳遞給主程序；live safety／economic 判定為 NO-GO／INCONCLUSIVE。** 第 12.14 節的 Step D live retry 歷史判定仍為 NO-GO，不得回寫成 GO；cancellation 修復見第 12.15 節，Step E 目標、風險邊界與本次結果見第 12.16 節。最新兩次 fresh authenticated postflight 均為 Market Maker 程序 `0`、BTC/account open orders `0`、BTC position `-0.00040`、`1x cross`，USDG total/free/used 分別為 `299.878968 / 268.959328 / 30.919640` 與 `299.878968 / 268.934928 / 30.944040`；config 已恢復 `dry_run: true`。依既定授權邊界，非 flat 時停止切換參數並等待倉位處置指示；VPS 同步與測試仍不在本階段範圍。
 
 ### 12.1 本輪完成項目
 
@@ -333,7 +333,7 @@ Step C baseline 當時以保守值 `maker_fee_rate: 0.00050`（`5 bps`）設定�
 ### 12.5 尚未完成
 
 1. **Step D 小額長時間**：首次 live 於約 `5m15s`、修復後 retry 於約 `28m55s` 均提前停止並判定 **NO-GO**，仍未完成原授權的 `2h` 長時間 gate。第 12.15 節已完成 cancellation-only bounded confirmation 修復、離線驗證與 T3 dry-run；尚待 fresh live 授權及完整 Step D。
-2. **Step E 逐步調參**：操作者於 2026-08-23 明確接受跳過 Step D prerequisite 後已開始；E0 fee-truth 與 E1 spread T3 已完成，E1 live 經濟驗證尚待執行。這是 operator-accepted rollout deviation，不會把 Step D 歷史 NO-GO 改判為 GO；每一階仍只能改一項，並各自保存 fingerprint、驗證、停止與 authenticated postflight。
+2. **Step E 逐步調參**：操作者於 2026-08-23 明確接受跳過 Step D prerequisite 後已開始；E0 fee-truth 與 E1 spread T3 已完成。首次 E1 live 最後由 operator interrupt 停止，但只取得兩筆開倉 maker fills 且留下 `-0.00040 BTC`，另有監看讀值不一致與 hard-stop propagation 缺口，因此 economic result 為 INCONCLUSIVE，E2 未開始。這是 operator-accepted rollout deviation，不會把 Step D 歷史 NO-GO 改判為 GO；每一階仍只能改一項，並各自保存 fingerprint、驗證、停止與 authenticated postflight。
 3. **Live proof**：第 12.14 節自然驗證 position-cap 下只報 reduce-only side 並正常回到 flat，但當時累積 mutation 尚低於 `8/min`，所以沒有觸發 emergency budget；該額外額度仍只有 deterministic regression proof。新的 cancellation-only `4 / 0.5s` window 亦只有 deterministic 與 dry-run proof，仍須在下一個 live stage 自然發生取消時觀察；不得在主網刻意製造 ambiguity 或 budget exhaustion，也不得用 blind signer retry 掩蓋 read-after-write timing。
 4. **VPS 同步與測試**：不在本次作業範圍，未執行。
 
@@ -725,3 +725,30 @@ Exact-config T3 以 direct PTY 於 22:57:35 啟動，23:29:28 單次 operator in
 Position 全程 `0`，worst exposure `±0.00020`、utilization `0.5`；`would_place=104` 僅為模擬，真實 create/cancel/fill 全部 `0`。Ambiguous submission/cancellation、reconciliation failure、unknown order、mutation-limiter block、HTTP 429、WS reconnect全部 `0`，reconciliation success `377`。48 個 resource samples 為 RSS `133.047–134.391 MiB`、threads `15–25`、CPU `16.641→59.922s`，未見 busy loop 或無界成長。
 
 停止後兩次 fresh authenticated read 均為程序 `0`、BTC/account orders `0`、BTC position `0`、`1x cross`、USDG total/free `299.882680 / 299.882680`、used `0`，BTC history count仍為 `33`，證明沒有 dry-run mutation/fill。E1 **software/safety T3 gate GO**；這不等於 live 經濟 GO。下一步必須先 commit/push 本節、確認 local/remote SHA、以同一 config 做 fresh flat preflight，且只有 raw spread回到 `<=30 bps` 才啟動受監控 E1 live。Step D 仍為歷史 NO-GO，Step E 下一個參數 stage 與 VPS 作業都尚未開始。
+
+#### E1 首次 live：hard-stop propagation NO-GO，economic INCONCLUSIVE
+
+E0/E1 文件 checkpoint 已先以 commit `816e03eae2f70500c7d08af821ac3d90349013e5` push 至 `feat/lighter-market-maker-mvp`，local/remote SHA 一致且 working tree clean。Live 前 fresh authenticated preflight 於 23:36:31 確認 Robinhood mainnet、premium maker/taker fee tick `120/350`、USDG total/free `299.882680 / 299.882680`、used `0`、BTC position `0`、BTC/account orders `0`、`1x cross`；BBO `77227.5 / 77242.9`，raw spread約 `1.99391 bps`。E1 dry config SHA-256 仍為 `8e4563804d0e193e818ee33aba50d7679d188ab28fe0a6083bb43cab67753be4`；只把執行副本切為 `dry_run: false` 後的 live SHA-256 為 `d4d436c5d0a9a040d46122a3bc3d024862a4269dda2c780fe72b410008773ed3`，沒有改動其他策略參數。
+
+獨立 authenticated risk monitor 於 23:37:55 啟動，基準權益 `299.882680`、stage hard floor `299.382680`，每 `15s` 檢查權益、倉位、`1x cross` 與掛單；sanitized artifact 為 `logs/step_e_audit/risk-20260823T153753Z.jsonl`。Market Maker 以 direct PTY 於 23:39:27 啟動，明確記錄 `dry_run=False`；初始建立兩張 `BTC 0.00020 POST_ONLY` 雙邊報價。23:39:42 status 為 ACTIVE、`4/4` cycles successful、兩側 live remaining 均為 `0.00020`、quote spread約 `6.46862 bps`，ambiguous/reconciliation failure/unknown/429 均為 `0`。
+
+23:39:59 的風控 snapshot 同時讀到 BTC active order `1`、account-wide active orders `0`。這個「account-wide 少於其 BTC 子集」的組合本身不可能證明存在非 BTC 掛單，但當時 monitor 將不相等錯誤分類為 `non_btc_order` 並依 hard-stop evaluator 自行退出。Account state 已失去可信度且 monitor 中斷本來就是立即停止條件；然而 monitor 只自行退出，沒有把 hard stop 傳遞給主程序，主程序到 23:41:12 才由 operator interrupt，中間約 `72.6s` 失去獨立監看。因此 hard-stop detection 有效，但 stop orchestration 本身亦為 NO-GO，不能因事後判斷為監看分類／跨 endpoint 一致性問題而忽略。
+
+停止前 authenticated order inspection 只看到一張 `BTC BUY 0.00020 / limit / post-only / reduce-only`，沒有非 BTC 訂單證據；策略當時已到 `-0.00040 BTC` cap 並進入 `risk_reduction`。23:41:12 單次 operator interrupt 後完成 shutdown cancel、WebSocket cleanup 與 disconnect，23:41:19 寫出正常 operator-stop marker。最後 status uptime約 `102.984s`、`25/25` cycles successful、failed/consecutive errors `0`；create `6/6`、cancel `3/3`、full-fill events `2`、reconciliation success `25`，runtime ambiguous submission/cancellation、reconciliation failure、unknown、mutation limiter、HTTP 429 均為 `0`。Windows PTY exit `1` 仍是既知 ETX harness 表現，不是應用 traceback。
+
+Authenticated unique trade ledger 在 `[23:39:27, 23:41:20]` 內只有兩筆，均為自然外部 maker sell：
+
+| 時間（Asia/Taipei） | Side / role | Base | Price | Turnover | Exact fee |
+|---|---|---:|---:|---:|---:|
+| 23:39:50.946 | sell / maker | `0.00020` | `77315.3` | `15.463060` | `0.0018555672` |
+| 23:39:58.521 | sell / maker | `0.00020` | `77321.7` | `15.464340` | `0.0018557208` |
+
+合計 unique trades `2`、maker/taker `2/0`、turnover `30.927400 USDG`、exact fee `0.0037112880 USDG`、trade realized PnL `0`、funding `0`；ledger net realized為 `-0.0037112880 USDG`。兩筆都只是開倉腿，未達 `8` fills 且沒有 flat-to-flat close，因此不能用這個數字宣稱 fee coverage 或盈利能力。相對啟動 collateral 的顯示差額為 `-0.003712 USDG`，與費用扣款在六位顯示精度內相符，但仍不得替代非 flat 階段缺少的完整經濟驗證。
+
+Config 已立即恢復 `dry_run: true`，SHA-256 回到 `8e4563804d0e193e818ee33aba50d7679d188ab28fe0a6083bb43cab67753be4`；Market Maker Python processes為 `0`。23:42:17 與 23:44:05 兩次 fresh authenticated postflight 均確認 BTC/account active orders `0`、BTC position `-0.00040`、`1x cross`、USDG total `299.878968`；兩次 free/used 分別為 `268.959328 / 30.919640` 與 `268.934928 / 30.944040`，差異來自未平倉期間的市場變動。
+
+本輪判定為 **E1 live safety gate NO-GO / economic INCONCLUSIVE / STOPPED**。Hard-stop detection 有效，但 monitor → main stop propagation 未即時生效；operator interrupt 後的 shutdown cancel 有效。沒有 taker fill、cap breach、殘留掛單或 production grid code 變更；但 monitor 的 account-wide／symbol subset invariant 與 stop orchestration 都未能提供可信的持續稽核，且帳戶仍非 flat。依本節既定邊界，現在不得切到 E2、不得自行使用 IOC，也不得把兩筆 opening fills 算成已 cover fee。恢復前必須：
+
+1. 由操作者處置 `-0.00040 BTC`，或另行明確授權最小必要的平倉方式；恢復前再做 fresh authenticated flat proof。
+2. 重建 monitor 判定與 stop propagation：只有 `account-wide > BTC` 才可能表示存在其他 market orders；`account-wide < BTC` 必須視為跨 endpoint 不一致，bounded retry 後仍不一致就標記 `account_state_untrusted`。任何 hard stop 都必須主動 signal/request-stop 主程序，monitor 不得先自行退出，並須留存到確認 main process `0`；這條完成 deterministic proof 前不得重跑 E1。
+3. 以相同 E1 config 重跑 live baseline並取得至少 `8` 筆 unique maker fills、自然 flat 與 flat-to-flat equity reconciliation；E1 經濟 GO 前不得開始 E2 spread stage。
