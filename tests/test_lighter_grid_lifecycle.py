@@ -1674,6 +1674,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         rest._request_interval = 0.0
         rest._max_rate_limit_delay = 30.0
         rest._uncertain_cancellations = set()
+        rest.CANCELLATION_RECONCILIATION_DELAY = 0
         rest._next_client_order_index = MagicMock(return_value=self.CLIENT_ID)
         rest.get_open_orders = AsyncMock(return_value=[])
         rest.get_order_history = AsyncMock(return_value=[])
@@ -2103,7 +2104,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             client_id="client-101",
             status=OrderStatus.CANCELED,
         )
-        rest.get_order_history = AsyncMock(return_value=[terminal])
+        rest.get_order_history = AsyncMock(side_effect=[[], [], [terminal]])
         rest.signer_client = SimpleNamespace(
             cancel_order=AsyncMock(
                 return_value=(
@@ -2114,9 +2115,20 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        cancelled = await rest.cancel_order("BTC", "101")
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            cancelled = await rest.cancel_order("BTC", "101")
 
         self.assertTrue(cancelled)
+        rest.signer_client.cancel_order.assert_awaited_once_with(
+            market_index=1,
+            order_index=101,
+        )
+        self.assertEqual(rest.get_open_orders.await_count, 3)
+        self.assertEqual(rest.get_order_history.await_count, 3)
+        self.assertEqual(sleep_mock.await_count, 2)
         self.assertEqual(rest._uncertain_cancellations, set())
 
     async def test_cancel_numeric_client_id_does_not_require_exchange_index(self):
@@ -2162,32 +2174,40 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
     async def test_ambiguous_cancel_never_repeats_signer_mutation(self):
         rest = self._rest()
         rest.get_market_index = MagicMock(return_value=1)
-        rest.get_open_orders = AsyncMock(
-            return_value=[SimpleNamespace(id="101", client_id="client-101")]
-        )
         rest.signer_client = SimpleNamespace(
             cancel_order=AsyncMock(
-                side_effect=ConnectionError("connection reset after send")
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="cancel-tx"),
+                    None,
+                )
             )
         )
 
         with patch(
             "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
             new=AsyncMock(),
-        ):
+        ) as sleep_mock:
             first = await rest.cancel_order("BTC", "101")
             second = await rest.cancel_order("BTC", "101")
 
         self.assertFalse(first)
         self.assertFalse(second)
-        rest.signer_client.cancel_order.assert_awaited_once()
+        rest.signer_client.cancel_order.assert_awaited_once_with(
+            market_index=1,
+            order_index=101,
+        )
+        self.assertEqual(rest.get_open_orders.await_count, 8)
+        self.assertEqual(rest.get_order_history.await_count, 8)
+        self.assertEqual(sleep_mock.await_count, 6)
+        self.assertEqual(rest._uncertain_cancellations, {("BTC", "101")})
 
     async def test_cancel_absence_is_not_terminal_and_later_active_never_resends(self):
         rest = self._rest()
         rest.get_market_index = MagicMock(return_value=1)
         active_order = SimpleNamespace(id="101", client_id="client-101")
         rest.get_open_orders = AsyncMock(
-            side_effect=[[], [active_order], [active_order]]
+            side_effect=[[]] + [[active_order]] * 7
         )
         rest.signer_client = SimpleNamespace(
             cancel_order=AsyncMock(
@@ -2205,7 +2225,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first)
         self.assertFalse(second)
         rest.signer_client.cancel_order.assert_awaited_once()
-        self.assertEqual(rest.get_order_history.await_count, 4)
+        self.assertEqual(rest.get_order_history.await_count, 8)
 
     async def test_ambiguous_cancel_succeeds_only_on_exact_terminal_history(self):
         rest = self._rest()

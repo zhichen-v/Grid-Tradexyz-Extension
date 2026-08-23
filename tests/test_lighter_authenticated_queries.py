@@ -116,8 +116,8 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_reconciliation_outlasts_stale_active_snapshot(self):
         rest = self.make_rest()
-        rest.MUTATION_RECONCILIATION_ATTEMPTS = 2
-        rest.MUTATION_RECONCILIATION_DELAY = 0
+        rest.CANCELLATION_RECONCILIATION_ATTEMPTS = 2
+        rest.CANCELLATION_RECONCILIATION_DELAY = 0
         active = SimpleNamespace(id="123", client_id="client-123")
         canceled = SimpleNamespace(
             id="123",

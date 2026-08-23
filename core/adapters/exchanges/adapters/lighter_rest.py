@@ -85,6 +85,8 @@ class LighterRest(LighterBase):
 
     MUTATION_RECONCILIATION_ATTEMPTS = 2
     MUTATION_RECONCILIATION_DELAY = 0.25
+    CANCELLATION_RECONCILIATION_ATTEMPTS = 4
+    CANCELLATION_RECONCILIATION_DELAY = 0.5
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -485,7 +487,7 @@ class LighterRest(LighterBase):
                 str(getattr(order, "client_id", "") or ""),
             }
 
-        for attempt in range(self.MUTATION_RECONCILIATION_ATTEMPTS):
+        for attempt in range(self.CANCELLATION_RECONCILIATION_ATTEMPTS):
             try:
                 active_orders = await self.get_open_orders(symbol)
             except Exception as exc:
@@ -518,8 +520,8 @@ class LighterRest(LighterBase):
                     }:
                         return True
 
-            if attempt + 1 < self.MUTATION_RECONCILIATION_ATTEMPTS:
-                await asyncio.sleep(self.MUTATION_RECONCILIATION_DELAY)
+            if attempt + 1 < self.CANCELLATION_RECONCILIATION_ATTEMPTS:
+                await asyncio.sleep(self.CANCELLATION_RECONCILIATION_DELAY)
         return False if active_seen else None
 
     async def _handle_ambiguous_cancellation(
