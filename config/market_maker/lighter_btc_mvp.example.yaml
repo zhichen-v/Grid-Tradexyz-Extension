@@ -33,6 +33,16 @@ market_maker:
   order_sync_interval_seconds: 10
   health_check_interval_seconds: 60
 
+  # 0 表示停用；live 必須啟用 in-process authenticated account audit。
+  account_audit_interval_seconds: 0
+  account_audit_timeout_seconds: 5
+  max_session_drawdown: "0"
+  # 達 completed fill 門檻即驗 fee/net；完整 equity GO 另待自然 flat。
+  economic_min_fills: 8
+  # (completed gross - exact fee) / two-leg turnover，單位為 bps。
+  min_completed_net_turnover_bps: "0"
+  require_flat_start: false
+
   max_consecutive_errors: 5
   error_cooldown_seconds: 5
   max_mutations_per_minute: 30

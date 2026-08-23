@@ -53,6 +53,27 @@ market_maker:
         with self.assertRaisesRegex(ValueError, "refresh_interval_ms"):
             MarketMakerConfig(refresh_interval_ms=0)
 
+    def test_account_audit_requires_positive_drawdown_and_flat_start(self) -> None:
+        with self.assertRaisesRegex(ValueError, "account_audit_timeout_seconds"):
+            MarketMakerConfig(account_audit_timeout_seconds=0)
+        with self.assertRaisesRegex(ValueError, "max_session_drawdown"):
+            MarketMakerConfig(account_audit_interval_seconds=15)
+        with self.assertRaisesRegex(ValueError, "require_flat_start"):
+            MarketMakerConfig(
+                account_audit_interval_seconds=15,
+                max_session_drawdown="5",
+            )
+        config = MarketMakerConfig(
+            account_audit_interval_seconds=15,
+            max_session_drawdown="5",
+            require_flat_start=True,
+            min_completed_net_turnover_bps="0.1",
+        )
+        self.assertEqual(config.max_session_drawdown, Decimal("5"))
+        self.assertEqual(
+            config.min_completed_net_turnover_bps, Decimal("0.1")
+        )
+
     def test_rejects_false_or_wrong_type_post_only(self) -> None:
         for value in (False, "true", 1):
             with self.subTest(value=value):

@@ -509,6 +509,26 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.reconcile(self.desired(), self.risk())
         self.assertEqual(self.adapter.create_order.await_count, 3)
 
+    async def test_immediate_full_fill_keeps_confirmed_order_id(self) -> None:
+        self.adapter.create_order.side_effect = lambda *args, **kwargs: exchange_order(
+            "fast-fill",
+            args[1],
+            status=OrderStatus.FILLED,
+            price=str(args[4]),
+            amount=str(args[3]),
+            remaining="0",
+        )
+
+        result = await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+
+        self.assertTrue(result.position_refresh_required)
+        self.assertEqual(result.errors, ())
+        self.assertTrue(result.actions[0].success)
+        self.assertIn("fast-fill", self.manager.known_order_ids)
+        self.assertIsNone(self.manager.slots[OrderSide.BUY])
+
     async def test_matched_post_only_terminal_blocks_create_but_allows_cancel(
         self,
     ) -> None:
@@ -569,6 +589,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             self.manager.slots[OrderSide.BUY].state,
             OrderSlotState.UNCERTAIN_SUBMISSION,
         )
+        self.assertNotIn("1", self.manager.known_order_ids)
         self.assertEqual(
             self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
         )
@@ -1498,6 +1519,39 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(position_refresh_required)
         self.assertIsNone(self.manager.slots[OrderSide.BUY])
+
+    async def test_history_terminal_records_exchange_id_from_client_match(self) -> None:
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        slot = self.manager._slots[OrderSide.BUY]
+        self.manager._known_order_ids.clear()
+        slot.order_id = None
+        self.adapter.get_open_orders.return_value = []
+        self.adapter.get_order_history.return_value = [
+            exchange_order(
+                "exchange-1",
+                OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                price="99.9",
+                remaining="0",
+                client_id=slot.client_id,
+            )
+        ]
+
+        self.assertTrue(await self.manager.sync_open_orders())
+
+        self.assertIn("exchange-1", self.manager.known_order_ids)
+        self.assertIsNone(self.manager.slots[OrderSide.BUY])
+
+    async def test_shutdown_wraps_resolution_and_cancel_in_safety_scope(self) -> None:
+        self.adapter.begin_safety_requests = Mock()
+        self.adapter.end_safety_requests = Mock()
+
+        await self.manager.shutdown()
+
+        self.adapter.begin_safety_requests.assert_called_once_with()
+        self.adapter.end_safety_requests.assert_called_once_with()
 
     async def test_rest_partial_fill_requires_position_refresh(self) -> None:
         await self.manager.reconcile(

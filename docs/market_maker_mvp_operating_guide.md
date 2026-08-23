@@ -67,6 +67,12 @@ Market Maker YAML 不保存 credentials。程式沿用既有 credential bootstra
 | `position_poll_interval_seconds` | REST position safety sync 間隔。 |
 | `order_sync_interval_seconds` | REST open-order reconciliation 間隔。 |
 | `health_check_interval_seconds` | Exchange/WS health check 間隔。 |
+| `account_audit_interval_seconds` | In-process authenticated account audit 間隔；`0` 為停用，但 live 入口會拒絕停用 audit 的設定。 |
+| `account_audit_timeout_seconds` | 包含等待 coordinator cycle lock 與完整 snapshot 的 audit 上限；timeout 直接 hard stop。 |
+| `max_session_drawdown` | 以啟動時 total account value 為基準的 session hard stop；audit 啟用時必須大於 0。 |
+| `economic_min_fills` | 達此 completed maker fill 門檻即啟用 fee/net gate；完整 equity GO 另待自然回到 flat。 |
+| `min_completed_net_turnover_bps` | Completed net／雙腿 turnover 與 flat account-value change／turnover 的最低 bps。 |
+| `require_flat_start` | Audit 啟用時必須為 `true`；非 flat 不得建立 session 基準。 |
 | `max_consecutive_errors` | 連續錯誤達門檻後暫停。 |
 | `error_cooldown_seconds` | 錯誤後冷卻時間；不可 busy retry。 |
 | `max_mutations_per_minute` | create/cancel mutation budget；必要安全撤單優先。 |
@@ -251,7 +257,7 @@ Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet�
 
 ## 12. Phase 8 本地驗證紀錄與交接（2026-08-20 起）
 
-> **目前狀態：STOPPED / Step E E1 `250-tick` half-spread 的完整 T3 dry-run 已 GO，但首次 E1 live 發生 account-wide／BTC 掛單讀值不一致，且 monitor hard stop 未即時傳遞給主程序；live safety／economic 判定為 NO-GO／INCONCLUSIVE。** 第 12.14 節的 Step D live retry 歷史判定仍為 NO-GO，不得回寫成 GO；cancellation 修復見第 12.15 節，Step E 目標、風險邊界與本次結果見第 12.16 節。最新兩次 fresh authenticated postflight 均為 Market Maker 程序 `0`、BTC/account open orders `0`、BTC position `-0.00040`、`1x cross`，USDG total/free/used 分別為 `299.878968 / 268.959328 / 30.919640` 與 `299.878968 / 268.934928 / 30.944040`；config 已恢復 `dry_run: true`。依既定授權邊界，非 flat 時停止切換參數並等待倉位處置指示；VPS 同步與測試仍不在本階段範圍。
+> **目前狀態：STOPPED / 第 12.16 節首次 E1 live 的歷史判定仍為 safety NO-GO／economic INCONCLUSIVE；第 12.17 節已完成 in-process audit 與 long-run 候選修復，新的 live proof 尚待操作者執行。** 歷史 `SHORT 0.00040 BTC` 已由操作者處置；是否仍 flat、account orders 是否仍為 0 一律以每次啟動前的 fresh authenticated preflight 為準，不得沿用文件快照。Config 維持 `dry_run: true`；VPS 同步與測試仍不在本階段範圍。
 
 ### 12.1 本輪完成項目
 
@@ -704,11 +710,11 @@ Independent account monitor 共保存 `112` 筆 sanitized risk snapshots，所�
 
 操作者明確指示在既有 commit/push 後直接跳到 Step E，目標是在可覆蓋實際手續費的硬條件下，以放大自然外部 maker 成交量為主要目標、淨盈利為次要目標。這是對「Step D 必須先 GO」的明確 operator-accepted deviation；第 12.12 與 12.14 節的 Step D NO-GO 歷史仍然成立，不得因進入 Step E 而改寫。
 
-優先序固定為：safety／無自成交 > 實際 fee coverage > maker turnover／eligible quote hour > 淨盈利。只計自然外部成交，不得使用其他自有帳戶、策略或手動單製造 wash/self-trade；runtime 的 fill-event counter 不是成交 ledger，經濟結果以 authenticated unique BTC trades、每筆 fee tick、funding 與 flat-to-flat equity 為準。精確 fee 為 `Trade Value × 該筆 maker/taker fee tick / 1,000,000`；CSV export 的 `Fee` 只有四位小數，只能交叉核對，不能作為小額高換手的精算來源。
+優先序固定為：safety／無自成交 > 實際 fee coverage > maker turnover／eligible quote hour > 淨盈利。只計自然外部成交，不得使用其他自有帳戶、策略或手動單製造 wash/self-trade；runtime 的 fill-event counter 不是成交 ledger，經濟結果以 authenticated unique BTC trades、每筆 fee tick、funding 與 flat-to-flat equity 為準。在 managed order 已明確簽署 integrator fee 為零，且 API `null` 已由本地 signer invariant 受限補足的前提下，精確 fee 為 `Trade Value × 該筆 maker/taker fee tick / 1,000,000`；CSV export 的 `Fee` 只有四位小數，只能交叉核對，不能作為小額高換手的精算來源。
 
 既有 `POST_ONLY`、`max_raw_spread_bps=30`、`order_size=0.00020`、`max_position=0.00040`、exclusive/abort/pause/shutdown-cancel、BTC `1x cross` 與整輪 `5 USDG` hard ceiling 全部保留。每個 live stage 另採更嚴格的 `0.50 USDG` stage drawdown stop；任何 ambiguous submission/cancellation、failed cycle、reconciliation failure、unknown order、HTTP 429、非 maker fill、超過 position cap、帳戶狀態失去可信度或 repeated monitor read fault 都立即停止。這次指示不授權提高 position cap、leverage/loss ceiling，也不預先授權非 flat 時使用 IOC；若停止後非 flat，須停止切換參數並重新請示。
 
-每個 stage 最少觀察 15 分鐘，最多 30 分鐘；達到至少 `8` 筆 unique maker fills 且自然回到 flat 才可做完整經濟判定。`turnover = Σ abs(Trade Value)`；`gross = Σ account realized trade PnL`；`funding_cashflow` 使用帶正負號的帳戶 cashflow（credit 為正、debit 為負）；`net = gross - exact fee + funding_cashflow`。Flat-to-flat 且期間沒有 transfer 時，net 必須與 `equity_end - equity_start` 在顯示精度內一致，否則經濟結果為 INCONCLUSIVE。E1 是第一個可比較 live baseline，只要求全為 maker、`net >= 0`、gross 覆蓋 exact fee、保存 turnover／eligible hour 且所有 safety counters 通過；從 E2 起才要求 turnover／eligible hour 相較 E1 或上一個 accepted stage 上升。樣本不足只能記為 economic INCONCLUSIVE，不可宣稱已證明 cover fee。
+第 12.16 節原始逐參數 calibration 的每個 stage 最少觀察 15 分鐘、最多 30 分鐘；達到至少 `8` 筆 unique maker fills 且自然回到 flat 才可做完整經濟判定。`turnover = Σ abs(Trade Value)`；`gross = Σ account realized trade PnL`；`funding_cashflow` 使用帶正負號的帳戶 cashflow（credit 為正、debit 為負）；`net = gross - exact fee + funding_cashflow`。Flat-to-flat 且期間沒有 transfer 時，net 必須與 `equity_end - equity_start` 在顯示精度內一致，否則經濟結果為 INCONCLUSIVE。E1 是第一個可比較 live baseline，只要求全為 maker、`net >= 0`、gross 覆蓋 exact fee、保存 turnover／eligible hour 且所有 safety counters 通過；從 E2 起才要求 turnover／eligible hour 相較 E1 或上一個 accepted stage 上升。樣本不足只能記為 economic INCONCLUSIVE，不可宣稱已證明 cover fee。第 12.17 節的 long-run 候選明確取代此處「最多 30 分鐘」的 calibration 上限：前 15–30 分鐘只是同一 session 的 safety checkpoint，健康時不停止或重設 baseline。
 
 #### E0：authenticated fee truth 單參數校準
 
@@ -752,3 +758,66 @@ Config 已立即恢復 `dry_run: true`，SHA-256 回到 `8e4563804d0e193e818ee33
 1. 由操作者處置 `-0.00040 BTC`，或另行明確授權最小必要的平倉方式；恢復前再做 fresh authenticated flat proof。
 2. 重建 monitor 判定與 stop propagation：只有 `account-wide > BTC` 才可能表示存在其他 market orders；`account-wide < BTC` 必須視為跨 endpoint 不一致，bounded retry 後仍不一致就標記 `account_state_untrusted`。任何 hard stop 都必須主動 signal/request-stop 主程序，monitor 不得先自行退出，並須留存到確認 main process `0`；這條完成 deterministic proof 前不得重跑 E1。
 3. 以相同 E1 config 重跑 live baseline並取得至少 `8` 筆 unique maker fills、自然 flat 與 flat-to-flat equity reconciliation；E1 經濟 GO 前不得開始 E2 spread stage。
+
+### 12.17 Long-run 前最後優化與本機候選（2026-08-24）
+
+#### 修復範圍與狀態
+
+本輪只處理 Market Maker runtime、其測試與文件；沒有修改 Grid strategy／engine production code，沒有同步或測試 VPS，也沒有送出 live mutation。第 12.16 節 E1 首次 live 的歷史判定仍是 **safety NO-GO / economic INCONCLUSIVE**；本節完成的是下一輪候選的 offline 修復，不是新的 live GO。
+
+外掛式 monitor 的 control-plane 缺口已改為主程序內建的 authenticated account audit worker：
+
+- Coordinator 在第一張 quote 前先做 account-wide open orders、全部 positions、collateral 與 BTC authenticated trade baseline；候選設定要求從 flat、無任何 account open order 開始。Live 入口會拒絕 `account_audit_interval_seconds=0`。
+- 每 `15s` 由同一 coordinator worker 稽核，單次讀取以 trades 前後 fence 加 position／balance 組成可信 snapshot；包含等待 cycle lock 的整輪上限為 `5s`，transport 或跨 endpoint mismatch 最多 bounded retry 三次。仍不可信、worker exception、taker／非標準／非本 runtime 成交、未知掛單、非 BTC position、超過 position cap或 drawdown 時，worker exception 直接觸發既有 `request_stop → shutdown cancel → unsubscribe → disconnect`，不再允許 monitor 靜默退出而主程序繼續。
+- Account orders 只取一次 account-wide response並逐列檢查 symbol／ownership，不再比較兩個不同 endpoint 的 count，所以不會重現「account-wide 少於 BTC 子集」的錯誤分類。
+- 已確認的 managed order id 會保留整個 runtime；即使 create acknowledgement 回來時訂單已完全成交，或 final exchange ID 稍後才由 history 解析，也能把 authenticated trade 精確歸因。合法 partial fill 後反向穿越零倉位會留在同一 flat-to-flat episode，不再誤停。Trade page 使用穩定 id 去重與數字 sequence 排序；一次 audit 若出現 `100` 筆全新 fills，因可能超出單頁窗口而 fail closed，不猜測缺失歷史。
+- Authenticated account response 必須恰有一筆且 account identity 相符；collateral、nonzero position 的 unrealized PnL、IMF 與 margin mode 均採 finite／presence 嚴格解析，不能以缺值 fallback 成 `0` 或 `1x cross`。Shared Lighter adapter 仍接受交易所兩位小數表示的合法 IMF（例如 `33.33 → 3x`、`6.66 → 15x`）；只有 Market Maker audit 會另外以 raw IMF `100`、parsed leverage `1` 與 `cross` 三項同時鎖定本候選的精確 `1x cross`。
+- Authenticated trade 的 maker/taker fee tick 與本 runtime 設定必須完全相符。每張 managed limit order 會在 signer 參數明確固定 integrator account/taker/maker fee 為 `0`；若 trades API 回報非零 integrator fee 必定 fail closed。主網歷史回報可能將零值表示為 `null`；新成交只有在訂單 ID 屬於本 runtime，且 adapter 仍提供上述零費率簽署保證時才可接受 `null`，否則仍 fail closed。
+- Fail-closed／shutdown 的 cancellation、uncertain resolution 與 terminal-proof reads 使用 bounded safety-priority path，不受舊 read cooldown 卡住。Stop 的上限涵蓋等待 cycle lock 與 order-manager shutdown；即使該段 timeout，仍會繼續 unsubscribe、disconnect 並留下失敗終態，不會永久卡在鎖等待。
+- Trade ledger 目前刻意只查 configured BTC market。測試 sub-account「沒有其他手動／自動 writer」是不可破壞的運行前提；account-wide orders／positions 仍會攔截持續存在的其他市場曝險，但不能偵測兩次 audit 間已完整開平的其他市場交易。
+
+#### Fee cover 與成交量閘門
+
+本候選保留兩個不同層級，不能互相替代：
+
+1. **報價前 floor**：`maker_fee_rate=0.000120`、`min_profit_buffer_bps=0.5`，策略要求完整 quote spread 至少為 `2 × 1.2 + 0.5 = 2.9 bps`。若帳戶 authenticated fee tick 不再是 `120`，live 前必須先更新設定並重新驗證；live 中任一成交的實際 fee rate 不等於設定值會 hard stop。
+2. **成交後 gate**：只使用 authenticated unique maker trades；`exact_fee = Σ turnover × actual fee tick / 1,000,000`，並以從 flat 出發、自然回到 flat 的完整 episode 累積 `gross`、`exact_fee`、`net_ex_funding` 與 two-leg `turnover = Σ abs(trade value)`。至少累積 `8` 筆 completed fills 後，已封口 episodes 的 `gross >= exact_fee` 與 `net_ex_funding / turnover >= 0.10 bps` 會立即評估，不會被同一 audit 尾端的新 opening inventory 遮蔽；任一失敗都自動 hard stop。兩者通過但目前 nonflat 時，狀態為 `fee_gate_pass_equity_pending_flat`，只有自然回到 flat 後才要求 `flat account-value change / turnover >= 0.10 bps` 並給出完整 runtime GO。
+
+`0.10 bps = 0.001%` 是扣除精確交易 fee 後、相對雙腿成交量的 session 累積門檻。它刻意不是「每一筆 fill 的盈利百分比」：開倉腿尚未有完整 realized PnL，逐筆判斷會產生假 NO-GO；累積 flat-to-flat 也比任選買賣配對更可重建。`8` completed fills 是最早 fail-fast 門檻，不是耐久盈利證明；未來從 E1 promotion 到 `200 ticks` 前，人工證據另要求至少 `10` 個 completed round trips及 funding／transfer postflight 核對。`min_profit_buffer_bps=0.5` 使用單程 reference notional，而 post-trade 分母包含兩腿 turnover，因此兩個 bps 數字不可直接當作同一分母比較。
+
+Status 的 `account_audit` 另提供 `unique_maker_fills`、`turnover`、`maker_fills_per_wall_hour`、`maker_turnover_per_wall_hour`、`maker_fills_per_eligible_hour`、`maker_turnover_per_eligible_hour`、completed round trips、exact fee、gross、fee-cover ratio、net/turnover bps、drawdown、flat equity change與 `unattributed_flat_cashflow`。目前 runtime 未另查 authenticated funding／transfer cashflow；因此 `gross >= exact_fee` 與 `net_ex_funding` 不會把正 funding credit 拿來掩蓋未 cover fee，但 `fee_and_equity_gate_go` 仍只是 runtime gate。正式 session economic GO 必須在停止後以 authenticated funding／transfer 與 flat equity 差額交叉核對。
+
+#### 最後候選與操作者動作
+
+本機 `config/market_maker/test_lighter_btc_mvp.yaml` 的最終 dry-run SHA-256 以本節驗證結果為準。策略幾何保留 E1 `both / order 0.00020 / max position 0.00040 / configured half-spread 250 ticks / reprice 250 ticks / max raw spread 30 bps / 30s lifetime / 8 mutations per minute`；effective half-spread仍會取 base 與 fee floor 的較大值再向 tick ceil。本輪沒有直接縮到 `200 ticks`，因上一輪失敗點是 monitor control plane，且尚未建立可信 E1 live turnover baseline。未來要提高成交量時，應先讓此候選取得 safety/economic GO，再只改 `250 → 200`，以 `maker_turnover_per_eligible_hour` 做同口徑比較。
+
+設定檔安全預設仍為 `dry_run: true`。操作者開始長測前：
+
+1. Fresh authenticated read-only preflight 必須確認正確 Robinhood mainnet 測試 subaccount／wallet owner、BTC/account open orders `0`、BTC position `0`、`1x cross`、maker fee tick `120`，且沒有其他手動或自動策略。舊文件的 position 只是歷史快照，不可取代 fresh read。
+2. 本輪 monitor／adapter／stop-propagation 修復依第 5.1 節完成一次完整 `30m` T3（且至少 10 次 `account_audit`）；結果記在下節。此 fingerprint GO 後，live 前可另做約 2–3 分鐘 startup canary，確認 audit state `healthy`、failed cycle `0`、真實 mutation `0`，不必再重複一輪 30 分鐘。後續修改仍依第 5.1 節分級，只有真正 T0–T2 變更才能使用縮短 gate。
+3. Live 執行副本只把 `dry_run` 明確改成 `false`；wallet profile 只透過 `--wallet-name <profile>` 傳入，不把 key/account 寫入 YAML。前 `15–30m` 視為同一程序的 safety canary：audit 必須持續 healthy，且 failed cycle、uncertainty、taker、unknown 與 429 均為 `0`。若因成交樣本不足仍為 `economic_state=collecting`，可讓同一 session 繼續 long-run；累積至少 `8` completed fills 時立即判定 fee/net，失敗即 hard stop；通過但 nonflat 時只等待自然 flat 完成 equity gate。Cleanup 只在最終停止後驗證，不能作為「同一程序繼續」前置條件。
+4. 候選固定採第 12.16 節較嚴格的 `max_session_drawdown=0.50 USDG`，canary 與長測不得中途重設 baseline。先前授權的 `5 USDG` 只是整輪外層上限，不會覆蓋這個較嚴格的自動 hard stop；本輪不建議放寬，也不得同時提高 order size、position cap或 leverage。
+5. 出現 `account_audit.state=hard_stop`、程序退出、任何 uncertainty／taker／unknown、position cap、drawdown或經濟 NO-GO 時，不得自動重啟。Shutdown 只撤 managed orders，不自動 flatten；須 fresh authenticated 確認 orders／position，若非 flat 再由操作者決定處置。
+6. Runner 沒有 `15–30m` 或 `2h` 自動 duration。前 `15–30m` 只是 live safety checkpoint：健康時不要 Ctrl+C，讓同一 session 與 drawdown baseline直接繼續；只有異常停止條件或最終 `2h`／人工 long-run 界線才由操作者 Ctrl+C。不得使用自動重啟器。
+
+建議命令（先 dry-run）：
+
+```powershell
+.\.venv\Scripts\python.exe run_market_maker.py config\market_maker\test_lighter_btc_mvp.yaml --dry-run --debug
+```
+
+目前本機測試 sub-account 由預設 Lighter config 載入，所以命令不加 `--wallet-name`。只有完整且已驗證的 named profile 才另加 `--wallet-name <profile>`。Live 時沿用同一命令，但使用已明確切為 `dry_run: false` 的執行副本並移除 `--dry-run`；程式本身不提供任何 CLI 參數把安全預設反向切成 live。
+
+### 12.18 Long-run 最後候選 T3 與交接（2026-08-24）
+
+真實 trades API 會將歷史成交的零 integrator fee 回報為 `null`，因此曾有一次 startup fail-closed；修復後的第一次短輪又因獨立審查發現 `False == 0` 的 capability 型別邊界而主動中止。這些輪次均不計入 T3。最終修復明確在 signer 中固定 integrator account/taker/maker fee 為 `0`，trade `null` 只在「嚴格整數零 capability + 本 runtime managed order ID」同時成立時接受；非零、無證明或非本 runtime 成交仍 hard stop。
+
+最終候選 YAML SHA-256 為 `B8FD57C29BBD7A51A54B6769647F9F74A8CFA62BECD97F8BE993902FF7419475`，檔案與 CLI 同時保持 dry-run。Fresh authenticated preflight 確認 Market Maker 程序 `0`、account/BTC open orders `0`、BTC position `0`、餘額未佔用與 wallet ownership PASS。正式 T3 於 `02:01:54–02:33:13` （Asia/Taipei）執行；最後 status uptime `1872.344s`、account session age `1870.547s`、cycles `360/360` successful，failed/consecutive errors `0`。
+
+前段在 raw spread 合格時累積 `would_place=226`、eligible quote seconds `586.532`，quote edge after fees 約 `4.07–4.09 bps`；後續 raw spread 超過 `30 bps` 後正確切到 `paused_market`、targets 為空且 eligible time 不再增加。全程 account audit `healthy`、total read failures `0`；WS reconnect、ambiguous submission/cancellation、reconciliation failure、unknown orders、mutation limiter block、HTTP 429、真實 create/cancel/fill 全部 `0`。Position、equity 與 drawdown 全程不變；因 dry-run 無成交，economic state 保持 `collecting`，本輪只驗證 software/safety，不宣稱已實證 cover fee。
+
+資源樣本 RSS 約 `132.793 → 133.555 → 134.574 → 137.781 → 138.363 → 138.969 → 138.520 MiB`，threads `16 → 18 → 24 → 28 → 32 → 32 → 34`。30 分鐘後額外 25 秒六點樣本為 RSS `138.51–138.53 MiB`、threads `34 → 33`、handles `595 → 593`，顯示 thread-pool 擴張後趨穩，未觀察到 busy loop 或無界資源成長。單次 operator interrupt 完成 unsubscribe/disconnect；Windows PTY exit `1` 是既知 ETX harness 表現，無 traceback。Fresh postflight 確認程序 `0`、open orders `0`、position `0`、餘額未佔用，config SHA 未變。因此本 fingerprint 判定 **offline regression + T3 software/safety gate GO**。
+
+回歸證據為關聯 `79 tests / OK`、全部 Market Maker `216 tests / OK`、`compileall` 與 `git diff --check` PASS。全專案 `451 tests` 維持與修復前相同的既知 Grid selective-cancel 基準 `8 failures + 4 errors`，本輪沒有新增失敗類型，也沒有修改 Grid production code。
+
+操作者現在可用第 12.17 節候選進行手動 long-run：只在執行副本把 `dry_run` 改為 `false`、移除 CLI `--dry-run`，其餘參數不變。啟動前仍須 fresh preflight；前 `15–30m` 只是同一 session 的 canary，健康時不停止或重設 drawdown baseline。達 `8` completed fills 後 fee/net 立即判定，通過但 nonflat 時等待 equity gate；若 hard stop 或程序退出，不得自動重啟。本次 T3 GO 不改寫 Step D 歷史 NO-GO，也不會在取得 E1 safety/economic GO 與至少 `10` 個 completed round trips 前允許縮至 `200 ticks`。

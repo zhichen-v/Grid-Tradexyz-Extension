@@ -213,6 +213,13 @@ def _install_stop_signals(
     return installed
 
 
+def _validate_live_safety(config: MarketMakerConfig) -> None:
+    if not config.dry_run and config.account_audit_interval_seconds <= 0:
+        raise ValueError(
+            "live market maker requires account_audit_interval_seconds > 0"
+        )
+
+
 async def run_market_maker(
     config: MarketMakerConfig,
     settings: dict[str, Any],
@@ -223,6 +230,7 @@ async def run_market_maker(
     logger: BaseLogger | None = None,
 ) -> MarketMakerCoordinator:
     """Build the SDK adapter in the active loop and own graceful shutdown."""
+    _validate_live_safety(config)
     previous_record_factory = _install_log_redaction(settings)
     try:
         adapter = adapter_factory(settings)
@@ -259,7 +267,11 @@ async def run_market_maker(
                 for sig in installed:
                     loop.remove_signal_handler(sig)
         if coordinator.state is RuntimeState.PAUSED_ERROR:
-            raise RuntimeError("market maker stopped after a fatal runtime error")
+            detail = coordinator.fatal_exception
+            raise RuntimeError(
+                "market maker stopped after a fatal runtime error"
+                + (f": {detail}" if detail is not None else "")
+            )
         if logger is not None:
             logger.info("Market maker stopped cleanly")
         return coordinator
@@ -315,6 +327,7 @@ def main(
         config = load_market_maker_config(args.config)
         if args.dry_run and not config.dry_run:
             config = replace(config, dry_run=True)
+        _validate_live_safety(config)
         settings = load_lighter_settings(args.wallet_name)
         run(
             runtime(

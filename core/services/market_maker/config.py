@@ -76,9 +76,15 @@ class MarketMakerConfig:
     position_poll_interval_seconds: int = 3
     order_sync_interval_seconds: int = 10
     health_check_interval_seconds: int = 60
+    account_audit_interval_seconds: int = 0
+    account_audit_timeout_seconds: int = 5
     max_consecutive_errors: int = 5
     error_cooldown_seconds: int = 5
     max_mutations_per_minute: int = 30
+    max_session_drawdown: Decimal = Decimal("0")
+    economic_min_fills: int = 8
+    min_completed_net_turnover_bps: Decimal = Decimal("0")
+    require_flat_start: bool = False
     post_only: bool = True
     exclusive_symbol_control: bool = True
     startup_open_order_policy: str = "abort"
@@ -93,6 +99,8 @@ class MarketMakerConfig:
             "max_raw_spread_bps",
             "maker_fee_rate",
             "min_profit_buffer_bps",
+            "max_session_drawdown",
+            "min_completed_net_turnover_bps",
             "max_position",
             "soft_position_ratio",
             "hard_position_ratio",
@@ -126,6 +134,31 @@ class MarketMakerConfig:
             raise ValueError("maker_fee_rate cannot be negative")
         if self.min_profit_buffer_bps < 0:
             raise ValueError("min_profit_buffer_bps cannot be negative")
+        if self.max_session_drawdown < 0:
+            raise ValueError("max_session_drawdown cannot be negative")
+        if self.min_completed_net_turnover_bps < 0:
+            raise ValueError(
+                "min_completed_net_turnover_bps cannot be negative"
+            )
+        if (
+            type(self.account_audit_interval_seconds) is not int
+            or self.account_audit_interval_seconds < 0
+        ):
+            raise ValueError(
+                "account_audit_interval_seconds must be an integer >= 0"
+            )
+        if (
+            self.account_audit_interval_seconds
+            and self.max_session_drawdown <= 0
+        ):
+            raise ValueError(
+                "max_session_drawdown must be positive when account audit is enabled"
+            )
+        if self.account_audit_interval_seconds and not self.require_flat_start:
+            raise ValueError(
+                "require_flat_start must be true when account audit is enabled"
+            )
+        self._validate_int("economic_min_fills", minimum=2)
         if not (
             Decimal("0")
             < self.soft_position_ratio
@@ -144,6 +177,7 @@ class MarketMakerConfig:
             "position_poll_interval_seconds",
             "order_sync_interval_seconds",
             "health_check_interval_seconds",
+            "account_audit_timeout_seconds",
             "max_consecutive_errors",
             "error_cooldown_seconds",
             "max_mutations_per_minute",
@@ -156,6 +190,7 @@ class MarketMakerConfig:
             "exclusive_symbol_control",
             "cancel_on_shutdown",
             "dry_run",
+            "require_flat_start",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")

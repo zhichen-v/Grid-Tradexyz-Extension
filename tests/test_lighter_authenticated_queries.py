@@ -1,11 +1,12 @@
+import asyncio
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from core.adapters.exchanges.adapters.lighter import LighterAdapter
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
-from core.adapters.exchanges.models import OrderStatus, PositionSide
+from core.adapters.exchanges.models import OrderSide, OrderStatus, PositionSide
 
 
 class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
@@ -21,8 +22,11 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
         rest.order_api = SimpleNamespace(
             account_active_orders=AsyncMock(),
             account_inactive_orders=AsyncMock(),
+            trades=AsyncMock(),
         )
         rest.account_api = SimpleNamespace(account=AsyncMock())
+        rest.network = "robinhood"
+        rest.get_market_index = MagicMock(return_value=1)
         return rest
 
     async def test_open_orders_requires_signer(self):
@@ -46,6 +50,246 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(await rest.get_open_orders(), [])
+
+    async def test_account_trades_preserve_account_side_role_fee_and_pnl(self):
+        rest = self.make_rest()
+        rest.order_api.trades.return_value = SimpleNamespace(
+            code=200,
+            trades=[
+                SimpleNamespace(
+                    trade_id=1,
+                    trade_id_str="trade-1",
+                    type="trade",
+                    market_id=1,
+                    size="0.00020",
+                    price="77000",
+                    usd_amount="15.400000",
+                    ask_id=11,
+                    ask_id_str="ask-11",
+                    bid_id=12,
+                    bid_id_str="bid-12",
+                    ask_account_id=123,
+                    bid_account_id=999,
+                    is_maker_ask=True,
+                    maker_fee=120,
+                    taker_fee=None,
+                    integrator_maker_fee=0,
+                    ask_account_pnl="0.010000",
+                    bid_account_pnl="0",
+                    timestamp=1_800_000_000_000,
+                )
+            ],
+        )
+
+        trades = await rest.get_account_trades("BTC")
+
+        self.assertEqual(len(trades), 1)
+        self.assertIs(trades[0].side, OrderSide.SELL)
+        self.assertEqual(trades[0].order_id, "ask-11")
+        self.assertEqual(trades[0].fee["role"], "maker")
+        self.assertEqual(trades[0].fee["rate"], Decimal("0.00012"))
+        self.assertEqual(trades[0].fee["cost"], Decimal("0.00184800000"))
+        self.assertEqual(trades[0].raw_data["trade_sequence"], 1)
+        self.assertEqual(trades[0].raw_data["realized_pnl"], Decimal("0.010000"))
+        rest.order_api.trades.assert_awaited_once_with(
+            sort_by="timestamp",
+            limit=100,
+            authorization="token",
+            market_id=1,
+            market_type="perp",
+            account_index=123,
+            sort_dir="desc",
+            aggregate=False,
+        )
+
+    async def test_account_trades_reject_self_trade_attribution(self):
+        rest = self.make_rest()
+        rest.order_api.trades.return_value = SimpleNamespace(
+            code=200,
+            trades=[
+                SimpleNamespace(
+                    ask_account_id=123,
+                    bid_account_id=123,
+                )
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "self-trade"):
+            await rest.get_account_trades("BTC")
+
+    async def test_account_trades_treat_null_opening_pnl_as_zero(self):
+        rest = self.make_rest()
+        rest.order_api.trades.return_value = SimpleNamespace(
+            code=200,
+            trades=[
+                SimpleNamespace(
+                    trade_id=2,
+                    trade_id_str="trade-2",
+                    type="trade",
+                    size="0.00020",
+                    price="77000",
+                    usd_amount="15.400000",
+                    ask_id_str="ask-12",
+                    ask_account_id=123,
+                    bid_account_id=999,
+                    is_maker_ask=True,
+                    maker_fee=120,
+                    integrator_maker_fee=0,
+                    ask_account_pnl=None,
+                    timestamp=1_800_000_000_001,
+                )
+            ],
+        )
+
+        trades = await rest.get_account_trades("BTC")
+
+        self.assertEqual(trades[0].raw_data["realized_pnl"], Decimal("0"))
+
+    async def test_account_trades_classify_both_sides_and_roles_exactly(self):
+        cases = (
+            (999, 123, False, "maker", 120, OrderSide.BUY),
+            (999, 123, True, "taker", 350, OrderSide.BUY),
+            (123, 999, True, "maker", 120, OrderSide.SELL),
+            (123, 999, False, "taker", 350, OrderSide.SELL),
+        )
+        for ask_account, bid_account, maker_ask, role, tick, side in cases:
+            with self.subTest(role=role, side=side):
+                rest = self.make_rest()
+                rest.order_api.trades.return_value = SimpleNamespace(
+                    code=200,
+                    trades=[
+                        SimpleNamespace(
+                            trade_id=3,
+                            trade_id_str="trade-3",
+                            type="trade",
+                            size="0.00020",
+                            price="77000",
+                            usd_amount="15.400000",
+                            ask_id_str="ask-13",
+                            bid_id_str="bid-13",
+                            ask_account_id=ask_account,
+                            bid_account_id=bid_account,
+                            is_maker_ask=maker_ask,
+                            maker_fee=120,
+                            taker_fee=350,
+                            integrator_maker_fee=0,
+                            integrator_taker_fee=0,
+                            ask_account_pnl=None,
+                            bid_account_pnl=None,
+                            timestamp=1_800_000_000_002,
+                        )
+                    ],
+                )
+
+                parsed = await rest.get_account_trades("BTC")
+
+                self.assertIs(parsed[0].side, side)
+                self.assertEqual(parsed[0].fee["role"], role)
+                self.assertEqual(parsed[0].fee["tick"], tick)
+
+    async def test_account_trades_reject_missing_role_or_nonzero_integrator_fee(self):
+        for role_value, integrator_fee, message in (
+            (None, 0, "maker/taker"),
+            (True, 1, "integrator fee"),
+        ):
+            with self.subTest(message=message):
+                rest = self.make_rest()
+                rest.order_api.trades.return_value = SimpleNamespace(
+                    code=200,
+                    trades=[
+                        SimpleNamespace(
+                            trade_id=4,
+                            trade_id_str="trade-4",
+                            type="trade",
+                            size="0.00020",
+                            price="77000",
+                            usd_amount="15.400000",
+                            ask_id_str="ask-14",
+                            ask_account_id=123,
+                            bid_account_id=999,
+                            is_maker_ask=role_value,
+                            maker_fee=120,
+                            ask_account_pnl=None,
+                            integrator_maker_fee=integrator_fee,
+                            timestamp=1_800_000_000_003,
+                        )
+                    ],
+                )
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    await rest.get_account_trades("BTC")
+
+    async def test_account_trades_preserve_null_integrator_fee_as_unverified(self):
+        rest = self.make_rest()
+        rest.order_api.trades.return_value = SimpleNamespace(
+            code=200,
+            trades=[
+                SimpleNamespace(
+                    trade_id=4,
+                    trade_id_str="trade-4",
+                    type="trade",
+                    size="0.00020",
+                    price="77000",
+                    usd_amount="15.400000",
+                    ask_id_str="ask-14",
+                    ask_account_id=123,
+                    bid_account_id=999,
+                    is_maker_ask=True,
+                    maker_fee=120,
+                    ask_account_pnl=None,
+                    integrator_maker_fee=None,
+                    timestamp=1_800_000_000_003,
+                )
+            ],
+        )
+
+        trades = await rest.get_account_trades("BTC")
+
+        self.assertIsNone(trades[0].raw_data["integrator_fee_tick"])
+
+    async def test_safety_cancellation_bypasses_existing_read_cooldown(self):
+        rest = self.make_rest()
+        rest._request_lock = asyncio.Lock()
+        rest._next_request_at = asyncio.get_running_loop().time() + 30
+        rest._rate_limit_failures = 1
+        rest._request_interval = 0.05
+        rest._max_rate_limit_delay = 30.0
+        request = AsyncMock(return_value="cancelled")
+
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep:
+            result = await rest._call_api(
+                "order cancellation", request, retry_on_429=False
+            )
+
+        self.assertEqual(result, "cancelled")
+        request.assert_awaited_once_with()
+        sleep.assert_not_awaited()
+
+    async def test_safety_scope_bypasses_cooldown_for_terminal_reads(self):
+        rest = self.make_rest()
+        rest._request_lock = asyncio.Lock()
+        rest._next_request_at = asyncio.get_running_loop().time() + 30
+        rest._rate_limit_failures = 1
+        rest._request_interval = 0.05
+        rest._max_rate_limit_delay = 30.0
+        request = AsyncMock(return_value="proof")
+
+        rest.begin_safety_requests()
+        try:
+            with patch(
+                "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep:
+                result = await rest._call_api("order history query", request)
+        finally:
+            rest.end_safety_requests()
+
+        self.assertEqual(result, "proof")
+        sleep.assert_not_awaited()
+        self.assertEqual(rest._safety_request_depth, 0)
 
     async def test_get_order_matches_active_client_id(self):
         rest = self.make_rest()
@@ -151,12 +395,12 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
         rest = self.make_rest()
         rest.account_api.account.return_value = SimpleNamespace(code=200, accounts=[])
 
-        with self.assertRaisesRegex(RuntimeError, "未返回"):
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
             await rest.get_positions()
 
     async def test_positions_legitimate_empty_account(self):
         rest = self.make_rest()
-        account = SimpleNamespace(positions=[])
+        account = SimpleNamespace(account_index=123, positions=[])
         rest.account_api.account.return_value = SimpleNamespace(
             code=200, accounts=[account]
         )
@@ -178,7 +422,8 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
             liquidation_price="0",
         )
         rest.account_api.account.return_value = SimpleNamespace(
-            code=200, accounts=[SimpleNamespace(positions=[position])]
+            code=200,
+            accounts=[SimpleNamespace(account_index=123, positions=[position])],
         )
 
         positions = await rest.get_positions()
@@ -191,7 +436,8 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
         rest = self.make_rest()
         position = SimpleNamespace(symbol="ETH", position="0.1", sign=2)
         rest.account_api.account.return_value = SimpleNamespace(
-            code=200, accounts=[SimpleNamespace(positions=[position])]
+            code=200,
+            accounts=[SimpleNamespace(account_index=123, positions=[position])],
         )
 
         with self.assertRaisesRegex(RuntimeError, "position sign"):
@@ -204,7 +450,9 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
                 position = SimpleNamespace(symbol="ETH", position=value, sign=1)
                 rest.account_api.account.return_value = SimpleNamespace(
                     code=200,
-                    accounts=[SimpleNamespace(positions=[position])],
+                    accounts=[
+                        SimpleNamespace(account_index=123, positions=[position])
+                    ],
                 )
 
                 with self.assertRaises(RuntimeError):
@@ -221,7 +469,11 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_balance_is_an_explicit_usdg_record(self):
         rest = self.make_rest()
         rest.network = "robinhood"
-        account = SimpleNamespace(available_balance="0", collateral="0")
+        account = SimpleNamespace(
+            account_index=123,
+            available_balance="0",
+            collateral="0",
+        )
         rest.account_api.account.return_value = SimpleNamespace(
             code=200, accounts=[account]
         )
@@ -231,6 +483,95 @@ class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(balances), 1)
         self.assertEqual(balances[0].currency, "USDG")
         self.assertEqual(balances[0].total, Decimal("0"))
+
+    async def test_account_queries_reject_wrong_identity_or_missing_collateral(self):
+        for account, message in (
+            (
+                SimpleNamespace(
+                    account_index=999,
+                    available_balance="1",
+                    collateral="1",
+                ),
+                "different account",
+            ),
+            (
+                SimpleNamespace(account_index=123, available_balance="1"),
+                "collateral",
+            ),
+        ):
+            with self.subTest(message=message):
+                rest = self.make_rest()
+                rest.account_api.account.return_value = SimpleNamespace(
+                    code=200, accounts=[account]
+                )
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    await rest.get_account_balance()
+
+    async def test_positions_reject_untrusted_risk_fields(self):
+        valid = {
+            "symbol": "BTC",
+            "position": "0.2",
+            "sign": 1,
+            "avg_entry_price": "70000",
+            "unrealized_pnl": "0",
+            "realized_pnl": "0",
+            "initial_margin_fraction": "100",
+            "margin_mode": 0,
+            "allocated_margin": "14",
+            "liquidation_price": "0",
+        }
+        cases = (
+            ({"unrealized_pnl": None}, "unrealized"),
+            ({"initial_margin_fraction": None}, "margin fraction"),
+            ({"initial_margin_fraction": "101"}, "margin fraction"),
+            ({"margin_mode": None}, "margin mode"),
+            ({"margin_mode": 2}, "margin mode"),
+        )
+        for overrides, message in cases:
+            with self.subTest(message=message):
+                rest = self.make_rest()
+                values = dict(valid)
+                values.update(overrides)
+                rest.account_api.account.return_value = SimpleNamespace(
+                    code=200,
+                    accounts=[
+                        SimpleNamespace(
+                            account_index=123,
+                            positions=[SimpleNamespace(**values)],
+                        )
+                    ],
+                )
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    await rest.get_positions()
+
+    async def test_positions_accept_exchange_imf_precision(self):
+        for margin_fraction, expected_leverage in (("33.33", 3), ("6.66", 15)):
+            with self.subTest(margin_fraction=margin_fraction):
+                rest = self.make_rest()
+                position = SimpleNamespace(
+                    symbol="BTC",
+                    position="0.2",
+                    sign=1,
+                    avg_entry_price="70000",
+                    unrealized_pnl="0",
+                    realized_pnl="0",
+                    initial_margin_fraction=margin_fraction,
+                    margin_mode=0,
+                    allocated_margin="14",
+                    liquidation_price="0",
+                )
+                rest.account_api.account.return_value = SimpleNamespace(
+                    code=200,
+                    accounts=[
+                        SimpleNamespace(account_index=123, positions=[position])
+                    ],
+                )
+
+                parsed = await rest.get_positions()
+
+                self.assertEqual(parsed[0].leverage, expected_leverage)
 
     async def test_cancel_rejects_non_200_sdk_response(self):
         rest = self.make_rest()

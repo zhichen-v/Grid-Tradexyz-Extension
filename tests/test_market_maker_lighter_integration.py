@@ -125,6 +125,14 @@ class FakeLighterAdapter:
         self.events.append(("positions", tuple(symbols or ())))
         return []
 
+    async def get_balances(self) -> list:
+        self.events.append(("balances",))
+        return [SimpleNamespace(currency="USDG", total=Decimal("300"))]
+
+    async def get_account_trades(self, symbol: str, limit: int = 100) -> list:
+        self.events.append(("account_trades", symbol, limit))
+        return []
+
     async def get_open_orders(self, symbol: str | None = None) -> list[OrderData]:
         snapshot = list(self.active.values())
         self.events.append(("open_orders", symbol, tuple(self.active)))
@@ -214,6 +222,9 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             refresh_interval_ms=1,
             dry_run=dry_run,
             quote_mode=quote_mode,
+            account_audit_interval_seconds=60 if not dry_run else 0,
+            max_session_drawdown=Decimal("1") if not dry_run else Decimal("0"),
+            require_flat_start=not dry_run,
         )
 
     async def run_fake(self, *, dry_run: bool, quote_mode: str = "both"):
@@ -485,6 +496,41 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
             params["order_type"], lighter.SignerClient.ORDER_TYPE_LIMIT
         )
         self.assertFalse(params["is_ask"])
+        self.assertEqual(params["integrator_account_index"], 0)
+        self.assertEqual(params["integrator_taker_fee"], 0)
+        self.assertEqual(params["integrator_maker_fee"], 0)
+
+    async def test_limit_submission_passes_explicit_zero_integrator_fees(self) -> None:
+        rest = object.__new__(LighterRest)
+        rest._convert_base_amount = Mock(return_value=2)
+        rest._next_client_order_index = Mock(return_value=7)
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(return_value=(None, None, None))
+        )
+
+        async def call_api(_operation, request, **_kwargs):
+            return await request()
+
+        rest._call_api = call_api
+        rest._handle_order_result = AsyncMock(return_value=SimpleNamespace(id="1"))
+
+        await rest._execute_limit_order(
+            "BTC",
+            "buy",
+            Decimal("0.00020"),
+            Decimal("65000.0"),
+            {
+                "price_decimals": 1,
+                "price_multiplier": Decimal("10"),
+                "market_index": 1,
+            },
+            time_in_force="POST_ONLY",
+        )
+
+        submitted = rest.signer_client.create_order.await_args.kwargs
+        self.assertEqual(submitted["integrator_account_index"], 0)
+        self.assertEqual(submitted["integrator_taker_fee"], 0)
+        self.assertEqual(submitted["integrator_maker_fee"], 0)
 
     async def test_order_submission_429_is_sanitized_and_propagated(self) -> None:
         rest = object.__new__(LighterRest)
@@ -854,7 +900,12 @@ class CliAndWalletProfileTests(unittest.TestCase):
             captured["config"] = config
             raise RuntimeError(f"adapter failed with {settings['api_key_private_key']}")
 
-        live_config = MarketMakerConfig(dry_run=False)
+        live_config = MarketMakerConfig(
+            dry_run=False,
+            account_audit_interval_seconds=60,
+            max_session_drawdown=Decimal("1"),
+            require_flat_start=True,
+        )
         settings = {
             "network": "robinhood",
             "testnet": False,
@@ -906,7 +957,12 @@ class CliAndWalletProfileTests(unittest.TestCase):
             runner_calls += 1
             return asyncio.run(awaitable)
 
-        live_config = MarketMakerConfig(dry_run=False)
+        live_config = MarketMakerConfig(
+            dry_run=False,
+            account_audit_interval_seconds=60,
+            max_session_drawdown=Decimal("1"),
+            require_flat_start=True,
+        )
         with (
             patch.object(entrypoint, "load_market_maker_config", return_value=live_config),
             patch.object(entrypoint, "load_lighter_settings", return_value={}),
@@ -923,6 +979,33 @@ class CliAndWalletProfileTests(unittest.TestCase):
         self.assertFalse(captured["config"].dry_run)
         self.assertIs(captured["adapter_factory"], factory)
         self.assertEqual(runner_calls, 1)
+
+    def test_main_rejects_live_when_account_audit_is_disabled(self) -> None:
+        runtime = Mock()
+        settings_loader = Mock(return_value={})
+        stderr = io.StringIO()
+
+        with (
+            patch.object(
+                entrypoint,
+                "load_market_maker_config",
+                return_value=MarketMakerConfig(dry_run=False),
+            ),
+            patch.object(
+                entrypoint, "load_lighter_settings", settings_loader
+            ),
+            redirect_stderr(stderr),
+        ):
+            code = entrypoint.main(
+                ["ignored.yaml"],
+                runtime=runtime,
+                logger_factory=lambda _debug: Mock(),
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("requires account_audit", stderr.getvalue())
+        settings_loader.assert_not_called()
+        runtime.assert_not_called()
 
 
 if __name__ == "__main__":

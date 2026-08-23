@@ -107,6 +107,7 @@ async def check_collateral_currency() -> None:
             return SimpleNamespace(
                 code=200,
                 accounts=[SimpleNamespace(
+                    account_index=rest.account_index,
                     available_balance="90",
                     collateral="100",
                 )],

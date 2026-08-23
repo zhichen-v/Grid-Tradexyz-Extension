@@ -80,9 +80,20 @@ if not logger.handlers:
     logger.setLevel(logging.WARNING)
 
 
+def _require_finite_decimal(value: Any, name: str) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid Lighter {name}") from exc
+    if not parsed.is_finite():
+        raise RuntimeError(f"Invalid Lighter {name}")
+    return parsed
+
+
 class LighterRest(LighterBase):
     """Lighter REST API封装类"""
 
+    MANAGED_ORDER_INTEGRATOR_FEE_TICK = 0
     MUTATION_RECONCILIATION_ATTEMPTS = 2
     MUTATION_RECONCILIATION_DELAY = 0.25
     CANCELLATION_RECONCILIATION_ATTEMPTS = 4
@@ -112,6 +123,7 @@ class LighterRest(LighterBase):
 
         # 连接状态
         self._connected = False
+        self._safety_request_depth = 0
 
         # 🔥 初始化markets字典（用于WebSocket共享）
         self.markets = {}
@@ -201,7 +213,13 @@ class LighterRest(LighterBase):
             async with self._request_lock:
                 loop = asyncio.get_running_loop()
                 wait_for = self._next_request_at - loop.time()
-                if wait_for > 0:
+                # A previously rate-limited read must not delay a shutdown/safety
+                # cancellation. The cancellation itself stays single-shot.
+                safety_priority = (
+                    operation == "order cancellation"
+                    or getattr(self, "_safety_request_depth", 0) > 0
+                )
+                if wait_for > 0 and not safety_priority:
                     await asyncio.sleep(wait_for)
 
                 try:
@@ -229,6 +247,39 @@ class LighterRest(LighterBase):
                 raise RuntimeError(f"{operation} rate limited (HTTP 429)")
 
         raise RuntimeError(f"{operation} failed")
+
+    def begin_safety_requests(self) -> None:
+        """Let bounded shutdown/cancel reads bypass an older read cooldown."""
+        self._safety_request_depth = (
+            getattr(self, "_safety_request_depth", 0) + 1
+        )
+
+    def end_safety_requests(self) -> None:
+        self._safety_request_depth = max(
+            0, getattr(self, "_safety_request_depth", 0) - 1
+        )
+
+    def _configured_account(self, response: Any, operation: str) -> Any:
+        accounts = getattr(response, "accounts", None) or []
+        if len(accounts) != 1:
+            raise RuntimeError(
+                f"{operation} did not return exactly one configured account"
+            )
+        account = accounts[0]
+        returned_index = getattr(account, "account_index", None)
+        if returned_index is None:
+            returned_index = getattr(account, "index", None)
+        parsed_index = _require_finite_decimal(
+            returned_index, f"account index during {operation}"
+        )
+        if (
+            parsed_index != parsed_index.to_integral_value()
+            or int(parsed_index) != self.account_index
+        ):
+            raise RuntimeError(
+                f"{operation} returned a different account index"
+            )
+        return account
 
     def is_connected(self) -> bool:
         """检查是否已连接"""
@@ -538,7 +589,11 @@ class LighterRest(LighterBase):
         key = (symbol, str(order_id))
         uncertain.add(key)
 
-        reconciled = await self._reconcile_cancellation(symbol, order_id)
+        self.begin_safety_requests()
+        try:
+            reconciled = await self._reconcile_cancellation(symbol, order_id)
+        finally:
+            self.end_safety_requests()
         if reconciled is True:
             uncertain.discard(key)
             logger.warning(
@@ -946,6 +1001,163 @@ class LighterRest(LighterBase):
             logger.error(f"获取最近成交失败 {symbol}: {e}")
             return []
 
+    async def get_account_trades(
+        self, symbol: str, limit: int = 100
+    ) -> List[TradeData]:
+        """Return authenticated account trades with exact role, fee and PnL."""
+        if not self.signer_client:
+            raise RuntimeError("未配置SignerClient，无法获取账户成交")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("account trade limit must be between 1 and 100")
+        market_id = self.get_market_index(symbol)
+        if market_id is None:
+            raise ValueError(f"未找到交易对 {symbol} 的市场索引")
+
+        auth_result = self.signer_client.create_auth_token_with_expiry(
+            deadline=3600,
+            api_key_index=self.api_key_index,
+        )
+        if isinstance(auth_result, tuple):
+            auth_token, error = auth_result
+            if error:
+                raise RuntimeError(f"生成认证令牌失败: {error}")
+        else:
+            auth_token = auth_result
+        if not auth_token:
+            raise RuntimeError("生成认证令牌失败: empty token")
+
+        response = await self._call_api(
+            "account trades query",
+            lambda: self.order_api.trades(
+                sort_by="timestamp",
+                limit=limit,
+                authorization=auth_token,
+                market_id=market_id,
+                market_type="perp",
+                account_index=self.account_index,
+                sort_dir="desc",
+                aggregate=False,
+            ),
+        )
+        self._require_success_response(response, "account trades query")
+        if not hasattr(response, "trades"):
+            raise RuntimeError("账户成交 API 回应缺少 trades 字段")
+
+        parsed: List[TradeData] = []
+        for trade in response.trades or []:
+            own_ask = getattr(trade, "ask_account_id", None) == self.account_index
+            own_bid = getattr(trade, "bid_account_id", None) == self.account_index
+            if own_ask == own_bid:
+                raise RuntimeError(
+                    "账户成交无法唯一归因，可能是 self-trade 或账户索引不符"
+                )
+            is_maker_ask = getattr(trade, "is_maker_ask", None)
+            if type(is_maker_ask) is not bool:
+                raise RuntimeError("账户成交缺少可信 maker/taker 角色")
+            is_maker = is_maker_ask == own_ask
+            fee_tick = getattr(
+                trade, "maker_fee" if is_maker else "taker_fee", None
+            )
+            if fee_tick is None:
+                raise RuntimeError("账户成交缺少实际 fee tick")
+            def parse_value(value: Any, name: str) -> Decimal:
+                try:
+                    result = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise RuntimeError(f"账户成交 {name} 无效") from exc
+                if not result.is_finite():
+                    raise RuntimeError(f"账户成交 {name} 无效")
+                return result
+
+            fee_tick_decimal = parse_value(fee_tick, "fee tick")
+            amount = parse_value(getattr(trade, "size", None), "size")
+            price = parse_value(getattr(trade, "price", None), "price")
+            turnover = parse_value(
+                getattr(trade, "usd_amount", None), "usd amount"
+            )
+            gross_value = getattr(
+                trade,
+                "ask_account_pnl" if own_ask else "bid_account_pnl",
+                None,
+            )
+            # Lighter returns null when this fill does not realize inventory PnL.
+            gross = (
+                Decimal("0")
+                if gross_value is None
+                else parse_value(gross_value, "account pnl")
+            )
+            if (
+                fee_tick_decimal < 0
+                or fee_tick_decimal != fee_tick_decimal.to_integral_value()
+            ):
+                raise RuntimeError("账户成交 fee tick 无效")
+            if amount <= 0:
+                raise RuntimeError("账户成交 size 无效")
+            if price <= 0:
+                raise RuntimeError("账户成交 price 无效")
+            if turnover <= 0:
+                raise RuntimeError("账户成交 usd amount 无效")
+            integrator_fee = getattr(
+                trade,
+                "integrator_maker_fee" if is_maker else "integrator_taker_fee",
+                None,
+            )
+            integrator_fee_tick = (
+                None
+                if integrator_fee is None
+                else parse_value(integrator_fee, "integrator fee")
+            )
+            if integrator_fee_tick is not None and integrator_fee_tick != 0:
+                raise RuntimeError("账户成交包含未纳入的 integrator fee")
+            fee_rate = fee_tick_decimal / Decimal("1000000")
+            order_id = getattr(
+                trade,
+                "ask_id_str" if own_ask else "bid_id_str",
+                None,
+            ) or getattr(trade, "ask_id" if own_ask else "bid_id", None)
+            timestamp = getattr(trade, "timestamp", None)
+            if type(timestamp) is not int or timestamp < 0:
+                raise RuntimeError("账户成交 timestamp 无效")
+            trade_sequence_value = getattr(trade, "trade_id", None)
+            trade_id = getattr(trade, "trade_id_str", None) or trade_sequence_value
+            try:
+                trade_sequence = int(str(trade_sequence_value))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("账户成交 trade id 无效") from exc
+            if trade_sequence < 0 or trade_id is None or not str(trade_id):
+                raise RuntimeError("账户成交 trade id 无效")
+            parsed.append(
+                TradeData(
+                    id=str(trade_id),
+                    symbol=symbol,
+                    side=OrderSide.SELL if own_ask else OrderSide.BUY,
+                    amount=amount,
+                    price=price,
+                    cost=turnover,
+                    fee={
+                        "role": "maker" if is_maker else "taker",
+                        "tick": int(fee_tick_decimal),
+                        "rate": fee_rate,
+                        "cost": turnover * fee_rate,
+                        "currency": (
+                            "USDG"
+                            if self.network in {"robinhood", "robinhood_testnet"}
+                            else "USDC"
+                        ),
+                    },
+                    timestamp=self._parse_timestamp(timestamp) or datetime.now(),
+                    order_id=str(order_id) if order_id is not None else None,
+                    raw_data={
+                        "timestamp": timestamp,
+                        "trade_sequence": trade_sequence,
+                        "trade_type": str(getattr(trade, "type", "")),
+                        "realized_pnl": gross,
+                        "integrator_fee_tick": integrator_fee_tick,
+                    },
+                )
+            )
+        return parsed
+
     # ============= 账户信息 =============
 
     async def get_account_balance(self) -> List[BalanceData]:
@@ -969,22 +1181,21 @@ class LighterRest(LighterBase):
             )
             self._require_success_response(response, "account balance query")
 
-            if not hasattr(response, 'accounts') or not response.accounts:
-                raise RuntimeError(
-                    f"account balance query returned no account_index={self.account_index}"
-                )
-
             balances = []
 
             # 解析 DetailedAccounts 结构
-            # 获取第一个账户（通常就是查询的账户）
-            account = response.accounts[0]
+            account = self._configured_account(response, "account balance query")
 
             # 获取可用余额和抵押品
-            available_balance = self._safe_decimal(
-                getattr(account, 'available_balance', 0))
-            collateral = self._safe_decimal(
-                getattr(account, 'collateral', 0))
+            available_balance = _require_finite_decimal(
+                getattr(account, 'available_balance', None),
+                "available balance",
+            )
+            collateral = _require_finite_decimal(
+                getattr(account, 'collateral', None), "collateral"
+            )
+            if collateral < 0:
+                raise RuntimeError("Invalid negative Lighter collateral")
 
             # 计算锁定余额（抵押品 - 可用余额）
             locked = max(collateral - available_balance, Decimal("0"))
@@ -1234,14 +1445,9 @@ class LighterRest(LighterBase):
             )
             self._require_success_response(response, "positions query")
 
-            if not hasattr(response, 'accounts') or not response.accounts:
-                raise RuntimeError(
-                    f"持仓 API 未返回 account_index={self.account_index} 的账户"
-                )
-
             positions = []
             # 解析 DetailedAccounts 结构
-            account = response.accounts[0]
+            account = self._configured_account(response, "positions query")
 
             if hasattr(account, 'positions') and account.positions:
                 for idx, position_info in enumerate(account.positions):
@@ -1299,6 +1505,45 @@ class LighterRest(LighterBase):
                     # ✅ 测试验证：BUY订单成交后，position返回正数，表示做多
                     position_side = PositionSide.LONG if position_size > 0 else PositionSide.SHORT
 
+                    unrealized_pnl = _require_finite_decimal(
+                        getattr(position_info, 'unrealized_pnl', None),
+                        f"unrealized PnL for {symbol or idx}",
+                    )
+                    margin_fraction = _require_finite_decimal(
+                        getattr(position_info, 'initial_margin_fraction', None),
+                        f"initial margin fraction for {symbol or idx}",
+                    )
+                    if margin_fraction <= 0:
+                        raise RuntimeError(
+                            f"Invalid Lighter initial margin fraction for {symbol or idx}"
+                        )
+                    if margin_fraction > 100:
+                        raise RuntimeError(
+                            f"Invalid Lighter initial margin fraction for {symbol or idx}"
+                        )
+                    # Lighter exposes percentage IMF with two-decimal precision
+                    # (for example 33.33 for 3x), so its reciprocal is not
+                    # necessarily an exact integer. Preserve the shared adapter's
+                    # established conversion; MM validates exact 1x from raw IMF.
+                    leverage_value = self._leverage_from_initial_margin_fraction(
+                        margin_fraction
+                    )
+                    margin_mode_raw = getattr(position_info, 'margin_mode', None)
+                    if type(margin_mode_raw) is bool:
+                        raise RuntimeError(
+                            f"Invalid Lighter margin mode for {symbol or idx}"
+                        )
+                    try:
+                        margin_mode_value = int(str(margin_mode_raw))
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            f"Invalid Lighter margin mode for {symbol or idx}"
+                        ) from exc
+                    if margin_mode_value not in {0, 1}:
+                        raise RuntimeError(
+                            f"Invalid Lighter margin mode for {symbol or idx}"
+                        )
+
                     positions.append(PositionData(
                         symbol=symbol,
                         side=position_side,
@@ -1307,15 +1552,16 @@ class LighterRest(LighterBase):
                             getattr(position_info, 'avg_entry_price', 0)),
                         mark_price=None,  # Lighter不提供标记价格
                         current_price=None,  # 需要单独查询
-                        unrealized_pnl=self._safe_decimal(
-                            getattr(position_info, 'unrealized_pnl', 0)),
+                        unrealized_pnl=unrealized_pnl,
                         realized_pnl=self._safe_decimal(
                             getattr(position_info, 'realized_pnl', 0)),
                         percentage=None,  # 可以计算
-                        leverage=self._leverage_from_initial_margin_fraction(
-                            getattr(position_info, 'initial_margin_fraction', 0)),
-                        margin_mode=MarginMode.CROSS if getattr(
-                            position_info, 'margin_mode', 0) == 0 else MarginMode.ISOLATED,
+                        leverage=leverage_value,
+                        margin_mode=(
+                            MarginMode.CROSS
+                            if margin_mode_value == 0
+                            else MarginMode.ISOLATED
+                        ),
                         margin=self._safe_decimal(
                             getattr(position_info, 'allocated_margin', 0)),
                         liquidation_price=self._safe_decimal(getattr(position_info, 'liquidation_price', 0)) if getattr(
@@ -1616,7 +1862,12 @@ class LighterRest(LighterBase):
             'time_in_force': tif_map.get(time_in_force,
                                          lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME),
             'reduce_only': kwargs.get("reduce_only", False),
-            'trigger_price': 0
+            'trigger_price': 0,
+            # Pin the signer defaults so a managed order can never acquire an
+            # unaccounted integrator fee through an SDK/default change.
+            'integrator_account_index': 0,
+            'integrator_taker_fee': self.MANAGED_ORDER_INTEGRATOR_FEE_TICK,
+            'integrator_maker_fee': self.MANAGED_ORDER_INTEGRATOR_FEE_TICK,
         }
 
     async def _execute_market_order(

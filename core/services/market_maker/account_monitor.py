@@ -1,0 +1,603 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from typing import Any, Awaitable, Callable, Iterable
+
+from ...adapters.exchanges.models import OrderSide
+from .config import MarketMakerConfig
+
+
+_ZERO = Decimal("0")
+_TEN_THOUSAND = Decimal("10000")
+_READ_ATTEMPTS = 3
+_READ_RETRY_SECONDS = 0.5
+
+
+class AccountAuditError(RuntimeError):
+    """The authenticated account state is unsafe or cannot be trusted."""
+
+
+class _SnapshotMismatch(RuntimeError):
+    pass
+
+
+def _decimal(value: Any, name: str) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise AccountAuditError(f"invalid {name}") from exc
+    if not parsed.is_finite():
+        raise AccountAuditError(f"invalid {name}")
+    return parsed
+
+
+def _position_state(
+    positions: Iterable[Any], symbol: str
+) -> tuple[Decimal, Decimal]:
+    signed = _ZERO
+    unrealized_pnl = _ZERO
+    for position in positions:
+        size = _decimal(getattr(position, "size", None), "position size")
+        if size < 0:
+            raise AccountAuditError("position size cannot be negative")
+        if size == 0:
+            continue
+        position_symbol = getattr(position, "symbol", None)
+        if position_symbol != symbol:
+            raise AccountAuditError(
+                f"non-{symbol} position is present: {position_symbol}"
+            )
+        raw_data = getattr(position, "raw_data", None)
+        raw_position = (
+            raw_data.get("position_info") if isinstance(raw_data, dict) else None
+        )
+        margin_fraction = _decimal(
+            getattr(raw_position, "initial_margin_fraction", None),
+            "position initial margin fraction",
+        )
+        if margin_fraction != 100:
+            raise AccountAuditError(f"{symbol} position leverage is not 1x")
+        if _decimal(getattr(position, "leverage", None), "position leverage") != 1:
+            raise AccountAuditError(f"{symbol} position leverage is not 1x")
+        margin_mode = str(
+            getattr(getattr(position, "margin_mode", None), "value", "")
+        ).lower()
+        if margin_mode != "cross":
+            raise AccountAuditError(f"{symbol} position is not cross margin")
+        unrealized_pnl += _decimal(
+            getattr(position, "unrealized_pnl", None),
+            "position unrealized pnl",
+        )
+        side = str(getattr(getattr(position, "side", None), "value", "")).lower()
+        if side == "long":
+            signed += size
+        elif side == "short":
+            signed -= size
+        else:
+            raise AccountAuditError("position side is invalid")
+    return signed, unrealized_pnl
+
+
+def _collateral_total(balances: Iterable[Any]) -> Decimal:
+    candidates = [
+        balance
+        for balance in balances
+        if str(getattr(balance, "currency", "")).upper() in {"USDG", "USDC"}
+    ]
+    if len(candidates) != 1:
+        raise AccountAuditError("exactly one USDG/USDC collateral balance is required")
+    total = _decimal(getattr(candidates[0], "total", None), "collateral total")
+    if total < 0:
+        raise AccountAuditError("collateral total cannot be negative")
+    return total
+
+
+def _trade_ids(trades: Iterable[Any]) -> set[str]:
+    ids = [str(getattr(trade, "id", "") or "") for trade in trades]
+    if any(not trade_id for trade_id in ids) or len(ids) != len(set(ids)):
+        raise _SnapshotMismatch("account trade page has invalid/duplicate ids")
+    return set(ids)
+
+
+def _has_zero_integrator_fee_signing_proof(adapter: Any) -> bool:
+    value = getattr(adapter, "managed_order_integrator_fee_tick", None)
+    return type(value) is int and value == 0
+
+
+@dataclass(frozen=True)
+class _Fill:
+    trade_id: str
+    order_id: str
+    side: OrderSide
+    amount: Decimal
+    turnover: Decimal
+    fee: Decimal
+    gross: Decimal
+    sort_key: tuple[int, int]
+
+    @property
+    def signed_amount(self) -> Decimal:
+        return self.amount if self.side is OrderSide.BUY else -self.amount
+
+
+def _fill_from_trade(
+    trade: Any,
+    expected_fee_rate: Decimal,
+    *,
+    allow_unreported_zero_integrator_fee: bool = False,
+) -> _Fill:
+    trade_id = str(getattr(trade, "id", "") or "")
+    order_id = str(getattr(trade, "order_id", "") or "")
+    if not trade_id or not order_id:
+        raise AccountAuditError("account trade is missing a stable trade/order id")
+    side = getattr(trade, "side", None)
+    if side not in {OrderSide.BUY, OrderSide.SELL}:
+        raise AccountAuditError("account trade side is invalid")
+    amount = _decimal(getattr(trade, "amount", None), "trade amount")
+    turnover = abs(_decimal(getattr(trade, "cost", None), "trade turnover"))
+    if amount <= 0 or turnover <= 0:
+        raise AccountAuditError("account trade amount/turnover must be positive")
+
+    fee_data = getattr(trade, "fee", None)
+    raw_data = getattr(trade, "raw_data", None)
+    if not isinstance(fee_data, dict) or not isinstance(raw_data, dict):
+        raise AccountAuditError("account trade fee metadata is unavailable")
+    if fee_data.get("role") != "maker":
+        raise AccountAuditError("non-maker account trade detected")
+    fee_rate = _decimal(fee_data.get("rate"), "trade fee rate")
+    if fee_rate != expected_fee_rate:
+        raise AccountAuditError(
+            f"maker fee changed: expected {expected_fee_rate}, observed {fee_rate}"
+        )
+    fee = _decimal(fee_data.get("cost"), "trade fee")
+    gross = _decimal(raw_data.get("realized_pnl"), "trade realized pnl")
+    integrator_fee_tick = raw_data.get("integrator_fee_tick")
+    if integrator_fee_tick is None:
+        if not allow_unreported_zero_integrator_fee:
+            raise AccountAuditError("account trade integrator fee is unverified")
+    elif _decimal(integrator_fee_tick, "trade integrator fee") != 0:
+        raise AccountAuditError("account trade contains an unaccounted integrator fee")
+    if fee < 0:
+        raise AccountAuditError("trade fee cannot be negative")
+    if raw_data.get("trade_type") != "trade":
+        raise AccountAuditError("non-standard account trade detected")
+    timestamp = raw_data.get("timestamp")
+    if type(timestamp) is not int or timestamp < 0:
+        raise AccountAuditError("account trade timestamp is invalid")
+    trade_sequence = raw_data.get("trade_sequence", trade_id)
+    try:
+        trade_sequence = int(str(trade_sequence))
+    except (TypeError, ValueError) as exc:
+        raise AccountAuditError("account trade sequence is invalid") from exc
+    if trade_sequence < 0:
+        raise AccountAuditError("account trade sequence is invalid")
+    return _Fill(
+        trade_id=trade_id,
+        order_id=order_id,
+        side=side,
+        amount=amount,
+        turnover=turnover,
+        fee=fee,
+        gross=gross,
+        sort_key=(timestamp, trade_sequence),
+    )
+
+
+@dataclass
+class SessionEconomics:
+    config: MarketMakerConfig
+    baseline_equity: Decimal
+    seen_trade_ids: set[str] = field(default_factory=set)
+    ledger_position: Decimal = _ZERO
+    unique_maker_fills: int = 0
+    turnover: Decimal = _ZERO
+    exact_fee: Decimal = _ZERO
+    gross: Decimal = _ZERO
+    completed_round_trips: int = 0
+    completed_fills: int = 0
+    completed_turnover: Decimal = _ZERO
+    completed_exact_fee: Decimal = _ZERO
+    completed_gross: Decimal = _ZERO
+    _episode_fills: int = 0
+    _episode_turnover: Decimal = _ZERO
+    _episode_fee: Decimal = _ZERO
+    _episode_gross: Decimal = _ZERO
+    current_equity: Decimal | None = None
+    economic_state: str = "collecting"
+    economic_reason: str | None = None
+
+    def seed(self, trades: Iterable[Any]) -> None:
+        for trade in trades:
+            trade_id = str(getattr(trade, "id", "") or "")
+            if not trade_id:
+                raise AccountAuditError("baseline account trade is missing an id")
+            self.seen_trade_ids.add(trade_id)
+
+    def apply(
+        self,
+        trades: Iterable[Any],
+        *,
+        current_position: Decimal,
+        current_equity: Decimal,
+        managed_order_ids: set[str],
+        allow_unreported_zero_integrator_fee: bool = False,
+    ) -> None:
+        new_fills = sorted(
+            (
+                _fill_from_trade(
+                    trade,
+                    self.config.maker_fee_rate,
+                    allow_unreported_zero_integrator_fee=(
+                        allow_unreported_zero_integrator_fee
+                    ),
+                )
+                for trade in trades
+                if str(getattr(trade, "id", "") or "")
+                not in self.seen_trade_ids
+            ),
+            key=lambda fill: fill.sort_key,
+        )
+        if len(new_fills) >= 100:
+            raise AccountAuditError("account trade audit window exhausted")
+        if any(fill.order_id not in managed_order_ids for fill in new_fills):
+            raise AccountAuditError("account trade is not attributable to this runtime")
+        expected_position = self.ledger_position + sum(
+            (fill.signed_amount for fill in new_fills), _ZERO
+        )
+        if expected_position != current_position:
+            raise _SnapshotMismatch(
+                "account trades and position are from inconsistent snapshots"
+            )
+
+        for fill in new_fills:
+            next_position = self.ledger_position + fill.signed_amount
+            self.seen_trade_ids.add(fill.trade_id)
+            self.ledger_position = next_position
+            self.unique_maker_fills += 1
+            self.turnover += fill.turnover
+            self.exact_fee += fill.fee
+            self.gross += fill.gross
+            self._episode_fills += 1
+            self._episode_turnover += fill.turnover
+            self._episode_fee += fill.fee
+            self._episode_gross += fill.gross
+            if next_position == 0:
+                self.completed_round_trips += 1
+                self.completed_fills += self._episode_fills
+                self.completed_turnover += self._episode_turnover
+                self.completed_exact_fee += self._episode_fee
+                self.completed_gross += self._episode_gross
+                self._episode_fills = 0
+                self._episode_turnover = _ZERO
+                self._episode_fee = _ZERO
+                self._episode_gross = _ZERO
+
+        self.current_equity = current_equity
+        self._evaluate()
+
+    def _evaluate(self) -> None:
+        if self.completed_fills < self.config.economic_min_fills:
+            if self.ledger_position != 0:
+                self.economic_state = "incomplete_nonflat"
+                self.economic_reason = "inventory has not returned to flat"
+            else:
+                self.economic_state = "collecting"
+                self.economic_reason = (
+                    f"need {self.config.economic_min_fills} completed maker fills"
+                )
+            return
+        net_bps = self.completed_net_turnover_bps
+        if self.completed_gross < self.completed_exact_fee:
+            self.economic_state = "no_go"
+            self.economic_reason = "completed gross does not cover exact fees"
+        elif (
+            net_bps is None
+            or net_bps < self.config.min_completed_net_turnover_bps
+        ):
+            self.economic_state = "no_go"
+            self.economic_reason = (
+                "completed net/turnover is below the configured threshold"
+            )
+        elif self.ledger_position != 0:
+            self.economic_state = "fee_gate_pass_equity_pending_flat"
+            self.economic_reason = (
+                "completed fee/net gate passed; waiting for flat equity reconciliation"
+            )
+            return
+        elif (
+            self.flat_equity_turnover_bps is None
+            or self.flat_equity_turnover_bps
+            < self.config.min_completed_net_turnover_bps
+        ):
+            self.economic_state = "no_go"
+            self.economic_reason = (
+                "flat account-value change/turnover is below the configured threshold"
+            )
+        else:
+            self.economic_state = "fee_and_equity_gate_go"
+            self.economic_reason = None
+        if self.economic_state == "no_go":
+            raise AccountAuditError(self.economic_reason or "economic gate failed")
+
+    @property
+    def completed_net(self) -> Decimal:
+        return self.completed_gross - self.completed_exact_fee
+
+    @property
+    def completed_net_turnover_bps(self) -> Decimal | None:
+        if self.completed_turnover <= 0:
+            return None
+        return self.completed_net / self.completed_turnover * _TEN_THOUSAND
+
+    @property
+    def flat_equity_turnover_bps(self) -> Decimal | None:
+        if (
+            self.current_equity is None
+            or self.ledger_position != 0
+            or self.completed_turnover <= 0
+        ):
+            return None
+        return (
+            (self.current_equity - self.baseline_equity)
+            / self.completed_turnover
+            * _TEN_THOUSAND
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        fee_cover_ratio = (
+            self.completed_gross / self.completed_exact_fee
+            if self.completed_exact_fee > 0
+            else None
+        )
+        flat_equity_change = (
+            self.current_equity - self.baseline_equity
+            if self.current_equity is not None and self.ledger_position == 0
+            else None
+        )
+        return {
+            "economic_state": self.economic_state,
+            "economic_reason": self.economic_reason,
+            "ledger_position": self.ledger_position,
+            "baseline_equity": self.baseline_equity,
+            "current_equity": self.current_equity,
+            "unique_maker_fills": self.unique_maker_fills,
+            "turnover": self.turnover,
+            "exact_fee": self.exact_fee,
+            "gross": self.gross,
+            "completed_round_trips": self.completed_round_trips,
+            "completed_fills": self.completed_fills,
+            "completed_turnover": self.completed_turnover,
+            "completed_exact_fee": self.completed_exact_fee,
+            "completed_gross": self.completed_gross,
+            "completed_net_ex_funding": self.completed_net,
+            "completed_net_turnover_bps": self.completed_net_turnover_bps,
+            "flat_equity_turnover_bps": self.flat_equity_turnover_bps,
+            "completed_fee_cover_ratio": fee_cover_ratio,
+            "flat_equity_change": flat_equity_change,
+            "unattributed_flat_cashflow": (
+                flat_equity_change - self.completed_net
+                if flat_equity_change is not None
+                else None
+            ),
+            "min_completed_net_turnover_bps": (
+                self.config.min_completed_net_turnover_bps
+            ),
+        }
+
+
+class MarketMakerAccountMonitor:
+    """Authenticated in-process safety and economics monitor."""
+
+    def __init__(
+        self,
+        adapter: Any,
+        config: MarketMakerConfig,
+        *,
+        monotonic: Callable[[], float],
+        sleep: Callable[[float], Awaitable[None]],
+    ) -> None:
+        self.adapter = adapter
+        self.config = config
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self.economics: SessionEconomics | None = None
+        self.started_monotonic: float | None = None
+        self.last_audit_monotonic: float | None = None
+        self.total_read_failures = 0
+        self.current_drawdown = _ZERO
+        self.max_observed_drawdown = _ZERO
+        self.state = "starting"
+        self.reason: str | None = None
+
+    async def initialize(self) -> None:
+        try:
+            snapshot = await self._read_consistent(set(), baseline=True)
+        except AccountAuditError as exc:
+            self.mark_hard_stop(str(exc))
+            raise
+        if self.config.require_flat_start and snapshot["position"] != 0:
+            reason = "account audit requires a flat starting position"
+            self.mark_hard_stop(reason)
+            raise AccountAuditError(reason)
+        self.economics = SessionEconomics(
+            self.config, baseline_equity=snapshot["equity"]
+        )
+        self.economics.ledger_position = snapshot["position"]
+        self.economics.seed(snapshot["trades"])
+        self.economics.current_equity = snapshot["equity"]
+        self.started_monotonic = self._monotonic()
+        self.last_audit_monotonic = self.started_monotonic
+        self.state = "healthy"
+
+    async def audit(self, managed_order_ids: set[str]) -> None:
+        if self.economics is None:
+            raise AccountAuditError("account monitor is not initialized")
+        try:
+            snapshot = await self._read_consistent(
+                managed_order_ids, baseline=False
+            )
+            self.economics.apply(
+                snapshot["trades"],
+                current_position=snapshot["position"],
+                current_equity=snapshot["equity"],
+                managed_order_ids=managed_order_ids,
+                allow_unreported_zero_integrator_fee=(
+                    _has_zero_integrator_fee_signing_proof(self.adapter)
+                ),
+            )
+            self._update_drawdown(snapshot["equity"])
+        except AccountAuditError as exc:
+            self.mark_hard_stop(str(exc))
+            raise
+        self.last_audit_monotonic = self._monotonic()
+        self.state = "healthy"
+        self.reason = None
+
+    def mark_hard_stop(self, reason: str) -> None:
+        self.state = "hard_stop"
+        self.reason = reason
+
+    async def _read_consistent(
+        self, managed_order_ids: set[str], *, baseline: bool
+    ) -> dict[str, Any]:
+        last_error: BaseException | None = None
+        for attempt in range(_READ_ATTEMPTS):
+            try:
+                orders = list(await self.adapter.get_open_orders())
+                self._validate_orders(orders, managed_order_ids)
+                trades = list(
+                    await self.adapter.get_account_trades(
+                        self.config.symbol, limit=100
+                    )
+                )
+                positions = list(await self.adapter.get_positions())
+                position, unrealized_pnl = _position_state(
+                    positions, self.config.symbol
+                )
+                if abs(position) > self.config.max_position:
+                    raise AccountAuditError("position exceeds max_position")
+                balances = list(await self.adapter.get_balances())
+                collateral = _collateral_total(balances)
+                equity = collateral + unrealized_pnl
+                confirmed_trades = list(
+                    await self.adapter.get_account_trades(
+                        self.config.symbol, limit=100
+                    )
+                )
+                if _trade_ids(trades) != _trade_ids(confirmed_trades):
+                    raise _SnapshotMismatch(
+                        "account trades changed during the audit read"
+                    )
+                trades = confirmed_trades
+                if not baseline and self.economics is not None:
+                    fills = [
+                        _fill_from_trade(
+                            trade,
+                            self.config.maker_fee_rate,
+                            allow_unreported_zero_integrator_fee=(
+                                _has_zero_integrator_fee_signing_proof(
+                                    self.adapter
+                                )
+                            ),
+                        )
+                        for trade in trades
+                        if str(getattr(trade, "id", "") or "")
+                        not in self.economics.seen_trade_ids
+                    ]
+                    if len(fills) >= 100:
+                        raise AccountAuditError(
+                            "account trade audit window exhausted"
+                        )
+                    expected = self.economics.ledger_position + sum(
+                        (fill.signed_amount for fill in fills), _ZERO
+                    )
+                    if expected != position:
+                        raise _SnapshotMismatch(
+                            "account trades and position are inconsistent"
+                        )
+                return {
+                    "equity": equity,
+                    "collateral": collateral,
+                    "position": position,
+                    "trades": trades,
+                }
+            except AccountAuditError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                self.total_read_failures += 1
+                if attempt + 1 < _READ_ATTEMPTS:
+                    await self._sleep(_READ_RETRY_SECONDS)
+        self.state = "hard_stop"
+        detail = (
+            f"{type(last_error).__name__}: {last_error}"
+            if last_error is not None
+            else "unknown read failure"
+        )
+        self.reason = (
+            "account state remained untrusted after bounded retries: " + detail
+        )
+        raise AccountAuditError(self.reason) from last_error
+
+    def _validate_orders(
+        self, orders: Iterable[Any], managed_order_ids: set[str]
+    ) -> None:
+        for order in orders:
+            symbol = getattr(order, "symbol", None)
+            if symbol != self.config.symbol:
+                raise AccountAuditError(f"non-{self.config.symbol} open order detected")
+            if str(getattr(order, "id", "") or "") not in managed_order_ids:
+                raise AccountAuditError("unmanaged open order detected")
+
+    def _update_drawdown(self, equity: Decimal) -> None:
+        if self.economics is None:
+            return
+        self.current_drawdown = max(
+            _ZERO, self.economics.baseline_equity - equity
+        )
+        self.max_observed_drawdown = max(
+            self.max_observed_drawdown, self.current_drawdown
+        )
+        if self.current_drawdown >= self.config.max_session_drawdown:
+            self.mark_hard_stop("max_session_drawdown reached")
+            raise AccountAuditError(self.reason)
+
+    def snapshot(self, now: float) -> dict[str, Any]:
+        economics = self.economics.snapshot() if self.economics else {}
+        session_age = (
+            max(0.0, now - self.started_monotonic)
+            if self.started_monotonic is not None
+            else None
+        )
+        hours = (
+            Decimal(str(session_age)) / Decimal("3600")
+            if session_age is not None and session_age > 0
+            else None
+        )
+        turnover = economics.get("turnover")
+        fills = economics.get("unique_maker_fills")
+        return {
+            "state": self.state,
+            "reason": self.reason,
+            "session_age_seconds": session_age,
+            "age_seconds": (
+                max(0.0, now - self.last_audit_monotonic)
+                if self.last_audit_monotonic is not None
+                else None
+            ),
+            "total_read_failures": self.total_read_failures,
+            "current_drawdown": self.current_drawdown,
+            "max_observed_drawdown": self.max_observed_drawdown,
+            "maker_turnover_per_wall_hour": (
+                turnover / hours
+                if hours is not None and isinstance(turnover, Decimal)
+                else None
+            ),
+            "maker_fills_per_wall_hour": (
+                Decimal(fills) / hours
+                if hours is not None and type(fills) is int
+                else None
+            ),
+            **economics,
+        }

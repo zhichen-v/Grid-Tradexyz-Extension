@@ -63,6 +63,11 @@ def _env_auth_fill_in(env_path: Path = Path(".env")) -> Dict[str, Any]:
 class LighterAdapter(ExchangeAdapter):
     """Lighter交易所适配器 - 统一接口"""
 
+    @property
+    def managed_order_integrator_fee_tick(self) -> int:
+        """Integrator fee signed into every managed limit order."""
+        return self._rest.MANAGED_ORDER_INTEGRATOR_FEE_TICK
+
     def __init__(self, config: ExchangeConfig, event_bus=None):
         super().__init__(config, event_bus)
 
@@ -501,6 +506,13 @@ class LighterAdapter(ExchangeAdapter):
         normalized_symbol = self._normalize_symbol(symbol)
         return await self._rest.get_recent_trades(normalized_symbol, limit)
 
+    async def get_account_trades(
+        self, symbol: str, limit: int = 100
+    ) -> List[TradeData]:
+        """Get authenticated trades for this configured account."""
+        normalized_symbol = self._normalize_symbol(symbol)
+        return await self._rest.get_account_trades(normalized_symbol, limit)
+
     async def get_ohlcv(
         self,
         symbol: str,
@@ -632,6 +644,12 @@ class LighterAdapter(ExchangeAdapter):
     async def resolve_unresolved_submissions(self) -> List[OrderData]:
         """Resolve unconfirmed mutations with active/history reads only."""
         return await self._rest.resolve_unresolved_submissions()
+
+    def begin_safety_requests(self) -> None:
+        self._rest.begin_safety_requests()
+
+    def end_safety_requests(self) -> None:
+        self._rest.end_safety_requests()
 
     # ============= 交易功能 =============
 

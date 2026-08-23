@@ -67,10 +67,15 @@ class MarketMakerMetrics:
     live_sell_remaining: Decimal = Decimal("0")
     quote_spread_ticks: Decimal | None = None
     quote_spread_bps: Decimal | None = None
+    round_trip_fee_bps: Decimal = Decimal("0")
+    min_profit_buffer_bps: Decimal = Decimal("0")
+    quote_edge_after_fees_bps: Decimal | None = None
+    eligible_quote_seconds: float = 0.0
     skew_ticks: Decimal | None = None
     risk_increasing_side_multiplier: Decimal | None = None
     reduce_only_mode: bool = False
     counters: dict[str, int] = field(default_factory=_default_counters)
+    account_audit: dict[str, Any] = field(default_factory=dict)
 
     def transition(self, state: RuntimeState, reason: str | None = None) -> None:
         if state is not self.runtime_state:
@@ -127,8 +132,13 @@ class MarketMakerMetrics:
             "live_sell_remaining": self.live_sell_remaining,
             "quote_spread_ticks": self.quote_spread_ticks,
             "quote_spread_bps": self.quote_spread_bps,
+            "round_trip_fee_bps": self.round_trip_fee_bps,
+            "min_profit_buffer_bps": self.min_profit_buffer_bps,
+            "quote_edge_after_fees_bps": self.quote_edge_after_fees_bps,
+            "eligible_quote_seconds": self.eligible_quote_seconds,
             "skew_ticks": self.skew_ticks,
             "risk_increasing_side_multiplier": self.risk_increasing_side_multiplier,
             "reduce_only_mode": self.reduce_only_mode,
             "counters": dict(self.counters),
+            "account_audit": dict(self.account_audit),
         }

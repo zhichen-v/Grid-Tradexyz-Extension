@@ -13,6 +13,7 @@ from core.adapters.exchanges.models import (
     OrderStatus,
     OrderType,
 )
+from core.services.market_maker.account_monitor import AccountAuditError
 from core.services.market_maker.config import MarketMakerConfig
 from core.services.market_maker.coordinator import MarketMakerCoordinator
 from core.services.market_maker.models import (
@@ -384,6 +385,17 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await coordinator.process_quote_event())
         manager.handle_order_update.assert_awaited_once()
         manager.reconcile.assert_awaited_once()
+
+    async def test_cycle_uses_order_manager_confirmed_order_ids(self) -> None:
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"fast-fill"})
+        coordinator = self.prepare_running(order_manager=manager)
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(
+            coordinator._managed_order_id_snapshot(), {"fast-fill"}
+        )
 
     async def test_post_only_terminal_requires_fresh_book_and_cooldown(
         self,
@@ -1018,6 +1030,42 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         manager.shutdown.assert_awaited_once()
         self.assertEqual(coordinator.state, RuntimeState.STOPPED)
 
+    async def test_stop_bounds_cycle_lock_wait_and_still_disconnects(self) -> None:
+        adapter = self.adapter()
+        manager = self.order_manager()
+        coordinator = self.prepare_running(
+            adapter=adapter,
+            order_manager=manager,
+        )
+        coordinator._subscribed = True
+        await coordinator._cycle_lock.acquire()
+        real_wait_for = asyncio.wait_for
+
+        async def timeout_shutdown(awaitable, timeout):
+            code = getattr(awaitable, "cr_code", None)
+            if code is not None and code.co_name == "_shutdown_order_manager_locked":
+                awaitable.close()
+                raise TimeoutError
+            return await real_wait_for(awaitable, timeout)
+
+        try:
+            with patch(
+                "core.services.market_maker.coordinator.asyncio.wait_for",
+                new=timeout_shutdown,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "shutdown did not finish within"
+                ):
+                    await coordinator.stop()
+        finally:
+            coordinator._cycle_lock.release()
+
+        manager.shutdown.assert_not_awaited()
+        adapter.unsubscribe.assert_awaited_once()
+        adapter.disconnect.assert_awaited_once()
+        self.assertTrue(coordinator._stopped_event.is_set())
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+
     async def test_cancelled_stop_waits_for_cleanup_then_reraises(self) -> None:
         adapter = self.adapter()
         manager = self.order_manager()
@@ -1146,6 +1194,133 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
         manager.shutdown.assert_awaited_once()
         adapter.disconnect.assert_awaited_once()
+
+    async def test_account_audit_failure_stops_main_and_runs_cleanup(self) -> None:
+        adapter = self.adapter()
+        manager = self.order_manager()
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=RuntimeError("account hard stop")),
+            snapshot=Mock(
+                return_value={"state": "hard_stop", "reason": "account hard stop"}
+            ),
+        )
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator.account_monitor = monitor
+        coordinator._subscribed = True
+
+        task = asyncio.create_task(
+            coordinator.audit_account_once(), name="market-maker-account-audit"
+        )
+        coordinator._tasks.append(task)
+        task.add_done_callback(coordinator._task_done)
+        await asyncio.gather(task, return_exceptions=True)
+        for _ in range(20):
+            if coordinator.state is RuntimeState.PAUSED_ERROR:
+                break
+            await asyncio.sleep(0)
+
+        self.assertFalse(coordinator.running)
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+        self.assertEqual(coordinator.metrics.account_audit["state"], "hard_stop")
+        manager.shutdown.assert_awaited_once()
+        adapter.unsubscribe.assert_awaited_once()
+        adapter.disconnect.assert_awaited_once()
+
+    async def test_order_sync_and_audit_share_fresh_confirmed_ids(self) -> None:
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset()
+
+        async def sync_orders():
+            manager.known_order_ids = frozenset({"reconciled-order"})
+            return False
+
+        manager.sync_open_orders.side_effect = sync_orders
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        coordinator = self.prepare_running(order_manager=manager)
+        coordinator.account_monitor = monitor
+
+        self.assertTrue(await coordinator.sync_open_orders_once())
+        await coordinator.audit_account_once()
+
+        monitor.audit.assert_awaited_once_with({"reconciled-order"})
+
+    async def test_account_audit_timeout_marks_hard_stop(self) -> None:
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            mark_hard_stop=Mock(),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        coordinator = self.prepare_running()
+        coordinator.account_monitor = monitor
+
+        async def timeout(awaitable, **_kwargs):
+            awaitable.close()
+            raise TimeoutError
+
+        with patch(
+            "core.services.market_maker.coordinator.asyncio.wait_for",
+            new=timeout,
+        ):
+            with self.assertRaisesRegex(AccountAuditError, "timed out"):
+                await coordinator.audit_account_once()
+
+        monitor.mark_hard_stop.assert_called_once_with("account audit timed out")
+
+    async def test_account_audit_timeout_includes_cycle_lock_wait(self) -> None:
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            mark_hard_stop=Mock(),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        coordinator = self.prepare_running()
+        coordinator.account_monitor = monitor
+        await coordinator._cycle_lock.acquire()
+
+        async def timeout(awaitable, **_kwargs):
+            awaitable.close()
+            raise TimeoutError
+
+        try:
+            with patch(
+                "core.services.market_maker.coordinator.asyncio.wait_for",
+                new=timeout,
+            ):
+                with self.assertRaisesRegex(AccountAuditError, "timed out"):
+                    await coordinator.audit_account_once()
+        finally:
+            coordinator._cycle_lock.release()
+
+        monitor.audit.assert_not_awaited()
+        monitor.mark_hard_stop.assert_called_once_with("account audit timed out")
+
+    async def test_disabled_account_audit_does_not_start_worker(self) -> None:
+        coordinator = self.coordinator(
+            config=self.config(account_audit_interval_seconds=0)
+        )
+        coordinator.account_monitor = SimpleNamespace()
+
+        coordinator._start_tasks()
+        task_names = {task.get_name() for task in coordinator._tasks}
+        await asyncio.gather(*coordinator._tasks)
+        coordinator._tasks.clear()
+
+        self.assertNotIn("market-maker-account-audit", task_names)
+
+    async def test_eligible_quote_seconds_exclude_paused_time(self) -> None:
+        coordinator = self.prepare_running()
+        coordinator._transition(RuntimeState.ACTIVE)
+        self.now += 60
+
+        active = await coordinator.emit_status_once()
+        coordinator._transition(RuntimeState.PAUSED_MARKET)
+        self.now += 40
+        paused = await coordinator.emit_status_once()
+
+        self.assertEqual(active["eligible_quote_seconds"], 60)
+        self.assertEqual(paused["eligible_quote_seconds"], 60)
 
     async def test_unknown_order_update_pauses_and_cancels_in_cycle(self) -> None:
         manager = self.order_manager()

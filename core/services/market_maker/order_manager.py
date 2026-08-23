@@ -89,6 +89,24 @@ def _has_visible_fill(
     )
 
 
+def _valid_limit_order_values(order: OrderData) -> bool:
+    try:
+        amount = Decimal(str(order.amount))
+        remaining = Decimal(str(order.remaining))
+        price = Decimal(str(order.price))
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+    return (
+        amount.is_finite()
+        and remaining.is_finite()
+        and price.is_finite()
+        and amount > 0
+        and 0 <= remaining <= amount
+        and price > 0
+        and (order.status is not OrderStatus.FILLED or remaining == 0)
+    )
+
+
 def _is_post_only_cancellation(order: OrderData) -> bool:
     return (
         order.status is OrderStatus.CANCELED
@@ -142,6 +160,7 @@ class MarketMakerOrderManager:
         self._pending_post_only_cancellations = 0
         self._post_only_create_not_before = 0.0
         self._risk_reducing_create_not_before = 0.0
+        self._known_order_ids: set[str] = set()
         self.runtime_state = RuntimeState.SYNCING
         self.pause_reason: str | None = None
         self._shutting_down = False
@@ -158,6 +177,11 @@ class MarketMakerOrderManager:
         return tuple(
             replace(order) for order in self._slots.values() if order is not None
         )
+
+    @property
+    def known_order_ids(self) -> frozenset[str]:
+        """Confirmed order ids attributable to this manager runtime."""
+        return frozenset(self._known_order_ids)
 
     @property
     def has_uncertain_state(self) -> bool:
@@ -535,6 +559,13 @@ class MarketMakerOrderManager:
             return position_refresh_required
 
     async def cancel_managed_orders(self, reason: str) -> ReconcileResult:
+        self._begin_safety_requests()
+        try:
+            return await self._cancel_managed_orders(reason)
+        finally:
+            self._end_safety_requests()
+
+    async def _cancel_managed_orders(self, reason: str) -> ReconcileResult:
         async with self._lock:
             actions: list[ReconcileAction] = []
             errors: list[str] = []
@@ -546,6 +577,13 @@ class MarketMakerOrderManager:
             )
 
     async def shutdown(self) -> None:
+        self._begin_safety_requests()
+        try:
+            await self._shutdown()
+        finally:
+            self._end_safety_requests()
+
+    async def _shutdown(self) -> None:
         async with self._lock:
             if self.runtime_state is RuntimeState.STOPPED:
                 return
@@ -583,6 +621,16 @@ class MarketMakerOrderManager:
             self.runtime_state = RuntimeState.STOPPED
             self.pause_reason = None
             self.last_result = ReconcileResult(tuple(actions), self.runtime_state)
+
+    def _begin_safety_requests(self) -> None:
+        begin = getattr(self.adapter, "begin_safety_requests", None)
+        if callable(begin):
+            begin()
+
+    def _end_safety_requests(self) -> None:
+        end = getattr(self.adapter, "end_safety_requests", None)
+        if callable(end):
+            end()
 
     async def _place_locked(
         self,
@@ -690,7 +738,23 @@ class MarketMakerOrderManager:
             )
             errors.append("create outcome uncertain: invalid confirmation")
             return position_refresh_required
+        if not _valid_limit_order_values(order):
+            self._mark_submission_uncertain(
+                desired.side, "adapter returned invalid order financials"
+            )
+            errors.append("create outcome uncertain: invalid confirmation")
+            return position_refresh_required
+        if order.id is not None:
+            self._known_order_ids.add(str(order.id))
         if order.status in _TERMINAL_STATUSES:
+            if order.status is OrderStatus.FILLED:
+                actions[action_index] = replace(
+                    action,
+                    reason="filled during submission",
+                    success=True,
+                )
+                self._slots[desired.side] = None
+                return True
             actions[action_index] = replace(
                 action,
                 reason=(
@@ -872,12 +936,11 @@ class MarketMakerOrderManager:
             None,
         )
         if terminal is not None:
-            if _is_post_only_cancellation(terminal):
-                self._record_post_only_cancellation()
-            self._slots[side] = None
-            return _has_visible_fill(
+            visible_fill = _has_visible_fill(
                 terminal, previous_remaining=slot.remaining
             )
+            self._apply_order_update(side, terminal)
+            return visible_fill if self._slots[side] is None else False
         if slot.state in {
             OrderSlotState.CANCELING,
             OrderSlotState.UNCERTAIN_CANCELLATION,
@@ -913,6 +976,16 @@ class MarketMakerOrderManager:
             self._pause(f"{side.value} order status is unknown")
             return
         if order.status in _TERMINAL_STATUSES:
+            if not _valid_limit_order_values(order):
+                slot = self._slots[side]
+                if slot is not None:
+                    slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
+                    slot.submission_uncertain = True
+                    slot.updated_monotonic = self._monotonic()
+                self._pause(f"invalid {side.value} order update")
+                return
+            if order.id is not None:
+                self._known_order_ids.add(str(order.id))
             if _is_post_only_cancellation(order):
                 self._record_post_only_cancellation()
             self._slots[side] = None
@@ -949,6 +1022,8 @@ class MarketMakerOrderManager:
                 previous.updated_monotonic = now
             self._pause(f"invalid {side.value} order update")
             return
+        if order.id is not None:
+            self._known_order_ids.add(str(order.id))
         state = (
             OrderSlotState.PARTIALLY_FILLED
             if remaining < amount
