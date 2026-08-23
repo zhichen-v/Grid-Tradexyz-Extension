@@ -5,8 +5,56 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from core.adapters.exchanges.adapters.lighter import LighterAdapter
+from core.adapters.exchanges.adapters.lighter_base import LighterBase
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.models import OrderSide, OrderStatus, PositionSide
+
+
+class LighterSignerConfigTests(unittest.TestCase):
+    @patch("lighter.SignerClient")
+    def test_signer_indices_from_string_config_are_converted_to_ints(
+        self, signer_client
+    ):
+        LighterBase(
+            {
+                "network": "robinhood",
+                "api_key_private_key": "test-only",
+                "account_index": "65",
+                "api_key_index": "4",
+            }
+        )
+
+        signer_client.assert_called_once()
+        kwargs = signer_client.call_args.kwargs
+        self.assertEqual(kwargs["account_index"], 65)
+        self.assertIsInstance(kwargs["account_index"], int)
+        self.assertEqual(kwargs["api_private_keys"], {4: "test-only"})
+        self.assertIsInstance(next(iter(kwargs["api_private_keys"])), int)
+
+    @patch("lighter.SignerClient")
+    def test_invalid_signer_indices_fail_before_sdk_client_creation(
+        self, signer_client
+    ):
+        invalid_values = (
+            ("account_index", True),
+            ("account_index", "1.5"),
+            ("account_index", "-1"),
+            ("api_key_index", "255"),
+        )
+
+        for field, value in invalid_values:
+            with self.subTest(field=field, value=value):
+                config = {
+                    "network": "robinhood",
+                    "api_key_private_key": "test-only",
+                    "account_index": "65",
+                    "api_key_index": "4",
+                    field: value,
+                }
+                with self.assertRaisesRegex(ValueError, field):
+                    LighterBase(config)
+
+        signer_client.assert_not_called()
 
 
 class LighterAuthenticatedQueryTests(unittest.IsolatedAsyncioTestCase):

@@ -63,6 +63,38 @@ class LighterBase:
         False: "buy",   # is_ask=False -> buy
     }
 
+    @staticmethod
+    def _parse_config_index(
+        value: Any,
+        field: str,
+        *,
+        maximum: Optional[int] = None,
+    ) -> int:
+        """Normalize an SDK index without silently truncating invalid values."""
+        if value is None or value == "":
+            return 0
+        if isinstance(value, bool):
+            raise ValueError(f"Lighter {field} must be a non-negative integer")
+
+        try:
+            parsed_decimal = Decimal(str(value).strip())
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Lighter {field} must be a non-negative integer"
+            ) from None
+
+        if (
+            not parsed_decimal.is_finite()
+            or parsed_decimal != parsed_decimal.to_integral_value()
+            or parsed_decimal < 0
+        ):
+            raise ValueError(f"Lighter {field} must be a non-negative integer")
+
+        parsed = int(parsed_decimal)
+        if maximum is not None and parsed > maximum:
+            raise ValueError(f"Lighter {field} must be between 0 and {maximum}")
+        return parsed
+
     def __init__(self, config: Dict[str, Any], signer_client: Any = None):
         """
         初始化Lighter基础类
@@ -76,8 +108,12 @@ class LighterBase:
 
         # API 配置
         self.api_key_private_key = config.get("api_key_private_key", "")
-        self.account_index = config.get("account_index", 0)
-        self.api_key_index = config.get("api_key_index", 0)
+        self.account_index = self._parse_config_index(
+            config.get("account_index", 0), "account_index"
+        )
+        self.api_key_index = self._parse_config_index(
+            config.get("api_key_index", 0), "api_key_index", maximum=254
+        )
 
         # Prefer the official SDK profiles while keeping the legacy testnet
         # boolean as a backwards-compatible profile selector.
