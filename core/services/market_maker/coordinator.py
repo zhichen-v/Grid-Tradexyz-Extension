@@ -36,6 +36,19 @@ _PAUSED_STATES = {
 _QUOTING_STATES = {RuntimeState.ACTIVE, RuntimeState.RISK_REDUCTION}
 
 
+def _valid_book_level(level: Any) -> bool:
+    price = getattr(level, "price", None)
+    size = getattr(level, "size", None)
+    return (
+        isinstance(price, Decimal)
+        and price.is_finite()
+        and price > 0
+        and isinstance(size, Decimal)
+        and size.is_finite()
+        and size > 0
+    )
+
+
 class MarketMakerCoordinator:
     """Own the MM lifecycle and serialize quote reconciliation cycles."""
 
@@ -388,6 +401,10 @@ class MarketMakerCoordinator:
             self._market = self._normalize_market(book)
         except (AttributeError, TypeError, ValueError):
             self.metrics.increment("invalid_book_updates")
+            if getattr(book, "symbol", None) == self.config.symbol:
+                self._market = None
+                if not self._stopping:
+                    self._quote_event.set()
             return
         self._ws_book_event.set()
         if not self._stopping:
@@ -1332,22 +1349,28 @@ class MarketMakerCoordinator:
         self, book: OrderBookData | MarketSnapshot
     ) -> MarketSnapshot:
         if isinstance(book, MarketSnapshot):
-            if book.symbol != self.config.symbol:
-                raise ValueError("order book symbol does not match config")
-            return replace(book, received_monotonic=self._monotonic())
-        if not isinstance(book, OrderBookData) or book.symbol != self.config.symbol:
+            exchange_timestamp = book.exchange_timestamp
+        elif isinstance(book, OrderBookData):
+            exchange_timestamp = book.exchange_timestamp or book.timestamp
+        else:
             raise ValueError("order book update is invalid")
-        bids = tuple(book.bids)
-        asks = tuple(book.asks)
+        if book.symbol != self.config.symbol:
+            raise ValueError("order book symbol does not match config")
+        bids = tuple(level for level in book.bids if _valid_book_level(level))
+        asks = tuple(level for level in book.asks if _valid_book_level(level))
         if not bids or not asks:
-            raise ValueError("order book is empty")
+            raise ValueError("order book is empty or has no valid positive levels")
+        best_bid = max(level.price for level in bids)
+        best_ask = min(level.price for level in asks)
+        if best_bid >= best_ask:
+            raise ValueError("order book is crossed")
         return MarketSnapshot(
             symbol=book.symbol,
             bids=bids,
             asks=asks,
-            best_bid=Decimal(str(bids[0].price)),
-            best_ask=Decimal(str(asks[0].price)),
-            exchange_timestamp=book.exchange_timestamp or book.timestamp,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            exchange_timestamp=exchange_timestamp,
             received_monotonic=self._monotonic(),
         )
 

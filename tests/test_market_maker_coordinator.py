@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from core.adapters.exchanges.models import (
+    OrderBookData,
     OrderBookLevel,
     OrderData,
     OrderSide,
@@ -385,6 +386,115 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await coordinator.process_quote_event())
         manager.handle_order_update.assert_awaited_once()
         manager.reconcile.assert_awaited_once()
+
+    async def test_invalid_target_book_immediately_fails_closed(self) -> None:
+        manager = self.order_manager()
+        coordinator = self.prepare_running(order_manager=manager)
+        invalid = OrderBookData(
+            symbol="BTC",
+            bids=[OrderBookLevel(Decimal("100.2"), Decimal("1"))],
+            asks=[OrderBookLevel(Decimal("100.1"), Decimal("1"))],
+            timestamp=datetime.now(),
+            nonce=None,
+        )
+
+        await coordinator.on_orderbook(invalid)
+
+        self.assertIsNone(coordinator.market_snapshot)
+        self.assertTrue(coordinator.quote_event.is_set())
+        self.assertTrue(await coordinator.process_quote_event())
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_DATA)
+        manager.cancel_managed_orders.assert_awaited_once()
+        self.assertEqual(
+            coordinator.metrics.counters["invalid_book_updates"], 1
+        )
+
+    async def test_wrong_symbol_book_does_not_invalidate_market(self) -> None:
+        coordinator = self.prepare_running()
+        original = coordinator.market_snapshot
+        wrong_symbol = OrderBookData(
+            symbol="ETH",
+            bids=[OrderBookLevel(Decimal("99.9"), Decimal("1"))],
+            asks=[OrderBookLevel(Decimal("100.1"), Decimal("1"))],
+            timestamp=datetime.now(),
+            nonce=None,
+        )
+
+        await coordinator.on_orderbook(wrong_symbol)
+
+        self.assertIs(coordinator.market_snapshot, original)
+        self.assertFalse(coordinator.quote_event.is_set())
+
+    def test_normalize_market_uses_positive_price_extrema_for_bbo(self) -> None:
+        bids = (
+            OrderBookLevel(Decimal("90"), Decimal("1")),
+            OrderBookLevel(Decimal("200"), Decimal("0")),
+            OrderBookLevel(Decimal("NaN"), Decimal("1")),
+            OrderBookLevel(Decimal("99.8"), Decimal("Infinity")),
+            OrderBookLevel(Decimal("99.9"), Decimal("1")),
+        )
+        asks = (
+            OrderBookLevel(Decimal("110"), Decimal("1")),
+            OrderBookLevel(Decimal("50"), Decimal("0")),
+            OrderBookLevel(Decimal("Infinity"), Decimal("1")),
+            OrderBookLevel(Decimal("100.2"), Decimal("NaN")),
+            OrderBookLevel(Decimal("100.1"), Decimal("1")),
+        )
+        books = (
+            OrderBookData(
+                symbol="BTC",
+                bids=list(bids),
+                asks=list(asks),
+                timestamp=datetime.now(),
+                nonce=None,
+            ),
+            MarketSnapshot(
+                symbol="BTC",
+                bids=bids,
+                asks=asks,
+                best_bid=Decimal("90"),
+                best_ask=Decimal("110"),
+                exchange_timestamp=None,
+                received_monotonic=self.now - 1,
+            ),
+        )
+        coordinator = self.coordinator()
+
+        for book in books:
+            with self.subTest(book_type=type(book).__name__):
+                normalized = coordinator._normalize_market(book)
+
+                self.assertEqual(normalized.best_bid, Decimal("99.9"))
+                self.assertEqual(normalized.best_ask, Decimal("100.1"))
+                self.assertEqual(len(normalized.bids), 2)
+                self.assertEqual(len(normalized.asks), 2)
+                self.assertEqual(normalized.received_monotonic, self.now)
+
+    def test_normalize_market_rejects_empty_or_crossed_valid_book(self) -> None:
+        coordinator = self.coordinator()
+        books = (
+            OrderBookData(
+                symbol="BTC",
+                bids=[OrderBookLevel(Decimal("99.9"), Decimal("0"))],
+                asks=[OrderBookLevel(Decimal("100.1"), Decimal("1"))],
+                timestamp=datetime.now(),
+                nonce=None,
+            ),
+            MarketSnapshot(
+                symbol="BTC",
+                bids=(OrderBookLevel(Decimal("100.2"), Decimal("1")),),
+                asks=(OrderBookLevel(Decimal("100.1"), Decimal("1")),),
+                best_bid=Decimal("99.9"),
+                best_ask=Decimal("100.1"),
+                exchange_timestamp=None,
+                received_monotonic=self.now,
+            ),
+        )
+
+        for book in books:
+            with self.subTest(book_type=type(book).__name__):
+                with self.assertRaisesRegex(ValueError, "empty|crossed"):
+                    coordinator._normalize_market(book)
 
     async def test_cycle_uses_order_manager_confirmed_order_ids(self) -> None:
         manager = self.order_manager()

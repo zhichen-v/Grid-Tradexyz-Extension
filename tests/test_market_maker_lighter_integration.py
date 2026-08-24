@@ -384,8 +384,14 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         tight = OrderBookData(
             symbol="BTC",
-            bids=[OrderBookLevel(Decimal("100"), Decimal("1"))],
-            asks=[OrderBookLevel(Decimal("101"), Decimal("1"))],
+            bids=[
+                OrderBookLevel(Decimal("90"), Decimal("1")),
+                OrderBookLevel(Decimal("100"), Decimal("1")),
+            ],
+            asks=[
+                OrderBookLevel(Decimal("110"), Decimal("1")),
+                OrderBookLevel(Decimal("101"), Decimal("1")),
+            ],
             timestamp=datetime.now(timezone.utc),
             nonce=2,
         )

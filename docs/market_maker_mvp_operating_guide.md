@@ -257,7 +257,7 @@ Live 僅能由操作者在完成 dry-run gate 後執行。優先使用 testnet�
 
 ## 12. Phase 8 本地驗證紀錄與交接（2026-08-20 起）
 
-> **目前狀態：STOPPED / 第 12.16 節首次 E1 live 的歷史判定仍為 safety NO-GO／economic INCONCLUSIVE；第 12.17 節已完成 in-process audit 與 long-run 候選修復，新的 live proof 尚待操作者執行。** 歷史 `SHORT 0.00040 BTC` 已由操作者處置；是否仍 flat、account orders 是否仍為 0 一律以每次啟動前的 fresh authenticated preflight 為準，不得沿用文件快照。Config 維持 `dry_run: true`；VPS 同步與測試仍不在本階段範圍。
+> **目前狀態：STOPPED / 第 12.20 節現行 MM-only BBO fingerprint 的 parser/data T3 與 software/safety gate GO；live／economic NOT TESTED，且不得 promotion。** 第 12.19 節 4 小時 live 的帳戶、成交、cleanup 與資源資料仍是有效歷史證據，但其中由舊 BBO normalizer 衍生的 raw-spread、eligible-time 與市場流動性解讀已被第 12.20 節取代。2026-08-25 fresh postflight 為 account orders `0`、positions `0`、USDG total/free `299.752078 / 299.752078`；下一輪仍須 fresh authenticated preflight。Config 維持 `dry_run: true`；VPS 同步與測試仍不在本階段範圍。
 
 ### 12.1 本輪完成項目
 
@@ -821,3 +821,94 @@ Status 的 `account_audit` 另提供 `unique_maker_fills`、`turnover`、`maker_
 回歸證據為關聯 `79 tests / OK`、全部 Market Maker `216 tests / OK`、`compileall` 與 `git diff --check` PASS。全專案 `451 tests` 維持與修復前相同的既知 Grid selective-cancel 基準 `8 failures + 4 errors`，本輪沒有新增失敗類型，也沒有修改 Grid production code。
 
 操作者現在可用第 12.17 節候選進行手動 long-run：只在執行副本把 `dry_run` 改為 `false`、移除 CLI `--dry-run`，其餘參數不變。啟動前仍須 fresh preflight；前 `15–30m` 只是同一 session 的 canary，健康時不停止或重設 drawdown baseline。達 `8` completed fills 後 fee/net 立即判定，通過但 nonflat 時等待 equity gate；若 hard stop 或程序退出，不得自動重啟。本次 T3 GO 不改寫 Step D 歷史 NO-GO，也不會在取得 E1 safety/economic GO 與至少 `10` 個 completed round trips 前允許縮至 `200 ticks`。
+
+### 12.19 本機 4 小時 live long-run 與交接（2026-08-24）
+
+#### 授權、版本與啟動前狀態
+
+操作者授權協助執行約 4 小時的本機 live long-run。本輪固定使用第 12.17 節候選：`both / order 0.00020 / max position 0.00040 / configured half-spread 250 ticks / max raw spread 30 bps / 1x cross / max session drawdown 0.50 USDG`；沒有中途調參、沒有自動重啟、沒有 VPS 作業，也沒有修改 Grid production code。執行 branch 為 `feat/lighter-market-maker-mvp`，HEAD `ee87444d69583216cb43c6d25573100ffd8382db`。安全來源檔 `config/market_maker/test_lighter_btc_mvp.yaml` 全程保持 `dry_run: true`，SHA-256 為 `B8FD57C29BBD7A51A54B6769647F9F74A8CFA62BECD97F8BE993902FF7419475`；忽略的 live 副本 SHA-256 為 `A9FF27D7B69C7BC4189160802805A1966AF3AA5979FF1D3C045C5A7A2E1B1F3C`，解析後只差 `dry_run: false`，停止後已刪除。
+
+Fresh authenticated preflight 確認 Robinhood mainnet、wallet ownership、BTC metadata 與 signer PASS；Market Maker 程序 `0`、account/BTC open orders `0`、positions `0`、BTC `1x cross`，USDG total/free `299.895633 / 299.895633`、used `0`。Authenticated maker/taker fee tick 為 `120/350`；當時 BBO `78383.6 / 78393.0`、raw spread約 `1.199 bps`。Market Maker tests 為 `216 tests / OK`；全專案既知 Grid selective-cancel extension 基準不屬於本輪 Market Maker 修復範圍。
+
+#### Live 結果
+
+同一 direct-PTY 程序於 `19:47:51` 啟動，`23:47:53` 達 4 小時人工界線，`23:48:10` 完成 operator-stop cleanup。最後完整 status uptime `14415.172s`，即約 `4h00m15s`；沒有重設 session baseline。
+
+| 項目 | 最後／累積結果 |
+|---|---|
+| Runtime / cycles | `2769/2769` successful，failed／consecutive errors `0`；最後 `paused_market`，state transitions `17` |
+| Market / eligible time | 最後 raw spread `273.3575236666599 bps > 30 bps`，targets 與 live orders皆空；eligible quote seconds只有 `45.063s`，其後絕大多數時間因 raw-spread guard 停掛 |
+| Orders / fills | create `7/7`、cancel `2/2`、post-only cancellations `2`、full fills `3`、partial fills `0`；最終 managed live remaining皆為 `0` |
+| Position / risk | 最後 BTC `SHORT 0.00020`；未超過 `±0.00040` cap，最壞觀察 utilization `1`；current／max observed drawdown `0.224781 / 0.318601 USDG < 0.50` |
+| Account audit | 最終 `healthy`、total read failures `0`；reconciliation success `2769` |
+| Fault counters | ambiguous submission/cancellation、reconciliation failure、unknown orders、mutation-limiter blocks、HTTP 429、WS reconnect全部 `0` |
+| Ledger | unique maker fills `3`、taker `0`、turnover `46.993860 USDG`、exact fee `0.00563926320 USDG`、gross `0.010410 USDG` |
+| Economic gate | completed round trips／completed fills皆為 `0`，position未回到 flat；`economic_state=incomplete_nonflat`，completed fee-cover、net/turnover與 flat-equity指標皆不可判定 |
+
+啟動最初曾出現兩次「cancellation transaction acknowledged without terminal proof」中間警告；bounded exact history 隨後確認 terminal cancellation，最終 ambiguous cancellations 與 reconciliation failures 均為 `0`。早段也有一次短暫 `paused_position` 與一次 `paused_data`，下一輪完整 REST resync後自行恢復，沒有 failed cycle。這些事件保留在交接中，不能寫成從未發生；但它們沒有留下 unresolved mutation、未知訂單或中斷監控。
+
+資源在 warm-up 後保持平台：實際 worker 的 1h／1.5h／2h／2.5h／3h／3.5h／4h RSS 約 `136.48 / 136.59 / 136.68 / 136.57 / 136.67 / 136.67 / 136.66 MiB`；threads約 `35 / 34 / 36 / 36 / 35 / 36 / 36`，handles約 `511 / 512 / 518 / 516 / 514 / 518 / 518`。沒有 busy loop、記憶體、thread 或 handle 無界成長跡象。
+
+#### 停止、postflight 與判定
+
+達人工界線後只送一次 Ctrl+C。Console 明確記錄 WebSocket task取消、全部訂閱取消、Lighter disconnect與 `Market maker stopped after operator interrupt`，無 traceback；Windows PTY exit `1` 仍是既知 ETX 表現。停止後 Market Maker process tree為 `0`。`23:48:25` 與 `23:48:37` 兩次獨立 authenticated postflight 均確認 open orders `0`、BTC `SHORT 0.00020 @ 78340.4`、`1x cross`；USDG total固定為 `299.901162`，兩次 free/used分別為 `283.825531 / 16.075631` 與 `283.833251 / 16.067911`，非 flat 時的 free/used變化來自市場標記。Shutdown依設計只撤 managed orders，不自動 flatten；本輪沒有取得額外平倉授權，因此保留該最小殘倉。
+
+本輪判定為 **STOPPED / 4h runtime-and-safety long-run GO / economic-and-fee-cover INCONCLUSIVE / volume objective NOT MET / NO PROMOTION**：
+
+- GO 只涵蓋同一 live 程序的 4 小時穩定性、in-process audit、風控邊界、資源平台與 clean shutdown；不覆蓋第 12.16 節歷史事故，也不代表 production-ready。
+- 雖然未封口 ledger 的累積 gross數字大於累積 exact fee，只有 `3` 筆 maker fills、`0` completed fills／round trips且最終 nonflat；不得據此宣稱 cover fee或盈利。未達 `8` completed fills只能是 economic INCONCLUSIVE，不是可忽略的 economic GO。
+- 成交量只有 `46.993860 USDG / 3 fills`，wall-clock約 `11.7375 USDG turnover/hour / 0.7493 fills/hour`；eligible time僅 `45.063s`，因此 eligible-hour換算值沒有足夠樣本代表性。主要限制是 raw book spread長時間高於 `30 bps`，不是本輪可以靠盲目縮小 configured half-spread解決的問題。
+
+下一輪之前的未完成事項：
+
+1. 若要從 flat 重建 fee/equity證據，先由操作者處置或另行授權處置 `SHORT 0.00020 BTC`，再 fresh authenticated確認 positions／orders `0`、`1x cross`；不得把本節快照當成目前帳戶狀態。
+2. 先比對同時間 WS order book、authenticated/REST BBO、mark/index reference與市場流動性，確認長時間 `>30 bps` 是真實 Robinhood Lighter book、資料來源語意或訂閱品質問題。診斷完成前不得直接放寬 raw-spread guard至數百 bps，避免 adverse-selection風險。
+3. 補足可保留的 paused/eligible原因與 spread分布證據，再以一次只改一項的方式決定重跑原 E1、選擇較正常流動性時段，或提出新的 guard/reference設計。`250 → 200 ticks` 仍須 E1 safety/economic同時 GO且至少 `10` 個 completed round trips後才可 promotion。
+4. VPS同步與測試仍不在本階段；目前只完成本機 long-run。
+
+### 12.20 MM-only BBO 正規化修復與 exact-config T3（2026-08-25）
+
+#### 根因、修復與歷史證據邊界
+
+第 12.19 節 long-run 後的唯讀診斷確認：Lighter WebSocket book level 的陣列順序不是可依賴的 BBO 契約，但舊 `MarketMakerCoordinator` 直接把 `bids[0] / asks[0]` 當成 best bid／ask。當首項是深檔時，MM 因而把真實約 `1–3 bps` 的 spread 誤讀成數百 bps，長時間錯誤進入 `PAUSED_MARKET`。本輪只修改 `core/services/market_maker/coordinator.py` 與 MM tests；shared Lighter adapter、Grid production code/config/tests、策略 geometry、`30 bps` raw-spread guard、fee/economic gate與風險值均未修改。
+
+新的 MM boundary 只保留 price、size 都是 finite `Decimal` 且 `> 0` 的 levels，以 `max(valid bid prices)`／`min(valid ask prices)` 建立 BBO；任一側沒有有效 level或 `best_bid >= best_ask` 時拒絕資料。Target-symbol invalid update會立即清除舊可信 market並喚醒 quote cycle，使策略 fail closed；wrong-symbol update只忽略，不污染或清除 BTC snapshot。這同時套用 `OrderBookData` 與直接 `MarketSnapshot` 兩條路徑。
+
+本節不改寫第 12.19 節 authenticated fills、fee、position、cleanup、資源平台與 economic `INCONCLUSIVE` 的歷史事實，但取代其中由舊 MM BBO normalizer導出的 `273 bps`、`45.063s eligible`、quote uptime與「真實市場流動性是主要限制」解讀。第 12.18 節 T3及更早 coordinator衍生的 spread／state／eligible數字也只屬 pre-fix fingerprint，不能作現行 parser rollout gate；相同 YAML SHA只代表設定相同，不代表 runtime fingerprint相同。
+
+#### Fingerprint、離線驗證與 fresh preflight
+
+- Branch／HEAD：`feat/lighter-market-maker-mvp`／`ee87444d69583216cb43c6d25573100ffd8382db`；T3使用尚未 commit 的 code/test diff，該三個 runtime/test檔案的 canonical diff SHA-256為 `54937dd81ca18a12160486b233ddb63582d2b5b1ddf14d3cbb44f3c312e3cea8`。
+- 安全來源檔：`config/market_maker/test_lighter_btc_mvp.yaml`，SHA-256仍為 `B8FD57C29BBD7A51A54B6769647F9F74A8CFA62BECD97F8BE993902FF7419475`，解析值為 `dry_run: true / both / 0.00020 / max position 0.00040 / half-spread 250 ticks / max raw spread 30 bps / 1x cross / max drawdown 0.50 USDG`。
+- Red／green證據：舊碼在 unsorted BBO、empty/crossed reject與integration recovery的 3 個 test methods產生 5 個 assertion failures；修復後這些測試及 target-invalid立即 fail closed、wrong-symbol不污染測試全部通過。Fixture涵蓋 unsorted levels、zero size、NaN／Infinity price/size、`OrderBookData`與`MarketSnapshot`分支。
+- 最終離線結果：targeted `5 tests / OK`；全部 Market Maker `220 tests / OK`；相關 Lighter／Grid safety slice `127 tests`及全專案 `457 tests`都只保留既知 Grid selective-cancel baseline `8 failures + 4 errors`，沒有新增失敗類型。`compileall` PASS，`git diff --check`無 whitespace error；未修理或修改不相關 Grid code。
+- T3前另做連續 10 分鐘唯讀 paired BBO screen：`120/120` WS與REST samples有效，觀察到 `10,401` 次WS updates；舊 index-0 BBO在 `120/120` samples與真實 extrema不符。正規化WS spread `min/p50/p95/max = 0.01266/1.01202/1.56890/2.03508 bps`，REST為 `0.01261/0.99734/1.74336/2.59882 bps`，兩者皆 `120/120 <= 30 bps`；WS/REST mid差 `p50/p95/max = 0.0190/0.7836/2.0981 bps`。這是獨立資料檢查，不取代T3。
+- `00:46` fresh authenticated preflight確認 Robinhood mainnet、wallet ownership／signer、BTC metadata PASS；MM process `0`、account-wide open orders `0`、positions `0`、USDG total/free `299.752078 / 299.752078`、used `0`、BTC `1x cross`、maker/taker fee tick `120/350`，BTC trade-history baseline `16`。沒有 mutation。
+
+#### Exact-config 30 分鐘 T3 dry-run
+
+第一次啟動 guard只因 PowerShell程序檢查把自身 command text中的 `run_market_maker.py`誤當成既有程序而在 Python啟動前退出；沒有 connect、runtime或 mutation，亦不計入T3。Guard改為只匹配 Python process後，正式 direct-PTY命令為：
+
+```powershell
+.\.venv\Scripts\python.exe run_market_maker.py config\market_maker\test_lighter_btc_mvp.yaml --dry-run --debug
+```
+
+YAML與CLI保持雙重dry-run。程序於 `01:00:05`啟動，第一筆完整status為`01:00:20`，最後完整status為`01:30:50`，uptime `1843.031s`；全程是同一PID tree、沒有restart。
+
+| 項目 | T3結果 |
+|---|---|
+| Runtime / state | `354/354` successful cycles，failed／consecutive errors `0`，state transitions `2`；184個10秒status samples全部`active`，`paused_market=0`、`paused_data=0` |
+| Corrected BBO | status-sample raw spread `min/p50/p90/p95/max = 0.01263/1.32146/2.25655/2.50614/5.05803 bps`；`184/184 <= 30 bps`；book age max `0.218s` |
+| Eligibility / targets | eligible quote seconds `1840.171 / 1843.031`（`99.84%`）；184組target都有`bid < ask`，reservation／target持續存在；`reference_includes_own_quote=false` |
+| Dry-run mutations | `would_place=708`、`would_cancel=0`；真實 create、cancel、partial/full fill全部`0` |
+| Reconciliation / faults | reconciliation `354/0`；ambiguous submission/cancellation、unknown orders、mutation limiter、HTTP 429、WS reconnect、invalid-book observations全部`0` |
+| Account / risk | 184/184 audit samples `healthy`、read failures `0`、audit age max `15.672s`；position、current/max drawdown皆`0`，equity固定`299.752078` |
+| Resources | worker RSS約`132.87 MiB`起，短暫峰值約`137.53 MiB`，停止前約`135.9 MiB`；threads擴張至約`33–35`後持平，未見busy loop或單調無界成長 |
+
+Status中的book與上一cycle targets不是atomic snapshot，因此不以兩者的瞬時相對位置判定post-only crossing；本輪可判定的是所有target pair都保持`bid < ask`、dry-run無真實mutation，且post-only clamp／crossing由deterministic strategy/integration tests覆蓋。
+
+#### 停止、postflight、判定與下一步
+
+達門檻後只送一次Ctrl+C；console記錄unsubscribe、disconnect與`Market maker stopped after operator interrupt`，沒有traceback。Windows PTY exit `1`仍是已知ETX表現，停止後MM process tree為`0`。`01:31:15`與`01:31:21`兩次fresh authenticated postflight都確認wallet/signer PASS、account-wide open orders `0`、positions `0`、USDG total/free `299.752078 / 299.752078`、used `0`。BTC trade history仍為`16`筆，最新成交時間維持`2026-08-24 23:55:35.133 +08:00`，故本輪沒有新增fill；config仍為`dry_run: true`且SHA未變。
+
+本輪結論為 **BBO parser/data T3 GO / current-diff software-and-safety GO / live-and-economic NOT TESTED / NO PROMOTION**。這證明MM-only正規化在真實WS資料流上消除了假性寬spread並維持fail-closed與clean shutdown；不證明maker成交量、cover fee或盈利。下一步只可在fresh flat preflight與新的明確live授權後，使用同一candidate重建E1 live economic baseline；不得因T3的高eligible比例就自動live、提高size／position／leverage或直接promotion至`200 ticks`。
