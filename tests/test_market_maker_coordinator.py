@@ -30,6 +30,7 @@ from core.services.market_maker.order_manager import (
     ReconcileAction,
 )
 from core.services.market_maker.risk_manager import RiskDecision
+from core.services.market_maker.strategy import SoftExitEconomics
 
 
 class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
@@ -89,6 +90,20 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             unrealized_pnl=Decimal("0"),
             received_monotonic=self.now if received is None else received,
         )
+
+    @staticmethod
+    def soft_exit_snapshot(**overrides):
+        snapshot = {
+            "state": "healthy",
+            "age_seconds": 1.0,
+            "ledger_position": Decimal("0.2"),
+            "completed_turnover": Decimal("100"),
+            "completed_net_ex_funding": Decimal("0.003"),
+            "open_episode_turnover": Decimal("20"),
+            "open_episode_net_ex_funding": Decimal("-0.0024"),
+        }
+        snapshot.update(overrides)
+        return snapshot
 
     @staticmethod
     def order(
@@ -232,11 +247,227 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         kwargs.setdefault("metadata", self.metadata)
         coordinator = self.coordinator(**kwargs)
         coordinator._running = True
+        coordinator._authenticated = True
         coordinator._exchange_healthy = True
         coordinator._market = self.market()
         coordinator._position = self.position()
         coordinator._transition(RuntimeState.SYNCING)
         return coordinator
+
+    def test_trusted_soft_exit_economics_requires_audited_surplus(self) -> None:
+        coordinator = self.coordinator(
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                min_completed_net_turnover_bps=Decimal("0.1"),
+                soft_exit_surplus_reserve_bps=Decimal("0.02"),
+            )
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.soft_exit_snapshot())
+        )
+
+        self.assertEqual(
+            coordinator._trusted_soft_exit_economics(self.now),
+            SoftExitEconomics(
+                completed_turnover=Decimal("100"),
+                completed_net=Decimal("0.003"),
+                open_turnover=Decimal("20"),
+                open_net=Decimal("-0.0024"),
+            ),
+        )
+
+    def test_soft_exit_economics_fails_closed_on_untrusted_prerequisites(
+        self,
+    ) -> None:
+        config = self.config(
+            account_audit_interval_seconds=15,
+            max_session_drawdown=Decimal("0.5"),
+            require_flat_start=True,
+            soft_exit_after_seconds=120,
+            min_completed_net_turnover_bps=Decimal("0.1"),
+            soft_exit_surplus_reserve_bps=Decimal("0.02"),
+        )
+        cases = {
+            "dry_run": {"config": replace(config, dry_run=True)},
+            "soft_exit_disabled": {
+                "config": replace(config, soft_exit_after_seconds=0)
+            },
+            "monitor_not_initialized": {"initialized": False},
+            "monitor_missing": {"monitor": None},
+            "position_missing": {"position": None},
+            "position_flat": {"position": self.position()},
+            "position_non_finite": {
+                "position": self.position(signed_size=Decimal("NaN"))
+            },
+            "position_wrong_type": {
+                "position": SimpleNamespace(signed_size="0.2")
+            },
+            "position_missing_size": {"position": SimpleNamespace()},
+        }
+        for name, case in cases.items():
+            with self.subTest(name=name):
+                coordinator = self.coordinator(config=case.get("config", config))
+                coordinator._position = case.get(
+                    "position", self.position(signed_size=Decimal("0.2"))
+                )
+                coordinator._account_monitor_initialized = case.get(
+                    "initialized", True
+                )
+                coordinator.account_monitor = case.get(
+                    "monitor",
+                    SimpleNamespace(
+                        snapshot=Mock(return_value=self.soft_exit_snapshot())
+                    ),
+                )
+                self.assertIsNone(
+                    coordinator._trusted_soft_exit_economics(self.now)
+                )
+
+    def test_soft_exit_economics_fails_closed_on_untrusted_audit_snapshot(
+        self,
+    ) -> None:
+        coordinator = self.coordinator(
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                min_completed_net_turnover_bps=Decimal("0.1"),
+                soft_exit_surplus_reserve_bps=Decimal("0.02"),
+            )
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        monitor = SimpleNamespace(snapshot=Mock())
+        coordinator.account_monitor = monitor
+        cases = {
+            "not_mapping": None,
+            "unhealthy": self.soft_exit_snapshot(state="hard_stop"),
+            "missing_age": self.soft_exit_snapshot(age_seconds=None),
+            "boolean_age": self.soft_exit_snapshot(age_seconds=True),
+            "negative_age": self.soft_exit_snapshot(age_seconds=-0.1),
+            "stale": self.soft_exit_snapshot(age_seconds=21.0),
+            "non_finite_age": self.soft_exit_snapshot(age_seconds=float("nan")),
+            "position_mismatch": self.soft_exit_snapshot(
+                ledger_position=Decimal("0.1")
+            ),
+            "completed_turnover_zero": self.soft_exit_snapshot(
+                completed_turnover=Decimal("0")
+            ),
+            "open_turnover_negative": self.soft_exit_snapshot(
+                open_episode_turnover=Decimal("-1")
+            ),
+            "decimal_missing": self.soft_exit_snapshot(
+                open_episode_net_ex_funding=None
+            ),
+            "decimal_wrong_type": self.soft_exit_snapshot(
+                completed_net_ex_funding="0.003"
+            ),
+            "decimal_non_finite": self.soft_exit_snapshot(
+                open_episode_net_ex_funding=Decimal("Infinity")
+            ),
+            "no_surplus": self.soft_exit_snapshot(
+                completed_net_ex_funding=Decimal("0.001")
+            ),
+            "reserve_consumes_surplus": self.soft_exit_snapshot(
+                completed_net_ex_funding=Decimal("0.0011")
+            ),
+        }
+        for name, snapshot in cases.items():
+            with self.subTest(name=name):
+                monitor.snapshot.side_effect = None
+                monitor.snapshot.return_value = snapshot
+                self.assertIsNone(
+                    coordinator._trusted_soft_exit_economics(self.now)
+                )
+
+        monitor.snapshot.side_effect = RuntimeError("snapshot unavailable")
+        self.assertIsNone(coordinator._trusted_soft_exit_economics(self.now))
+
+    async def test_cycle_passes_only_trusted_soft_exit_economics(self) -> None:
+        coordinator = self.prepare_running(
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                min_completed_net_turnover_bps=Decimal("0.1"),
+                soft_exit_surplus_reserve_bps=Decimal("0.02"),
+            )
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.soft_exit_snapshot())
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        economics = coordinator.strategy.calculate_quotes.call_args.kwargs[
+            "soft_exit_economics"
+        ]
+        self.assertIsInstance(economics, SoftExitEconomics)
+        self.assertEqual(economics.completed_net, Decimal("0.003"))
+
+    async def test_soft_exit_waits_for_audit_after_processed_fill_updates(
+        self,
+    ) -> None:
+        adapter = self.adapter()
+        adapter.get_positions.return_value = [
+            self.position(signed_size=Decimal("0.2"))
+        ]
+        coordinator = self.prepare_running(
+            adapter=adapter,
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                min_completed_net_turnover_bps=Decimal("0.1"),
+                soft_exit_surplus_reserve_bps=Decimal("0.02"),
+            ),
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            snapshot=Mock(return_value=self.soft_exit_snapshot()),
+        )
+        sell_fill = replace(
+            self.order("sell-fill", filled="0.1"),
+            side=OrderSide.SELL,
+        )
+        buy_fill = replace(
+            self.order("buy-fill", filled="0.1"),
+            side=OrderSide.BUY,
+        )
+
+        await coordinator.on_order_update(sell_fill)
+        await coordinator.on_order_update(buy_fill)
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(coordinator._processed_fill_generation, 2)
+        self.assertEqual(coordinator._audited_fill_generation, 0)
+        self.assertIsNone(
+            coordinator.strategy.calculate_quotes.call_args.kwargs[
+                "soft_exit_economics"
+            ]
+        )
+
+        await coordinator.audit_account_once()
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(coordinator._audited_fill_generation, 2)
+        economics = coordinator.strategy.calculate_quotes.call_args.kwargs[
+            "soft_exit_economics"
+        ]
+        self.assertIsInstance(economics, SoftExitEconomics)
+        self.assertEqual(economics.completed_net, Decimal("0.003"))
 
     async def test_startup_loads_data_subscribes_then_becomes_active(self) -> None:
         adapter = self.adapter()
@@ -264,6 +495,213 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             coordinator.on_position
         )
         manager.reconcile.assert_awaited_once()
+
+    async def test_live_abort_after_auth_runs_early_final_account_audit(self) -> None:
+        events = []
+        adapter = self.adapter()
+        adapter.disconnect.side_effect = lambda: events.append("disconnect")
+        monitor = SimpleNamespace(
+            initialize=AsyncMock(side_effect=lambda: events.append("initialize")),
+            audit=AsyncMock(side_effect=lambda _ids: events.append("audit")),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+
+        async def emit(snapshot):
+            events.append("status")
+            self.assertEqual(snapshot["event"], "market_maker_final_account_audit")
+
+        callback = AsyncMock(side_effect=emit)
+        coordinator = self.coordinator(
+            adapter=adapter,
+            config=self.config(
+                account_audit_interval_seconds=1,
+                max_session_drawdown=Decimal("1"),
+                require_flat_start=True,
+            ),
+        )
+        coordinator.order_manager = None
+        coordinator._status_callback = callback
+
+        async def authenticate():
+            coordinator.request_stop()
+            return True
+
+        adapter.authenticate.side_effect = authenticate
+        with patch(
+            "core.services.market_maker.coordinator.MarketMakerAccountMonitor",
+            return_value=monitor,
+        ) as monitor_factory:
+            await coordinator.start()
+
+        monitor_factory.assert_called_once()
+        monitor.initialize.assert_awaited_once_with()
+        monitor.audit.assert_awaited_once_with(set())
+        adapter.get_exchange_info.assert_not_awaited()
+        self.assertEqual(events, ["initialize", "audit", "status", "disconnect"])
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
+
+    async def test_live_exception_after_auth_runs_early_final_account_audit(
+        self,
+    ) -> None:
+        adapter = self.adapter()
+        adapter.get_exchange_info.side_effect = RuntimeError("metadata unavailable")
+        monitor = SimpleNamespace(
+            initialize=AsyncMock(),
+            audit=AsyncMock(),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        callback = AsyncMock()
+        coordinator = self.coordinator(
+            adapter=adapter,
+            config=self.config(
+                account_audit_interval_seconds=1,
+                max_session_drawdown=Decimal("1"),
+                require_flat_start=True,
+            ),
+        )
+        coordinator.order_manager = None
+        coordinator._status_callback = callback
+
+        with patch(
+            "core.services.market_maker.coordinator.MarketMakerAccountMonitor",
+            return_value=monitor,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
+                await coordinator.start()
+
+        monitor.initialize.assert_awaited_once_with()
+        monitor.audit.assert_awaited_once_with(set())
+        final_snapshot = callback.await_args.args[0]
+        self.assertEqual(final_snapshot["event"], "market_maker_final_account_audit")
+        adapter.disconnect.assert_awaited_once_with()
+
+    async def test_retry_after_early_startup_failure_reinitializes_account_monitor(
+        self,
+    ) -> None:
+        adapter = self.adapter()
+        exchange_info = adapter.get_exchange_info.return_value
+        adapter.get_exchange_info.side_effect = [
+            RuntimeError("metadata unavailable"),
+            exchange_info,
+        ]
+        manager = self.order_manager()
+        initialization_versions = []
+
+        async def initialize():
+            initialization_versions.append(len(initialization_versions) + 1)
+
+        monitor = SimpleNamespace(
+            initialize=AsyncMock(side_effect=initialize),
+            audit=AsyncMock(),
+            snapshot=Mock(
+                side_effect=lambda _now: {
+                    "state": "healthy",
+                    "baseline_equity": Decimal(
+                        str(initialization_versions[-1])
+                    ),
+                }
+            ),
+        )
+        coordinator = self.coordinator(
+            adapter=adapter,
+            config=self.config(
+                account_audit_interval_seconds=60,
+                max_session_drawdown=Decimal("1"),
+                require_flat_start=True,
+            ),
+            order_manager=manager,
+        )
+        coordinator.account_monitor = monitor
+
+        with self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
+            await coordinator.start()
+
+        self.assertEqual(initialization_versions, [1])
+        self.assertTrue(coordinator._account_monitor_initialized)
+
+        await coordinator.start()
+
+        self.assertEqual(initialization_versions, [1, 2])
+        self.assertTrue(coordinator._account_monitor_initialized)
+        self.assertEqual(
+            coordinator.metrics.account_audit["baseline_equity"],
+            Decimal("2"),
+        )
+        self.assertEqual(coordinator.state, RuntimeState.ACTIVE)
+
+    async def test_early_account_audit_is_not_added_before_auth_or_in_dry_run(
+        self,
+    ) -> None:
+        cases = (
+            ("unauthenticated", False, False, "authentication failed"),
+            ("dry-run", True, True, "metadata unavailable"),
+        )
+        for name, dry_run, authenticated, reason in cases:
+            with self.subTest(name=name):
+                adapter = self.adapter()
+                adapter.authenticate.return_value = authenticated
+                if authenticated:
+                    adapter.get_exchange_info.side_effect = RuntimeError(reason)
+                callback = AsyncMock()
+                coordinator = self.coordinator(
+                    adapter=adapter,
+                    config=self.config(
+                        dry_run=dry_run,
+                        account_audit_interval_seconds=1,
+                        max_session_drawdown=Decimal("1"),
+                        require_flat_start=True,
+                    ),
+                )
+                coordinator.order_manager = None
+                coordinator._status_callback = callback
+
+                with patch(
+                    "core.services.market_maker.coordinator.MarketMakerAccountMonitor"
+                ) as monitor_factory:
+                    with self.assertRaisesRegex(RuntimeError, reason):
+                        await coordinator.start()
+
+                monitor_factory.assert_not_called()
+                callback.assert_not_awaited()
+
+    async def test_injected_monitor_is_not_used_without_successful_auth(self) -> None:
+        for name, auth_error in (
+            ("false", None),
+            ("exception", RuntimeError("auth unavailable")),
+        ):
+            with self.subTest(name=name):
+                adapter = self.adapter()
+                if auth_error is None:
+                    adapter.authenticate.return_value = False
+                    expected = "authentication failed"
+                else:
+                    adapter.authenticate.side_effect = auth_error
+                    expected = "auth unavailable"
+                monitor = SimpleNamespace(
+                    initialize=AsyncMock(),
+                    audit=AsyncMock(),
+                    snapshot=Mock(return_value={"state": "healthy"}),
+                )
+                callback = AsyncMock()
+                coordinator = self.coordinator(
+                    adapter=adapter,
+                    config=self.config(
+                        account_audit_interval_seconds=1,
+                        max_session_drawdown=Decimal("1"),
+                        require_flat_start=True,
+                    ),
+                )
+                coordinator.order_manager = None
+                coordinator.account_monitor = monitor
+                coordinator._status_callback = callback
+
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    await coordinator.start()
+
+                monitor.initialize.assert_not_awaited()
+                monitor.audit.assert_not_awaited()
+                callback.assert_not_awaited()
+                adapter.disconnect.assert_awaited_once_with()
 
     async def test_startup_reads_position_after_order_initialization(self) -> None:
         adapter = self.adapter()
@@ -1093,6 +1531,210 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         adapter.unsubscribe.assert_awaited_once_with()
         adapter.disconnect.assert_awaited_once_with()
 
+    async def test_stop_audits_final_account_state_before_disconnect(self) -> None:
+        events = []
+        adapter = self.adapter()
+        adapter.unsubscribe.side_effect = lambda: events.append("unsubscribe")
+        adapter.disconnect.side_effect = lambda: events.append("disconnect")
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"filled-during-shutdown"})
+        manager.shutdown.side_effect = lambda: events.append("shutdown")
+
+        async def audit(managed_order_ids):
+            events.append("audit")
+            self.assertEqual(managed_order_ids, {"filled-during-shutdown"})
+
+        final_snapshot = {
+            "state": "healthy",
+            "ledger_position": Decimal("0.1"),
+        }
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=audit),
+            snapshot=Mock(return_value=final_snapshot),
+        )
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator.account_monitor = monitor
+        coordinator._subscribed = True
+
+        with self.assertLogs(
+            "core.services.market_maker.coordinator", level="INFO"
+        ) as captured:
+            await coordinator.stop()
+
+        self.assertEqual(events, ["shutdown", "audit", "unsubscribe", "disconnect"])
+        self.assertEqual(
+            coordinator.metrics.account_audit["ledger_position"], Decimal("0.1")
+        )
+        self.assertTrue(
+            any("market_maker_final_account_audit" in line for line in captured.output)
+        )
+
+    async def test_stop_emits_final_audit_through_status_callback(self) -> None:
+        events = []
+        adapter = self.adapter()
+        adapter.unsubscribe.side_effect = lambda: events.append("unsubscribe")
+        adapter.disconnect.side_effect = lambda: events.append("disconnect")
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"final-fill"})
+        manager.shutdown.side_effect = lambda: events.append("shutdown")
+
+        async def audit(_managed_order_ids):
+            events.append("audit")
+
+        async def emit(snapshot):
+            events.append("status")
+            self.assertEqual(snapshot["event"], "market_maker_final_account_audit")
+            self.assertEqual(snapshot["account_audit"]["state"], "healthy")
+
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=audit),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        callback = AsyncMock(side_effect=emit)
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator.account_monitor = monitor
+        coordinator._status_callback = callback
+        coordinator._subscribed = True
+
+        with patch("core.services.market_maker.coordinator.logger.info"):
+            await coordinator.stop()
+
+        callback.assert_awaited_once()
+        self.assertEqual(events, ["shutdown", "audit", "status", "unsubscribe", "disconnect"])
+
+    async def test_final_status_callback_failure_does_not_skip_disconnect(self) -> None:
+        adapter = self.adapter()
+        adapter.close_position = AsyncMock()
+        manager = self.order_manager()
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        callback = AsyncMock(side_effect=RuntimeError("final status callback failed"))
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator.account_monitor = monitor
+        coordinator._status_callback = callback
+        coordinator._subscribed = True
+
+        with self.assertRaisesRegex(RuntimeError, "final status callback failed"):
+            await coordinator.stop()
+
+        monitor.audit.assert_awaited_once()
+        callback.assert_awaited_once()
+        adapter.unsubscribe.assert_awaited_once_with()
+        adapter.disconnect.assert_awaited_once_with()
+        adapter.close_position.assert_not_awaited()
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+
+    async def test_stop_fails_closed_when_final_account_audit_fails(self) -> None:
+        adapter = self.adapter()
+        adapter.close_position = AsyncMock()
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"final-order"})
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=AccountAuditError("final audit failed")),
+            snapshot=Mock(
+                return_value={"state": "hard_stop", "reason": "final audit failed"}
+            ),
+        )
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator.account_monitor = monitor
+        coordinator._subscribed = True
+
+        with self.assertLogs(
+            "core.services.market_maker.coordinator", level="INFO"
+        ) as captured:
+            with self.assertRaisesRegex(AccountAuditError, "final audit failed"):
+                await coordinator.stop()
+
+        monitor.audit.assert_awaited_once_with({"final-order"})
+        adapter.unsubscribe.assert_awaited_once_with()
+        adapter.disconnect.assert_awaited_once_with()
+        adapter.close_position.assert_not_awaited()
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+        self.assertEqual(coordinator.metrics.account_audit["state"], "hard_stop")
+        self.assertTrue(
+            any("market_maker_final_account_audit" in line for line in captured.output)
+        )
+
+    async def test_stop_audits_and_aggregates_when_order_shutdown_fails(self) -> None:
+        events = []
+        adapter = self.adapter()
+        adapter.close_position = AsyncMock()
+        adapter.unsubscribe.side_effect = lambda: events.append("unsubscribe")
+        adapter.disconnect.side_effect = lambda: events.append("disconnect")
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"shutdown-fill"})
+
+        async def shutdown():
+            events.append("shutdown")
+            raise RuntimeError("order shutdown failed")
+
+        async def audit(_managed_order_ids):
+            events.append("audit")
+            raise AccountAuditError("final audit failed")
+
+        manager.shutdown.side_effect = shutdown
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=audit),
+            snapshot=Mock(
+                return_value={"state": "hard_stop", "reason": "final audit failed"}
+            ),
+        )
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator.account_monitor = monitor
+        coordinator._subscribed = True
+
+        with self.assertLogs(
+            "core.services.market_maker.coordinator", level="INFO"
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "order shutdown failed.*final audit failed"
+            ):
+                await coordinator.stop()
+
+        monitor.audit.assert_awaited_once_with({"shutdown-fill"})
+        self.assertEqual(events, ["shutdown", "audit", "unsubscribe", "disconnect"])
+        adapter.close_position.assert_not_awaited()
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+
+    async def test_stop_preserves_fatal_and_cleanup_errors(self) -> None:
+        adapter = self.adapter()
+        manager = self.order_manager()
+        manager.shutdown.side_effect = RuntimeError("shutdown failed")
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator._fatal_exception = RuntimeError("worker failed")
+
+        with self.assertRaisesRegex(
+            RuntimeError, "worker failed.*shutdown failed"
+        ):
+            await coordinator.stop()
+
+        self.assertRegex(
+            str(coordinator.fatal_exception), "worker failed.*shutdown failed"
+        )
+        adapter.disconnect.assert_awaited_once_with()
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+
+    async def test_dry_run_stop_skips_final_account_audit(self) -> None:
+        manager = self.order_manager()
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        callback = AsyncMock()
+        coordinator = self.prepare_running(
+            config=self.config(dry_run=True), order_manager=manager
+        )
+        coordinator.account_monitor = monitor
+        coordinator._status_callback = callback
+
+        await coordinator.stop()
+
+        manager.shutdown.assert_awaited_once_with()
+        monitor.audit.assert_not_awaited()
+        callback.assert_not_awaited()
+
     async def test_stop_requested_during_start_prevents_first_reconcile(self) -> None:
         adapter = self.adapter()
         manager = self.order_manager()
@@ -1176,6 +1818,36 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(coordinator._stopped_event.is_set())
         self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
 
+    async def test_stop_audits_after_order_shutdown_timeout(self) -> None:
+        adapter = self.adapter()
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"timeout-fill"})
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        coordinator = self.prepare_running(adapter=adapter, order_manager=manager)
+        coordinator.account_monitor = monitor
+        real_wait_for = asyncio.wait_for
+
+        async def timeout_shutdown(awaitable, timeout):
+            code = getattr(awaitable, "cr_code", None)
+            if code is not None and code.co_name == "_shutdown_order_manager_locked":
+                awaitable.close()
+                raise TimeoutError
+            return await real_wait_for(awaitable, timeout)
+
+        with patch(
+            "core.services.market_maker.coordinator.asyncio.wait_for",
+            new=timeout_shutdown,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "shutdown did not finish within"):
+                await coordinator.stop()
+
+        monitor.audit.assert_awaited_once_with({"timeout-fill"})
+        adapter.disconnect.assert_awaited_once_with()
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+
     async def test_cancelled_stop_waits_for_cleanup_then_reraises(self) -> None:
         adapter = self.adapter()
         manager = self.order_manager()
@@ -1255,6 +1927,49 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         adapter.disconnect.assert_awaited_once()
         self.assertTrue(coordinator._stopped_event.is_set())
         self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+
+    async def test_startup_stop_runs_final_audit_after_first_reconcile(self) -> None:
+        events = []
+        adapter = self.adapter()
+        adapter.unsubscribe.side_effect = lambda: events.append("unsubscribe")
+        adapter.disconnect.side_effect = lambda: events.append("disconnect")
+        manager = self.order_manager()
+        manager.shutdown.side_effect = lambda: events.append("shutdown")
+
+        async def audit(_managed_order_ids):
+            events.append("audit")
+
+        monitor = SimpleNamespace(
+            initialize=AsyncMock(),
+            audit=AsyncMock(side_effect=audit),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        coordinator = self.coordinator(
+            adapter=adapter,
+            config=self.config(
+                account_audit_interval_seconds=1,
+                max_session_drawdown=Decimal("1"),
+                require_flat_start=True,
+            ),
+            order_manager=manager,
+        )
+        coordinator.account_monitor = monitor
+
+        async def reconcile(*_args):
+            manager.known_order_ids = frozenset({"startup-fill"})
+            coordinator.request_stop()
+            return SimpleNamespace(
+                actions=(), errors=(), runtime_state=RuntimeState.ACTIVE
+            )
+
+        manager.reconcile.side_effect = reconcile
+
+        await coordinator.start()
+        await coordinator.stop()
+
+        monitor.audit.assert_awaited_once_with({"startup-fill"})
+        self.assertEqual(events, ["shutdown", "audit", "unsubscribe", "disconnect"])
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
 
     async def test_critical_failure_blocks_new_cycles_before_shutdown(self) -> None:
         manager = self.order_manager()
@@ -1829,6 +2544,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["reservation_price"], Decimal("100"))
         self.assertEqual(snapshot["quote_spread_ticks"], Decimal("2"))
         self.assertEqual(snapshot["quote_spread_bps"], Decimal("20"))
+        self.assertEqual(snapshot["quote_reason"], "normal")
         self.assertEqual(snapshot["max_position_utilization"], Decimal("0.2"))
         self.assertEqual(snapshot["counters"]["reconciliation_success"], 1)
 

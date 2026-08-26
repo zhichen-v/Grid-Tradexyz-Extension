@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import replace
@@ -22,7 +23,7 @@ from .metrics import MarketMakerMetrics
 from .models import MarketMetadata, MarketSnapshot, PositionSnapshot, RuntimeState
 from .order_manager import MarketMakerOrderManager
 from .risk_manager import RiskManager
-from .strategy import MarketMakerStrategy
+from .strategy import MarketMakerStrategy, SoftExitEconomics
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,10 @@ class MarketMakerCoordinator:
         )
         self.metrics.min_profit_buffer_bps = config.min_profit_buffer_bps
         self.account_monitor = account_monitor
+        self._account_monitor_initialized = False
+        self._processed_fill_generation = 0
+        self._audited_fill_generation = 0
+        self._authenticated = False
         self._state = RuntimeState.STARTING
         self._market: MarketSnapshot | None = None
         self._position: PositionSnapshot | None = None
@@ -159,6 +164,10 @@ class MarketMakerCoordinator:
                 self._transition(RuntimeState.STOPPED)
                 self._stopped_event.set()
                 return
+            self._account_monitor_initialized = False
+            self._processed_fill_generation = 0
+            self._audited_fill_generation = -1
+            self._authenticated = False
             self._stopping = False
             self._fatal_exception = None
             self._error_paused_until = None
@@ -174,6 +183,18 @@ class MarketMakerCoordinator:
                     return
                 if not await self.adapter.authenticate():
                     raise RuntimeError("exchange authentication failed")
+                self._authenticated = True
+                if (
+                    not self.config.dry_run
+                    and self.config.account_audit_interval_seconds
+                    and self.account_monitor is None
+                ):
+                    self.account_monitor = MarketMakerAccountMonitor(
+                        self.adapter,
+                        self.config,
+                        monotonic=self._monotonic,
+                        sleep=self._sleep,
+                    )
                 if await self._abort_start_if_requested():
                     return
 
@@ -207,36 +228,7 @@ class MarketMakerCoordinator:
                 await self.order_manager.initialize()
                 positions = await self.adapter.get_positions([self.config.symbol])
                 self._position = self._position_from_rest(positions)
-                if self.config.account_audit_interval_seconds:
-                    if self.account_monitor is None:
-                        self.account_monitor = MarketMakerAccountMonitor(
-                            self.adapter,
-                            self.config,
-                            monotonic=self._monotonic,
-                            sleep=self._sleep,
-                        )
-                    try:
-                        await asyncio.wait_for(
-                            self.account_monitor.initialize(),
-                            timeout=self.config.account_audit_timeout_seconds,
-                        )
-                    except TimeoutError as exc:
-                        self.account_monitor.mark_hard_stop(
-                            "account audit initialization timed out"
-                        )
-                        raise AccountAuditError(
-                            "account audit initialization timed out"
-                        ) from exc
-                    except AccountAuditError:
-                        raise
-                    except Exception as exc:
-                        reason = (
-                            "account audit initialization failed: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-                        self.account_monitor.mark_hard_stop(reason)
-                        raise AccountAuditError(reason) from exc
-                    self._update_account_audit_metrics()
+                await self._initialize_account_monitor()
                 if await self._abort_start_if_requested():
                     return
 
@@ -343,40 +335,24 @@ class MarketMakerCoordinator:
                 error.__cause__ = exc
         self._tasks.clear()
 
-        try:
-            if self.order_manager is not None:
-                cleanup_timeout = max(
-                    5.0,
-                    float(self.config.stale_position_seconds),
-                )
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown_order_manager_locked(),
-                        timeout=cleanup_timeout,
-                    )
-                except TimeoutError as exc:
-                    cleanup_error = RuntimeError(
-                        "order manager shutdown did not finish within "
-                        f"{cleanup_timeout:g} seconds"
-                    )
-                    cleanup_error.__cause__ = exc
-                    raise cleanup_error
-        except BaseException as exc:
-            error = error or exc
+        cleanup_error = await self._cleanup_orders_and_final_audit()
+        error = self._combine_cleanup_errors(error, cleanup_error)
 
         try:
             if self._subscribed:
                 await asyncio.wait_for(self.adapter.unsubscribe(), timeout=5.0)
                 self._subscribed = False
         except BaseException as exc:
-            error = error or exc
+            error = self._combine_cleanup_errors(error, exc)
         try:
             await asyncio.wait_for(self.adapter.disconnect(), timeout=5.0)
         except BaseException as exc:
-            error = error or exc
+            error = self._combine_cleanup_errors(error, exc)
+        finally:
+            self._authenticated = False
 
         self._stopping = False
-        failure = error or self._fatal_exception
+        failure = self._combine_cleanup_errors(self._fatal_exception, error)
         if failure is not None:
             self._fatal_exception = failure
             self._transition(RuntimeState.PAUSED_ERROR, str(failure))
@@ -384,11 +360,85 @@ class MarketMakerCoordinator:
             self._transition(RuntimeState.STOPPED)
         self._stopped_event.set()
         if error is not None:
-            raise error
+            assert failure is not None
+            raise failure
 
     async def _shutdown_order_manager_locked(self) -> None:
         async with self._cycle_lock:
             await self.order_manager.shutdown()
+
+    async def _cleanup_orders_and_final_audit(self) -> BaseException | None:
+        shutdown_error: BaseException | None = None
+        if self.order_manager is not None:
+            cleanup_timeout = max(
+                5.0,
+                float(self.config.stale_position_seconds),
+            )
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_order_manager_locked(),
+                    timeout=cleanup_timeout,
+                )
+            except TimeoutError as exc:
+                shutdown_error = RuntimeError(
+                    "order manager shutdown did not finish within "
+                    f"{cleanup_timeout:g} seconds"
+                )
+                shutdown_error.__cause__ = exc
+            except BaseException as exc:
+                shutdown_error = exc
+
+        initialization_error: BaseException | None = None
+        if (
+            not self.config.dry_run
+            and self._authenticated
+            and self.config.account_audit_interval_seconds
+            and self.account_monitor is not None
+            and not self._account_monitor_initialized
+        ):
+            try:
+                await self._initialize_account_monitor()
+            except BaseException as exc:
+                initialization_error = exc
+
+        audit_error: BaseException | None = None
+        status_error: BaseException | None = None
+        if (
+            not self.config.dry_run
+            and self._authenticated
+            and callable(getattr(self.account_monitor, "audit", None))
+        ):
+            try:
+                await self.audit_account_once()
+            except BaseException as exc:
+                audit_error = exc
+            try:
+                await self.emit_status_once(
+                    event="market_maker_final_account_audit"
+                )
+            except BaseException as exc:
+                status_error = exc
+        return self._combine_cleanup_errors(
+            shutdown_error,
+            initialization_error,
+            audit_error,
+            status_error,
+        )
+
+    @staticmethod
+    def _combine_cleanup_errors(
+        *errors: BaseException | None,
+    ) -> BaseException | None:
+        failures = tuple(error for error in errors if error is not None)
+        if not failures:
+            return None
+        if len(failures) == 1:
+            return failures[0]
+        combined = RuntimeError(
+            "; ".join(str(error) or type(error).__name__ for error in failures)
+        )
+        combined.__cause__ = failures[0]
+        return combined
 
     async def on_orderbook(self, book: OrderBookData | MarketSnapshot) -> None:
         """Cache one typed book update; trading mutations happen in the loop."""
@@ -479,9 +529,10 @@ class MarketMakerCoordinator:
                 return
             self._last_cycle_monotonic = now
             while self._pending_orders:
-                await self.order_manager.handle_order_update(
-                    self._pending_orders.popleft()
-                )
+                order = self._pending_orders.popleft()
+                await self.order_manager.handle_order_update(order)
+                if self._is_fill_update(order):
+                    self._processed_fill_generation += 1
             if not await self._refresh_after_post_only_cancellations():
                 return
 
@@ -589,10 +640,12 @@ class MarketMakerCoordinator:
                 risk,
                 orders,
                 now_monotonic=now,
+                soft_exit_economics=self._trusted_soft_exit_economics(now),
             )
             self.metrics.reservation_price = desired.reservation_price
             self.metrics.target_bid = desired.bid.price if desired.bid else None
             self.metrics.target_ask = desired.ask.price if desired.ask else None
+            self.metrics.quote_reason = desired.reason
             self.metrics.skew_ticks = (
                 desired.reservation_price - desired.reference_price
             ) / self.metadata.price_tick
@@ -807,7 +860,47 @@ class MarketMakerCoordinator:
         self._quote_event.set()
         return True
 
-    async def emit_status_once(self) -> dict[str, Any]:
+    async def _initialize_account_monitor(self) -> None:
+        if (
+            not self.config.account_audit_interval_seconds
+            or self._account_monitor_initialized
+        ):
+            return
+        if self.account_monitor is None:
+            self.account_monitor = MarketMakerAccountMonitor(
+                self.adapter,
+                self.config,
+                monotonic=self._monotonic,
+                sleep=self._sleep,
+            )
+        try:
+            await asyncio.wait_for(
+                self.account_monitor.initialize(),
+                timeout=self.config.account_audit_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            self.account_monitor.mark_hard_stop(
+                "account audit initialization timed out"
+            )
+            raise AccountAuditError(
+                "account audit initialization timed out"
+            ) from exc
+        except AccountAuditError:
+            raise
+        except Exception as exc:
+            reason = (
+                "account audit initialization failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            self.account_monitor.mark_hard_stop(reason)
+            raise AccountAuditError(reason) from exc
+        self._account_monitor_initialized = True
+        self._audited_fill_generation = self._processed_fill_generation
+        self._update_account_audit_metrics()
+
+    async def emit_status_once(
+        self, *, event: str | None = None
+    ) -> dict[str, Any]:
         now = self._monotonic()
         orders = (
             self.order_manager.snapshot()
@@ -826,8 +919,10 @@ class MarketMakerCoordinator:
         self._update_live_metrics(orders)
         self._update_account_audit_metrics()
         snapshot = self.metrics.snapshot(now)
+        if event is not None:
+            snapshot["event"] = event
         if self._status_callback is None:
-            logger.info("market_maker_status %s", snapshot)
+            logger.info("%s %s", event or "market_maker_status", snapshot)
         else:
             result = self._status_callback(snapshot)
             if inspect.isawaitable(result):
@@ -862,6 +957,7 @@ class MarketMakerCoordinator:
     async def _audit_account_locked(self) -> None:
         async with self._cycle_lock:
             await self.account_monitor.audit(self._managed_order_id_snapshot())
+            self._audited_fill_generation = self._processed_fill_generation
 
     async def _fail_closed(self, state: RuntimeState, reason: str) -> None:
         self._transition(state, reason)
@@ -1077,6 +1173,16 @@ class MarketMakerCoordinator:
             if str(order_id)
         }
 
+    @staticmethod
+    def _is_fill_update(order: OrderData) -> bool:
+        try:
+            filled = Decimal(str(order.filled))
+        except (InvalidOperation, TypeError, ValueError):
+            return True
+        return (
+            filled.is_finite() and filled > 0
+        ) or order.status is OrderStatus.FILLED
+
     def _update_account_audit_metrics(self) -> None:
         if self.account_monitor is None:
             return
@@ -1099,6 +1205,93 @@ class MarketMakerCoordinator:
             snapshot["maker_turnover_per_eligible_hour"] = None
             snapshot["maker_fills_per_eligible_hour"] = None
         self.metrics.account_audit = snapshot
+
+    def _trusted_soft_exit_economics(
+        self, now: float
+    ) -> SoftExitEconomics | None:
+        if (
+            self.config.dry_run
+            or self.config.soft_exit_after_seconds <= 0
+            or not self._account_monitor_initialized
+            or self._audited_fill_generation != self._processed_fill_generation
+            or self.account_monitor is None
+            or self._position is None
+        ):
+            return None
+
+        try:
+            position = self._position.signed_size
+        except Exception:
+            return None
+        if (
+            not isinstance(position, Decimal)
+            or not position.is_finite()
+            or position == 0
+        ):
+            return None
+
+        try:
+            snapshot = self.account_monitor.snapshot(now)
+            if not isinstance(snapshot, dict) or snapshot.get("state") != "healthy":
+                return None
+
+            age = snapshot.get("age_seconds")
+            if (
+                isinstance(age, bool)
+                or not isinstance(age, (int, float, Decimal))
+                or not math.isfinite(age)
+                or age < 0
+                or age
+                > self.config.account_audit_interval_seconds
+                + self.config.account_audit_timeout_seconds
+            ):
+                return None
+
+            ledger_position = snapshot.get("ledger_position")
+            completed_turnover = snapshot.get("completed_turnover")
+            completed_net = snapshot.get("completed_net_ex_funding")
+            open_turnover = snapshot.get("open_episode_turnover")
+            open_net = snapshot.get("open_episode_net_ex_funding")
+            values = (
+                ledger_position,
+                completed_turnover,
+                completed_net,
+                open_turnover,
+                open_net,
+            )
+            if any(
+                not isinstance(value, Decimal) or not value.is_finite()
+                for value in values
+            ):
+                return None
+            if (
+                ledger_position != position
+                or completed_turnover <= 0
+                or open_turnover < 0
+            ):
+                return None
+
+            minimum_rate = (
+                self.config.min_completed_net_turnover_bps / Decimal("10000")
+            )
+            surplus = completed_net - minimum_rate * completed_turnover
+            reserve = min(
+                surplus,
+                self.config.soft_exit_surplus_reserve_bps
+                / Decimal("10000")
+                * completed_turnover,
+            )
+            if surplus <= 0 or surplus - reserve <= 0:
+                return None
+
+            return SoftExitEconomics(
+                completed_turnover=completed_turnover,
+                completed_net=completed_net,
+                open_turnover=open_turnover,
+                open_net=open_net,
+            )
+        except Exception:
+            return None
 
     async def _refresh_market_once(self) -> None:
         book = await self.adapter.get_orderbook(self.config.symbol)
@@ -1231,28 +1424,19 @@ class MarketMakerCoordinator:
             logger.exception("critical cleanup failed after %s", task_name)
 
     async def _startup_cleanup(self) -> BaseException | None:
-        error: BaseException | None = None
-        if self.order_manager is not None:
-            try:
-                await asyncio.wait_for(
-                    self.order_manager.shutdown(),
-                    timeout=max(
-                        5.0,
-                        float(self.config.stale_position_seconds),
-                    ),
-                )
-            except BaseException as exc:
-                error = exc
+        error = await self._cleanup_orders_and_final_audit()
         if self._subscribed:
             try:
                 await asyncio.wait_for(self.adapter.unsubscribe(), timeout=5.0)
             except BaseException as exc:
-                error = error or exc
+                error = self._combine_cleanup_errors(error, exc)
             self._subscribed = False
         try:
             await asyncio.wait_for(self.adapter.disconnect(), timeout=5.0)
         except BaseException as exc:
-            error = error or exc
+            error = self._combine_cleanup_errors(error, exc)
+        finally:
+            self._authenticated = False
         self._stopped_event.set()
         return error
 

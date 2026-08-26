@@ -145,6 +145,8 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["completed_round_trips"], 1)
         self.assertEqual(snapshot["completed_turnover"], Decimal("200.04"))
         self.assertEqual(snapshot["completed_net_ex_funding"], account_net)
+        self.assertEqual(snapshot["open_episode_turnover"], Decimal("0"))
+        self.assertEqual(snapshot["open_episode_net_ex_funding"], Decimal("0"))
         self.assertEqual(
             snapshot["completed_net_turnover_bps"],
             account_net / Decimal("200.04") * Decimal("10000"),
@@ -170,6 +172,10 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["economic_state"], "incomplete_nonflat")
         self.assertEqual(snapshot["completed_fills"], 0)
         self.assertEqual(snapshot["turnover"], Decimal("100"))
+        self.assertEqual(snapshot["open_episode_turnover"], Decimal("100"))
+        self.assertEqual(
+            snapshot["open_episode_net_ex_funding"], Decimal("-0.012")
+        )
 
     async def test_null_integrator_fee_requires_local_zero_fee_signing_proof(self):
         adapter = self.adapter()
@@ -677,7 +683,28 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(monitor.total_read_failures, 1)
         self.assertEqual(monitor.state, "healthy")
 
-    async def test_persistent_read_fault_hard_stops_after_three_attempts(self):
+    async def test_four_transient_read_faults_recover_on_fifth_attempt(self):
+        adapter = self.adapter()
+        monitor = self.monitor(adapter)
+        await monitor.initialize()
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds):
+            sleeps.append(seconds)
+
+        monitor._sleep = record_sleep
+        adapter.get_open_orders.side_effect = [
+            OSError("gateway") for _ in range(4)
+        ] + [[]]
+
+        await monitor.audit(set())
+
+        self.assertEqual(adapter.get_open_orders.await_count, 6)
+        self.assertEqual(monitor.total_read_failures, 4)
+        self.assertEqual(monitor.state, "healthy")
+        self.assertEqual(sleeps, [1.0, 1.0, 1.0, 1.0])
+
+    async def test_persistent_read_fault_hard_stops_after_five_attempts(self):
         adapter = self.adapter()
         monitor = self.monitor(adapter)
         await monitor.initialize()
@@ -686,8 +713,8 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(AccountAuditError, "dns unavailable"):
             await monitor.audit(set())
 
-        self.assertEqual(adapter.get_open_orders.await_count, 4)
-        self.assertEqual(monitor.total_read_failures, 3)
+        self.assertEqual(adapter.get_open_orders.await_count, 6)
+        self.assertEqual(monitor.total_read_failures, 5)
         self.assertEqual(monitor.state, "hard_stop")
 
     async def test_actual_non_target_order_is_a_hard_stop(self):

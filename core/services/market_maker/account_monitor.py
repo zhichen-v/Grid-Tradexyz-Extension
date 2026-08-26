@@ -10,8 +10,8 @@ from .config import MarketMakerConfig
 
 _ZERO = Decimal("0")
 _TEN_THOUSAND = Decimal("10000")
-_READ_ATTEMPTS = 3
-_READ_RETRY_SECONDS = 0.5
+_READ_ATTEMPTS = 5
+_READ_RETRY_SECONDS = 1.0
 
 
 class AccountAuditError(RuntimeError):
@@ -371,6 +371,10 @@ class SessionEconomics:
             "completed_exact_fee": self.completed_exact_fee,
             "completed_gross": self.completed_gross,
             "completed_net_ex_funding": self.completed_net,
+            "open_episode_turnover": self._episode_turnover,
+            "open_episode_net_ex_funding": (
+                self._episode_gross - self._episode_fee
+            ),
             "completed_net_turnover_bps": self.completed_net_turnover_bps,
             "flat_equity_turnover_bps": self.flat_equity_turnover_bps,
             "completed_fee_cover_ratio": fee_cover_ratio,

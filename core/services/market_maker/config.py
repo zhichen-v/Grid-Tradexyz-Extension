@@ -84,6 +84,9 @@ class MarketMakerConfig:
     max_session_drawdown: Decimal = Decimal("0")
     economic_min_fills: int = 8
     min_completed_net_turnover_bps: Decimal = Decimal("0")
+    soft_exit_after_seconds: int = 0
+    soft_exit_net_turnover_bps: Decimal = Decimal("0")
+    soft_exit_surplus_reserve_bps: Decimal = Decimal("0.02")
     require_flat_start: bool = False
     post_only: bool = True
     exclusive_symbol_control: bool = True
@@ -101,6 +104,8 @@ class MarketMakerConfig:
             "min_profit_buffer_bps",
             "max_session_drawdown",
             "min_completed_net_turnover_bps",
+            "soft_exit_net_turnover_bps",
+            "soft_exit_surplus_reserve_bps",
             "max_position",
             "soft_position_ratio",
             "hard_position_ratio",
@@ -140,6 +145,28 @@ class MarketMakerConfig:
             raise ValueError(
                 "min_completed_net_turnover_bps cannot be negative"
             )
+        if self.soft_exit_surplus_reserve_bps < 0:
+            raise ValueError(
+                "soft_exit_surplus_reserve_bps cannot be negative"
+            )
+        self._validate_int("soft_exit_after_seconds", minimum=0)
+        if self.soft_exit_after_seconds:
+            if (
+                self.soft_exit_net_turnover_bps
+                >= self.min_completed_net_turnover_bps
+            ):
+                raise ValueError(
+                    "soft_exit_net_turnover_bps must be below "
+                    "min_completed_net_turnover_bps when soft exit is enabled"
+                )
+            soft_exit_rate = (
+                self.maker_fee_rate
+                + self.soft_exit_net_turnover_bps / Decimal("10000")
+            )
+            if not Decimal("-1") < soft_exit_rate < Decimal("1"):
+                raise ValueError(
+                    "soft exit fee-aware rate must be between -1 and 1"
+                )
         if (
             type(self.account_audit_interval_seconds) is not int
             or self.account_audit_interval_seconds < 0

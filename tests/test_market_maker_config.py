@@ -31,12 +31,22 @@ market_maker:
   max_position: "0.002"
   soft_position_ratio: "0.5"
   hard_position_ratio: "0.8"
+  soft_exit_after_seconds: 120
+  soft_exit_net_turnover_bps: "-5.0"
+  soft_exit_surplus_reserve_bps: "0.03"
 """
         )
 
         self.assertEqual(config.symbol, "ETH")
         self.assertEqual(config.order_size, Decimal("0.00020000000000000001"))
         self.assertIsInstance(config.order_size, Decimal)
+        self.assertEqual(config.soft_exit_after_seconds, 120)
+        self.assertEqual(
+            config.soft_exit_net_turnover_bps, Decimal("-5.0")
+        )
+        self.assertEqual(
+            config.soft_exit_surplus_reserve_bps, Decimal("0.03")
+        )
 
     def test_requires_market_maker_block(self) -> None:
         with self.assertRaisesRegex(ValueError, "market_maker"):
@@ -52,6 +62,35 @@ market_maker:
     def test_rejects_non_positive_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "refresh_interval_ms"):
             MarketMakerConfig(refresh_interval_ms=0)
+
+    def test_soft_exit_requires_valid_relaxed_fee_target(self) -> None:
+        for timeout in (-1, True):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "soft_exit_after_seconds"):
+                    MarketMakerConfig(soft_exit_after_seconds=timeout)
+        with self.assertRaisesRegex(ValueError, "must be below"):
+            MarketMakerConfig(
+                soft_exit_after_seconds=1,
+                min_completed_net_turnover_bps="0.1",
+                soft_exit_net_turnover_bps="0.1",
+            )
+        with self.assertRaisesRegex(ValueError, "between -1 and 1"):
+            MarketMakerConfig(
+                soft_exit_after_seconds=1,
+                soft_exit_net_turnover_bps="-10000",
+            )
+
+    def test_soft_exit_surplus_reserve_is_finite_and_nonnegative(self) -> None:
+        self.assertEqual(
+            MarketMakerConfig().soft_exit_surplus_reserve_bps,
+            Decimal("0.02"),
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            MarketMakerConfig(soft_exit_surplus_reserve_bps="-0.01")
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be finite"):
+                    MarketMakerConfig(soft_exit_surplus_reserve_bps=value)
 
     def test_account_audit_requires_positive_drawdown_and_flat_start(self) -> None:
         with self.assertRaisesRegex(ValueError, "account_audit_timeout_seconds"):

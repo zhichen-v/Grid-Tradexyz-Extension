@@ -18,11 +18,15 @@ from core.services.market_maker.models import (
     DesiredQuotes,
     ManagedOrder,
     MarketMetadata,
+    MarketSnapshot,
+    OrderBookLevel,
     OrderSlotState,
+    PositionSnapshot,
     RuntimeState,
 )
 from core.services.market_maker.order_manager import MarketMakerOrderManager
-from core.services.market_maker.risk_manager import RiskDecision
+from core.services.market_maker.risk_manager import RiskDecision, RiskManager
+from core.services.market_maker.strategy import MarketMakerStrategy
 
 
 class Clock:
@@ -234,6 +238,47 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.manager.slots[OrderSide.BUY])
         self.assertIsNotNone(self.manager.slots[OrderSide.SELL])
 
+    async def test_first_create_prefers_inventory_reducing_side(self) -> None:
+        config = MarketMakerConfig(
+            symbol="BTC",
+            order_size=Decimal("0.2"),
+            max_position=Decimal("1"),
+            min_profit_buffer_bps=Decimal("0"),
+            max_mutations_per_minute=1,
+            dry_run=False,
+        )
+        cases = (
+            (Decimal("0.5"), OrderSide.SELL),
+            (Decimal("-0.5"), OrderSide.BUY),
+            (Decimal("0"), OrderSide.BUY),
+        )
+
+        for inventory_ratio, expected_side in cases:
+            with self.subTest(inventory_ratio=inventory_ratio):
+                self.adapter.create_order.reset_mock()
+                manager = self.make_manager(config)
+                risk = replace(
+                    self.risk(), inventory_ratio=inventory_ratio
+                )
+
+                result = await manager.reconcile(self.desired(), risk)
+
+                self.assertEqual(result.errors, ())
+                self.adapter.create_order.assert_awaited_once()
+                call = self.adapter.create_order.await_args
+                self.assertEqual(call.args[1], expected_side)
+                self.assertEqual(
+                    call.kwargs["params"],
+                    {"time_in_force": "POST_ONLY", "reduce_only": False},
+                )
+                self.assertIsNotNone(manager.slots[expected_side])
+                opposite_side = (
+                    OrderSide.SELL
+                    if expected_side is OrderSide.BUY
+                    else OrderSide.BUY
+                )
+                self.assertIsNone(manager.slots[opposite_side])
+
     async def test_hard_risk_order_is_reduce_only(self) -> None:
         desired = self.desired(
             bid_price=None, ask_reduce_only=True
@@ -251,6 +296,288 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             self.adapter.create_order.await_args.kwargs["params"],
             {"time_in_force": "POST_ONLY", "reduce_only": True},
         )
+
+    async def test_lighter_residual_risk_to_post_only_submission(self) -> None:
+        config = MarketMakerConfig(
+            symbol="BTC",
+            order_size=Decimal("0.00020"),
+            max_position=Decimal("0.00040"),
+            maker_fee_rate=Decimal("0"),
+            min_profit_buffer_bps=Decimal("0"),
+            min_completed_net_turnover_bps=Decimal("0"),
+            dry_run=False,
+        )
+        self.metadata = MarketMetadata(
+            symbol="BTC",
+            price_decimals=1,
+            size_decimals=5,
+            price_tick=Decimal("0.1"),
+            quantity_step=Decimal("0.00001"),
+            min_base_amount=Decimal("0.00020"),
+            min_quote_amount=Decimal("10"),
+        )
+        market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("77999.9"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("78000.1"), Decimal("1")),),
+            best_bid=Decimal("77999.9"),
+            best_ask=Decimal("78000.1"),
+            exchange_timestamp=None,
+            received_monotonic=self.clock(),
+        )
+
+        for size, reducing_side in (
+            (Decimal("0.00009"), OrderSide.SELL),
+            (Decimal("-0.00009"), OrderSide.BUY),
+        ):
+            with self.subTest(size=size):
+                self.adapter.create_order.reset_mock()
+                position = PositionSnapshot(
+                    symbol="BTC",
+                    signed_size=size,
+                    entry_price=Decimal("78000"),
+                    unrealized_pnl=Decimal("0"),
+                    received_monotonic=self.clock(),
+                )
+                risk = RiskManager(config).evaluate(
+                    position,
+                    (),
+                    self.metadata,
+                    now_monotonic=self.clock(),
+                )
+                quotes = MarketMakerStrategy(config).calculate_quotes(
+                    market,
+                    position,
+                    self.metadata,
+                    risk,
+                    now_monotonic=self.clock(),
+                )
+                manager = self.make_manager(config)
+
+                result = await manager.reconcile(quotes, risk)
+
+                desired = (
+                    quotes.ask
+                    if reducing_side is OrderSide.SELL
+                    else quotes.bid
+                )
+                opposite = (
+                    quotes.bid
+                    if reducing_side is OrderSide.SELL
+                    else quotes.ask
+                )
+                self.assertIsNone(opposite)
+                self.assertIsNotNone(desired)
+                self.assertEqual(desired.amount, Decimal("0.00020"))
+                self.assertTrue(desired.reduce_only)
+                self.assertGreater(desired.amount, abs(size))
+                self.assertEqual(risk.worst_long, size)
+                self.assertEqual(risk.worst_short, size)
+                self.assertEqual(result.errors, ())
+                self.adapter.create_order.assert_awaited_once()
+                call = self.adapter.create_order.await_args
+                self.assertEqual(call.args[1], reducing_side)
+                self.assertEqual(call.args[2], OrderType.LIMIT)
+                self.assertEqual(call.args[3], Decimal("0.00020"))
+                self.assertEqual(
+                    call.kwargs["params"],
+                    {"time_in_force": "POST_ONLY", "reduce_only": True},
+                )
+
+    async def test_reduce_only_below_base_minimum_fails_closed(
+        self,
+    ) -> None:
+        self.metadata = MarketMetadata(
+            symbol="BTC",
+            price_decimals=1,
+            size_decimals=2,
+            price_tick=Decimal("0.1"),
+            quantity_step=Decimal("0.01"),
+            min_base_amount=Decimal("0.10"),
+            min_quote_amount=Decimal("0"),
+        )
+        manager = self.make_manager()
+        desired = self.desired(
+            bid_price=None,
+            ask_amount="0.05",
+            ask_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        risk = self.risk(
+            buy_amount=None,
+            sell_amount="0.05",
+            sell_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+
+        result = await manager.reconcile(desired, risk)
+
+        self.adapter.create_order.assert_not_awaited()
+        self.assertEqual(
+            result.errors,
+            ("sell desired price/amount is invalid",),
+        )
+
+    async def test_reduce_only_at_base_minimum_is_submitted_post_only(
+        self,
+    ) -> None:
+        self.metadata = MarketMetadata(
+            symbol="BTC",
+            price_decimals=1,
+            size_decimals=5,
+            price_tick=Decimal("0.1"),
+            quantity_step=Decimal("0.00001"),
+            min_base_amount=Decimal("0.00020"),
+            min_quote_amount=Decimal("0"),
+        )
+        manager = self.make_manager()
+        desired = self.desired(
+            bid_price=None,
+            ask_amount="0.00020",
+            ask_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        risk = self.risk(
+            buy_amount=None,
+            sell_amount="0.00020",
+            sell_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+
+        result = await manager.reconcile(desired, risk)
+
+        self.assertEqual(result.errors, ())
+        self.adapter.create_order.assert_awaited_once()
+        call = self.adapter.create_order.await_args
+        self.assertEqual(call.args[3], Decimal("0.00020"))
+        self.assertEqual(
+            call.kwargs["params"],
+            {"time_in_force": "POST_ONLY", "reduce_only": True},
+        )
+
+    async def test_non_reduce_only_dust_still_obeys_base_minimum(self) -> None:
+        self.metadata = MarketMetadata(
+            symbol="BTC",
+            price_decimals=1,
+            size_decimals=2,
+            price_tick=Decimal("0.1"),
+            quantity_step=Decimal("0.01"),
+            min_base_amount=Decimal("0.10"),
+            min_quote_amount=Decimal("0"),
+        )
+        manager = self.make_manager()
+
+        result = await manager.reconcile(
+            self.desired(bid_price=None, ask_amount="0.05"),
+            self.risk(buy_amount=None, sell_amount="0.05"),
+        )
+
+        self.adapter.create_order.assert_not_awaited()
+        self.assertEqual(result.errors, ("sell desired price/amount is invalid",))
+
+    async def test_reduce_only_still_obeys_quote_minimum(self) -> None:
+        self.metadata = MarketMetadata(
+            symbol="BTC",
+            price_decimals=1,
+            size_decimals=1,
+            price_tick=Decimal("0.1"),
+            quantity_step=Decimal("0.1"),
+            min_base_amount=Decimal("0.1"),
+            min_quote_amount=Decimal("25"),
+        )
+        normal_manager = self.make_manager()
+        normal_result = await normal_manager.reconcile(
+            self.desired(bid_price=None),
+            self.risk(buy_amount=None),
+        )
+
+        self.adapter.create_order.assert_not_awaited()
+        self.assertEqual(
+            normal_result.errors,
+            ("sell desired price/amount is invalid",),
+        )
+
+        reduce_manager = self.make_manager()
+        reduce_result = await reduce_manager.reconcile(
+            self.desired(
+                bid_price=None,
+                ask_reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+            self.risk(
+                buy_amount=None,
+                sell_reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+        )
+
+        self.adapter.create_order.assert_not_awaited()
+        self.assertEqual(
+            reduce_result.errors,
+            ("sell desired price/amount is invalid",),
+        )
+
+    def test_reduce_only_keeps_all_non_minimum_validation(self) -> None:
+        desired = DesiredOrder(
+            OrderSide.SELL,
+            Decimal("100.1"),
+            Decimal("0.1"),
+            True,
+            "dust reduction",
+        )
+        validation_risk = self.risk(
+            buy_amount=None,
+            sell_amount="0.2",
+            sell_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        cases = (
+            replace(desired, amount=Decimal("0")),
+            replace(desired, amount=Decimal("-0.1")),
+            replace(desired, amount=Decimal("NaN")),
+            replace(desired, amount=Decimal("Infinity")),
+            replace(desired, amount=Decimal("0.15")),
+            replace(desired, price=Decimal("0")),
+            replace(desired, price=Decimal("NaN")),
+            replace(desired, price=Decimal("Infinity")),
+            replace(desired, price=Decimal("100.05")),
+        )
+
+        for invalid in cases:
+            with self.subTest(order=invalid):
+                self.assertIsNotNone(
+                    self.manager._validate_desired(invalid, validation_risk)
+                )
+
+        for invalid, risk in (
+            (
+                replace(desired, amount=Decimal("0.3")),
+                validation_risk,
+            ),
+            (
+                desired,
+                self.risk(
+                    buy_amount=None,
+                    sell_amount="0.1",
+                    sell_reduce_only=False,
+                    state=RuntimeState.RISK_REDUCTION,
+                ),
+            ),
+            (replace(desired, reduce_only=1), validation_risk),
+            (
+                desired,
+                self.risk(
+                    buy_amount=None,
+                    sell_amount=None,
+                    sell_reduce_only=True,
+                    state=RuntimeState.RISK_REDUCTION,
+                ),
+            ),
+        ):
+            with self.subTest(order=invalid, risk=risk):
+                self.assertIsNotNone(
+                    self.manager._validate_desired(invalid, risk)
+                )
 
     async def test_unchanged_reduce_only_bid_is_not_safety_canceled(
         self,
@@ -296,6 +623,72 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.adapter.cancel_order.assert_not_awaited()
         self.assertEqual(self.adapter.create_order.await_count, 1)
+
+    async def test_more_aggressive_reduce_only_reprice_bypasses_threshold_after_lifetime(
+        self,
+    ) -> None:
+        config = MarketMakerConfig(
+            symbol="BTC",
+            order_size=Decimal("0.2"),
+            max_position=Decimal("1"),
+            min_profit_buffer_bps=Decimal("0"),
+            reprice_threshold_ticks=125,
+            min_order_lifetime_ms=30_000,
+            dry_run=False,
+        )
+        cases = (
+            (OrderSide.BUY, "99.9", "100.0", "99.8"),
+            (OrderSide.SELL, "100.1", "100.0", "100.2"),
+        )
+        for side, initial, more_aggressive, less_aggressive in cases:
+            with self.subTest(side=side):
+                self.clock.value = 100.0
+                self.created = 0
+                self.adapter.create_order.reset_mock()
+                self.adapter.cancel_order.reset_mock()
+
+                async def cancel(order_id, _symbol, *, cancel_side=side):
+                    return exchange_order(
+                        str(order_id),
+                        cancel_side,
+                        status=OrderStatus.CANCELED,
+                        params={"cancel_terminal": True},
+                    )
+
+                self.adapter.cancel_order.side_effect = cancel
+                manager = self.make_manager(config)
+                risk = self.risk(
+                    buy_amount="0.2" if side is OrderSide.BUY else None,
+                    sell_amount="0.2" if side is OrderSide.SELL else None,
+                    buy_reduce_only=side is OrderSide.BUY,
+                    sell_reduce_only=side is OrderSide.SELL,
+                    state=RuntimeState.RISK_REDUCTION,
+                )
+
+                def quotes(price: str) -> DesiredQuotes:
+                    return self.desired(
+                        bid_price=price if side is OrderSide.BUY else None,
+                        ask_price=price if side is OrderSide.SELL else None,
+                        bid_reduce_only=side is OrderSide.BUY,
+                        ask_reduce_only=side is OrderSide.SELL,
+                        state=RuntimeState.RISK_REDUCTION,
+                    )
+
+                await manager.reconcile(quotes(initial), risk)
+                await manager.reconcile(quotes(more_aggressive), risk)
+                self.adapter.cancel_order.assert_not_awaited()
+
+                self.clock.value += 30
+                await manager.reconcile(quotes(less_aggressive), risk)
+                self.adapter.cancel_order.assert_not_awaited()
+
+                result = await manager.reconcile(
+                    quotes(more_aggressive), risk
+                )
+
+                self.adapter.cancel_order.assert_awaited_once()
+                self.assertEqual(self.adapter.create_order.await_count, 1)
+                self.assertTrue(result.position_refresh_required)
 
     async def test_reprice_defers_replacement_until_after_position_refresh(self) -> None:
         sequence = []
@@ -410,6 +803,19 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.adapter.cancel_order.assert_not_awaited()
+
+    async def test_disabled_exit_side_bypasses_minimum_lifetime(self) -> None:
+        await self.manager.reconcile(self.desired(), self.risk())
+        await self.manager.reconcile(self.desired(), self.risk())
+
+        result = await self.manager.reconcile(
+            self.desired(ask_price=None), self.risk()
+        )
+
+        self.adapter.cancel_order.assert_awaited_once_with("2", "BTC")
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.assertIsNone(self.manager.slots[OrderSide.SELL])
+        self.assertTrue(result.position_refresh_required)
 
     async def test_partial_and_terminal_updates_change_slot(self) -> None:
         await self.manager.reconcile(
@@ -528,6 +934,55 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.actions[0].success)
         self.assertIn("fast-fill", self.manager.known_order_ids)
         self.assertIsNone(self.manager.slots[OrderSide.BUY])
+
+    async def test_partial_reduce_only_remaining_keeps_existing_order(self) -> None:
+        await self.manager.reconcile(
+            self.desired(
+                bid_price=None,
+                ask_price="100.1",
+                ask_amount="0.4",
+                ask_reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+            self.risk(
+                buy_amount=None,
+                sell_amount="0.4",
+                sell_reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+        )
+        await self.manager.handle_order_update(
+            exchange_order(
+                "1",
+                OrderSide.SELL,
+                price="100.1",
+                amount="0.4",
+                remaining="0.2",
+            )
+        )
+
+        await self.manager.reconcile(
+            self.desired(
+                bid_price=None,
+                ask_price="100.1",
+                ask_amount="0.2",
+                ask_reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+            self.risk(
+                buy_amount=None,
+                sell_amount="0.2",
+                sell_reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+        )
+
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+        self.assertEqual(
+            self.manager.slots[OrderSide.SELL].remaining,
+            Decimal("0.2"),
+        )
 
     async def test_matched_post_only_terminal_blocks_create_but_allows_cancel(
         self,

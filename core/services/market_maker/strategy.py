@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Iterable
 
@@ -33,12 +34,42 @@ _OWN_QUOTE_STATES = {
 }
 
 
+@dataclass(frozen=True)
+class SoftExitEconomics:
+    completed_turnover: Decimal
+    completed_net: Decimal
+    open_turnover: Decimal
+    open_net: Decimal
+
+
 def _finite_decimal(value: object, *, positive: bool = False) -> bool:
     return (
         isinstance(value, Decimal)
         and value.is_finite()
         and (not positive or value > 0)
     )
+
+
+def _live_order_violates_exit_limit(
+    orders: Iterable[ManagedOrder],
+    side: OrderSide,
+    limit: Decimal,
+) -> bool:
+    for order in orders:
+        if (
+            order.side is not side
+            or order.state
+            not in {OrderSlotState.LIVE, OrderSlotState.PARTIALLY_FILLED}
+            or order.submission_uncertain
+            or not _finite_decimal(order.price, positive=True)
+            or not _finite_decimal(order.remaining, positive=True)
+        ):
+            continue
+        if side is OrderSide.SELL and order.price < limit:
+            return True
+        if side is OrderSide.BUY and order.price > limit:
+            return True
+    return False
 
 
 def validate_market_snapshot(
@@ -143,6 +174,8 @@ def calculate_external_bbo(
 class MarketMakerStrategy:
     def __init__(self, config: MarketMakerConfig):
         self.config = config
+        self._inventory_sign = 0
+        self._inventory_started_monotonic: float | None = None
 
     def calculate_quotes(
         self,
@@ -153,6 +186,7 @@ class MarketMakerStrategy:
         live_orders: Iterable[ManagedOrder] = (),
         *,
         now_monotonic: float | None = None,
+        soft_exit_economics: SoftExitEconomics | None = None,
     ) -> DesiredQuotes:
         if now_monotonic is None:
             return self._no_quotes(
@@ -166,9 +200,8 @@ class MarketMakerStrategy:
                 stale_after_seconds=self.config.stale_book_seconds,
             )
             self._validate_metadata(market, metadata)
-            external_bid, external_ask = calculate_external_bbo(
-                market, live_orders
-            )
+            orders = tuple(live_orders)
+            external_bid, external_ask = calculate_external_bbo(market, orders)
         except (AttributeError, TypeError, ValueError) as exc:
             return self._no_quotes(RuntimeState.PAUSED_DATA, str(exc))
 
@@ -178,6 +211,31 @@ class MarketMakerStrategy:
         ):
             return self._no_quotes(
                 RuntimeState.PAUSED_POSITION, "position snapshot is invalid"
+            )
+        inventory_age = self._inventory_age_seconds(
+            position.signed_size, now_monotonic
+        )
+        hard_exit_rate = (
+            self.config.maker_fee_rate
+            + self.config.min_completed_net_turnover_bps / _TEN_THOUSAND
+        )
+        soft_exit_active = self._soft_exit_active(
+            position.signed_size, risk, inventory_age
+        )
+        enforce_exit_limit = soft_exit_active or hard_exit_rate > 0
+        if enforce_exit_limit and not -_ONE < hard_exit_rate < _ONE:
+            return self._no_quotes(
+                RuntimeState.PAUSED_ERROR,
+                "fee-aware exit rate must be between -1 and 1",
+            )
+        if (
+            position.signed_size != 0
+            and enforce_exit_limit
+            and not _finite_decimal(position.entry_price, positive=True)
+        ):
+            return self._no_quotes(
+                RuntimeState.PAUSED_POSITION,
+                "non-flat position entry price is invalid",
             )
 
         reference = (external_bid + external_ask) / _TWO
@@ -239,6 +297,53 @@ class MarketMakerStrategy:
                 market.best_bid + metadata.price_tick, metadata.price_tick
             ),
         )
+        cancel_unsafe_bid = False
+        cancel_unsafe_ask = False
+        quote_reason = reason
+        if position.signed_size != 0 and enforce_exit_limit:
+            entry_price = position.entry_price
+            if position.signed_size > 0:
+                hard_exit_limit = ceil_to_step(
+                    entry_price
+                    * (_ONE + hard_exit_rate)
+                    / (_ONE - hard_exit_rate),
+                    metadata.price_tick,
+                )
+                exit_limit = hard_exit_limit
+                if soft_exit_active:
+                    exit_limit, quote_reason = self._soft_exit_limit(
+                        position,
+                        metadata,
+                        soft_exit_economics,
+                        hard_exit_limit,
+                    )
+                ask_price = max(ask_price, exit_limit)
+                cancel_unsafe_ask = _live_order_violates_exit_limit(
+                    orders, OrderSide.SELL, exit_limit
+                )
+            else:
+                hard_exit_limit = floor_to_step(
+                    entry_price
+                    * (_ONE - hard_exit_rate)
+                    / (_ONE + hard_exit_rate),
+                    metadata.price_tick,
+                )
+                exit_limit = hard_exit_limit
+                if soft_exit_active:
+                    exit_limit, quote_reason = self._soft_exit_limit(
+                        position,
+                        metadata,
+                        soft_exit_economics,
+                        hard_exit_limit,
+                    )
+                bid_price = min(bid_price, exit_limit)
+                cancel_unsafe_bid = _live_order_violates_exit_limit(
+                    orders, OrderSide.BUY, exit_limit
+                )
+            if cancel_unsafe_bid or cancel_unsafe_ask:
+                quote_reason = (
+                    f"{quote_reason}; existing quote violates fee-aware exit limit"
+                )
         if bid_price >= ask_price:
             return DesiredQuotes(
                 bid=None,
@@ -251,22 +356,26 @@ class MarketMakerStrategy:
                 reason="invalid post-only boundary",
             )
 
-        bid = self._desired_order(
-            OrderSide.BUY,
-            bid_price,
-            getattr(risk, "buy_amount", None),
-            getattr(risk, "buy_reduce_only", False),
-            metadata,
-            reason,
-        )
-        ask = self._desired_order(
-            OrderSide.SELL,
-            ask_price,
-            getattr(risk, "sell_amount", None),
-            getattr(risk, "sell_reduce_only", False),
-            metadata,
-            reason,
-        )
+        bid = None
+        if not cancel_unsafe_bid:
+            bid = self._desired_order(
+                OrderSide.BUY,
+                bid_price,
+                getattr(risk, "buy_amount", None),
+                getattr(risk, "buy_reduce_only", False),
+                metadata,
+                reason,
+            )
+        ask = None
+        if not cancel_unsafe_ask:
+            ask = self._desired_order(
+                OrderSide.SELL,
+                ask_price,
+                getattr(risk, "sell_amount", None),
+                getattr(risk, "sell_reduce_only", False),
+                metadata,
+                reason,
+            )
         return DesiredQuotes(
             bid=bid,
             ask=ask,
@@ -275,8 +384,142 @@ class MarketMakerStrategy:
             half_spread=half_spread,
             inventory_ratio=inventory_ratio,
             runtime_state=runtime_state,
-            reason=reason,
+            reason=quote_reason,
         )
+
+    def _soft_exit_limit(
+        self,
+        position: PositionSnapshot,
+        metadata: MarketMetadata,
+        economics: SoftExitEconomics | None,
+        hard_exit_limit: Decimal,
+    ) -> tuple[Decimal, str]:
+        if not self._valid_soft_exit_economics(economics):
+            return hard_exit_limit, "soft_exit_hard_fallback"
+
+        minimum_rate = (
+            self.config.min_completed_net_turnover_bps / _TEN_THOUSAND
+        )
+        completed_surplus = max(
+            _ZERO,
+            economics.completed_net
+            - minimum_rate * economics.completed_turnover,
+        )
+        reserve = min(
+            completed_surplus,
+            self.config.soft_exit_surplus_reserve_bps
+            / _TEN_THOUSAND
+            * economics.completed_turnover,
+        )
+        if completed_surplus - reserve <= 0:
+            return hard_exit_limit, "soft_exit_no_surplus"
+
+        amount = abs(position.signed_size)
+        entry_price = position.entry_price
+        fee_rate = self.config.maker_fee_rate
+        soft_rate = (
+            fee_rate
+            + self.config.soft_exit_net_turnover_bps / _TEN_THOUSAND
+        )
+        if not -_ONE < soft_rate < _ONE:
+            return hard_exit_limit, "soft_exit_hard_fallback"
+
+        prior_turnover = (
+            economics.completed_turnover + economics.open_turnover
+        )
+        prior_net = economics.completed_net + economics.open_net
+        if position.signed_size > 0:
+            denominator = amount * (_ONE - fee_rate - minimum_rate)
+            if denominator <= 0:
+                return hard_exit_limit, "soft_exit_hard_fallback"
+            budget_limit = ceil_to_step(
+                (
+                    minimum_rate * prior_turnover
+                    + reserve
+                    - prior_net
+                    + amount * entry_price
+                )
+                / denominator,
+                metadata.price_tick,
+            )
+            soft_limit = ceil_to_step(
+                entry_price * (_ONE + soft_rate) / (_ONE - soft_rate),
+                metadata.price_tick,
+            )
+            exit_limit = max(soft_limit, budget_limit)
+        else:
+            denominator = amount * (_ONE + fee_rate + minimum_rate)
+            if denominator <= 0:
+                return hard_exit_limit, "soft_exit_hard_fallback"
+            budget_limit = floor_to_step(
+                (
+                    prior_net
+                    + amount * entry_price
+                    - minimum_rate * prior_turnover
+                    - reserve
+                )
+                / denominator,
+                metadata.price_tick,
+            )
+            soft_limit = floor_to_step(
+                entry_price * (_ONE - soft_rate) / (_ONE + soft_rate),
+                metadata.price_tick,
+            )
+            exit_limit = min(soft_limit, budget_limit)
+
+        if not _finite_decimal(exit_limit, positive=True):
+            return hard_exit_limit, "soft_exit_hard_fallback"
+        return exit_limit, "soft_exit_active"
+
+    @staticmethod
+    def _valid_soft_exit_economics(
+        economics: SoftExitEconomics | None,
+    ) -> bool:
+        return (
+            isinstance(economics, SoftExitEconomics)
+            and _finite_decimal(economics.completed_turnover, positive=True)
+            and _finite_decimal(economics.completed_net)
+            and _finite_decimal(economics.open_turnover, positive=True)
+            and _finite_decimal(economics.open_net)
+        )
+
+    def _inventory_age_seconds(
+        self, signed_size: Decimal, now_monotonic: float
+    ) -> float:
+        sign = 1 if signed_size > 0 else -1 if signed_size < 0 else 0
+        if sign == 0:
+            self._inventory_sign = 0
+            self._inventory_started_monotonic = None
+            return 0.0
+        if (
+            self._inventory_started_monotonic is None
+            or sign != self._inventory_sign
+            or now_monotonic < self._inventory_started_monotonic
+        ):
+            self._inventory_sign = sign
+            self._inventory_started_monotonic = now_monotonic
+            return 0.0
+        return now_monotonic - self._inventory_started_monotonic
+
+    def _soft_exit_active(
+        self,
+        signed_size: Decimal,
+        risk: RiskDecision,
+        inventory_age: float,
+    ) -> bool:
+        if (
+            self.config.soft_exit_after_seconds <= 0
+            or inventory_age < self.config.soft_exit_after_seconds
+            or getattr(risk, "safe", False) is not True
+            or getattr(risk, "runtime_state", None)
+            is not RuntimeState.RISK_REDUCTION
+        ):
+            return False
+        if signed_size > 0:
+            return getattr(risk, "sell_reduce_only", False) is True
+        if signed_size < 0:
+            return getattr(risk, "buy_reduce_only", False) is True
+        return False
 
     def _validate_metadata(
         self, market: MarketSnapshot, metadata: MarketMetadata

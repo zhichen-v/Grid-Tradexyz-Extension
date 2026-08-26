@@ -61,6 +61,7 @@ class MarketMakerMetrics:
     reservation_price: Decimal | None = None
     target_bid: Decimal | None = None
     target_ask: Decimal | None = None
+    quote_reason: str | None = None
     live_bid: Decimal | None = None
     live_ask: Decimal | None = None
     live_buy_remaining: Decimal = Decimal("0")
@@ -126,6 +127,7 @@ class MarketMakerMetrics:
             "reservation_price": self.reservation_price,
             "target_bid": self.target_bid,
             "target_ask": self.target_ask,
+            "quote_reason": self.quote_reason,
             "live_bid": self.live_bid,
             "live_ask": self.live_ask,
             "live_buy_remaining": self.live_buy_remaining,

@@ -426,11 +426,18 @@ class MarketMakerOrderManager:
                 )
 
             # Risk-reducing creates have priority over risk-increasing creates.
+            # For ordinary two-sided quotes, spend scarce mutation budget on
+            # the inventory-reducing side first. Flat inventory keeps BUY-first.
+            preferred_side = (
+                OrderSide.SELL
+                if risk.inventory_ratio > 0
+                else OrderSide.BUY
+            )
             placements = sorted(
                 desired_by_side.items(),
                 key=lambda item: (
                     item[1] is None or not item[1].reduce_only,
-                    item[0] is OrderSide.SELL,
+                    item[0] is not preferred_side,
                 ),
             )
             for side, target in placements:
@@ -1091,6 +1098,17 @@ class MarketMakerOrderManager:
     def _validate_desired(
         self, desired: DesiredOrder, risk: RiskDecision
     ) -> str | None:
+        if (
+            not desired.amount.is_finite()
+            or not desired.price.is_finite()
+            or desired.amount <= 0
+            or desired.price <= 0
+            or not is_step_aligned(
+                desired.amount, self.metadata.quantity_step
+            )
+            or not is_step_aligned(desired.price, self.metadata.price_tick)
+        ):
+            return f"{desired.side.value} desired price/amount is invalid"
         expected_amount = (
             risk.buy_amount
             if desired.side is OrderSide.BUY
@@ -1103,19 +1121,11 @@ class MarketMakerOrderManager:
         )
         if expected_amount is None or desired.amount > expected_amount:
             return f"{desired.side.value} desired amount exceeds risk decision"
-        if desired.reduce_only != expected_reduce_only:
+        if desired.reduce_only is not expected_reduce_only:
             return f"{desired.side.value} reduce_only conflicts with risk decision"
         if (
-            not desired.amount.is_finite()
-            or not desired.price.is_finite()
-            or desired.amount <= 0
-            or desired.price <= 0
-            or desired.amount < self.metadata.min_base_amount
+            desired.amount < self.metadata.min_base_amount
             or desired.amount * desired.price < self.metadata.min_quote_amount
-            or not is_step_aligned(
-                desired.amount, self.metadata.quantity_step
-            )
-            or not is_step_aligned(desired.price, self.metadata.price_tick)
         ):
             return f"{desired.side.value} desired price/amount is invalid"
         return None
@@ -1128,6 +1138,22 @@ class MarketMakerOrderManager:
     ) -> str | None:
         if self._is_safety_replacement(live, desired, risk):
             return "live order no longer matches risk"
+        if (
+            risk.runtime_state is RuntimeState.RISK_REDUCTION
+            and live.reduce_only
+            and desired.reduce_only
+            and (
+                (
+                    live.side is OrderSide.BUY
+                    and desired.price > live.price
+                )
+                or (
+                    live.side is OrderSide.SELL
+                    and desired.price < live.price
+                )
+            )
+        ):
+            return "risk-reducing quote became more aggressive"
         threshold = (
             self.metadata.price_tick
             * Decimal(self.config.reprice_threshold_ticks)

@@ -60,6 +60,9 @@ class RiskDecision:
 class RiskManager:
     def __init__(self, config: MarketMakerConfig):
         self.config = config
+        self._inventory_sign = 0
+        self._inventory_started_monotonic: float | None = None
+        self._soft_exit_latched = False
 
     def evaluate(
         self,
@@ -113,6 +116,9 @@ class RiskManager:
                 position=position.signed_size,
                 inventory_ratio=inventory_ratio,
             )
+        inventory_age = self._inventory_age_seconds(
+            position.signed_size, now
+        )
         if (
             not _finite_decimal(metadata.quantity_step)
             or metadata.quantity_step <= 0
@@ -188,23 +194,45 @@ class RiskManager:
         reason = "normal inventory"
         state = RuntimeState.ACTIVE
 
-        if absolute_ratio >= self.config.hard_position_ratio:
+        residual_position = (
+            _ZERO < abs(position.signed_size) < self.config.order_size
+        )
+        normal_reduction = (
+            residual_position
+            or absolute_ratio >= self.config.hard_position_ratio
+        )
+        if (
+            not self._soft_exit_latched
+            and self.config.soft_exit_after_seconds > 0
+            and inventory_age >= self.config.soft_exit_after_seconds
+            and position.signed_size != _ZERO
+        ):
+            self._soft_exit_latched = True
+        if normal_reduction or self._soft_exit_latched:
             state = RuntimeState.RISK_REDUCTION
             reason = (
-                "absolute position limit reached"
-                if abs(position.signed_size) >= self.config.max_position
-                else "hard inventory limit reached"
+                "soft exit latched until flat"
+                if self._soft_exit_latched
+                else (
+                    "sub-order residual position"
+                    if residual_position
+                    else (
+                        "absolute position limit reached"
+                        if abs(position.signed_size) >= self.config.max_position
+                        else "hard inventory limit reached"
+                    )
+                    )
+                )
+            reduction_amount = max(
+                self.config.order_size,
+                abs(position.signed_size),
             )
             if position.signed_size > 0:
                 requested_buy = None
-                requested_sell = min(
-                    self.config.order_size, abs(position.signed_size)
-                )
+                requested_sell = reduction_amount
                 sell_reduce_only = True
             else:
-                requested_buy = min(
-                    self.config.order_size, abs(position.signed_size)
-                )
+                requested_buy = reduction_amount
                 requested_sell = None
                 buy_reduce_only = True
         else:
@@ -265,6 +293,25 @@ class RiskManager:
             reason=reason,
             safe=True,
         )
+
+    def _inventory_age_seconds(
+        self, signed_size: Decimal, now_monotonic: float
+    ) -> float:
+        sign = 1 if signed_size > 0 else -1 if signed_size < 0 else 0
+        if sign == 0:
+            self._inventory_sign = 0
+            self._inventory_started_monotonic = None
+            self._soft_exit_latched = False
+            return 0.0
+        if (
+            self._inventory_started_monotonic is None
+            or sign != self._inventory_sign
+            or now_monotonic < self._inventory_started_monotonic
+        ):
+            self._inventory_sign = sign
+            self._inventory_started_monotonic = now_monotonic
+            return 0.0
+        return now_monotonic - self._inventory_started_monotonic
 
     @staticmethod
     def _live_exposure(
