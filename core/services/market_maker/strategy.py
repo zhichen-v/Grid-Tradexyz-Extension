@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Iterable
@@ -174,8 +175,8 @@ def calculate_external_bbo(
 class MarketMakerStrategy:
     def __init__(self, config: MarketMakerConfig):
         self.config = config
-        self._inventory_sign = 0
-        self._inventory_started_monotonic: float | None = None
+        self._trend_samples: deque[tuple[float, Decimal]] = deque()
+        self._trend_direction = 0
 
     def calculate_quotes(
         self,
@@ -212,16 +213,11 @@ class MarketMakerStrategy:
             return self._no_quotes(
                 RuntimeState.PAUSED_POSITION, "position snapshot is invalid"
             )
-        inventory_age = self._inventory_age_seconds(
-            position.signed_size, now_monotonic
-        )
         hard_exit_rate = (
             self.config.maker_fee_rate
             + self.config.min_completed_net_turnover_bps / _TEN_THOUSAND
         )
-        soft_exit_active = self._soft_exit_active(
-            position.signed_size, risk, inventory_age
-        )
+        soft_exit_active = self._soft_exit_active(position.signed_size, risk)
         enforce_exit_limit = soft_exit_active or hard_exit_rate > 0
         if enforce_exit_limit and not -_ONE < hard_exit_rate < _ONE:
             return self._no_quotes(
@@ -285,6 +281,14 @@ class MarketMakerStrategy:
                 reason=reason,
             )
 
+        block_bid, block_ask, trend_reason = self._trend_guard(
+            reference,
+            metadata.price_tick,
+            position.signed_size,
+            market.received_monotonic,
+            risk,
+        )
+
         bid_price = min(
             floor_to_step(reservation - half_spread, metadata.price_tick),
             floor_to_step(
@@ -344,6 +348,12 @@ class MarketMakerStrategy:
                 quote_reason = (
                     f"{quote_reason}; existing quote violates fee-aware exit limit"
                 )
+        if trend_reason is not None:
+            quote_reason = (
+                trend_reason
+                if quote_reason == reason
+                else f"{quote_reason}; {trend_reason}"
+            )
         if bid_price >= ask_price:
             return DesiredQuotes(
                 bid=None,
@@ -357,7 +367,7 @@ class MarketMakerStrategy:
             )
 
         bid = None
-        if not cancel_unsafe_bid:
+        if not cancel_unsafe_bid and not block_bid:
             bid = self._desired_order(
                 OrderSide.BUY,
                 bid_price,
@@ -367,7 +377,7 @@ class MarketMakerStrategy:
                 reason,
             )
         ask = None
-        if not cancel_unsafe_ask:
+        if not cancel_unsafe_ask and not block_ask:
             ask = self._desired_order(
                 OrderSide.SELL,
                 ask_price,
@@ -395,6 +405,16 @@ class MarketMakerStrategy:
         hard_exit_limit: Decimal,
     ) -> tuple[Decimal, str]:
         if not self._valid_soft_exit_economics(economics):
+            return hard_exit_limit, "soft_exit_hard_fallback"
+
+        if self.config.max_session_loss_for_maker_exit > 0:
+            return self._session_loss_exit_limit(
+                position,
+                metadata,
+                economics,
+                hard_exit_limit,
+            )
+        if economics.completed_turnover <= 0:
             return hard_exit_limit, "soft_exit_hard_fallback"
 
         minimum_rate = (
@@ -471,45 +491,129 @@ class MarketMakerStrategy:
             return hard_exit_limit, "soft_exit_hard_fallback"
         return exit_limit, "soft_exit_active"
 
+    def _session_loss_exit_limit(
+        self,
+        position: PositionSnapshot,
+        metadata: MarketMetadata,
+        economics: SoftExitEconomics,
+        hard_exit_limit: Decimal,
+    ) -> tuple[Decimal, str]:
+        amount = abs(position.signed_size)
+        entry_price = position.entry_price
+        fee_rate = self.config.maker_fee_rate
+        prior_net = economics.completed_net + economics.open_net
+        loss_budget = self.config.max_session_loss_for_maker_exit
+
+        if position.signed_size > 0:
+            denominator = amount * (_ONE - fee_rate)
+            if denominator <= 0:
+                return hard_exit_limit, "soft_exit_hard_fallback"
+            exit_limit = ceil_to_step(
+                (amount * entry_price - prior_net - loss_budget)
+                / denominator,
+                metadata.price_tick,
+            )
+        else:
+            denominator = amount * (_ONE + fee_rate)
+            if denominator <= 0:
+                return hard_exit_limit, "soft_exit_hard_fallback"
+            exit_limit = floor_to_step(
+                (prior_net + amount * entry_price + loss_budget)
+                / denominator,
+                metadata.price_tick,
+            )
+
+        if not _finite_decimal(exit_limit, positive=True):
+            return hard_exit_limit, "soft_exit_hard_fallback"
+        return exit_limit, "session_loss_maker_exit_active"
+
     @staticmethod
     def _valid_soft_exit_economics(
         economics: SoftExitEconomics | None,
     ) -> bool:
         return (
             isinstance(economics, SoftExitEconomics)
-            and _finite_decimal(economics.completed_turnover, positive=True)
+            and _finite_decimal(economics.completed_turnover)
+            and economics.completed_turnover >= 0
             and _finite_decimal(economics.completed_net)
             and _finite_decimal(economics.open_turnover, positive=True)
             and _finite_decimal(economics.open_net)
         )
 
-    def _inventory_age_seconds(
-        self, signed_size: Decimal, now_monotonic: float
-    ) -> float:
-        sign = 1 if signed_size > 0 else -1 if signed_size < 0 else 0
-        if sign == 0:
-            self._inventory_sign = 0
-            self._inventory_started_monotonic = None
-            return 0.0
+    def _trend_guard(
+        self,
+        reference: Decimal,
+        price_tick: Decimal,
+        signed_size: Decimal,
+        sample_monotonic: float,
+        risk: RiskDecision,
+    ) -> tuple[bool, bool, str | None]:
+        window = self.config.trend_guard_window_seconds
+        if window <= 0:
+            return False, False, None
+
+        if self._trend_samples:
+            gap = sample_monotonic - self._trend_samples[-1][0]
+            if gap < 0 or gap > window:
+                self._trend_samples.clear()
+                self._trend_direction = 0
         if (
-            self._inventory_started_monotonic is None
-            or sign != self._inventory_sign
-            or now_monotonic < self._inventory_started_monotonic
+            self._trend_samples
+            and sample_monotonic == self._trend_samples[-1][0]
         ):
-            self._inventory_sign = sign
-            self._inventory_started_monotonic = now_monotonic
-            return 0.0
-        return now_monotonic - self._inventory_started_monotonic
+            self._trend_samples[-1] = (sample_monotonic, reference)
+        else:
+            self._trend_samples.append((sample_monotonic, reference))
+
+        cutoff = sample_monotonic - window
+        while (
+            len(self._trend_samples) > 1
+            and self._trend_samples[1][0] <= cutoff
+        ):
+            self._trend_samples.popleft()
+        if sample_monotonic - self._trend_samples[0][0] < window:
+            self._trend_direction = 0
+            return False, False, None
+
+        delta_ticks = (
+            reference - self._trend_samples[0][1]
+        ) / price_tick
+        threshold = Decimal(self.config.trend_guard_threshold_ticks)
+        if delta_ticks >= threshold:
+            self._trend_direction = 1
+        elif delta_ticks <= -threshold:
+            self._trend_direction = -1
+        elif (
+            self._trend_direction > 0
+            and delta_ticks <= threshold / _TWO
+        ) or (
+            self._trend_direction < 0
+            and delta_ticks >= -threshold / _TWO
+        ):
+            self._trend_direction = 0
+
+        if (
+            self._trend_direction > 0
+            and signed_size <= 0
+            and getattr(risk, "sell_reduce_only", False) is not True
+        ):
+            return False, True, "trend_guard_rising_block_ask"
+        if (
+            self._trend_direction < 0
+            and signed_size >= 0
+            and getattr(risk, "buy_reduce_only", False) is not True
+        ):
+            return True, False, "trend_guard_falling_block_bid"
+        return False, False, None
 
     def _soft_exit_active(
         self,
         signed_size: Decimal,
         risk: RiskDecision,
-        inventory_age: float,
     ) -> bool:
         if (
             self.config.soft_exit_after_seconds <= 0
-            or inventory_age < self.config.soft_exit_after_seconds
+            or getattr(risk, "soft_exit_latched", False) is not True
             or getattr(risk, "safe", False) is not True
             or getattr(risk, "runtime_state", None)
             is not RuntimeState.RISK_REDUCTION

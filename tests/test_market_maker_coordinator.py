@@ -28,6 +28,7 @@ from core.services.market_maker.models import (
 from core.services.market_maker.order_manager import (
     MarketMakerOrderManager,
     ReconcileAction,
+    ReconcileResult,
 )
 from core.services.market_maker.risk_manager import RiskDecision
 from core.services.market_maker.strategy import SoftExitEconomics
@@ -99,6 +100,9 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "ledger_position": Decimal("0.2"),
             "completed_turnover": Decimal("100"),
             "completed_net_ex_funding": Decimal("0.003"),
+            "completed_fills": 2,
+            "last_flat_equity_change": Decimal("0.003"),
+            "last_flat_completed_fills": 2,
             "open_episode_turnover": Decimal("20"),
             "open_episode_net_ex_funding": Decimal("-0.0024"),
         }
@@ -281,6 +285,119 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    def test_loss_budget_accepts_trusted_first_episode_without_surplus(
+        self,
+    ) -> None:
+        config = self.config(
+            account_audit_interval_seconds=15,
+            max_session_drawdown=Decimal("0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.1"),
+            require_flat_start=True,
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            min_completed_net_turnover_bps=Decimal("0.1"),
+        )
+        coordinator = self.coordinator(config=config)
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(
+                return_value=self.soft_exit_snapshot(
+                    completed_turnover=Decimal("0"),
+                    completed_net_ex_funding=Decimal("0"),
+                    completed_fills=0,
+                    last_flat_completed_fills=0,
+                )
+            )
+        )
+
+        self.assertEqual(
+            coordinator._trusted_soft_exit_economics(self.now),
+            SoftExitEconomics(
+                completed_turnover=Decimal("0"),
+                completed_net=Decimal("0"),
+                open_turnover=Decimal("20"),
+                open_net=Decimal("-0.0024"),
+            ),
+        )
+
+        coordinator.config = replace(
+            config, max_session_loss_for_maker_exit=Decimal("0")
+        )
+        self.assertIsNone(coordinator._trusted_soft_exit_economics(self.now))
+
+    def test_loss_budget_rejects_stale_flat_equity_generation(self) -> None:
+        coordinator = self.coordinator(
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                max_session_loss_for_maker_exit=Decimal("0.1"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                soft_exit_net_turnover_bps=Decimal("-0.5"),
+            )
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(
+                return_value=self.soft_exit_snapshot(
+                    completed_fills=4,
+                    last_flat_completed_fills=2,
+                )
+            )
+        )
+
+        self.assertIsNone(coordinator._trusted_soft_exit_economics(self.now))
+
+    def test_loss_budget_uses_worse_prior_flat_equity_evidence(self) -> None:
+        coordinator = self.coordinator(
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                max_session_loss_for_maker_exit=Decimal("0.1"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                soft_exit_net_turnover_bps=Decimal("-0.5"),
+            )
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(
+                return_value=self.soft_exit_snapshot(
+                    completed_net_ex_funding=Decimal("0.05"),
+                    last_flat_equity_change=Decimal("-0.09"),
+                )
+            )
+        )
+
+        economics = coordinator._trusted_soft_exit_economics(self.now)
+
+        self.assertIsNotNone(economics)
+        self.assertEqual(economics.completed_net, Decimal("-0.09"))
+
+    def test_loss_budget_rejects_missing_flat_equity_evidence(self) -> None:
+        coordinator = self.coordinator(
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                max_session_loss_for_maker_exit=Decimal("0.1"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                soft_exit_net_turnover_bps=Decimal("-0.5"),
+            )
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        snapshot = self.soft_exit_snapshot()
+        snapshot.pop("last_flat_equity_change")
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(return_value=snapshot)
+        )
+
+        self.assertIsNone(coordinator._trusted_soft_exit_economics(self.now))
+
     def test_soft_exit_economics_fails_closed_on_untrusted_prerequisites(
         self,
     ) -> None:
@@ -438,6 +555,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             audit=AsyncMock(),
             snapshot=Mock(return_value=self.soft_exit_snapshot()),
         )
+        coordinator.order_manager.handle_order_update.side_effect = [True, True]
         sell_fill = replace(
             self.order("sell-fill", filled="0.1"),
             side=OrderSide.SELL,
@@ -468,6 +586,84 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIsInstance(economics, SoftExitEconomics)
         self.assertEqual(economics.completed_net, Decimal("0.003"))
+
+    async def test_reconcile_fill_invalidates_same_position_audit(self) -> None:
+        adapter = self.adapter()
+        adapter.get_positions.return_value = [
+            self.position(signed_size=Decimal("0.2"))
+        ]
+        manager = self.order_manager()
+        manager.reconcile.return_value = ReconcileResult(
+            (),
+            RuntimeState.ACTIVE,
+            position_refresh_required=True,
+            fill_observed=True,
+        )
+        coordinator = self.prepare_running(
+            adapter=adapter,
+            order_manager=manager,
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                min_completed_net_turnover_bps=Decimal("0.1"),
+                soft_exit_surplus_reserve_bps=Decimal("0.02"),
+            ),
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.soft_exit_snapshot())
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(
+            coordinator.position_snapshot.signed_size, Decimal("0.2")
+        )
+        self.assertEqual(coordinator._processed_fill_generation, 1)
+        self.assertEqual(coordinator._audited_fill_generation, 0)
+        self.assertIsNone(coordinator._trusted_soft_exit_economics(self.now))
+
+    async def test_reprice_refresh_without_fill_keeps_audit_trusted(self) -> None:
+        adapter = self.adapter()
+        adapter.get_positions.return_value = [
+            self.position(signed_size=Decimal("0.2"))
+        ]
+        manager = self.order_manager()
+        manager.reconcile.return_value = ReconcileResult(
+            (),
+            RuntimeState.ACTIVE,
+            position_refresh_required=True,
+            fill_observed=False,
+        )
+        coordinator = self.prepare_running(
+            adapter=adapter,
+            order_manager=manager,
+            config=self.config(
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+                soft_exit_after_seconds=120,
+                min_completed_net_turnover_bps=Decimal("0.1"),
+                soft_exit_surplus_reserve_bps=Decimal("0.02"),
+            ),
+        )
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._account_monitor_initialized = True
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.soft_exit_snapshot())
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(coordinator._processed_fill_generation, 0)
+        self.assertEqual(coordinator._audited_fill_generation, 0)
+        self.assertIsInstance(
+            coordinator._trusted_soft_exit_economics(self.now),
+            SoftExitEconomics,
+        )
 
     async def test_startup_loads_data_subscribes_then_becomes_active(self) -> None:
         adapter = self.adapter()
@@ -2023,6 +2219,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_account_audit_failure_stops_main_and_runs_cleanup(self) -> None:
         adapter = self.adapter()
         manager = self.order_manager()
+        manager.known_order_ids = frozenset({"resting"})
         monitor = SimpleNamespace(
             audit=AsyncMock(side_effect=RuntimeError("account hard stop")),
             snapshot=Mock(
@@ -2047,6 +2244,10 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(coordinator.running)
         self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
         self.assertEqual(coordinator.metrics.account_audit["state"], "hard_stop")
+        self.assertEqual(
+            [item.args for item in monitor.audit.await_args_list],
+            [({"resting"},), ({"resting"},)],
+        )
         manager.shutdown.assert_awaited_once()
         adapter.unsubscribe.assert_awaited_once()
         adapter.disconnect.assert_awaited_once()
@@ -2071,6 +2272,49 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.audit_account_once()
 
         monitor.audit.assert_awaited_once_with({"reconciled-order"})
+
+    async def test_dry_run_cycle_waits_for_account_audit_then_resumes(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"resting"})
+
+        async def audit(managed_order_ids):
+            self.assertEqual(managed_order_ids, {"resting"})
+            entered.set()
+            await release.wait()
+
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=audit),
+            snapshot=Mock(return_value={"state": "healthy"}),
+        )
+        coordinator = self.prepare_running(
+            order_manager=manager,
+            config=self.config(
+                dry_run=True,
+                account_audit_interval_seconds=15,
+                account_audit_timeout_seconds=15,
+                max_session_drawdown=Decimal("1"),
+                require_flat_start=True,
+            ),
+        )
+        coordinator.account_monitor = monitor
+
+        audit_task = asyncio.create_task(coordinator.audit_account_once())
+        await entered.wait()
+        cycle_task = asyncio.create_task(coordinator.run_one_cycle(force=True))
+        await asyncio.sleep(0)
+
+        manager.reconcile.assert_not_awaited()
+        manager.cancel_managed_orders.assert_not_awaited()
+
+        release.set()
+        await asyncio.gather(audit_task, cycle_task)
+
+        manager.reconcile.assert_awaited_once()
+        manager.cancel_managed_orders.assert_not_awaited()
+        self.assertTrue(coordinator.running)
+        self.assertEqual(coordinator.state, RuntimeState.ACTIVE)
 
     async def test_account_audit_timeout_marks_hard_stop(self) -> None:
         monitor = SimpleNamespace(
@@ -2272,6 +2516,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
         manager = self.order_manager()
+        manager.handle_order_update.return_value = True
         coordinator = self.prepare_running(
             adapter=adapter, order_manager=manager
         )
@@ -2286,6 +2531,43 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             coordinator.metrics.counters["position_refresh_after_order_update"],
             1,
         )
+
+    async def test_duplicate_full_fill_callback_is_counted_once(self) -> None:
+        adapter = self.adapter()
+        manager = self.order_manager()
+        manager.handle_order_update.side_effect = [True, False]
+        coordinator = self.prepare_running(
+            adapter=adapter, order_manager=manager
+        )
+        fill = replace(
+            self.order("filled", filled="0.2"),
+            status=OrderStatus.FILLED,
+        )
+
+        await coordinator.on_order_update(fill)
+        await coordinator.on_order_update(fill)
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(coordinator._processed_fill_generation, 1)
+        self.assertEqual(coordinator.metrics.counters["full_fills"], 1)
+        self.assertEqual(coordinator.metrics.counters["partial_fills"], 0)
+        adapter.get_positions.assert_awaited_once_with(["BTC"])
+
+    async def test_unproven_full_fill_callback_is_not_counted(self) -> None:
+        manager = self.order_manager()
+        manager.handle_order_update.return_value = False
+        coordinator = self.prepare_running(order_manager=manager)
+        fill = replace(
+            self.order("unknown-fill", filled="0.2"),
+            status=OrderStatus.FILLED,
+        )
+
+        await coordinator.on_order_update(fill)
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(coordinator._processed_fill_generation, 0)
+        self.assertEqual(coordinator.metrics.counters["full_fills"], 0)
+        self.assertEqual(coordinator.metrics.counters["partial_fills"], 0)
 
     async def test_reconcile_visible_fill_refreshes_position(self) -> None:
         adapter = self.adapter()
@@ -2533,7 +2815,10 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(coordinator._pending_orders)
 
     async def test_metrics_capture_market_quote_and_exposure(self) -> None:
-        coordinator = self.prepare_running()
+        manager = self.order_manager()
+        manager.unresolved_cancellation_count = 1
+        manager.resolved_ambiguous_cancellations = 2
+        coordinator = self.prepare_running(order_manager=manager)
 
         await coordinator.run_one_cycle(force=True)
         snapshot = await coordinator.emit_status_once()
@@ -2547,6 +2832,10 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["quote_reason"], "normal")
         self.assertEqual(snapshot["max_position_utilization"], Decimal("0.2"))
         self.assertEqual(snapshot["counters"]["reconciliation_success"], 1)
+        self.assertEqual(snapshot["counters"]["unresolved_cancellations"], 1)
+        self.assertEqual(
+            snapshot["counters"]["resolved_ambiguous_cancellations"], 2
+        )
 
     async def test_paused_status_uses_current_position_and_live_orders(
         self,
@@ -2614,6 +2903,33 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.run_one_cycle(force=True)
         coordinator.order_manager.reconcile.assert_awaited_once()
         coordinator.order_manager.cancel_managed_orders.assert_awaited_once()
+
+    async def test_definitive_not_sent_action_is_retryable_not_reconcile_failure(
+        self,
+    ) -> None:
+        coordinator = self.prepare_running()
+        coordinator.order_manager.reconcile.return_value = SimpleNamespace(
+            actions=(
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "place",
+                    "DNS resolution failed before send",
+                    success=False,
+                ),
+            ),
+            errors=(),
+            runtime_state=RuntimeState.ACTIVE,
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        counters = coordinator.metrics.counters
+        self.assertEqual(counters["create_attempts"], 1)
+        self.assertEqual(counters["create_success"], 0)
+        self.assertEqual(counters["ambiguous_submissions"], 0)
+        self.assertEqual(counters["reconciliation_failure"], 0)
+        self.assertEqual(counters["reconciliation_success"], 1)
+        self.assertEqual(coordinator.state, RuntimeState.ACTIVE)
 
     async def test_fail_closed_cancel_records_exact_action_metrics(self) -> None:
         manager = self.order_manager()

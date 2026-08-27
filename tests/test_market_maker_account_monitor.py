@@ -157,6 +157,256 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(snapshot["maker_fills_per_wall_hour"], Decimal("8"))
 
+    async def test_bounded_session_loss_recovers_to_full_economic_go(self):
+        config = self.config(
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.10"),
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        first_round = [
+            trade("1", "buy-1", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade(
+                "2",
+                "sell-1",
+                OrderSide.SELL,
+                "0.2",
+                "100",
+                "0",
+                timestamp=2,
+            ),
+        ]
+        adapter.get_account_trades.return_value = first_round
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("299.976"))
+        ]
+
+        await monitor.audit({"buy-1", "sell-1", "buy-2", "sell-2"})
+
+        recovering = monitor.snapshot(self.now)
+        self.assertEqual(
+            recovering["economic_state"], "bounded_economic_recovery"
+        )
+        self.assertEqual(
+            recovering["session_loss_for_maker_exit"], Decimal("0.024")
+        )
+        self.assertEqual(
+            recovering["remaining_session_loss_for_maker_exit"],
+            Decimal("0.076"),
+        )
+        self.assertEqual(monitor.state, "healthy")
+
+        adapter.get_account_trades.return_value = [
+            *first_round,
+            trade("3", "buy-2", OrderSide.BUY, "0.2", "100", "0", timestamp=3),
+            trade(
+                "4",
+                "sell-2",
+                OrderSide.SELL,
+                "0.2",
+                "100",
+                "0.08",
+                timestamp=4,
+            ),
+        ]
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("300.032"))
+        ]
+
+        await monitor.audit({"buy-1", "sell-1", "buy-2", "sell-2"})
+
+        recovered = monitor.snapshot(self.now)
+        self.assertEqual(
+            recovered["economic_state"], "fee_and_equity_gate_go"
+        )
+        self.assertEqual(recovered["completed_net_ex_funding"], Decimal("0.032"))
+        self.assertEqual(recovered["session_loss_for_maker_exit"], Decimal("0"))
+
+    async def test_bounded_session_loss_exact_limit_is_allowed_but_excess_stops(
+        self,
+    ) -> None:
+        fills = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade(
+                "2",
+                "sell",
+                OrderSide.SELL,
+                "0.2",
+                "100",
+                "0",
+                timestamp=2,
+            ),
+        ]
+        for budget, should_stop in (
+            (Decimal("0.024"), False),
+            (Decimal("0.023999"), True),
+        ):
+            with self.subTest(budget=budget):
+                config = self.config(
+                    soft_exit_after_seconds=120,
+                    soft_exit_net_turnover_bps=Decimal("-0.5"),
+                    max_session_loss_for_maker_exit=budget,
+                )
+                adapter = self.adapter(equity="299.976")
+                monitor = self.monitor(adapter, config)
+                await monitor.initialize()
+                adapter.get_account_trades.return_value = fills
+                if should_stop:
+                    with self.assertRaisesRegex(
+                        AccountAuditError, "session loss exceeded"
+                    ):
+                        await monitor.audit({"buy", "sell"})
+                    self.assertEqual(monitor.state, "hard_stop")
+                else:
+                    await monitor.audit({"buy", "sell"})
+                    self.assertEqual(
+                        monitor.economics.economic_state,
+                        "bounded_economic_recovery",
+                    )
+
+    async def test_bounded_session_loss_uses_worse_flat_equity_evidence(self):
+        config = self.config(
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.10"),
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("299.89"))
+        ]
+        adapter.get_account_trades.return_value = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade(
+                "2",
+                "sell",
+                OrderSide.SELL,
+                "0.2",
+                "100",
+                "0.03",
+                timestamp=2,
+            ),
+        ]
+
+        with self.assertRaisesRegex(AccountAuditError, "session loss exceeded"):
+            await monitor.audit({"buy", "sell"})
+
+        self.assertEqual(
+            monitor.economics.session_loss_for_maker_exit, Decimal("0.11")
+        )
+
+    async def test_flat_equity_loss_remains_reserved_during_next_episode(self):
+        config = self.config(
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.10"),
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        completed = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade(
+                "2",
+                "sell",
+                OrderSide.SELL,
+                "0.2",
+                "100",
+                "0.074",
+                timestamp=2,
+            ),
+        ]
+        adapter.get_account_trades.return_value = completed
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("299.91"))
+        ]
+
+        await monitor.audit({"buy", "sell", "next-buy"})
+
+        flat = monitor.snapshot(self.now)
+        self.assertEqual(flat["completed_net_ex_funding"], Decimal("0.050"))
+        self.assertEqual(flat["last_flat_equity_change"], Decimal("-0.09"))
+        self.assertEqual(flat["session_loss_for_maker_exit"], Decimal("0.09"))
+        self.assertEqual(
+            flat["remaining_session_loss_for_maker_exit"], Decimal("0.01")
+        )
+
+        adapter.get_account_trades.return_value = [
+            *completed,
+            trade(
+                "3",
+                "next-buy",
+                OrderSide.BUY,
+                "0.2",
+                "20",
+                "0",
+                timestamp=3,
+            ),
+        ]
+        adapter.get_positions.return_value = [
+            position("0.2", PositionSide.LONG)
+        ]
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("299.80"))
+        ]
+
+        await monitor.audit({"buy", "sell", "next-buy"})
+
+        nonflat = monitor.snapshot(self.now)
+        self.assertEqual(
+            nonflat["last_flat_equity_change"], Decimal("-0.09")
+        )
+        self.assertEqual(
+            nonflat["session_loss_for_maker_exit"], Decimal("0.09")
+        )
+        self.assertEqual(
+            nonflat["remaining_session_loss_for_maker_exit"], Decimal("0.01")
+        )
+
+    async def test_coalesced_close_and_reopen_marks_flat_evidence_stale(self):
+        config = self.config(
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.10"),
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        adapter.get_account_trades.return_value = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade(
+                "2",
+                "sell",
+                OrderSide.SELL,
+                "0.2",
+                "100",
+                "0.074",
+                timestamp=2,
+            ),
+            trade(
+                "3",
+                "next-buy",
+                OrderSide.BUY,
+                "0.2",
+                "20",
+                "0",
+                timestamp=3,
+            ),
+        ]
+        adapter.get_positions.return_value = [
+            position("0.2", PositionSide.LONG)
+        ]
+
+        await monitor.audit({"buy", "sell", "next-buy"})
+
+        snapshot = monitor.snapshot(self.now)
+        self.assertEqual(snapshot["completed_fills"], 2)
+        self.assertEqual(snapshot["last_flat_completed_fills"], 0)
+        self.assertIsNone(snapshot["flat_equity_change"])
+
     async def test_opening_fill_remains_incomplete_without_false_no_go(self):
         adapter = self.adapter()
         monitor = self.monitor(adapter)
@@ -683,7 +933,7 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(monitor.total_read_failures, 1)
         self.assertEqual(monitor.state, "healthy")
 
-    async def test_four_transient_read_faults_recover_on_fifth_attempt(self):
+    async def test_five_transient_read_faults_recover_on_sixth_attempt(self):
         adapter = self.adapter()
         monitor = self.monitor(adapter)
         await monitor.initialize()
@@ -694,28 +944,35 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         monitor._sleep = record_sleep
         adapter.get_open_orders.side_effect = [
-            OSError("gateway") for _ in range(4)
+            OSError("gateway") for _ in range(5)
         ] + [[]]
 
         await monitor.audit(set())
 
-        self.assertEqual(adapter.get_open_orders.await_count, 6)
-        self.assertEqual(monitor.total_read_failures, 4)
+        self.assertEqual(adapter.get_open_orders.await_count, 7)
+        self.assertEqual(monitor.total_read_failures, 5)
         self.assertEqual(monitor.state, "healthy")
-        self.assertEqual(sleeps, [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(sleeps, [1.0, 1.0, 1.0, 1.0, 1.0])
 
-    async def test_persistent_read_fault_hard_stops_after_five_attempts(self):
+    async def test_persistent_read_fault_hard_stops_after_six_attempts(self):
         adapter = self.adapter()
         monitor = self.monitor(adapter)
         await monitor.initialize()
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds):
+            sleeps.append(seconds)
+
+        monitor._sleep = record_sleep
         adapter.get_open_orders.side_effect = OSError("dns unavailable")
 
         with self.assertRaisesRegex(AccountAuditError, "dns unavailable"):
             await monitor.audit(set())
 
-        self.assertEqual(adapter.get_open_orders.await_count, 6)
-        self.assertEqual(monitor.total_read_failures, 5)
+        self.assertEqual(adapter.get_open_orders.await_count, 7)
+        self.assertEqual(monitor.total_read_failures, 6)
         self.assertEqual(monitor.state, "hard_stop")
+        self.assertEqual(sleeps, [1.0, 1.0, 1.0, 1.0, 1.0])
 
     async def test_actual_non_target_order_is_a_hard_stop(self):
         adapter = self.adapter()

@@ -92,6 +92,63 @@ market_maker:
                 with self.assertRaisesRegex(ValueError, "must be finite"):
                     MarketMakerConfig(soft_exit_surplus_reserve_bps=value)
 
+    def test_trend_guard_is_disabled_by_default_and_requires_a_pair(self) -> None:
+        config = MarketMakerConfig()
+        self.assertEqual(config.trend_guard_window_seconds, 0)
+        self.assertEqual(config.trend_guard_threshold_ticks, 0)
+
+        enabled = MarketMakerConfig(
+            trend_guard_window_seconds=60,
+            trend_guard_threshold_ticks=125,
+        )
+        self.assertEqual(enabled.trend_guard_window_seconds, 60)
+        self.assertEqual(enabled.trend_guard_threshold_ticks, 125)
+
+        for values in (
+            {"trend_guard_window_seconds": 60},
+            {"trend_guard_threshold_ticks": 125},
+        ):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, "trend guard"):
+                    MarketMakerConfig(**values)
+
+    def test_session_loss_maker_exit_requires_bounded_audited_soft_exit(
+        self,
+    ) -> None:
+        values = {
+            "account_audit_interval_seconds": 15,
+            "max_session_drawdown": "0.50",
+            "max_session_loss_for_maker_exit": "0.10",
+            "require_flat_start": True,
+            "soft_exit_after_seconds": 120,
+            "soft_exit_net_turnover_bps": "-0.5",
+        }
+        config = MarketMakerConfig(**values)
+        self.assertEqual(
+            config.max_session_loss_for_maker_exit, Decimal("0.10")
+        )
+
+        invalid_cases = (
+            ({**values, "max_session_loss_for_maker_exit": "-0.01"}, "negative"),
+            (
+                {
+                    **values,
+                    "account_audit_interval_seconds": 0,
+                    "require_flat_start": False,
+                },
+                "account audit",
+            ),
+            ({**values, "soft_exit_after_seconds": 0}, "soft exit"),
+            (
+                {**values, "max_session_loss_for_maker_exit": "0.50"},
+                "below max_session_drawdown",
+            ),
+        )
+        for invalid, message in invalid_cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    MarketMakerConfig(**invalid)
+
     def test_account_audit_requires_positive_drawdown_and_flat_start(self) -> None:
         with self.assertRaisesRegex(ValueError, "account_audit_timeout_seconds"):
             MarketMakerConfig(account_audit_timeout_seconds=0)

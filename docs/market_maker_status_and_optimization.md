@@ -1,50 +1,44 @@
 # Market Maker 現況與優化方向
 
-> 更新日期：2026-08-26。本文只做簡要總覽；實際啟停、硬閘門與最新證據以 [Market Maker MVP 操作指南](market_maker_mvp_operating_guide.md) 第 12 節及 fresh authenticated reads 為準。
+> 更新：2026-08-28 00:10（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
 
 ## 現況
 
-Market Maker MVP 已與 Grid runtime 分離，入口為 `run_market_maker.py`，核心位於 `core/services/market_maker/`。本輪沒有修改 Grid production code或 shared Lighter adapter。
+Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/market_maker/`，與 Grid runtime 分離。本輪未修改 Grid production code；shared Lighter adapter只新增預設關閉的MM pre-send opt-in，以及MM使用的read-only／exact-terminal hooks，Grid預設行為不變。
 
-目前具備：
+已具備：
 
-- 單一 Lighter 永續合約、每側最多一張 managed order，雙向或單向 `POST_ONLY` 報價。
-- 正規化 external BBO、fixed spread、inventory skew、fee-aware exit floor與 surplus-budgeted timed soft exit。
-- Worst-case exposure、position cap、reduce-only風險收斂與 oversized reduce-only dust cleanup。
-- Stale／invalid data、unknown order、uncertain mutation、reconciliation failure、account state不可信與drawdown超限時 fail closed。
-- In-process authenticated account audit：唯一maker fills、exact fee、flat-to-flat turnover／net、equity、fee tier、`1x cross`與帳戶獨占。
-- Cancel-before-replace、mutation limiter、WS／REST同步及 shutdown cancel／final audit。
-- Soft-exit 盈餘只有在最新 processed fill 之後完成新 authenticated audit 才可信；startup retry 會重建 session baseline。
-- Mutation budget不足時保留 reduce-only最高優先權；一般雙邊報價則依目前倉位先建立降低庫存的一側，避免固定BUY-first在long時先增加風險。
+- 單一 Lighter 永續合約、每側最多一張 managed order、單／雙向 `POST_ONLY` 報價。
+- 正規化 external BBO、fixed spread、inventory skew、fee-aware exit、趨勢入場 guard 與有界 session-loss maker exit。
+- Worst-case exposure、position cap、reduce-only收斂、oversized reduce-only dust cleanup。
+- 精確 fill generation：fill與純 position refresh 分離，REST／WS／immediate-create replay不重複失效經濟快照。
+- RiskManager 是 inventory age與soft-exit latch唯一來源，data/error recovery不重啟計時。
+- Authenticated account audit：唯一maker fills、exact fee、flat-to-flat net/equity、fee tier、`1x cross`與帳戶獨占。
+- Stale/untrusted data、unknown order、uncertain mutation、reconciliation failure與drawdown超限時 fail closed。
 
-## 現行 long-run 候選
+現行候選固定為：
 
-`both / 250 ticks / order 0.00020 / max position 0.00040 / 1x cross / max drawdown 0.50 USDG / mutation 8 per minute`
+`both / 250 ticks / order 0.00020 / max position 0.00040 / trend 60s/125 ticks / maker-exit loss 0.10 USDG / 1x cross / max drawdown 0.50 USDG / 8 mutations per minute`
 
-其他關鍵值：
-
-- maker fee `1.2 bps`；economic gate 至少 `30 completed maker fills`。
-- fee cover `>=1`，completed net／turnover `>=+0.02 bps`。
-- timed soft exit `120s`，保留已實現盈餘 `0.02 bps`。
-- account audit `15s`、外層 timeout `10s`、瞬時讀取 `5 attempts × 1s`。
-- Source YAML 永遠保持 `dry_run: true`；受 ignore 保護的 live copy 只能多出 `dry_run: false`。
+Fee gate：maker `1.2 bps`、至少 `30 completed maker fills`、fee cover `>=1`、completed與自然flat equity皆 `>=+0.02 bps`。Source YAML維持 `dry_run: true`；ignored live copy只能改成 `dry_run: false`。
 
 ## 最新判定
 
-- 前一live fingerprint的 `250 ticks / 8 mutations` 搭配降低庫存側優先修復，約29分鐘完成38筆／15輪：turnover `690.898688`、net `+0.00206015744`、`+0.0298185 bps`、cover `1.0248488`、約 `1416 USDG/h`／`77.9 fills/h`、max DD `0.031468`，自然flat後equity gate通過。
-- `10 mutations/min` 單變因canary約11分鐘完成22筆／10輪；completed episodes為 `+0.0367967 bps`、cover `1.0306639`，runtime wall-rate（含第23筆open authenticated fill）約 `2005 USDG/h`／`127.8 fills/h`。但未達30筆即依操作者要求停止，且有1次已精確解決的cancellation terminal-visibility race，因此不是promotion證據。
-- 停止窗口留下short `0.00020`，其後只用maker reduce-only於`78517.7`回補。Authenticated trade-ledger含此開放episode／cleanup的10/min全場結果為net `-0.00313897280`、`-0.0833743 bps`、cover `0.9305214`；baseline／final equity `299.558978 / 299.555839`，與ledger只差`2.72e-8 USDG`，故**本場完整economics為NO-GO**。10/min吞吐比較仍因22<30且非自然flat而INCONCLUSIVE；正式設定已回到 `8/min`，不能解讀為已證明10較差。
-- 2026-08-26 08:49兩次authenticated postflight皆為position／orders／unresolved `0/0/0`，process `0`、collateral `299.555839 USDG`；目前策略已暫停且沒有掛單。
-- 最後審查確認OrderManager現有 `position_refresh_required` 同時代表純cancel refresh與visible fill；在未拆出精確 `fill_observed` 前，不能安全加入REST同淨倉位fills的economics invalidation。匆忙實驗未納入本checkpoint，列為下一輪P0。
-- Market Maker回歸 `278/278 OK`；full repo `515`仍是既知Grid／selective-cancel baseline `8 failures + 4 errors`，本輪沒有新增失敗，也未修改Grid production或shared Lighter adapter。
+- 21:41:59–21:47:37固定候選短live完成`12 completed / 5 round trips`，turnover`190.098420`、exact fee`0.02281181040`、net`+0.00500818960`、completed／flat-equity`+0.263452 / +0.263442 bps`、cover`1.21954`、max DD`0.023630`；約`127 completed fills/h`，成交量與fee cover都出現明顯正訊號。
+- 本場仍是 **hard-safety NO-GO**：21:47:29 cancellation terminal proof未在既有有界窗口完成，current unresolved升為`1`，並短暫出現strategy position為flat但authenticated ledger仍short`0.00020`。依gate立即graceful stop；shutdown exact sync後ambiguity／resolved／unresolved為`1/1/0`、自然flat，但已有`1 failed cycle`且只到12 completed，不能倒推改判或進long-run。
+- Cancel-vs-fill缺口已離線修復：只有MM bootstrap啟用exact outcome side-channel；同周期exact `FILLED`會保留成交資料、refresh position、阻止立即補單，且不誤增cancel success或resolved ambiguity。Status／side／ID alias衝突、無法確認ownership或沒有exact proof時仍保留uncertainty並fail closed；Grid預設不啟用cache。
+- 新 guard 只用 external-BBO rolling mid：上漲時擋新增／加碼short，下降時擋新增／加碼long；reduce-only永不被擋，方向式50% hysteresis可解除或直接反轉。
+- `max_session_loss_for_maker_exit: "0.10"`只供已鎖定的`POST_ONLY + reduce_only`退出使用。退出價格採 exact trade P&L 與最後同 generation 的 authenticated flat-equity P&L較差者；缺失／過期證據退回嚴格fee-aware價格，超過budget即hard stop。`bounded_economic_recovery`不是GO，原fee cover／completed／flat-equity門檻完全不變。
+- Offline：最新精準`7/7`、Lighter cancellation`31/31`、Grid targeted`6/6`、Market Maker `319/319`；full repo `566`仍只有既知Grid baseline `8 failures + 4 errors`。Grid production未修改。完整13-file runtime fingerprint `200159C7F983A09113CF8B83148E76E398B7508367BBD104BCFA227E7701ABCE`；先前12-file值只漏列已存在的shared exception檔，沒有code drift。
+- 20:55:38–21:11:33最終T3為`182/182` cycles、`would_place=243`；實際看到rising／neutral／falling多次切換。真實create/cancel、failed、ambiguity／unresolved、reconciliation failure、unknown、mutation blocks、429、WS與account-read failure皆`0`，全程flat。短live停止後process0，雙authenticated postflight亦為position／orders`0/0`，source config已byte-for-byte恢復`dry_run:true`。
+- Cancel-race修復後T3於22:31:15–23:02:40完成：`360/360` cycles、`would_place=404`，真實mutation與全部hard-safety counters皆`0`，全程flat。Graceful stop後runtime0，雙authenticated postflight為position／orders`0/0`；證據`logs/market_maker_t3_cancel_race_20260827-230233.log`。
+- 23:09:02–00:09:28固定候選短live為 **runtime/safety GO、volume/economic NO-GO**：`735/735` cycles、21 completed／10 round trips、turnover`322.806772`、exact fee`0.03873681264`、gross`-0.001964`、net`-0.04070081264`，completed／flat-equity約`-1.260841 / -1.260816 bps`，max DD`0.138115`。Safety counters均為0，兩次瞬時authenticated read failure由bounded retry吸收。
+- 本場一度short`0.00030`並長時間維持`soft_exit_hard_fallback`的fee-preserving reduce-only bid；其後自然flat，但後段成交把先前正收益反轉為session loss`0.04070081264`。這證明loss budget有界，卻沒有證明fee cover或成交效率，不能進long-run。
 
 ## 下一步
 
-1. P0先拆分精確 `fill_observed` 與純position refresh，補同淨倉位fills／純reprice兩個反例；未完成前不進long-run。
-2. P1再統一RiskManager與Strategy的inventory age／soft-exit latch並補recovery timer drift測試；現況只會保守延後退出，但會影響換手。
-3. 完成P0／P1與offline regression後重算fingerprint、做相稱T3，再從fresh flat preflight以該fingerprint／`8/min`重跑至少30 completed且自然flat的短gate；通過後才執行多小時long-run。
-4. 若要繼續評估 `10/min`，必須另開乾淨單變因場次，至少30 completed且自然flat；比較block／hour、terminal race密度、turnover／hour與**全場**fee cover後才可promotion。
-5. 單向行情若仍造成長時間cap inventory，再研究MM-only momentum／toxicity entry guard；不以同輪縮spread或放大風險取代診斷。
-6. 完成前維持source YAML `dry_run: true`與mutation `8/min`。VPS仍不在本階段。
+1. 00:09停止後兩次authenticated postflight皆position0、open orders0；runtime0，source與fresh live copy都已恢復`dry_run:true`。
+2. Cancellation修復的安全路徑已GO；目前真正blocker改為`soft_exit_hard_fallback`的證據／定價路徑，以及有界loss exit造成的fee-cover反轉。先做離線鑑識，不直接重跑。
+3. Promotion條件不變：30 completed、自然flat、fee cover與completed／flat-equity雙門檻全部通過後，才能開始long-run。本場未達30且經濟明確NO-GO，禁止晉級。
 
-不以 taker／IOC、self-trade、放大size／position／leverage／drawdown或隱藏前輪損失換取成交量。
+不以 taker／IOC、self-trade或隱藏未完成episode換取成交量。VPS仍不在本階段。

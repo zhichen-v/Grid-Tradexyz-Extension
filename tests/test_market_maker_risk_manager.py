@@ -206,6 +206,7 @@ class RiskManagerTests(unittest.TestCase):
                     self.assertEqual(
                         decision.reason, "soft exit latched until flat"
                     )
+                    self.assertTrue(decision.soft_exit_latched)
                     if sign > 0:
                         self.assertIsNone(decision.buy_amount)
                         self.assertEqual(
@@ -222,6 +223,7 @@ class RiskManagerTests(unittest.TestCase):
                 flat = evaluate("0", 223.0)
                 new_half = evaluate(half, 224.0)
                 self.assertEqual(flat.runtime_state, RuntimeState.ACTIVE)
+                self.assertFalse(flat.soft_exit_latched)
                 self.assertEqual(new_half.runtime_state, RuntimeState.ACTIVE)
                 self.assertIsNotNone(new_half.buy_amount)
                 self.assertIsNotNone(new_half.sell_amount)

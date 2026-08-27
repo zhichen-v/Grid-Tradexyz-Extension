@@ -16,6 +16,9 @@ market_maker:
   reprice_threshold_ticks: 1
   # External BBO 過寬時 midpoint 不可信，停止報價並撤單。
   max_raw_spread_bps: "100"
+  # 兩者同為0時停用；啟用後只擋逆勢、風險增加的入場側。
+  trend_guard_window_seconds: 0
+  trend_guard_threshold_ticks: 0
 
   # Live 前依實際帳戶 tier 核對 maker fee；不可假設永遠為零。
   maker_fee_rate: "0"
@@ -36,17 +39,20 @@ market_maker:
 
   # 0 表示停用；live 必須啟用 in-process authenticated account audit。
   account_audit_interval_seconds: 0
-  # 主網 authenticated snapshot 由多個連續讀取組成；10s 仍為 bounded hard stop。
-  account_audit_timeout_seconds: 10
+  # 主網 authenticated snapshot 由多個連續讀取組成；15s 仍為 bounded hard stop。
+  account_audit_timeout_seconds: 15
   max_session_drawdown: "0"
+  # 絕對 session loss 上限；只供已鎖定的 POST_ONLY reduce-only exit 使用。
+  # 0 表示停用；啟用值必須低於 max_session_drawdown。
+  max_session_loss_for_maker_exit: "0"
   # 達 completed fill 門檻即驗 fee/net；完整 equity GO 另待自然 flat。
   economic_min_fills: 8
   # (completed gross - exact fee) / two-leg turnover，單位為 bps。
   min_completed_net_turnover_bps: "0"
   # Optional timed relaxation for reduce-only inventory exits. Disabled by
   # default. When enabled, the static soft target is only reachable when
-  # authenticated completed-session surplus can fund it; the reserve remains
-  # protected and the session economic gate stays enabled.
+  # authenticated completed-session surplus can fund it，或由上方明確的
+  # session-loss budget 支付；最終 session economic GO 門檻不會降低。
   soft_exit_after_seconds: 0
   soft_exit_net_turnover_bps: "0"
   soft_exit_surplus_reserve_bps: "0.02"

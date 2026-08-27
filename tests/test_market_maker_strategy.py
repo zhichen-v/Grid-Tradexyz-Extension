@@ -110,6 +110,9 @@ class MarketMakerStrategyTests(unittest.TestCase):
         self,
         size: str,
         economics: SoftExitEconomics | None,
+        *,
+        loss_budget: str = "0",
+        market_prices: tuple[Decimal, Decimal] | None = None,
     ):
         config = MarketMakerConfig(
             symbol="BTC",
@@ -122,6 +125,10 @@ class MarketMakerStrategyTests(unittest.TestCase):
             soft_exit_after_seconds=120,
             soft_exit_net_turnover_bps="-0.5",
             soft_exit_surplus_reserve_bps="0.02",
+            account_audit_interval_seconds=15,
+            max_session_drawdown="0.50",
+            max_session_loss_for_maker_exit=loss_budget,
+            require_flat_start=True,
         )
         metadata = replace(
             self.metadata,
@@ -139,21 +146,15 @@ class MarketMakerStrategyTests(unittest.TestCase):
             safe=True,
             runtime_state=RuntimeState.RISK_REDUCTION,
             reason="timed reduction",
+            soft_exit_latched=True,
         )
-        market_prices = (
-            (Decimal("99900.0"), Decimal("99900.2"))
-            if signed_size > 0
-            else (Decimal("100099.8"), Decimal("100100.0"))
-        )
-        strategy = MarketMakerStrategy(config)
-        strategy.calculate_quotes(
-            self.make_market(*market_prices, received_monotonic=100.0),
-            self.position(size, "100000"),
-            metadata,
-            risk,
-            now_monotonic=100.0,
-        )
-        return strategy.calculate_quotes(
+        if market_prices is None:
+            market_prices = (
+                (Decimal("99900.0"), Decimal("99900.2"))
+                if signed_size > 0
+                else (Decimal("100099.8"), Decimal("100100.0"))
+            )
+        return MarketMakerStrategy(config).calculate_quotes(
             self.make_market(*market_prices, received_monotonic=220.0),
             self.position(size, "100000"),
             metadata,
@@ -169,6 +170,184 @@ class MarketMakerStrategyTests(unittest.TestCase):
         self.assertEqual(quotes.reservation_price, Decimal("100.0"))
         self.assertEqual(quotes.bid.price, Decimal("99.9"))
         self.assertEqual(quotes.ask.price, Decimal("100.1"))
+
+    def test_trend_guard_blocks_only_the_adverse_flat_entry(self) -> None:
+        config = replace(
+            self.config,
+            trend_guard_window_seconds=60,
+            trend_guard_threshold_ticks=5,
+        )
+        cases = (
+            (
+                Decimal("100.5"),
+                Decimal("100.7"),
+                "trend_guard_rising_block_ask",
+                True,
+            ),
+            (
+                Decimal("99.3"),
+                Decimal("99.5"),
+                "trend_guard_falling_block_bid",
+                False,
+            ),
+        )
+        for bid, ask, reason, keeps_bid in cases:
+            with self.subTest(reason=reason):
+                strategy = MarketMakerStrategy(config)
+                warmup = strategy.calculate_quotes(
+                    self.make_market(received_monotonic=100.0),
+                    self.position("0"),
+                    self.metadata,
+                    self.risk,
+                    now_monotonic=100.0,
+                )
+                self.assertIsNotNone(warmup.bid)
+                self.assertIsNotNone(warmup.ask)
+
+                guarded = strategy.calculate_quotes(
+                    self.make_market(bid, ask, received_monotonic=160.0),
+                    self.position("0", received_monotonic=160.0),
+                    self.metadata,
+                    self.risk,
+                    now_monotonic=160.0,
+                )
+
+                self.assertEqual(guarded.reason, reason)
+                self.assertEqual(guarded.bid is not None, keeps_bid)
+                self.assertEqual(guarded.ask is not None, not keeps_bid)
+
+    def test_trend_guard_never_blocks_reduce_only_exit(self) -> None:
+        config = replace(
+            self.config,
+            trend_guard_window_seconds=60,
+            trend_guard_threshold_ticks=5,
+        )
+        cases = (
+            (
+                "-0.2",
+                Decimal("100.5"),
+                Decimal("100.7"),
+                OrderSide.BUY,
+            ),
+            (
+                "0.2",
+                Decimal("99.3"),
+                Decimal("99.5"),
+                OrderSide.SELL,
+            ),
+        )
+        for size, bid, ask, exit_side in cases:
+            with self.subTest(exit_side=exit_side):
+                strategy = MarketMakerStrategy(config)
+                signed_size = Decimal(size)
+                exit_risk = SimpleNamespace(
+                    buy_amount=abs(signed_size) if signed_size < 0 else None,
+                    sell_amount=abs(signed_size) if signed_size > 0 else None,
+                    buy_reduce_only=signed_size < 0,
+                    sell_reduce_only=signed_size > 0,
+                    safe=True,
+                    runtime_state=RuntimeState.RISK_REDUCTION,
+                    reason="reduce inventory",
+                    soft_exit_latched=False,
+                )
+                strategy.calculate_quotes(
+                    self.make_market(received_monotonic=100.0),
+                    self.position(size),
+                    self.metadata,
+                    exit_risk,
+                    now_monotonic=100.0,
+                )
+                guarded = strategy.calculate_quotes(
+                    self.make_market(bid, ask, received_monotonic=160.0),
+                    self.position(size, received_monotonic=160.0),
+                    self.metadata,
+                    exit_risk,
+                    now_monotonic=160.0,
+                )
+
+                order = (
+                    guarded.bid
+                    if exit_side is OrderSide.BUY
+                    else guarded.ask
+                )
+                self.assertIsNotNone(order)
+                self.assertTrue(order.reduce_only)
+
+    def test_trend_guard_hysteresis_and_long_gap_require_fresh_warmup(
+        self,
+    ) -> None:
+        strategy = MarketMakerStrategy(
+            replace(
+                self.config,
+                trend_guard_window_seconds=60,
+                trend_guard_threshold_ticks=5,
+            )
+        )
+
+        def quote(mid: str, received: float):
+            center = Decimal(mid)
+            return strategy.calculate_quotes(
+                self.make_market(
+                    center - Decimal("0.1"),
+                    center + Decimal("0.1"),
+                    received,
+                ),
+                self.position("0", received_monotonic=received),
+                self.metadata,
+                self.risk,
+                now_monotonic=received,
+            )
+
+        quote("100.0", 100.0)
+        triggered = quote("100.6", 160.0)
+        retained = quote("100.9", 220.0)
+        released = quote("100.9", 280.0)
+        reset = quote("102.0", 400.0)
+
+        self.assertEqual(triggered.reason, "trend_guard_rising_block_ask")
+        self.assertEqual(retained.reason, "trend_guard_rising_block_ask")
+        self.assertIsNotNone(released.bid)
+        self.assertIsNotNone(released.ask)
+        self.assertIsNotNone(reset.bid)
+        self.assertIsNotNone(reset.ask)
+
+    def test_trend_guard_abrupt_reversal_does_not_keep_stale_direction(
+        self,
+    ) -> None:
+        config = replace(
+            self.config,
+            trend_guard_window_seconds=60,
+            trend_guard_threshold_ticks=5,
+        )
+        cases = (
+            ("100.6", "100.3", "trend_guard_rising_block_ask"),
+            ("99.4", "99.7", "trend_guard_falling_block_bid"),
+        )
+        for triggered_mid, reversed_mid, triggered_reason in cases:
+            with self.subTest(triggered_reason=triggered_reason):
+                strategy = MarketMakerStrategy(config)
+
+                def quote(mid: str, received: float):
+                    center = Decimal(mid)
+                    return strategy.calculate_quotes(
+                        self.make_market(
+                            center - Decimal("0.1"),
+                            center + Decimal("0.1"),
+                            received,
+                        ),
+                        self.position("0", received_monotonic=received),
+                        self.metadata,
+                        self.risk,
+                        now_monotonic=received,
+                    )
+
+                quote("100.0", 100.0)
+                triggered = quote(triggered_mid, 160.0)
+                reversed_quote = quote(reversed_mid, 220.0)
+
+                self.assertEqual(triggered.reason, triggered_reason)
+                self.assertIsNotNone(reversed_quote.bid)
+                self.assertIsNotNone(reversed_quote.ask)
 
     def test_long_inventory_moves_reservation_down(self) -> None:
         quotes = self.quotes("0.5")
@@ -205,7 +384,7 @@ class MarketMakerStrategyTests(unittest.TestCase):
 
         self.assertEqual(quotes.half_spread, Decimal("0.2"))
 
-    def test_soft_exit_relaxes_only_timed_reduce_only_inventory(self) -> None:
+    def test_soft_exit_relaxes_only_latched_reduce_only_inventory(self) -> None:
         config = MarketMakerConfig(
             symbol="BTC",
             order_size="0.2",
@@ -231,6 +410,7 @@ class MarketMakerStrategyTests(unittest.TestCase):
                     safe=True,
                     runtime_state=RuntimeState.RISK_REDUCTION,
                     reason="hard inventory limit reached",
+                    soft_exit_latched=False,
                 ),
                 OrderSide.BUY,
                 Decimal("99.9"),
@@ -249,6 +429,7 @@ class MarketMakerStrategyTests(unittest.TestCase):
                     safe=True,
                     runtime_state=RuntimeState.RISK_REDUCTION,
                     reason="hard inventory limit reached",
+                    soft_exit_latched=False,
                 ),
                 OrderSide.SELL,
                 Decimal("100.1"),
@@ -259,26 +440,14 @@ class MarketMakerStrategyTests(unittest.TestCase):
         for size, market, risk, side, hard_price, soft_price in reduction_risks:
             with self.subTest(side=side):
                 strategy = MarketMakerStrategy(config)
-                start_market = self.make_market(
-                    market.best_bid, market.best_ask, 100.0
-                )
-                before_market = self.make_market(
-                    market.best_bid, market.best_ask, 219.0
-                )
-                started = strategy.calculate_quotes(
-                    start_market,
-                    self.position(size, "100"),
-                    self.metadata,
-                    risk,
-                    now_monotonic=100.0,
-                )
                 before = strategy.calculate_quotes(
-                    before_market,
+                    market,
                     self.position(size, "100"),
                     self.metadata,
                     risk,
-                    now_monotonic=219.0,
+                    now_monotonic=220.0,
                 )
+                risk.soft_exit_latched = True
                 active = strategy.calculate_quotes(
                     market,
                     self.position(size, "100"),
@@ -292,13 +461,9 @@ class MarketMakerStrategyTests(unittest.TestCase):
                         open_net=Decimal("-0.0048"),
                     ),
                 )
-                started_order = (
-                    started.bid if side is OrderSide.BUY else started.ask
-                )
                 before_order = before.bid if side is OrderSide.BUY else before.ask
                 active_order = active.bid if side is OrderSide.BUY else active.ask
 
-                self.assertEqual(started_order.price, hard_price)
                 self.assertEqual(before_order.price, hard_price)
                 self.assertEqual(active_order.price, soft_price)
                 self.assertTrue(active_order.reduce_only)
@@ -347,6 +512,110 @@ class MarketMakerStrategyTests(unittest.TestCase):
 
                 self.assertEqual(order.price, expected)
                 self.assertEqual(quotes.reason, "soft_exit_no_surplus")
+
+    def test_session_loss_maker_exit_uses_exact_first_episode_boundary(
+        self,
+    ) -> None:
+        economics = SoftExitEconomics(
+            completed_turnover=Decimal("0"),
+            completed_net=Decimal("0"),
+            open_turnover=Decimal("20"),
+            open_net=Decimal("-0.0024"),
+        )
+        cases = (
+            (
+                "0.00020",
+                OrderSide.SELL,
+                (Decimal("98999.8"), Decimal("99000.0")),
+                Decimal("-0.1"),
+            ),
+            (
+                "-0.00020",
+                OrderSide.BUY,
+                (Decimal("101000.0"), Decimal("101000.2")),
+                Decimal("0.1"),
+            ),
+        )
+        for size, side, market_prices, worse_tick in cases:
+            with self.subTest(side=side):
+                quotes = self.timed_soft_quote(
+                    size,
+                    economics,
+                    loss_budget="0.10",
+                    market_prices=market_prices,
+                )
+                order = quotes.ask if side is OrderSide.SELL else quotes.bid
+                self.assertIsNotNone(order)
+                self.assertTrue(order.reduce_only)
+                self.assertEqual(
+                    quotes.reason, "session_loss_maker_exit_active"
+                )
+
+                amount = abs(Decimal(size))
+                entry = Decimal("100000")
+                fee_rate = Decimal("0.000120")
+
+                def projected_net(price: Decimal) -> Decimal:
+                    gross = (
+                        amount * (price - entry)
+                        if side is OrderSide.SELL
+                        else amount * (entry - price)
+                    )
+                    return (
+                        economics.completed_net
+                        + economics.open_net
+                        + gross
+                        - amount * price * fee_rate
+                    )
+
+                self.assertGreaterEqual(
+                    projected_net(order.price), Decimal("-0.10")
+                )
+                self.assertLess(
+                    projected_net(order.price + worse_tick),
+                    Decimal("-0.10"),
+                )
+
+    def test_session_loss_maker_exit_budget_is_cumulative(self) -> None:
+        first_episode = SoftExitEconomics(
+            completed_turnover=Decimal("0"),
+            completed_net=Decimal("0"),
+            open_turnover=Decimal("20"),
+            open_net=Decimal("-0.0024"),
+        )
+        budget_partly_used = replace(
+            first_episode,
+            completed_turnover=Decimal("100"),
+            completed_net=Decimal("-0.05"),
+        )
+
+        long_first = self.timed_soft_quote(
+            "0.00020",
+            first_episode,
+            loss_budget="0.10",
+            market_prices=(Decimal("98999.8"), Decimal("99000.0")),
+        )
+        long_used = self.timed_soft_quote(
+            "0.00020",
+            budget_partly_used,
+            loss_budget="0.10",
+            market_prices=(Decimal("98999.8"), Decimal("99000.0")),
+        )
+        short_first = self.timed_soft_quote(
+            "-0.00020",
+            first_episode,
+            loss_budget="0.10",
+            market_prices=(Decimal("101000.0"), Decimal("101000.2")),
+        )
+        short_used = self.timed_soft_quote(
+            "-0.00020",
+            budget_partly_used,
+            loss_budget="0.10",
+            market_prices=(Decimal("101000.0"), Decimal("101000.2")),
+        )
+
+        self.assertGreater(long_used.ask.price, long_first.ask.price)
+        self.assertLess(short_used.bid.price, short_first.bid.price)
 
     def test_soft_exit_partial_surplus_uses_exact_budget_boundary(self) -> None:
         economics = SoftExitEconomics(
@@ -532,6 +801,7 @@ class MarketMakerStrategyTests(unittest.TestCase):
             safe=True,
             runtime_state=RuntimeState.RISK_REDUCTION,
             reason="not reduce-only",
+            soft_exit_latched=True,
         )
         strategy.calculate_quotes(
             self.make_market(Decimal("100.4"), Decimal("100.6"), 100.0),
@@ -551,54 +821,48 @@ class MarketMakerStrategyTests(unittest.TestCase):
         self.assertEqual(quotes.bid.price, Decimal("99.9"))
         self.assertFalse(quotes.reason.startswith("soft_exit_active:"))
 
-    def test_soft_exit_timer_resets_on_flat_sign_flip_and_clock_rollback(
-        self,
-    ) -> None:
-        strategy = MarketMakerStrategy(
-            MarketMakerConfig(
-                symbol="BTC",
-                order_size="0.2",
-                max_position="1",
-                maker_fee_rate="0.000120",
-                min_completed_net_turnover_bps="0.10",
-                soft_exit_after_seconds=120,
-                soft_exit_net_turnover_bps="-5.0",
-            )
+    def test_soft_exit_latch_survives_strategy_data_recovery(self) -> None:
+        config = MarketMakerConfig(
+            symbol="BTC",
+            order_size="0.2",
+            max_position="1",
+            max_inventory_skew_ticks=0,
+            maker_fee_rate="0.000120",
+            min_profit_buffer_bps="0",
+            min_completed_net_turnover_bps="0.10",
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps="-5.0",
         )
-        risk = SimpleNamespace(
-            buy_amount=Decimal("0.2"),
-            sell_amount=None,
-            buy_reduce_only=True,
-            sell_reduce_only=False,
-            safe=True,
-            runtime_state=RuntimeState.RISK_REDUCTION,
-            reason="reduce short",
+        manager = RiskManager(config)
+        strategy = MarketMakerStrategy(config)
+        position = self.position("0.4", "100", received_monotonic=100.0)
+        manager.evaluate(position, (), self.metadata, now_monotonic=100.0)
+
+        recovered_position = self.position(
+            "0.4", "100", received_monotonic=220.0
+        )
+        risk = manager.evaluate(
+            recovered_position, (), self.metadata, now_monotonic=220.0
+        )
+        quotes = strategy.calculate_quotes(
+            self.make_market(
+                Decimal("99.4"), Decimal("99.6"), received_monotonic=220.0
+            ),
+            recovered_position,
+            self.metadata,
+            risk,
+            now_monotonic=220.0,
+            soft_exit_economics=SoftExitEconomics(
+                completed_turnover=Decimal("100"),
+                completed_net=Decimal("1"),
+                open_turnover=Decimal("40"),
+                open_net=Decimal("-0.0048"),
+            ),
         )
 
-        self.assertEqual(
-            strategy._inventory_age_seconds(Decimal("-0.4"), 100.0), 0.0
-        )
-        self.assertEqual(
-            strategy._inventory_age_seconds(Decimal("-0.2"), 150.0), 50.0
-        )
-        self.assertEqual(
-            strategy._inventory_age_seconds(Decimal("0"), 160.0), 0.0
-        )
-        self.assertEqual(
-            strategy._inventory_age_seconds(Decimal("-0.4"), 200.0), 0.0
-        )
-        self.assertEqual(
-            strategy._inventory_age_seconds(Decimal("0.4"), 250.0), 0.0
-        )
-        self.assertEqual(
-            strategy._inventory_age_seconds(Decimal("0.2"), 240.0), 0.0
-        )
-        self.assertFalse(
-            strategy._soft_exit_active(Decimal("-0.4"), risk, 119.9)
-        )
-        self.assertTrue(
-            strategy._soft_exit_active(Decimal("-0.4"), risk, 120.0)
-        )
+        self.assertTrue(risk.soft_exit_latched)
+        self.assertEqual(quotes.reason, "soft_exit_active")
+        self.assertEqual(quotes.ask.price, Decimal("100.0"))
 
     def test_soft_exit_active_without_entry_price_fails_closed(self) -> None:
         strategy = MarketMakerStrategy(
@@ -620,6 +884,7 @@ class MarketMakerStrategyTests(unittest.TestCase):
             safe=True,
             runtime_state=RuntimeState.RISK_REDUCTION,
             reason="reduce short",
+            soft_exit_latched=True,
         )
         strategy.calculate_quotes(
             self.make_market(received_monotonic=100.0),

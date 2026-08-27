@@ -64,6 +64,8 @@ class MarketMakerConfig:
     max_inventory_skew_ticks: int = 4
     reprice_threshold_ticks: int = 1
     max_raw_spread_bps: Decimal = Decimal("100")
+    trend_guard_window_seconds: int = 0
+    trend_guard_threshold_ticks: int = 0
     maker_fee_rate: Decimal = Decimal("0")
     min_profit_buffer_bps: Decimal = Decimal("0.5")
     max_position: Decimal = Decimal("0.00200")
@@ -82,6 +84,7 @@ class MarketMakerConfig:
     error_cooldown_seconds: int = 5
     max_mutations_per_minute: int = 30
     max_session_drawdown: Decimal = Decimal("0")
+    max_session_loss_for_maker_exit: Decimal = Decimal("0")
     economic_min_fills: int = 8
     min_completed_net_turnover_bps: Decimal = Decimal("0")
     soft_exit_after_seconds: int = 0
@@ -103,6 +106,7 @@ class MarketMakerConfig:
             "maker_fee_rate",
             "min_profit_buffer_bps",
             "max_session_drawdown",
+            "max_session_loss_for_maker_exit",
             "min_completed_net_turnover_bps",
             "soft_exit_net_turnover_bps",
             "soft_exit_surplus_reserve_bps",
@@ -133,6 +137,14 @@ class MarketMakerConfig:
         self._validate_int("base_half_spread_ticks", minimum=1)
         self._validate_int("max_inventory_skew_ticks", minimum=0)
         self._validate_int("reprice_threshold_ticks", minimum=1)
+        self._validate_int("trend_guard_window_seconds", minimum=0)
+        self._validate_int("trend_guard_threshold_ticks", minimum=0)
+        if bool(self.trend_guard_window_seconds) != bool(
+            self.trend_guard_threshold_ticks
+        ):
+            raise ValueError(
+                "trend guard window and threshold must both be zero or positive"
+            )
         if self.max_raw_spread_bps <= 0:
             raise ValueError("max_raw_spread_bps must be positive")
         if self.maker_fee_rate < 0:
@@ -141,6 +153,10 @@ class MarketMakerConfig:
             raise ValueError("min_profit_buffer_bps cannot be negative")
         if self.max_session_drawdown < 0:
             raise ValueError("max_session_drawdown cannot be negative")
+        if self.max_session_loss_for_maker_exit < 0:
+            raise ValueError(
+                "max_session_loss_for_maker_exit cannot be negative"
+            )
         if self.min_completed_net_turnover_bps < 0:
             raise ValueError(
                 "min_completed_net_turnover_bps cannot be negative"
@@ -185,6 +201,24 @@ class MarketMakerConfig:
             raise ValueError(
                 "require_flat_start must be true when account audit is enabled"
             )
+        if self.max_session_loss_for_maker_exit:
+            if not self.account_audit_interval_seconds:
+                raise ValueError(
+                    "max_session_loss_for_maker_exit requires account audit"
+                )
+            if not self.soft_exit_after_seconds:
+                raise ValueError(
+                    "max_session_loss_for_maker_exit requires soft exit"
+                )
+            if (
+                self.max_session_drawdown <= 0
+                or self.max_session_loss_for_maker_exit
+                >= self.max_session_drawdown
+            ):
+                raise ValueError(
+                    "max_session_loss_for_maker_exit must be below "
+                    "max_session_drawdown"
+                )
         self._validate_int("economic_min_fills", minimum=2)
         if not (
             Decimal("0")

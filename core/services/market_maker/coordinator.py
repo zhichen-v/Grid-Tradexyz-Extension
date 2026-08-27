@@ -489,17 +489,6 @@ class MarketMakerCoordinator:
             self.metrics.increment("ignored_other_symbol_orders")
             return
         self._pending_orders.append(order)
-        try:
-            filled = Decimal(str(order.filled))
-            if (filled.is_finite() and filled > 0) or order.status is OrderStatus.FILLED:
-                self._position_refresh_required = True
-                self.metrics.increment(
-                    "full_fills"
-                    if order.status is OrderStatus.FILLED
-                    else "partial_fills"
-                )
-        except (InvalidOperation, TypeError, ValueError):
-            self._position_refresh_required = True
         if not self._stopping:
             self._quote_event.set()
 
@@ -530,9 +519,17 @@ class MarketMakerCoordinator:
             self._last_cycle_monotonic = now
             while self._pending_orders:
                 order = self._pending_orders.popleft()
-                await self.order_manager.handle_order_update(order)
-                if self._is_fill_update(order):
+                fill_observed = await self.order_manager.handle_order_update(
+                    order
+                )
+                if fill_observed is True:
                     self._processed_fill_generation += 1
+                    self._position_refresh_required = True
+                    self.metrics.increment(
+                        "full_fills"
+                        if order.status is OrderStatus.FILLED
+                        else "partial_fills"
+                    )
             if not await self._refresh_after_post_only_cancellations():
                 return
 
@@ -673,6 +670,8 @@ class MarketMakerCoordinator:
             self._record_reconcile_actions(getattr(result, "actions", ()))
             current_orders = self.order_manager.snapshot()
             self._update_live_metrics(current_orders)
+            if getattr(result, "fill_observed", False) is True:
+                self._processed_fill_generation += 1
             if getattr(result, "position_refresh_required", False) is True:
                 self._position = None
                 self._position_refresh_required = True
@@ -751,6 +750,7 @@ class MarketMakerCoordinator:
                     await self.order_manager.sync_open_orders()
                 )
                 if position_refresh_required is True:
+                    self._processed_fill_generation += 1
                     self._position = None
         except Exception as exc:
             count = await self._record_error(
@@ -971,6 +971,8 @@ class MarketMakerCoordinator:
         if result is None:
             return
         self._record_reconcile_actions(getattr(result, "actions", ()))
+        if getattr(result, "fill_observed", False) is True:
+            self._processed_fill_generation += 1
         if getattr(result, "position_refresh_required", False) is True:
             self._position = None
             self._position_refresh_required = True
@@ -1039,6 +1041,7 @@ class MarketMakerCoordinator:
                 await self.order_manager.sync_open_orders()
             )
             if position_refresh_required is True:
+                self._processed_fill_generation += 1
                 self._position = None
                 positions = await self.adapter.get_positions([self.config.symbol])
                 position = self._position_from_rest(positions)
@@ -1165,6 +1168,17 @@ class MarketMakerCoordinator:
         )
         self.metrics.live_bid = buys[0].price if buys else None
         self.metrics.live_ask = sells[0].price if sells else None
+        manager = self.order_manager
+        self.metrics.counters["unresolved_cancellations"] = int(
+            getattr(manager, "unresolved_cancellation_count", 0)
+            if manager is not None
+            else 0
+        )
+        self.metrics.counters["resolved_ambiguous_cancellations"] = int(
+            getattr(manager, "resolved_ambiguous_cancellations", 0)
+            if manager is not None
+            else 0
+        )
 
     def _managed_order_id_snapshot(self) -> set[str]:
         return {
@@ -1172,16 +1186,6 @@ class MarketMakerCoordinator:
             for order_id in getattr(self.order_manager, "known_order_ids", ())
             if str(order_id)
         }
-
-    @staticmethod
-    def _is_fill_update(order: OrderData) -> bool:
-        try:
-            filled = Decimal(str(order.filled))
-        except (InvalidOperation, TypeError, ValueError):
-            return True
-        return (
-            filled.is_finite() and filled > 0
-        ) or order.status is OrderStatus.FILLED
 
     def _update_account_audit_metrics(self) -> None:
         if self.account_monitor is None:
@@ -1266,10 +1270,40 @@ class MarketMakerCoordinator:
                 return None
             if (
                 ledger_position != position
-                or completed_turnover <= 0
-                or open_turnover < 0
+                or completed_turnover < 0
+                or (
+                    completed_turnover == 0
+                    and self.config.max_session_loss_for_maker_exit <= 0
+                )
+                or open_turnover <= 0
             ):
                 return None
+
+            if self.config.max_session_loss_for_maker_exit > 0:
+                last_flat_equity_change = snapshot.get(
+                    "last_flat_equity_change"
+                )
+                completed_fills = snapshot.get("completed_fills")
+                last_flat_completed_fills = snapshot.get(
+                    "last_flat_completed_fills"
+                )
+                if (
+                    not isinstance(last_flat_equity_change, Decimal)
+                    or not last_flat_equity_change.is_finite()
+                    or type(completed_fills) is not int
+                    or type(last_flat_completed_fills) is not int
+                    or completed_fills < 0
+                    or last_flat_completed_fills != completed_fills
+                ):
+                    return None
+                return SoftExitEconomics(
+                    completed_turnover=completed_turnover,
+                    completed_net=min(
+                        completed_net, last_flat_equity_change
+                    ),
+                    open_turnover=open_turnover,
+                    open_net=open_net,
+                )
 
             minimum_rate = (
                 self.config.min_completed_net_turnover_bps / Decimal("10000")

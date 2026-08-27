@@ -5,9 +5,12 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aiohttp import ClientConnectorDNSError
+
 from core.adapters.exchanges.adapters.lighter import LighterAdapter
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
+from core.adapters.exchanges.exceptions import OrderSubmissionNotSentError
 from core.adapters.exchanges.models import (
     OrderData,
     OrderSide,
@@ -1692,6 +1695,171 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             "min_quote_amount": Decimal("10"),
         }
 
+    @staticmethod
+    def _dns_failure(
+        host: str = "api.rh.lighter.xyz",
+    ) -> ClientConnectorDNSError:
+        connection = SimpleNamespace(
+            host=host,
+            port=443,
+            ssl=True,
+        )
+        return ClientConnectorDNSError(
+            connection,
+            OSError("Timeout while contacting DNS servers"),
+        )
+
+    async def test_dns_failure_before_limit_send_is_not_quarantined(self):
+        rest = self._rest()
+        rest.base_url = "https://api.rh.lighter.xyz"
+        rest.api_key_index = 3
+        rest._validate_order_preconditions = MagicMock(return_value=True)
+        rest._get_market_info = AsyncMock(return_value=self._market_info())
+        rest._validate_order_minimums = MagicMock()
+        nonce_manager = SimpleNamespace(
+            api_keys_list=[3],
+            acknowledge_failure=MagicMock(),
+        )
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(side_effect=self._dns_failure()),
+            nonce_manager=nonce_manager,
+        )
+
+        with self.assertRaisesRegex(
+            OrderSubmissionNotSentError,
+            "DNS resolution",
+        ):
+            await rest.place_order(
+                "BTC",
+                "buy",
+                "limit",
+                Decimal("0.00020"),
+                Decimal("64000"),
+                _raise_on_definitive_pre_send_failure=True,
+            )
+
+        rest.signer_client.create_order.assert_awaited_once()
+        nonce_manager.acknowledge_failure.assert_called_once_with(3)
+        self.assertEqual(rest.get_unresolved_submissions(), [])
+        rest.get_open_orders.assert_not_awaited()
+        rest.get_order_history.assert_not_awaited()
+
+    async def test_dns_failure_without_mm_opt_in_remains_ambiguous(self):
+        rest = self._rest()
+        rest.base_url = "https://api.rh.lighter.xyz"
+        rest.api_key_index = 3
+        nonce_manager = SimpleNamespace(
+            api_keys_list=[3],
+            acknowledge_failure=MagicMock(),
+        )
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(side_effect=self._dns_failure()),
+            nonce_manager=nonce_manager,
+        )
+
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await rest._execute_limit_order(
+                "BTC",
+                "buy",
+                Decimal("0.00020"),
+                Decimal("64000"),
+                self._market_info(),
+            )
+
+        self.assertTrue(result.raw_data["submission_uncertain"])
+        self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+        nonce_manager.acknowledge_failure.assert_not_called()
+
+    async def test_dns_opt_in_fails_closed_without_exact_host_and_key(self):
+        cases = (
+            ("wrong-host", "redirect.example", [3]),
+            ("multiple-keys", "api.rh.lighter.xyz", [3, 4]),
+        )
+        for label, host, keys in cases:
+            with self.subTest(label=label):
+                rest = self._rest()
+                rest.base_url = "https://api.rh.lighter.xyz"
+                rest.api_key_index = 3
+                nonce_manager = SimpleNamespace(
+                    api_keys_list=keys,
+                    acknowledge_failure=MagicMock(),
+                )
+                rest.signer_client = SimpleNamespace(
+                    create_order=AsyncMock(
+                        side_effect=self._dns_failure(host)
+                    ),
+                    nonce_manager=nonce_manager,
+                )
+
+                with patch(
+                    "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+                    new=AsyncMock(),
+                ):
+                    result = await rest._execute_limit_order(
+                        "BTC",
+                        "buy",
+                        Decimal("0.00020"),
+                        Decimal("64000"),
+                        self._market_info(),
+                        _raise_on_definitive_pre_send_failure=True,
+                    )
+
+                self.assertTrue(result.raw_data["submission_uncertain"])
+                self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+                nonce_manager.acknowledge_failure.assert_not_called()
+
+    async def test_post_send_dns_is_not_classified_as_not_sent(self):
+        rest = self._rest()
+        rest.base_url = "https://api.rh.lighter.xyz"
+        rest.api_key_index = 3
+        rest._validate_order_preconditions = MagicMock(return_value=True)
+        rest._get_market_info = AsyncMock(return_value=self._market_info())
+        rest._validate_order_minimums = MagicMock()
+        nonce_manager = SimpleNamespace(
+            api_keys_list=[3],
+            acknowledge_failure=MagicMock(),
+        )
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="tx"),
+                    None,
+                )
+            ),
+            nonce_manager=nonce_manager,
+        )
+        rest._handle_order_result = AsyncMock(
+            side_effect=self._dns_failure()
+        )
+
+        result = await rest.place_order(
+            "BTC",
+            "buy",
+            "limit",
+            Decimal("0.00020"),
+            Decimal("64000"),
+            _raise_on_definitive_pre_send_failure=True,
+        )
+
+        self.assertIsNone(result)
+        nonce_manager.acknowledge_failure.assert_not_called()
+
+    async def test_dns_failure_during_cancel_remains_uncertain(self):
+        rest = self._rest()
+        rest.get_market_index = MagicMock(return_value=1)
+        rest.signer_client = SimpleNamespace(
+            cancel_order=AsyncMock(side_effect=self._dns_failure())
+        )
+
+        cancelled = await rest.cancel_order("BTC", "101")
+
+        self.assertFalse(cancelled)
+        self.assertEqual(rest._uncertain_cancellations, {("BTC", "101")})
+
     async def test_transport_loss_reconciles_limit_order_by_original_client_id(self):
         rest = self._rest()
         found = exchange_order(OrderStatus.OPEN, "0", "0.00020")
@@ -2250,16 +2418,17 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ambiguous_cancel_fill_is_not_reported_as_cancelled(self):
         rest = self._rest()
+        rest._capture_terminal_cancellation_outcomes = True
         rest.get_market_index = MagicMock(return_value=1)
-        terminal = SimpleNamespace(
-            id="101",
-            client_id="client-101",
-            status=OrderStatus.FILLED,
-        )
+        terminal = exchange_order(OrderStatus.FILLED, "0.00020", "0")
         rest.get_order_history = AsyncMock(return_value=[terminal])
         rest.signer_client = SimpleNamespace(
             cancel_order=AsyncMock(
-                side_effect=ConnectionError("connection reset after send")
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="cancel-tx"),
+                    None,
+                )
             )
         )
 
@@ -2270,8 +2439,42 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             cancelled = await rest.cancel_order("BTC", "101")
 
         self.assertFalse(cancelled)
-        rest.signer_client.cancel_order.assert_awaited_once()
+        rest.signer_client.cancel_order.assert_awaited_once_with(
+            market_index=1,
+            order_index=101,
+        )
+        self.assertEqual(rest.get_open_orders.await_count, 1)
+        self.assertEqual(rest.get_order_history.await_count, 1)
         self.assertEqual(rest._uncertain_cancellations, {("BTC", "101")})
+        self.assertIs(
+            rest.get_terminal_cancellation_outcome("BTC", "101"), terminal
+        )
+
+    async def test_grid_path_does_not_capture_mm_terminal_outcomes(self):
+        rest = self._rest()
+        rest.get_market_index = MagicMock(return_value=1)
+        terminal = exchange_order(OrderStatus.FILLED, "0.00020", "0")
+        rest.get_order_history = AsyncMock(return_value=[terminal])
+        rest.signer_client = SimpleNamespace(
+            cancel_order=AsyncMock(
+                return_value=(
+                    object(),
+                    SimpleNamespace(code=200, tx_hash="cancel-tx"),
+                    None,
+                )
+            )
+        )
+
+        cancelled = await rest.cancel_order("BTC", "101")
+
+        self.assertFalse(cancelled)
+        self.assertEqual(rest._uncertain_cancellations, {("BTC", "101")})
+        self.assertIsNone(
+            rest.get_terminal_cancellation_outcome("BTC", "101")
+        )
+        self.assertEqual(
+            getattr(rest, "_terminal_cancellation_outcomes", {}), {}
+        )
 
 
 class LighterRestOrderParsingTests(unittest.TestCase):
@@ -2325,6 +2528,97 @@ class LighterRestOrderParsingTests(unittest.TestCase):
 
 
 class LighterAdapterHistoryTests(unittest.IsolatedAsyncioTestCase):
+    def test_terminal_order_clears_exact_uncertain_cancellation_key(self):
+        for status in (OrderStatus.CANCELED, OrderStatus.FILLED):
+            with self.subTest(status=status):
+                rest = object.__new__(LighterRest)
+                rest._uncertain_cancellations = {
+                    ("BTC", "101"),
+                    ("BTC", "other"),
+                }
+                adapter = object.__new__(LighterAdapter)
+                adapter._normalize_symbol = lambda symbol: symbol
+                adapter._rest = rest
+                terminal = exchange_order(
+                    status,
+                    "0.00020" if status is OrderStatus.FILLED else "0",
+                    "0" if status is OrderStatus.FILLED else "0.00020",
+                )
+                rest._terminal_cancellation_outcomes = {
+                    ("BTC", "101"): terminal
+                }
+
+                self.assertEqual(
+                    adapter.get_unresolved_cancellations(),
+                    [("BTC", "101"), ("BTC", "other")],
+                )
+                self.assertIs(
+                    adapter.get_terminal_cancellation_outcome("101", "BTC"),
+                    terminal,
+                )
+                self.assertTrue(
+                    adapter.confirm_terminal_cancellation_outcome(terminal)
+                )
+                self.assertEqual(
+                    adapter.get_unresolved_cancellations(),
+                    [("BTC", "other")],
+                )
+                self.assertIsNone(
+                    adapter.get_terminal_cancellation_outcome("101", "BTC")
+                )
+                self.assertFalse(
+                    adapter.confirm_terminal_cancellation_outcome(terminal)
+                )
+
+    def test_nonterminal_order_does_not_clear_uncertain_cancellation(self):
+        rest = object.__new__(LighterRest)
+        rest._uncertain_cancellations = {("BTC", "101")}
+        adapter = object.__new__(LighterAdapter)
+        adapter._normalize_symbol = lambda symbol: symbol
+        adapter._rest = rest
+
+        self.assertFalse(
+            adapter.confirm_terminal_cancellation_outcome(
+                exchange_order(OrderStatus.OPEN, "0", "0.00020")
+            )
+        )
+        self.assertEqual(
+            adapter.get_unresolved_cancellations(), [("BTC", "101")]
+        )
+
+    def test_conflicting_terminal_replay_does_not_erase_fill_proof(self):
+        terminal = exchange_order(OrderStatus.FILLED, "0.00020", "0")
+        rest = object.__new__(LighterRest)
+        rest._uncertain_cancellations = {("BTC", "101")}
+        rest._terminal_cancellation_outcomes = {("BTC", "101"): terminal}
+
+        self.assertFalse(
+            rest.confirm_terminal_cancellation_outcome(
+                "BTC", "101", OrderStatus.CANCELED
+            )
+        )
+        self.assertEqual(rest._uncertain_cancellations, {("BTC", "101")})
+        self.assertIs(
+            rest.get_terminal_cancellation_outcome("BTC", "101"), terminal
+        )
+
+    def test_terminal_confirmation_accepts_exact_client_id_alias(self):
+        terminal = exchange_order(OrderStatus.FILLED, "0.00020", "0")
+        rest = object.__new__(LighterRest)
+        rest._uncertain_cancellations = {("BTC", "client-101")}
+        rest._terminal_cancellation_outcomes = {
+            ("BTC", "client-101"): terminal
+        }
+        adapter = object.__new__(LighterAdapter)
+        adapter._normalize_symbol = lambda symbol: symbol
+        adapter._rest = rest
+
+        self.assertTrue(adapter.confirm_terminal_cancellation_outcome(terminal))
+        self.assertEqual(rest._uncertain_cancellations, set())
+        self.assertIsNone(
+            rest.get_terminal_cancellation_outcome("BTC", "client-101")
+        )
+
     async def test_cancel_returns_nonterminal_order_while_proof_is_uncertain(self):
         adapter = object.__new__(LighterAdapter)
         adapter._normalize_symbol = lambda symbol: symbol

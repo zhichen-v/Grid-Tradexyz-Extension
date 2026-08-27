@@ -10,7 +10,7 @@ from .config import MarketMakerConfig
 
 _ZERO = Decimal("0")
 _TEN_THOUSAND = Decimal("10000")
-_READ_ATTEMPTS = 5
+_READ_ATTEMPTS = 6
 _READ_RETRY_SECONDS = 1.0
 
 
@@ -204,6 +204,8 @@ class SessionEconomics:
     _episode_fee: Decimal = _ZERO
     _episode_gross: Decimal = _ZERO
     current_equity: Decimal | None = None
+    last_flat_equity_change: Decimal = _ZERO
+    last_flat_completed_fills: int = 0
     economic_state: str = "collecting"
     economic_reason: str | None = None
 
@@ -274,9 +276,23 @@ class SessionEconomics:
                 self._episode_gross = _ZERO
 
         self.current_equity = current_equity
+        if self.ledger_position == 0:
+            self.last_flat_equity_change = (
+                current_equity - self.baseline_equity
+            )
+            self.last_flat_completed_fills = self.completed_fills
         self._evaluate()
 
     def _evaluate(self) -> None:
+        loss_budget = self.config.max_session_loss_for_maker_exit
+        session_loss = self.session_loss_for_maker_exit
+        if loss_budget > 0 and session_loss > loss_budget:
+            self.economic_state = "no_go"
+            self.economic_reason = (
+                "bounded maker-exit session loss exceeded"
+            )
+            raise AccountAuditError(self.economic_reason)
+
         if self.completed_fills < self.config.economic_min_fills:
             if self.ledger_position != 0:
                 self.economic_state = "incomplete_nonflat"
@@ -288,15 +304,14 @@ class SessionEconomics:
                 )
             return
         net_bps = self.completed_net_turnover_bps
+        failure_reason: str | None = None
         if self.completed_gross < self.completed_exact_fee:
-            self.economic_state = "no_go"
-            self.economic_reason = "completed gross does not cover exact fees"
+            failure_reason = "completed gross does not cover exact fees"
         elif (
             net_bps is None
             or net_bps < self.config.min_completed_net_turnover_bps
         ):
-            self.economic_state = "no_go"
-            self.economic_reason = (
+            failure_reason = (
                 "completed net/turnover is below the configured threshold"
             )
         elif self.ledger_position != 0:
@@ -310,15 +325,22 @@ class SessionEconomics:
             or self.flat_equity_turnover_bps
             < self.config.min_completed_net_turnover_bps
         ):
-            self.economic_state = "no_go"
-            self.economic_reason = (
+            failure_reason = (
                 "flat account-value change/turnover is below the configured threshold"
             )
-        else:
-            self.economic_state = "fee_and_equity_gate_go"
-            self.economic_reason = None
-        if self.economic_state == "no_go":
-            raise AccountAuditError(self.economic_reason or "economic gate failed")
+        if failure_reason is not None:
+            if loss_budget > 0:
+                self.economic_state = "bounded_economic_recovery"
+                self.economic_reason = (
+                    f"{failure_reason}; maker-exit session loss remains bounded"
+                )
+                return
+            self.economic_state = "no_go"
+            self.economic_reason = failure_reason
+            raise AccountAuditError(failure_reason)
+
+        self.economic_state = "fee_and_equity_gate_go"
+        self.economic_reason = None
 
     @property
     def completed_net(self) -> Decimal:
@@ -342,6 +364,14 @@ class SessionEconomics:
             (self.current_equity - self.baseline_equity)
             / self.completed_turnover
             * _TEN_THOUSAND
+        )
+
+    @property
+    def session_loss_for_maker_exit(self) -> Decimal:
+        return max(
+            _ZERO,
+            -self.completed_net,
+            -self.last_flat_equity_change,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -379,6 +409,21 @@ class SessionEconomics:
             "flat_equity_turnover_bps": self.flat_equity_turnover_bps,
             "completed_fee_cover_ratio": fee_cover_ratio,
             "flat_equity_change": flat_equity_change,
+            "last_flat_equity_change": self.last_flat_equity_change,
+            "last_flat_completed_fills": self.last_flat_completed_fills,
+            "max_session_loss_for_maker_exit": (
+                self.config.max_session_loss_for_maker_exit
+            ),
+            "session_loss_for_maker_exit": self.session_loss_for_maker_exit,
+            "remaining_session_loss_for_maker_exit": (
+                max(
+                    _ZERO,
+                    self.config.max_session_loss_for_maker_exit
+                    - self.session_loss_for_maker_exit,
+                )
+                if self.config.max_session_loss_for_maker_exit > 0
+                else None
+            ),
             "unattributed_flat_cashflow": (
                 flat_equity_change - self.completed_net
                 if flat_equity_change is not None

@@ -36,6 +36,9 @@ import asyncio
 import logging
 import threading
 import time
+from urllib.parse import urlparse
+
+from aiohttp import ClientConnectorDNSError
 
 try:
     import lighter
@@ -47,6 +50,7 @@ except ImportError:
     logging.warning("lighter SDK未安装。请执行: uv pip install lighter-sdk==1.1.2")
 
 from .lighter_base import LighterBase
+from ..exceptions import OrderSubmissionNotSentError
 from ..models import (
     TickerData, OrderBookData, TradeData, BalanceData,
     OrderData, PositionData, ExchangeInfo, OrderBookLevel, OrderSide, OrderType, OrderStatus
@@ -142,6 +146,8 @@ class LighterRest(LighterBase):
         self._client_order_index_lock = threading.Lock()
         self._last_client_order_index = 0
         self._uncertain_cancellations = set()
+        self._capture_terminal_cancellation_outcomes = False
+        self._terminal_cancellation_outcomes = {}
         self._unresolved_submissions = {}
 
         # WebSocket由统一adapter持有，避免重复连接与SignerClient nonce状态。
@@ -312,6 +318,30 @@ class LighterRest(LighterBase):
         # handled separately by their callers.
         return LighterRest._is_rate_limited(exc)
 
+    def _is_configured_api_dns_failure(self, exc: Exception) -> bool:
+        """Return whether DNS failed for this adapter's configured API host."""
+        if not isinstance(exc, ClientConnectorDNSError):
+            return False
+        expected_host = urlparse(str(getattr(self, "base_url", ""))).hostname
+        return bool(expected_host) and exc.host == expected_host
+
+    def _restore_nonce_after_pre_send_failure(self) -> bool:
+        """Undo the SDK's optimistic nonce increment for the configured key."""
+        signer = getattr(self, "signer_client", None)
+        manager = getattr(signer, "nonce_manager", None)
+        api_key_index = getattr(self, "api_key_index", None)
+        configured_keys = list(getattr(manager, "api_keys_list", ()))
+        acknowledge = getattr(manager, "acknowledge_failure", None)
+        if (
+            manager is None
+            or api_key_index is None
+            or configured_keys != [api_key_index]
+            or not callable(acknowledge)
+        ):
+            return False
+        acknowledge(api_key_index)
+        return True
+
     @staticmethod
     def _order_matches_client_id(order: OrderData, client_order_id: int) -> bool:
         target = str(client_order_id)
@@ -361,6 +391,65 @@ class LighterRest(LighterBase):
         """Return copies of mutation intents that remain unconfirmed."""
         registry = getattr(self, "_unresolved_submissions", {})
         return [dict(item) for item in registry.values()]
+
+    def get_unresolved_cancellations(self) -> List[tuple[str, str]]:
+        """Return exact keys for cancellation outcomes lacking terminal proof."""
+        return sorted(getattr(self, "_uncertain_cancellations", set()))
+
+    def enable_terminal_cancellation_outcomes(self) -> None:
+        """Enable the MM-only exact outcome side channel."""
+        self._capture_terminal_cancellation_outcomes = True
+
+    def get_terminal_cancellation_outcome(
+        self,
+        symbol: str,
+        order_id: str,
+    ) -> Optional[OrderData]:
+        """Return exact terminal proof captured during cancel reconciliation."""
+        key = (str(symbol), str(order_id))
+        if key not in getattr(self, "_uncertain_cancellations", set()):
+            return None
+        outcomes = getattr(self, "_terminal_cancellation_outcomes", {})
+        return outcomes.get(key)
+
+    def confirm_terminal_cancellation_outcome(
+        self,
+        symbol: str,
+        order_id: str,
+        status: Any,
+    ) -> bool:
+        """Clear one cancel marker only after an exact terminal order update."""
+        status_value = getattr(status, "value", status)
+        if str(status_value or "").lower() not in {
+            "filled",
+            "canceled",
+            "cancelled",
+            "rejected",
+            "expired",
+        }:
+            return False
+        uncertain = getattr(self, "_uncertain_cancellations", set())
+        key = (str(symbol), str(order_id))
+        outcomes = getattr(self, "_terminal_cancellation_outcomes", {})
+        had_uncertain = key in uncertain
+        had_outcome = key in outcomes
+        if not had_uncertain and not had_outcome:
+            return False
+        if had_outcome:
+            stored_status = getattr(outcomes[key], "status", None)
+            stored_value = str(
+                getattr(stored_status, "value", stored_status) or ""
+            ).lower()
+            supplied_value = str(status_value or "").lower()
+            if stored_value == "cancelled":
+                stored_value = "canceled"
+            if supplied_value == "cancelled":
+                supplied_value = "canceled"
+            if stored_value != supplied_value:
+                return False
+        uncertain.discard(key)
+        outcomes.pop(key, None)
+        return True
 
     async def resolve_unresolved_submissions(self) -> List[OrderData]:
         """Resolve registered intents with bounded bulk snapshots."""
@@ -558,12 +647,31 @@ class LighterRest(LighterBase):
                     f"order_id={order_id}, source=history, error={exc}"
                 )
             else:
-                for order in history:
-                    if not matches(order):
-                        continue
+                matching_orders = [order for order in history if matches(order)]
+                for order in matching_orders:
                     status = getattr(order, "status", None)
                     status_value = getattr(status, "value", status)
-                    if str(status_value or "").lower() in {
+                    normalized_status = str(status_value or "").lower()
+                    if normalized_status == "filled" and bool(
+                        getattr(
+                            self,
+                            "_capture_terminal_cancellation_outcomes",
+                            False,
+                        )
+                    ):
+                        outcomes = getattr(
+                            self, "_terminal_cancellation_outcomes", None
+                        )
+                        if outcomes is None:
+                            outcomes = {}
+                            self._terminal_cancellation_outcomes = outcomes
+                        outcomes[(str(symbol), target)] = order
+                        return False
+                for order in matching_orders:
+                    status = getattr(order, "status", None)
+                    status_value = getattr(status, "value", status)
+                    normalized_status = str(status_value or "").lower()
+                    if normalized_status in {
                         "canceled",
                         "cancelled",
                         "rejected",
@@ -595,12 +703,22 @@ class LighterRest(LighterBase):
         finally:
             self.end_safety_requests()
         if reconciled is True:
-            uncertain.discard(key)
+            confirmed = self.confirm_terminal_cancellation_outcome(
+                symbol, order_id, OrderStatus.CANCELED
+            )
+            if confirmed:
+                logger.warning(
+                    "Reconciled ambiguous cancellation as complete: "
+                    f"order_id={order_id}, reason={reason}"
+                )
+                return True
+
+        if self.get_terminal_cancellation_outcome(symbol, order_id) is not None:
             logger.warning(
-                "Reconciled ambiguous cancellation as complete: "
+                "Reconciled ambiguous cancellation as an exact terminal fill; "
                 f"order_id={order_id}, reason={reason}"
             )
-            return True
+            return False
 
         logger.error(
             "Cancellation outcome remains uncertain; signer mutation will not be repeated: "
@@ -1959,6 +2077,10 @@ class LighterRest(LighterBase):
         if kwargs.get("client_order_id") is None:
             kwargs["client_order_id"] = self._next_client_order_index()
 
+        raise_on_pre_send_failure = bool(
+            kwargs.pop("_raise_on_definitive_pre_send_failure", False)
+        )
+
         # 转换参数
         params = self._convert_limit_order_params(
             market_info, quantity, price, side, **kwargs
@@ -1980,14 +2102,20 @@ class LighterRest(LighterBase):
                 lambda: self.signer_client.create_order(**params),
                 retry_on_429=False,
             )
-
-            # 🔥 处理结果（使用调整后的价格，与_convert_limit_order_params保持一致）
-            return await self._handle_order_result(
-                tx, response, err, symbol, side, "limit",
-                quantity, price_rounded, batch_mode=batch_mode,
-                skip_order_index_query=skip_order_index_query, **kwargs
-            )
+        except OrderSubmissionNotSentError:
+            raise
         except Exception as exc:
+            if (
+                raise_on_pre_send_failure
+                and self._is_configured_api_dns_failure(exc)
+                and self._restore_nonce_after_pre_send_failure()
+            ):
+                logger.warning(
+                    "Lighter limit order was not submitted: DNS resolution failed"
+                )
+                raise OrderSubmissionNotSentError(
+                    "limit order was not submitted: DNS resolution failed"
+                ) from None
             if self._is_definitive_mutation_exception(exc):
                 logger.error("执行限价单失败: HTTP 429 rate limited")
                 raise RuntimeError(
@@ -2002,6 +2130,15 @@ class LighterRest(LighterBase):
                 str(exc),
                 **kwargs,
             )
+
+        # Keep post-send response handling outside the pre-connect DNS catch.
+        # A later confirmation read must never make an accepted submission
+        # look retry-safe.
+        return await self._handle_order_result(
+            tx, response, err, symbol, side, "limit",
+            quantity, price_rounded, batch_mode=batch_mode,
+            skip_order_index_query=skip_order_index_query, **kwargs
+        )
 
     async def _handle_order_result(
         self,
@@ -2401,6 +2538,8 @@ class LighterRest(LighterBase):
                     skip_order_index_query=skip_order_index_query, **kwargs
                 )
 
+        except OrderSubmissionNotSentError:
+            raise
         except Exception as e:
             if self._is_definitive_mutation_exception(e):
                 logger.error(f"下单失败 {symbol}: HTTP 429 rate limited")
@@ -2446,8 +2585,10 @@ class LighterRest(LighterBase):
         if uncertain_key in uncertain:
             reconciled = await self._reconcile_cancellation(symbol, logical_order_id)
             if reconciled is True:
-                uncertain.discard(uncertain_key)
-                return True
+                if self.confirm_terminal_cancellation_outcome(
+                    symbol, logical_order_id, OrderStatus.CANCELED
+                ):
+                    return True
             logger.error(
                 "Skip repeated signer cancellation while prior outcome is uncertain: "
                 f"order_id={order_id}"

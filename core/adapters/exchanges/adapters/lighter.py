@@ -63,6 +63,8 @@ def _env_auth_fill_in(env_path: Path = Path(".env")) -> Dict[str, Any]:
 class LighterAdapter(ExchangeAdapter):
     """Lighter交易所适配器 - 统一接口"""
 
+    supports_definitive_pre_send_failure = True
+
     @property
     def managed_order_integrator_fee_tick(self) -> int:
         """Integrator fee signed into every managed limit order."""
@@ -640,6 +642,46 @@ class LighterAdapter(ExchangeAdapter):
     def get_unresolved_submissions(self) -> List[Dict[str, Any]]:
         """Return read-only snapshots of unconfirmed signer mutations."""
         return self._rest.get_unresolved_submissions()
+
+    def get_unresolved_cancellations(self) -> List[tuple[str, str]]:
+        """Return read-only keys for cancellations lacking terminal proof."""
+        return self._rest.get_unresolved_cancellations()
+
+    def enable_market_maker_cancellation_outcomes(self) -> None:
+        """Opt this adapter into MM-only exact cancel/fill outcome capture."""
+        self._rest.enable_terminal_cancellation_outcomes()
+
+    def get_terminal_cancellation_outcome(
+        self,
+        order_id: str,
+        symbol: str,
+    ) -> Optional[OrderData]:
+        """Return exact terminal proof retained by cancellation reconciliation."""
+        return self._rest.get_terminal_cancellation_outcome(
+            self._normalize_symbol(symbol),
+            str(order_id),
+        )
+
+    def confirm_terminal_cancellation_outcome(self, order: OrderData) -> bool:
+        """Clear one cancellation marker after an exact terminal update."""
+        identifiers = tuple(
+            dict.fromkeys(
+                str(identifier)
+                for identifier in (order.id, order.client_id)
+                if identifier is not None
+            )
+        )
+        cleared = False
+        for identifier in identifiers:
+            cleared = (
+                self._rest.confirm_terminal_cancellation_outcome(
+                    self._normalize_symbol(order.symbol),
+                    identifier,
+                    order.status,
+                )
+                or cleared
+            )
+        return cleared
 
     async def resolve_unresolved_submissions(self) -> List[OrderData]:
         """Resolve unconfirmed mutations with active/history reads only."""

@@ -73,6 +73,9 @@ class FakeLighterAdapter:
         self.stop_event: asyncio.Event | None = None
         self.stop_after_creates: int | None = None
 
+    def enable_market_maker_cancellation_outcomes(self) -> None:
+        self.events.append(("enable_cancel_outcomes",))
+
     async def connect(self) -> bool:
         self.events.append(("connect",))
         return True
@@ -265,6 +268,7 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(factory_in_loop)
         labels = [event[0] for event in adapter.events]
         for expected in (
+            "enable_cancel_outcomes",
             "connect",
             "authenticate",
             "metadata",

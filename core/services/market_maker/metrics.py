@@ -22,6 +22,8 @@ def _default_counters() -> dict[str, int]:
             "full_fills",
             "ambiguous_submissions",
             "ambiguous_cancellations",
+            "resolved_ambiguous_cancellations",
+            "unresolved_cancellations",
             "reconciliation_success",
             "reconciliation_failure",
             "unknown_orders",

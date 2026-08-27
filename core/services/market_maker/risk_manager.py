@@ -47,6 +47,7 @@ class RiskDecision:
     runtime_state: RuntimeState
     reason: str
     safe: bool
+    soft_exit_latched: bool = False
 
     @property
     def allow_buy(self) -> bool:
@@ -292,6 +293,7 @@ class RiskManager:
             runtime_state=state,
             reason=reason,
             safe=True,
+            soft_exit_latched=self._soft_exit_latched,
         )
 
     def _inventory_age_seconds(

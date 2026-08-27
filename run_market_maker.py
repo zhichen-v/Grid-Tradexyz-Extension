@@ -234,6 +234,11 @@ async def run_market_maker(
     previous_record_factory = _install_log_redaction(settings)
     try:
         adapter = adapter_factory(settings)
+        enable_terminal_outcomes = getattr(
+            adapter, "enable_market_maker_cancellation_outcomes", None
+        )
+        if callable(enable_terminal_outcomes):
+            enable_terminal_outcomes()
         coordinator = coordinator_factory(
             adapter,
             config,
