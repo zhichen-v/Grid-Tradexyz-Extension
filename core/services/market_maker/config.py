@@ -60,6 +60,7 @@ class MarketMakerConfig:
     symbol: str = "BTC"
     order_size: Decimal = Decimal("0.00020")
     quote_mode: str = "both"
+    ping_pong_enabled: bool = False
     base_half_spread_ticks: int = 1
     max_inventory_skew_ticks: int = 4
     reprice_threshold_ticks: int = 1
@@ -252,9 +253,15 @@ class MarketMakerConfig:
             "cancel_on_shutdown",
             "dry_run",
             "require_flat_start",
+            "ping_pong_enabled",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
+        if self.ping_pong_enabled:
+            if self.quote_mode != "both":
+                raise ValueError("ping_pong_enabled requires quote_mode 'both'")
+            if not self.account_audit_interval_seconds:
+                raise ValueError("ping_pong_enabled requires account audit")
         if not self.post_only:
             raise ValueError("post_only must be true")
         if (

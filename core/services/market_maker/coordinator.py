@@ -606,6 +606,17 @@ class MarketMakerCoordinator:
                 orders,
                 self.metadata,
                 now_monotonic=now,
+                allow_new_episode=(
+                    not self.config.ping_pong_enabled
+                    or self.config.dry_run
+                    or (
+                        self._account_monitor_initialized
+                        and self._audited_fill_generation
+                        == self._processed_fill_generation
+                        and self.metrics.account_audit.get("ledger_position")
+                        == Decimal("0")
+                    )
+                ),
             )
             self._update_market_metrics(now, orders)
             self.metrics.signed_position = self._position.signed_size

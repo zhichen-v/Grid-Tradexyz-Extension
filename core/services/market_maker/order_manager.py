@@ -190,6 +190,9 @@ class MarketMakerOrderManager:
         self._post_only_create_not_before = 0.0
         self._risk_reducing_create_not_before = 0.0
         self._known_order_ids: set[str] = set()
+        self._terminal_orders: dict[
+            tuple[OrderSide, str, str], ManagedOrder
+        ] = {}
         self.runtime_state = RuntimeState.SYNCING
         self.pause_reason: str | None = None
         self._shutting_down = False
@@ -543,6 +546,14 @@ class MarketMakerOrderManager:
             slot = self._slots.get(side)
             if slot is None or not self._order_matches(slot, order):
                 if order.status not in _TERMINAL_STATUSES:
+                    proof = self._terminal_order_replay(order)
+                    if proof is not None:
+                        fill_observed = _has_visible_fill(
+                            order, previous_remaining=proof.remaining
+                        )
+                        if fill_observed:
+                            self._record_terminal_order(proof, order)
+                        return fill_observed
                     self._pause(f"unknown open order update: {order.id}")
                 return False
             fill_observed = _has_visible_fill(
@@ -832,6 +843,9 @@ class MarketMakerOrderManager:
         if order.id is not None:
             self._known_order_ids.add(str(order.id))
         if order.status in _TERMINAL_STATUSES:
+            terminal_slot = self._slots[desired.side]
+            if terminal_slot is not None:
+                self._record_terminal_order(terminal_slot, order)
             if order.status is OrderStatus.FILLED:
                 actions[action_index] = replace(
                     action,
@@ -998,6 +1012,7 @@ class MarketMakerOrderManager:
                 action,
                 success=result.status is not OrderStatus.FILLED,
             )
+            self._record_terminal_order(slot, result)
             self._slots[side] = None
             return _OrderEffect(True, fill_observed)
         self._mark_cancellation_uncertain(slot)
@@ -1129,8 +1144,8 @@ class MarketMakerOrderManager:
                 if callable(confirmer):
                     confirmer(order)
                 self._resolved_ambiguous_cancellations += 1
-            if order.id is not None:
-                self._known_order_ids.add(str(order.id))
+            if slot is not None:
+                self._record_terminal_order(slot, order)
             if _is_post_only_cancellation(order):
                 self._record_post_only_cancellation()
             self._slots[side] = None
@@ -1358,6 +1373,71 @@ class MarketMakerOrderManager:
         return order.symbol == self.config.symbol and (
             order_id_matches or client_id_matches
         )
+
+    def _record_terminal_order(
+        self, slot: ManagedOrder, order: OrderData
+    ) -> None:
+        if order.id is not None:
+            self._known_order_ids.add(str(order.id))
+        order_id = slot.order_id or (
+            str(order.id) if order.id is not None else None
+        )
+        client_id = slot.client_id or (
+            str(order.client_id) if order.client_id is not None else None
+        )
+        remaining = slot.remaining
+        if _valid_limit_order_values(order):
+            remaining = min(remaining, Decimal(str(order.remaining)))
+        proof = replace(
+            slot,
+            order_id=order_id,
+            client_id=client_id,
+            remaining=remaining,
+        )
+        for namespace, value in (
+            ("order_id", proof.order_id),
+            ("client_id", proof.client_id),
+        ):
+            if value:
+                self._terminal_orders[(proof.side, namespace, value)] = proof
+
+    def _terminal_order_replay(
+        self, order: OrderData
+    ) -> ManagedOrder | None:
+        order_id = str(order.id) if order.id is not None else None
+        client_id = (
+            str(order.client_id) if order.client_id is not None else None
+        )
+        proofs: list[ManagedOrder] = []
+        for namespace, value in (
+            ("order_id", order_id),
+            ("client_id", client_id),
+        ):
+            if value:
+                proof = self._terminal_orders.get(
+                    (order.side, namespace, value)
+                )
+                if proof is not None:
+                    proofs.append(proof)
+        if not proofs or any(proof is not proofs[0] for proof in proofs[1:]):
+            return None
+        proof = proofs[0]
+        if (
+            order_id
+            and proof.order_id
+            and order_id != proof.order_id
+        ) or (
+            client_id
+            and proof.client_id
+            and client_id != proof.client_id
+        ):
+            return None
+        if not _valid_limit_order_values(order) or not (
+            Decimal(str(order.amount)) == proof.amount
+            and Decimal(str(order.price)) == proof.price
+        ):
+            return None
+        return proof
 
     def _active_symbol_orders(
         self, orders: Iterable[OrderData] | None

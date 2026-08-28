@@ -531,6 +531,49 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(economics, SoftExitEconomics)
         self.assertEqual(economics.completed_net, Decimal("0.003"))
 
+    async def test_ping_pong_waits_for_authenticated_flat_checkpoint(
+        self,
+    ) -> None:
+        coordinator = self.prepare_running(
+            config=self.config(
+                ping_pong_enabled=True,
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+            )
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator._processed_fill_generation = 1
+        coordinator._audited_fill_generation = 0
+        coordinator.metrics.account_audit["ledger_position"] = Decimal("0")
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertFalse(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+
+        coordinator._audited_fill_generation = 1
+        coordinator.metrics.account_audit["ledger_position"] = Decimal("0.2")
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertFalse(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+
+        coordinator.metrics.account_audit["ledger_position"] = Decimal("0")
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertTrue(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+
     async def test_soft_exit_waits_for_audit_after_processed_fill_updates(
         self,
     ) -> None:

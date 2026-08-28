@@ -72,6 +72,7 @@ class RiskManager:
         metadata: MarketMetadata,
         *,
         now_monotonic: float | None = None,
+        allow_new_episode: bool = True,
     ) -> RiskDecision:
         if position is None:
             return self._paused(
@@ -198,8 +199,12 @@ class RiskManager:
         residual_position = (
             _ZERO < abs(position.signed_size) < self.config.order_size
         )
+        ping_pong_reduction = (
+            self.config.ping_pong_enabled and position.signed_size != _ZERO
+        )
         normal_reduction = (
-            residual_position
+            ping_pong_reduction
+            or residual_position
             or absolute_ratio >= self.config.hard_position_ratio
         )
         if (
@@ -209,21 +214,35 @@ class RiskManager:
             and position.signed_size != _ZERO
         ):
             self._soft_exit_latched = True
-        if normal_reduction or self._soft_exit_latched:
+        if (
+            self.config.ping_pong_enabled
+            and position.signed_size == _ZERO
+            and not allow_new_episode
+        ):
+            state = RuntimeState.SYNCING
+            reason = "authenticated flat checkpoint pending"
+            requested_buy = None
+            requested_sell = None
+        elif normal_reduction or self._soft_exit_latched:
             state = RuntimeState.RISK_REDUCTION
             reason = (
                 "soft exit latched until flat"
                 if self._soft_exit_latched
                 else (
-                    "sub-order residual position"
-                    if residual_position
+                    "ping-pong inventory exit"
+                    if ping_pong_reduction
                     else (
-                        "absolute position limit reached"
-                        if abs(position.signed_size) >= self.config.max_position
-                        else "hard inventory limit reached"
-                    )
+                        "sub-order residual position"
+                        if residual_position
+                        else (
+                            "absolute position limit reached"
+                            if abs(position.signed_size)
+                            >= self.config.max_position
+                            else "hard inventory limit reached"
+                        )
                     )
                 )
+            )
             reduction_amount = max(
                 self.config.order_size,
                 abs(position.signed_size),

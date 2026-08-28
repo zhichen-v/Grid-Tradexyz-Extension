@@ -9,6 +9,8 @@ market_maker:
   order_size: "0.00020"
   # Step B 使用 bid_only 或 ask_only；Step C 使用 both。
   quote_mode: "both"
+  # 成交後只保留反向 reduce-only 報價，authenticated flat 後才恢復雙邊。
+  ping_pong_enabled: false
 
   # 單邊距離；完整 Bid-Ask spread 約為兩倍此值。
   base_half_spread_ticks: 1

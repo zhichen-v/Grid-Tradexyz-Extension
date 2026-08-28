@@ -92,7 +92,7 @@ Live 只在 fresh preflight 與相稱 dry-run 通過後啟動：
 3. Exact fee cover `>= 1`，completed net／turnover與 flat equity／turnover都 `>= +0.02 bps`。
 4. Graceful shutdown 後程序消失，兩次 authenticated postflight 都為 position／orders／unresolved `0/0/0`。
 
-`max_session_loss_for_maker_exit`只允許已鎖定的`POST_ONLY reduce-only`退出使用，且必須採 exact trade P&L 與同 generation 的最後flat-equity證據較差者；證據缺失／過期時退回嚴格fee-aware價格，超限即hard stop。`bounded_economic_recovery`明確不是GO。
+`max_session_loss_for_maker_exit`若非`0`，只允許已鎖定的`POST_ONLY reduce-only`退出使用，且必須採 exact trade P&L 與同 generation 的最後flat-equity證據較差者；證據缺失／過期時退回嚴格fee-aware價格，超限即hard stop。`bounded_economic_recovery`明確不是GO。現行候選為`0`，不啟用此loss budget。
 
 任一 hard-safety 失敗立即停止並保留證據；不得為湊成交數而忽略。Economic NO-GO 只淘汰該參數候選，門檻不得降低。只有短 gate 完整 GO 才可從新的 fresh-flat session 啟動數小時 long-run。
 
@@ -130,17 +130,17 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 | D | 小額長時間 | 只在短 gate GO 後執行數小時；觀察 drift、latency、fee、funding、資源與事故密度。 |
 | E | 單變因調參 | 一次只改 spread、size、skew、ratio 或 refresh 其中一項；每次重新驗證。 |
 
-## 8. 本地 checkpoint（2026-08-28 00:10 Asia/Taipei）
+## 8. 本地 checkpoint（2026-08-29 01:07 Asia/Taipei）
 
 ### 8.1 候選與邊界
 
 | 項目 | 現行值 |
 |---|---|
 | 帳戶／市場 | 隔離 Lighter sub-account、Robinhood mainnet、BTC 獨占 |
-| Source config | `config/market_maker/test_lighter_btc_mvp.yaml`，`dry_run: true`，SHA-256 `27266EF375984F8DA3A1724FC9F4EB50B625CDDEB746052E37C2B9057EEC5463` |
-| Current code fingerprint | SHA-256 `200159C7F983A09113CF8B83148E76E398B7508367BBD104BCFA227E7701ABCE`；入口＋MM核心＋shared Lighter adapter／exception，共13個runtime Python檔 |
-| Quote／risk | `both / 250 ticks / 0.00020 / max position 0.00040 / trend 60s/125 ticks / 1x cross / drawdown 0.50 USDG / 8 mutations/min` |
-| Fee／exit | maker `1.2 bps`、soft exit `120s`、maker-exit session loss最多`0.10 USDG`、全部 `POST_ONLY` |
+| Source config | `config/market_maker/test_lighter_btc_mvp.yaml`，`dry_run: true`、`ping_pong_enabled: true`、`max_session_loss_for_maker_exit: "0"`，SHA-256 `9162163CC3B65153CF8FDFE34C3FCC92D28C5DEF0D3590B90F5E3A18984DF711` |
+| Current runtime fingerprint | SHA-256 `984DD3D593E22BA98DE55C05DA2550125A3E501EA26FCC85C1901424732D2AAB`；terminal-replay修復後T3與固定邊界短live均已通過，runtime已停止 |
+| Quote／risk | `both / position-based ping-pong / 250 ticks / 0.00020 / max position 0.00040 / trend 60s/125 ticks / 1x cross / drawdown 0.50 USDG / 8 mutations/min` |
+| Fee／exit | maker `1.2 bps`、soft exit `120s`、session-loss maker exit停用（`0`），回到既有fee／authenticated-surplus aware `POST_ONLY reduce-only` exit |
 | Economic gate | `30 completed`、fee cover `>=1`、completed與flat-equity皆 `>=+0.02 bps` |
 
 ### 8.2 本輪結果
@@ -154,9 +154,15 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 | Cancel-vs-fill競態修復 | MM bootstrap才啟用exact terminal side-channel；legacy Grid cancel contract與production code不變。Exact `FILLED`保留原order資料、驗證ID／client alias、symbol／side／status與visible fill後清slot並refresh position，cancel不計success、當周期不補單；衝突replay、無法own proof或真正無proof仍fail closed，shutdown保留fill effect | **Offline/regression GO**。精準`7/7`、Lighter cancellation`31/31`、Grid targeted`6/6`、MM`319/319`；full repo`566`維持既知Grid `8F+4E` |
 | Cancel-race修復後T3 | 22:31:15–23:02:40，`360/360` cycles、`would_place=404`；真實create/cancel、failed、ambiguity／unresolved、reconciliation failure、unknown、blocks、429、WS reconnect與account-read failure皆`0`，全程flat | **Dry safety GO**；graceful stop、runtime0、雙authenticated postflight position／orders`0/0`，source仍dry-run。證據 `logs/market_maker_t3_cancel_race_20260827-230233.log` |
 | 固定邊界短live | 23:09:02–00:09:28，`735/735` cycles、21 completed／10 round trips、turnover`322.806772`、exact fee`0.03873681264`、gross`-0.001964`、net`-0.04070081264`、completed／flat-equity`-1.260841 / -1.260816 bps`、max DD`0.138115`。一度short`0.00030`長時間停在`soft_exit_hard_fallback`，其後自然flat；failed、ambiguity／unresolved、reconciliation failure、unknown、429與WS皆`0` | **Runtime/safety GO；volume/economic NO-GO**。未達30且gross未cover fee；session loss`0.04070081264 < 0.10`。Graceful stop、runtime0、雙postflight position／orders`0/0`，兩份config均恢復dry-run。證據 `logs/market_maker_cancel_race_short_live_20260828-000923.log` |
+| Hummingbot參考後最小修正 | 只借用ping-pong語意：position非零時取消風險增加側，只留反向reduce-only；position先變flat仍須等待同generation的authenticated ledger flat。拒絕ping-pong搭配單邊模式或未啟用account audit。沒有引入全域fill delay、hanging tracker、額外ledger／executor或新mutation lane | **Offline GO／待T3**。精準`4/4`、MM`323/323`；full repo`570`維持既知Grid`8F+4E`。Grid production未修改，runtime0，本輪未live |
+| Ping-pong正式T3 | 20:16:00–20:46:25，`348/348` cycles、`would_place=447`；真實create/cancel、failed、ambiguity／unresolved、reconciliation failure、unknown、429、WS及account-read failure皆`0`，全程flat | **Dry safety GO**；graceful stop、runtime0、雙postflight position／orders`0/0`。證據 `logs/market_maker_t3_ping_pong_20260828-204622.log` |
+| Ping-pong固定邊界短live | 20:48:12–21:36:32；已證明多輪「maker entry→同側抑制→反向reduce-only maker exit→authenticated-flat barrier→恢復報價」。停止前`654/654` cycles、34 completed／16 round trips、completed turnover`485.272502`、exact fee`0.05823270024`、gross`-0.009290`、net`-0.06752270024`、`-1.391439 bps`、cover`-0.15953`、max DD`0.078506` | **Hard-safety與economic NO-GO**。21:34:02同一受管訂單在cancel terminal confirmation清slot後才收到延遲partial-fill／nonterminal WS update，被active-slot-only matching誤判unknown；counter`2`是同一事件被兩處觀察，不是兩張外部單。REST／audit證明ownership且10秒後收斂，但依gate仍停止。Runtime0、雙postflight orders0，保留BTC long`0.00020`；未獲本輪recovery授權。證據 `logs/market_maker_ping_pong_short_live_unknown_orders_20260828-213627.log` |
+| 授權 maker-only recovery | 21:48以既有單向helper送出唯一`POST_ONLY + reduce_only SELL 0.00020`；helper取得flat terminal結果後正常退出 | **Recovery GO**。程序`0`；21:48:27與21:48:35兩次authenticated postflight皆BTC position／open orders=`0/0`、used collateral=`0`。Source與ignored live config均維持`dry_run:true`。 |
+| Terminal replay ownership＋strict exit候選 | MM manager以runtime內、side與ID namespace綁定的terminal ownership proof吸收已知order延遲WS replay；amount／price／identity衝突、foreign order與REST active-after-terminal仍fail closed。Remaining low-watermark只下降，新增partial只refresh一次，重播不重複計fill；沒有shared adapter或Grid變更。同時只把本地loss-budget設為`0` | **Offline/regression + dry safety GO**。精準terminal replay`4/4`、order manager`87/87`、經濟分支`4/4`、MM`326/326`；full repo`573`維持既知Grid `8F+4E`。00:08:13–00:38:39 T3保存狀態`348/348`，真實mutation與全部hard-safety counters為`0`，全程flat；graceful stop、runtime0、雙postflight position／orders=`0/0`、used collateral=`0`。證據 `logs/market_maker_t3_terminal_replay_20260829-003823.log`；本輪未live。 |
+| Terminal replay修復後固定邊界短live | 00:44:19–01:04:29，`277/277` cycles、32 completed／16 round trips、turnover`498.137240`、exact fee`0.05977646880`、gross`0.071120`、net`+0.01134353120`、completed／flat-equity`+0.227719 / +0.227708 bps`、cover`1.18977`、max DD`0.011374`。Session-scope證據中loss-budget exit與bounded recovery皆`0`；有可信authenticated盈餘時使用既有soft exit。Failed、ambiguity／unresolved、reconciliation failure、unknown、429、WS與account hard stop皆`0` | **Short-live safety／economic GO**。30 fills且flat時已達完整經濟gate；01:04:09一次position snapshot unavailable令runtime fail closed，account audit仍healthy，停止窗口中已進入的maker episode自然完成並由01:04:29 final audit確認flat。Terminal replay未自然出現，因此live只證明正常路徑，未宣稱已證明replay路徑。Evidence `logs/market_maker_terminal_replay_short_live_final_20260829-010429.log`；runtime0、雙postflight position／orders=`0/0`、used collateral=`0`、equity`299.383977`，source與fresh live copy均已恢復dry-run。 |
 
 ### 8.3 當前決策
 
-**OPERATION STOPPED / PROCESS、OPEN ORDERS、POSITION皆0 / CANCEL-RACE SAFETY GO / 固定候選VOLUME＋ECONOMIC NO-GO / LONG-RUN禁止晉級。** Cancel-vs-fill修復沒有再出現uncertainty事故，但本場只完成21 fills，且自然flat後淨值／fee gate明確為負。`0.10 USDG` maker-exit budget雖把session loss限制在`0.04070081264`，`soft_exit_hard_fallback`長時間不動與後段虧損成交仍需離線鑑識；未釐清前不得直接重跑或進long-run。
+**OPERATION STOPPED / RUNTIME 0 / OPEN ORDERS 0 / POSITION 0 / FIXED SHORT-LIVE SAFETY＋ECONOMIC GO / TERMINAL REPLAY LIVE PATH未自然觸發 / LONG-RUN需另行明確授權。** Source與本輪fresh live copy均維持`dry_run:true`。下一步不再自動重跑或調參；若要做long-run，須重新取得明確授權與fresh authenticated preflight。
 
 VPS 同步與測試仍不在本階段。歷史事故與舊 fingerprint 僅見 [驗證歷史](market_maker_mvp_validation_history.md)，不能代替 fresh preflight。

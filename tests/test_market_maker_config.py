@@ -176,6 +176,26 @@ market_maker:
                 with self.assertRaisesRegex(ValueError, "post_only"):
                     MarketMakerConfig(post_only=value)  # type: ignore[arg-type]
 
+    def test_ping_pong_requires_boolean(self) -> None:
+        for value in ("true", 1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "ping_pong_enabled"):
+                    MarketMakerConfig(  # type: ignore[arg-type]
+                        ping_pong_enabled=value
+                    )
+
+    def test_ping_pong_requires_both_and_account_audit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "account audit"):
+            MarketMakerConfig(ping_pong_enabled=True)
+        with self.assertRaisesRegex(ValueError, "quote_mode 'both'"):
+            MarketMakerConfig(
+                ping_pong_enabled=True,
+                quote_mode="bid_only",
+                account_audit_interval_seconds=15,
+                max_session_drawdown=Decimal("0.5"),
+                require_flat_start=True,
+            )
+
     def test_decimal_parser_rejects_non_finite_values(self) -> None:
         for value in ("NaN", "Infinity", "-Infinity"):
             with self.subTest(value=value):

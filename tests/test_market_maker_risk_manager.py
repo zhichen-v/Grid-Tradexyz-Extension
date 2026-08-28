@@ -113,6 +113,63 @@ class RiskManagerTests(unittest.TestCase):
         self.assertTrue(decision.sell_reduce_only)
         self.assertEqual(decision.runtime_state, RuntimeState.RISK_REDUCTION)
 
+    def test_ping_pong_keeps_only_reduce_only_exit_until_flat_confirmed(
+        self,
+    ) -> None:
+        config = replace(
+            self.config,
+            ping_pong_enabled=True,
+            account_audit_interval_seconds=15,
+            max_session_drawdown=Decimal("0.5"),
+            require_flat_start=True,
+        )
+
+        for size, exit_side in (
+            (Decimal("0.2"), OrderSide.SELL),
+            (Decimal("-0.2"), OrderSide.BUY),
+        ):
+            with self.subTest(size=size):
+                decision = RiskManager(config).evaluate(
+                    self.position(str(size), received=100.0),
+                    (),
+                    self.metadata,
+                    now_monotonic=100.0,
+                )
+                self.assertEqual(
+                    decision.runtime_state, RuntimeState.RISK_REDUCTION
+                )
+                self.assertEqual(decision.reason, "ping-pong inventory exit")
+                if exit_side is OrderSide.SELL:
+                    self.assertIsNone(decision.buy_amount)
+                    self.assertEqual(decision.sell_amount, Decimal("0.2"))
+                    self.assertTrue(decision.sell_reduce_only)
+                else:
+                    self.assertEqual(decision.buy_amount, Decimal("0.2"))
+                    self.assertTrue(decision.buy_reduce_only)
+                    self.assertIsNone(decision.sell_amount)
+
+        manager = RiskManager(config)
+        pending = manager.evaluate(
+            self.position("0", received=101.0),
+            (),
+            self.metadata,
+            now_monotonic=101.0,
+            allow_new_episode=False,
+        )
+        self.assertIsNone(pending.buy_amount)
+        self.assertIsNone(pending.sell_amount)
+        self.assertEqual(pending.runtime_state, RuntimeState.SYNCING)
+        self.assertEqual(pending.reason, "authenticated flat checkpoint pending")
+
+        confirmed = manager.evaluate(
+            self.position("0", received=102.0),
+            (),
+            self.metadata,
+            now_monotonic=102.0,
+        )
+        self.assertEqual(confirmed.buy_amount, config.order_size)
+        self.assertEqual(confirmed.sell_amount, config.order_size)
+
     def test_hard_short_only_allows_reduce_only_buy(self) -> None:
         decision = self.evaluate("-0.8")
 

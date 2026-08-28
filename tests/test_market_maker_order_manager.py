@@ -1188,7 +1188,47 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.adapter.create_order.await_count, 2)
 
-    async def test_nonterminal_ws_update_after_terminal_fails_closed(self) -> None:
+    async def test_nonterminal_ws_replay_after_terminal_is_ignored(self) -> None:
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        await self.manager.cancel_managed_orders("test terminal proof")
+        await self.manager.reconcile(
+            self.desired(bid_price="99.8", ask_price=None), self.risk()
+        )
+
+        self.assertFalse(
+            await self.manager.handle_order_update(
+                exchange_order("1", OrderSide.BUY, price="99.9")
+            )
+        )
+        self.assertTrue(
+            await self.manager.handle_order_update(
+                exchange_order(
+                    "1",
+                    OrderSide.BUY,
+                    price="99.9",
+                    remaining="0.1",
+                    client_id="client-1",
+                )
+            )
+        )
+        self.assertFalse(
+            await self.manager.handle_order_update(
+                exchange_order(
+                    "1",
+                    OrderSide.BUY,
+                    price="99.9",
+                    remaining="0.1",
+                    client_id="client-1",
+                )
+            )
+        )
+
+        self.assertEqual(self.manager.slots[OrderSide.BUY].order_id, "2")
+        self.assertIsNone(self.manager.pause_reason)
+
+    async def test_terminal_ws_replay_with_wrong_side_still_pauses(self) -> None:
         await self.manager.reconcile(
             self.desired(bid_price="99.9", ask_price=None), self.risk()
         )
@@ -1200,9 +1240,45 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
                 price="99.9",
             )
         )
-        replay = exchange_order("1", OrderSide.BUY, price="99.9")
 
-        await self.manager.handle_order_update(replay)
+        await self.manager.handle_order_update(
+            exchange_order("1", OrderSide.SELL, price="100.1")
+        )
+
+        self.assertIn("unknown open order update", self.manager.pause_reason)
+
+    async def test_terminal_proof_keeps_partial_fill_low_watermark(self) -> None:
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        partial = exchange_order(
+            "1",
+            OrderSide.BUY,
+            price="99.9",
+            remaining="0.1",
+            client_id="client-1",
+        )
+        self.assertTrue(await self.manager.handle_order_update(partial))
+
+        await self.manager.cancel_managed_orders("test stale terminal remaining")
+
+        self.assertFalse(await self.manager.handle_order_update(partial))
+        self.assertIsNone(self.manager.pause_reason)
+
+    async def test_terminal_replay_cross_namespace_collision_pauses(self) -> None:
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        await self.manager.cancel_managed_orders("test terminal proof")
+
+        await self.manager.handle_order_update(
+            exchange_order(
+                "client-1",
+                OrderSide.BUY,
+                price="99.9",
+                client_id="foreign-client",
+            )
+        )
 
         self.assertIn("unknown open order update", self.manager.pause_reason)
 
