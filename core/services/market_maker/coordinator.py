@@ -830,7 +830,7 @@ class MarketMakerCoordinator:
                 reason = "; ".join(result.errors) or "active unwind state is uncertain"
                 await self._record_error(reason, source="reconcile")
                 await self._fail_closed(RuntimeState.PAUSED_ORDER_STATE, reason)
-                return
+                raise RuntimeError(f"active unwind hard stop: {reason}")
             if getattr(result, "position_refresh_required", False) is True:
                 prepared_active_unwind = active_lane and any(
                     getattr(action, "operation", "")

@@ -766,6 +766,72 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             coordinator.metrics.inventory_unwind["state"], "passive_wait"
         )
 
+    async def test_active_unwind_error_is_terminal_hard_stop(self) -> None:
+        manager = self.order_manager()
+        manager.execute_active_unwind.return_value = ReconcileResult(
+            (),
+            RuntimeState.RISK_REDUCTION,
+            errors=("active unwind terminal proof is unavailable: timeout",),
+        )
+        monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.active_account_snapshot("-0.2")),
+            audit=AsyncMock(),
+            mark_hard_stop=Mock(),
+            last_audit_monotonic=self.now,
+        )
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(
+                active_unwind_loss_trigger="0.001"
+            ),
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator.metrics.account_audit = self.active_account_snapshot("-0.2")
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+        coordinator._market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("100.5"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("100.7"), Decimal("1")),),
+            best_bid=Decimal("100.5"),
+            best_ask=Decimal("100.7"),
+            exchange_timestamp=None,
+            received_monotonic=self.now,
+        )
+        coordinator.risk_manager.evaluate.return_value = replace(
+            self.risk(),
+            buy_amount=Decimal("0.2"),
+            sell_amount=None,
+            buy_reduce_only=True,
+            soft_exit_latched=True,
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+        coordinator.strategy.calculate_quotes.return_value = replace(
+            self.desired(),
+            bid=DesiredOrder(
+                OrderSide.BUY,
+                Decimal("99.8"),
+                Decimal("0.2"),
+                True,
+                "soft_exit_hard_fallback",
+            ),
+            ask=None,
+            reference_price=Decimal("100.6"),
+            reservation_price=Decimal("100.6"),
+            half_spread=Decimal("0.1"),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "active unwind hard stop"):
+            await coordinator.run_one_cycle(force=True)
+
+        manager.execute_active_unwind.assert_awaited_once()
+        manager.cancel_managed_orders.assert_awaited()
+        self.assertIs(coordinator._state, RuntimeState.PAUSED_ORDER_STATE)
+        self.assertEqual(
+            coordinator.metrics.counters["reconciliation_failure"], 1
+        )
+
     async def test_active_unwind_recomputes_only_after_fresh_cancel_truth(
         self,
     ) -> None:

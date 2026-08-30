@@ -29,9 +29,12 @@ from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
 from core.services.market_maker.config import MarketMakerConfig
 from core.services.market_maker.coordinator import MarketMakerCoordinator
+from core.services.market_maker.inventory_unwind import InventoryEpisodeExecutor
 from core.services.market_maker.models import (
     DesiredOrder,
     MarketMetadata,
+    MarketSnapshot,
+    PositionSnapshot,
     RuntimeState,
 )
 from core.services.market_maker.order_manager import MarketMakerOrderManager
@@ -370,6 +373,84 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             {"time_in_force": "IOC", "reduce_only": True},
         )
         self.assertEqual(manager.active_unwind_order_ids, {"1"})
+
+    async def test_active_enabled_dry_run_plans_unwind_without_mutation(
+        self,
+    ) -> None:
+        config = replace(self.active_config(enabled=True), dry_run=True)
+        metadata = self.active_metadata()
+        market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("100.5"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("100.7"), Decimal("1")),),
+            best_bid=Decimal("100.5"),
+            best_ask=Decimal("100.7"),
+            exchange_timestamp=None,
+            received_monotonic=0.0,
+        )
+        position = PositionSnapshot(
+            symbol="BTC",
+            signed_size=Decimal("-0.001"),
+            entry_price=Decimal("100"),
+            unrealized_pnl=Decimal("-0.0007"),
+            received_monotonic=0.0,
+        )
+        account = {
+            "state": "healthy",
+            "age_seconds": 0.5,
+            "ledger_position": Decimal("-0.001"),
+            "audited_position": Decimal("-0.001"),
+            "audited_unrealized_pnl": Decimal("-0.0007"),
+            "completed_net_ex_funding": Decimal("0"),
+            "last_flat_equity_change": Decimal("0"),
+            "open_episode_net_ex_funding": Decimal("-0.0007"),
+            "current_drawdown": Decimal("0.01"),
+            "baseline_equity": Decimal("300"),
+            "current_equity": Decimal("299.99"),
+        }
+        executor = InventoryEpisodeExecutor(config)
+        executor.evaluate(
+            position=position,
+            market=market,
+            metadata=metadata,
+            account_snapshot=account,
+            now_monotonic=0.0,
+            soft_exit_latched=True,
+            stranded_soft_exit=True,
+            authenticated_flat=False,
+            active_unwind_pending=False,
+            normal_passive_price=market.best_bid,
+        )
+        decision = executor.evaluate(
+            position=replace(position, received_monotonic=31.0),
+            market=replace(market, received_monotonic=31.0),
+            metadata=metadata,
+            account_snapshot=account,
+            now_monotonic=31.0,
+            soft_exit_latched=True,
+            stranded_soft_exit=True,
+            authenticated_flat=False,
+            active_unwind_pending=False,
+            normal_passive_price=market.best_bid,
+        )
+        self.assertIsNotNone(decision.active_order)
+
+        adapter = FakeLighterAdapter()
+        manager = MarketMakerOrderManager(adapter, config, metadata)
+        prepare = await manager.execute_active_unwind(decision.active_order)
+        generation = manager.active_unwind_prepared_generation
+        self.assertTrue(prepare.position_refresh_required)
+        self.assertIsNotNone(generation)
+
+        result = await manager.execute_active_unwind(
+            decision.active_order,
+            prepared_generation=generation,
+        )
+
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.actions[0].operation, "would_active_unwind")
+        self.assertTrue(result.actions[0].success)
+        self.assertEqual(adapter.create_calls, [])
 
     async def test_disabled_active_lane_sends_nothing_to_lighter(self) -> None:
         adapter = FakeLighterAdapter()
@@ -746,6 +827,35 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["integrator_account_index"], 0)
         self.assertEqual(params["integrator_taker_fee"], 0)
         self.assertEqual(params["integrator_maker_fee"], 0)
+
+    def test_active_ioc_reduce_only_maps_to_lighter_sdk_constant(self) -> None:
+        import lighter
+
+        rest = object.__new__(LighterRest)
+        rest._convert_base_amount = Mock(return_value=2)
+        rest._next_client_order_index = Mock(return_value=7)
+
+        params = rest._convert_limit_order_params(
+            {
+                "price_decimals": 1,
+                "price_multiplier": Decimal("10"),
+                "market_index": 1,
+            },
+            Decimal("0.00020"),
+            Decimal("65000.0"),
+            "buy",
+            time_in_force="IOC",
+            reduce_only=True,
+        )
+
+        self.assertEqual(
+            params["time_in_force"],
+            lighter.SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+        )
+        self.assertEqual(
+            params["order_type"], lighter.SignerClient.ORDER_TYPE_LIMIT
+        )
+        self.assertTrue(params["reduce_only"])
 
     async def test_limit_submission_passes_explicit_zero_integrator_fees(self) -> None:
         rest = object.__new__(LighterRest)
