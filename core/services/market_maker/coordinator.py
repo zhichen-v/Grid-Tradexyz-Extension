@@ -6,7 +6,7 @@ import logging
 import math
 import time
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -18,7 +18,8 @@ from ...adapters.exchanges.models import (
     PositionData,
 )
 from .account_monitor import AccountAuditError, MarketMakerAccountMonitor
-from .config import MarketMakerConfig
+from .config import MarketMakerConfig, ceil_to_step, floor_to_step
+from .inventory_unwind import InventoryEpisodeExecutor
 from .metrics import MarketMakerMetrics
 from .models import MarketMetadata, MarketSnapshot, PositionSnapshot, RuntimeState
 from .order_manager import MarketMakerOrderManager
@@ -35,6 +36,18 @@ _PAUSED_STATES = {
     RuntimeState.PAUSED_ERROR,
 }
 _QUOTING_STATES = {RuntimeState.ACTIVE, RuntimeState.RISK_REDUCTION}
+
+
+@dataclass(frozen=True)
+class _ActiveUnwindTruthToken:
+    episode_id: int
+    signed_position: Decimal
+    position_received_monotonic: float
+    audit_generation: int
+    audit_monotonic: float
+    minimum_book_received_monotonic: float
+    manager_mutation_generation: int
+    manager_prepare_generation: int
 
 
 def _valid_book_level(level: Any) -> bool:
@@ -64,6 +77,7 @@ class MarketMakerCoordinator:
         risk_manager: Any | None = None,
         metrics: MarketMakerMetrics | None = None,
         account_monitor: Any | None = None,
+        inventory_executor: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         status_callback: Callable[[dict[str, Any]], Any] | None = None,
@@ -85,6 +99,9 @@ class MarketMakerCoordinator:
         )
         self.metrics.min_profit_buffer_bps = config.min_profit_buffer_bps
         self.account_monitor = account_monitor
+        self.inventory_executor = inventory_executor or InventoryEpisodeExecutor(
+            config
+        )
         self._account_monitor_initialized = False
         self._processed_fill_generation = 0
         self._audited_fill_generation = 0
@@ -118,6 +135,7 @@ class MarketMakerCoordinator:
         self._fatal_exception: BaseException | None = None
         self._eligible_quote_seconds = 0.0
         self._eligible_quote_started: float | None = None
+        self._active_unwind_truth_token: _ActiveUnwindTruthToken | None = None
 
     @property
     def state(self) -> RuntimeState:
@@ -165,6 +183,8 @@ class MarketMakerCoordinator:
                 self._stopped_event.set()
                 return
             self._account_monitor_initialized = False
+            self.inventory_executor.reset_session()
+            self._active_unwind_truth_token = None
             self._processed_fill_generation = 0
             self._audited_fill_generation = -1
             self._authenticated = False
@@ -224,6 +244,7 @@ class MarketMakerCoordinator:
                         self.config,
                         self.metadata,
                         monotonic=self._monotonic,
+                        sleep=self._sleep,
                     )
                 await self.order_manager.initialize()
                 positions = await self.adapter.get_positions([self.config.symbol])
@@ -467,6 +488,7 @@ class MarketMakerCoordinator:
             RuntimeState.STOPPED,
         }:
             return
+        self._active_unwind_truth_token = None
         try:
             self._position = self._normalize_position(position)
         except (AttributeError, TypeError, ValueError):
@@ -488,6 +510,7 @@ class MarketMakerCoordinator:
         if order.symbol != self.config.symbol:
             self.metrics.increment("ignored_other_symbol_orders")
             return
+        self._active_unwind_truth_token = None
         self._pending_orders.append(order)
         if not self._stopping:
             self._quote_event.set()
@@ -698,7 +721,70 @@ class MarketMakerCoordinator:
                     )
                 )
             )
-            if stranded_soft_exit:
+            active_lane = False
+            if self.config.active_unwind_enabled:
+                unwind = self.inventory_executor.evaluate(
+                    position=self._position,
+                    market=self._market,
+                    metadata=self.metadata,
+                    account_snapshot=self._trusted_inventory_unwind_snapshot(now),
+                    now_monotonic=now,
+                    soft_exit_latched=(
+                        getattr(risk, "soft_exit_latched", False) is True
+                    ),
+                    stranded_soft_exit=stranded_soft_exit,
+                    authenticated_flat=self._authenticated_flat_checkpoint(),
+                    active_unwind_pending=bool(
+                        getattr(
+                            self.order_manager, "active_unwind_pending", False
+                        )
+                    ),
+                    normal_passive_price=self._normal_passive_unwind_price(
+                        desired
+                    ),
+                )
+                self.metrics.inventory_unwind = unwind.snapshot()
+                if unwind.blocked:
+                    self.metrics.increment("active_unwind_blocks")
+                    self.metrics.quote_reason = unwind.reason
+                    await self._fail_closed(RuntimeState.PAUSED_ERROR, unwind.reason)
+                    raise RuntimeError(
+                        f"inventory unwind hard stop: {unwind.reason}"
+                    )
+                if unwind.active_order is not None:
+                    active_lane = True
+                    prepared_generation = self._consume_active_unwind_truth(
+                        unwind.episode_id, now
+                    )
+                    result = await self.order_manager.execute_active_unwind(
+                        unwind.active_order,
+                        prepared_generation=prepared_generation,
+                    )
+                else:
+                    if unwind.passive_order is not None:
+                        if unwind.passive_order.side is OrderSide.BUY:
+                            desired = replace(
+                                desired,
+                                bid=unwind.passive_order,
+                                ask=None,
+                                reason=unwind.reason,
+                            )
+                        else:
+                            desired = replace(
+                                desired,
+                                bid=None,
+                                ask=unwind.passive_order,
+                                reason=unwind.reason,
+                            )
+                    elif unwind.suppress_passive:
+                        desired = replace(
+                            desired,
+                            bid=None,
+                            ask=None,
+                            reason=unwind.reason,
+                        )
+                    result = await self.order_manager.reconcile(desired, risk)
+            elif stranded_soft_exit:
                 reason = (
                     "soft exit is stranded outside the normal passive quote "
                     "band by the economic gate"
@@ -706,16 +792,68 @@ class MarketMakerCoordinator:
                 self.metrics.quote_reason = reason
                 await self._fail_closed(RuntimeState.PAUSED_ERROR, reason)
                 raise RuntimeError(f"strategy hard stop: {reason}")
-            result = await self.order_manager.reconcile(desired, risk)
-            self._record_reconcile_actions(getattr(result, "actions", ()))
+            else:
+                result = await self.order_manager.reconcile(desired, risk)
+            if active_lane and unwind.active_order is not None:
+                self.metrics.target_bid = (
+                    unwind.active_order.price
+                    if unwind.active_order.side is OrderSide.BUY
+                    else None
+                )
+                self.metrics.target_ask = (
+                    unwind.active_order.price
+                    if unwind.active_order.side is OrderSide.SELL
+                    else None
+                )
+            else:
+                self.metrics.target_bid = desired.bid.price if desired.bid else None
+                self.metrics.target_ask = desired.ask.price if desired.ask else None
+            actions = tuple(getattr(result, "actions", ()))
+            self._record_reconcile_actions(actions)
+            if active_lane:
+                for action in actions:
+                    if (
+                        getattr(action, "operation", "") == "active_unwind"
+                        and "not sent"
+                        not in str(getattr(action, "reason", "")).lower()
+                    ):
+                        self.inventory_executor.record_active_attempt()
             current_orders = self.order_manager.snapshot()
             self._update_live_metrics(current_orders)
             if getattr(result, "fill_observed", False) is True:
                 self._processed_fill_generation += 1
+            if active_lane and (
+                result.errors
+                or getattr(self.order_manager, "has_uncertain_state", False)
+            ):
+                self.metrics.increment("reconciliation_failure")
+                reason = "; ".join(result.errors) or "active unwind state is uncertain"
+                await self._record_error(reason, source="reconcile")
+                await self._fail_closed(RuntimeState.PAUSED_ORDER_STATE, reason)
+                return
             if getattr(result, "position_refresh_required", False) is True:
+                prepared_active_unwind = active_lane and any(
+                    getattr(action, "operation", "")
+                    == "prepare_active_unwind"
+                    and getattr(action, "success", None) is True
+                    for action in actions
+                )
                 self._position = None
                 self._position_refresh_required = True
-                if not await self._refresh_position_after_order_update():
+                if active_lane:
+                    if not await self._refresh_active_unwind_truth():
+                        return
+                    if prepared_active_unwind:
+                        if not self._arm_active_unwind_truth(unwind.episode_id):
+                            reason = (
+                                "active unwind fresh-truth token could not be armed"
+                            )
+                            await self._fail_closed(
+                                RuntimeState.PAUSED_ORDER_STATE, reason
+                            )
+                            return
+                        self._quote_event.set()
+                elif not await self._refresh_position_after_order_update():
                     return
             if not await self._refresh_after_post_only_cancellations():
                 return
@@ -749,7 +887,7 @@ class MarketMakerCoordinator:
                 self.metrics.record_success(now)
                 self._reset_error("reconcile")
             self._transition(
-                result.runtime_state,
+                risk.runtime_state if active_lane else result.runtime_state,
                 getattr(self.order_manager, "pause_reason", None),
             )
 
@@ -996,8 +1134,122 @@ class MarketMakerCoordinator:
 
     async def _audit_account_locked(self) -> None:
         async with self._cycle_lock:
-            await self.account_monitor.audit(self._managed_order_id_snapshot())
-            self._audited_fill_generation = self._processed_fill_generation
+            await self._audit_account_current_state()
+
+    async def _audit_account_current_state(self) -> None:
+        managed_ids = self._managed_order_id_snapshot()
+        active_ids = frozenset(
+            getattr(self.order_manager, "active_unwind_order_ids", ())
+        )
+        if active_ids:
+            await self.account_monitor.audit(
+                managed_ids, active_unwind_order_ids=active_ids
+            )
+        else:
+            await self.account_monitor.audit(managed_ids)
+        self._audited_fill_generation = self._processed_fill_generation
+
+    async def _refresh_active_unwind_truth(self) -> bool:
+        """Refresh all truth used by the next active-unwind decision."""
+        self._active_unwind_truth_token = None
+        try:
+            await self._refresh_market_once()
+            positions = await self.adapter.get_positions([self.config.symbol])
+            position = self._position_from_rest(positions)
+            if position is None:
+                raise RuntimeError("position REST response is unavailable")
+            self._position = position
+            self._position_refresh_required = False
+            if self.account_monitor is None:
+                raise AccountAuditError(
+                    "active unwind requires an authenticated account monitor"
+                )
+            await asyncio.wait_for(
+                self._audit_account_current_state(),
+                timeout=self.config.account_audit_timeout_seconds,
+            )
+            self._update_account_audit_metrics()
+        except Exception as exc:
+            reason = f"active unwind truth refresh failed: {type(exc).__name__}: {exc}"
+            marker = getattr(self.account_monitor, "mark_hard_stop", None)
+            if callable(marker):
+                marker(reason)
+            await self._fail_closed(RuntimeState.PAUSED_ERROR, reason)
+            return False
+        self.metrics.increment("position_refresh_after_order_update")
+        return True
+
+    def _arm_active_unwind_truth(self, episode_id: int | None) -> bool:
+        now = self._monotonic()
+        manager = self.order_manager
+        monitor = self.account_monitor
+        market = self._market
+        position = self._position
+        snapshot = self._trusted_inventory_unwind_snapshot(now)
+        prepared_generation = getattr(
+            manager, "active_unwind_prepared_generation", None
+        )
+        mutation_generation = getattr(manager, "mutation_generation", None)
+        audit_monotonic = getattr(monitor, "last_audit_monotonic", None)
+        if (
+            type(episode_id) is not int
+            or episode_id <= 0
+            or market is None
+            or position is None
+            or snapshot is None
+            or type(prepared_generation) is not int
+            or type(mutation_generation) is not int
+            or isinstance(audit_monotonic, bool)
+            or not isinstance(audit_monotonic, (int, float))
+            or not math.isfinite(audit_monotonic)
+            or snapshot.get("audited_position") != position.signed_size
+        ):
+            return False
+        self._active_unwind_truth_token = _ActiveUnwindTruthToken(
+            episode_id=episode_id,
+            signed_position=position.signed_size,
+            position_received_monotonic=position.received_monotonic,
+            audit_generation=self._audited_fill_generation,
+            audit_monotonic=float(audit_monotonic),
+            minimum_book_received_monotonic=market.received_monotonic,
+            manager_mutation_generation=mutation_generation,
+            manager_prepare_generation=prepared_generation,
+        )
+        return True
+
+    def _consume_active_unwind_truth(
+        self, episode_id: int | None, now: float
+    ) -> int | None:
+        token = self._active_unwind_truth_token
+        self._active_unwind_truth_token = None
+        if token is None:
+            return None
+        manager = self.order_manager
+        monitor = self.account_monitor
+        market = self._market
+        position = self._position
+        snapshot = self._trusted_inventory_unwind_snapshot(now)
+        if (
+            episode_id != token.episode_id
+            or market is None
+            or position is None
+            or snapshot is None
+            or position.signed_size != token.signed_position
+            or position.received_monotonic
+            != token.position_received_monotonic
+            or self._audited_fill_generation != token.audit_generation
+            or getattr(monitor, "last_audit_monotonic", None)
+            != token.audit_monotonic
+            or market.received_monotonic
+            < token.minimum_book_received_monotonic
+            or getattr(manager, "mutation_generation", None)
+            != token.manager_mutation_generation
+            or getattr(manager, "active_unwind_prepared_generation", None)
+            != token.manager_prepare_generation
+            or snapshot.get("audited_position") != token.signed_position
+        ):
+            return None
+        return token.manager_prepare_generation
 
     async def _fail_closed(self, state: RuntimeState, reason: str) -> None:
         self._transition(state, reason)
@@ -1195,6 +1447,19 @@ class MarketMakerCoordinator:
                 self.metrics.increment("would_cancel")
             elif operation == "blocked":
                 self.metrics.increment("mutation_limiter_blocks")
+            elif operation == "active_unwind":
+                self.metrics.increment("active_unwind_attempts")
+                reason = str(getattr(action, "reason", "")).lower()
+                if getattr(action, "success", None) is True:
+                    self.metrics.increment("active_unwind_success")
+                    if "partial fill" in reason:
+                        self.metrics.increment("active_unwind_partial_fill")
+                    elif "filled" not in reason:
+                        self.metrics.increment("active_unwind_no_fill")
+                elif getattr(action, "success", None) is None:
+                    self.metrics.increment("active_unwind_ambiguous")
+            elif operation == "would_active_unwind":
+                self.metrics.increment("would_active_unwind")
 
     def _update_live_metrics(self, orders: Iterable[Any]) -> None:
         live = tuple(orders)
@@ -1226,6 +1491,74 @@ class MarketMakerCoordinator:
             for order_id in getattr(self.order_manager, "known_order_ids", ())
             if str(order_id)
         }
+
+    def _authenticated_flat_checkpoint(self) -> bool:
+        return bool(
+            self._position is not None
+            and self._position.signed_size == 0
+            and self._account_monitor_initialized
+            and self._audited_fill_generation == self._processed_fill_generation
+            and self.metrics.account_audit.get("ledger_position") == Decimal("0")
+        )
+
+    def _trusted_inventory_unwind_snapshot(
+        self, now: float
+    ) -> dict[str, Any] | None:
+        if (
+            not self._account_monitor_initialized
+            or self._audited_fill_generation != self._processed_fill_generation
+            or self.account_monitor is None
+            or self._position is None
+        ):
+            return None
+        try:
+            snapshot = self.account_monitor.snapshot(now)
+            if not isinstance(snapshot, dict) or snapshot.get("state") != "healthy":
+                return None
+            age = snapshot.get("age_seconds")
+            if (
+                isinstance(age, bool)
+                or not isinstance(age, (int, float, Decimal))
+                or not math.isfinite(age)
+                or age < 0
+                or age
+                > self.config.account_audit_interval_seconds
+                + self.config.account_audit_timeout_seconds
+            ):
+                return None
+            ledger_position = snapshot.get("ledger_position")
+            if (
+                not isinstance(ledger_position, Decimal)
+                or not ledger_position.is_finite()
+                or ledger_position != self._position.signed_size
+            ):
+                return None
+            return snapshot
+        except Exception:
+            return None
+
+    def _normal_passive_unwind_price(self, desired: Any) -> Decimal | None:
+        if (
+            self._position is None
+            or self._position.signed_size == 0
+            or self._market is None
+        ):
+            return None
+        if self._position.signed_size > 0:
+            return max(
+                ceil_to_step(
+                    desired.reservation_price + desired.half_spread,
+                    self.metadata.price_tick,
+                ),
+                self._market.best_bid + self.metadata.price_tick,
+            )
+        return min(
+            floor_to_step(
+                desired.reservation_price - desired.half_spread,
+                self.metadata.price_tick,
+            ),
+            self._market.best_ask - self.metadata.price_tick,
+        )
 
     def _update_account_audit_metrics(self) -> None:
         if self.account_monitor is None:

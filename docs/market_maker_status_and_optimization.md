@@ -1,10 +1,12 @@
 # Market Maker 現況與優化方向
 
-> 更新：2026-08-30 07:35（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
+> 更新：2026-08-30 inventory-unwind code-only checkpoint（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
 
 ## 現況
 
 Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/market_maker/`，與 Grid runtime 分離。本輪未修改 Grid production code；shared Lighter adapter只新增預設關閉的MM pre-send opt-in，以及MM使用的read-only／exact-terminal hooks，Grid預設行為不變。
+
+舊候選的控制面可穩定運行：單一mutation authority、ownership、uncertainty／reconciliation、account audit、shutdown與stranded guard均能按規則收斂或fail closed。缺口在**單邊行情下的inventory lifecycle**，不是程序穩定性：例如先成交short後價格持續上漲，既有fee/equity hard gate可能讓reduce-only maker quote長期停在normal band外；guard只能安全撤單停機，無法在同一episode內動態追價並有界地主動減倉。
 
 已具備：
 
@@ -17,14 +19,19 @@ Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/marke
 - Authenticated account audit：唯一maker fills、exact fee、flat-to-flat net/equity、fee tier、`1x cross`與帳戶獨占。
 - Stale/untrusted data、unknown order、uncertain mutation、reconciliation failure與drawdown超限時 fail closed。
 - `soft_exit_latched`後若正確方向的reduce-only實際報價超出reference的normal half-spread加1 tick，先fail-closed撤managed orders再fatal stop；不改strategy算價、economic gate或maker-only限制。
+- 本次code-only加入per-position episode executor：嚴格fee-aware profit exit、soft-exit後passive chase／progressive loss unlock，以及deadline／loss trigger後的隔離active lane。Active lane僅允許`reduce_only LIMIT + IOC`，先撤managed orders並取得authenticated zero-orders proof，再刷新position／audit／BBO及一次性generation truth；slippage、episode／session loss、drawdown、attempt與confirmation timeout皆有界。
 
 現行候選固定為：
 
-`both / ping-pong / 250 ticks / order 0.00020 / max position 0.00040 / trend 60s/125 ticks / maker-exit loss budget 0 / 1x cross / max drawdown 0.50 USDG / 8 mutations per minute`
+`both / ping-pong / 250 ticks / order 0.00020 / max position 0.00040 / trend 60s/125 ticks / maker-exit loss budget 0 / active unwind OFF / 1x cross / max drawdown 0.50 USDG / 8 mutations per minute`
 
 Fee gate：maker `1.2 bps`、至少 `30 completed maker fills`、fee cover `>=1`、completed與自然flat equity皆 `>=+0.02 bps`。Source YAML維持 `dry_run: true`；ignored live copy只能改成 `dry_run: false`。
 
+Active unwind目前為 **default OFF / explicit opt-in / code-only offline verified / 尚未live validation**。`active_unwind_success`只代表某次active order取得乾淨terminal proof，可能是no-fill或partial；只有新的authenticated flat checkpoint才代表episode完成。此功能不會自動取得live資格，也不改變現行source的dry-run狀態。
+
 ## 最新判定
+
+- 對使用者提出的單邊庫存問題，判斷為「控制面穩定，但退出生命週期不完整」。本次已在MM範圍內加入per-episode triple barrier與bounded active unwind；一般quote仍`POST_ONLY`，active lane預設關閉且只允許`reduce_only LIMIT + IOC`。Two-phase prepare、authenticated zero-orders／fresh position+audit truth、exact terminal ownership及全部loss／slippage／attempt／timeout邊界已有deterministic offline coverage；尚未fresh T3或live，rollout維持blocked。
 
 - Invalid-nonce definitive-rejection修復只接受精確`21104 / invalid nonce / {}`且需MM opt-in，hard-refresh nonce後最多下一cycle重試；其他錯誤仍fail closed。23:15:28–23:49:40 T3為`390/390`、真實mutation與全部hard-safety counters`0`，evidence `logs/market_maker_t3_invalid_nonce_20260829-234937.log`。
 - 23:50:37–03:50:37首輪4小時雖為`2789/2789`且6 completed／3 round trips的completed net為`+0.0240908 bps`、cover`1.02008`，但少於30且final short`0.00020`，只能記`incomplete_nonflat`；依授權以單向`BUY LIMIT + POST_ONLY + reduce_only`於`78139.1` exact fill回到flat。
@@ -46,9 +53,9 @@ Fee gate：maker `1.2 bps`、至少 `30 completed maker fills`、fee cover `>=1`
 
 ## 下一步
 
-1. 保持flat、runtime0、open orders0，兩份本地候選config維持`dry_run:true`；禁止第三次同候選自動重跑。
-2. 目前固定候選會在單一entry後重現stranded soft-exit，無法形成有意義的4小時或30-completed自然flat經濟樣本；guard是安全GO，候選promotion仍被阻擋。
-3. 若要繼續，須由使用者另行授權一個單變因候選，並重新走offline regression、fresh T3與live gate；不得放寬fee/equity gate。
-4. 暫不調`250 ticks`、size、margin或風險額度；不以loss-budget、taker／IOC、market或未完成episode換取成交量。
+1. 保持flat、runtime0、open orders0，所有source／本地候選config維持`dry_run:true`；`active_unwind_enabled`保持`false`，禁止第三次舊候選自動重跑。
+2. 本批Market Maker `364/364`通過；full repo `611`維持既知且同名的Grid baseline `8F+4E`，沒有新增失敗。離線通過不等於live GO。
+3. 後續驗證應分成兩軌：先以default-off精確config做fresh T3，證明一般maker路徑無回歸；再以另建、仍為`dry_run:true`的active-enabled config驗證prepare barrier、zero mutation與telemetry。兩軌都通過後，才可提出獨立、明確授權的active-unwind最小live gate。
+4. Live gate若獲授權，須維持symbol獨占與shutdown撤單，單獨核對正值authenticated taker fee與全部deadline／loss／slippage／attempt／timeout cap，從fresh-flat開始；不得同時調`250 ticks`、size、margin或風險額度，也不得用market、self-trade或未完成episode換取成交量。
 
-不以 taker／IOC、self-trade或隱藏未完成episode換取成交量。VPS仍不在本階段。
+Active IOC是唯一、預設關閉且有界的taker例外，不是成交量工具。VPS仍不在本階段。

@@ -117,14 +117,62 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.created = 0
 
     def make_manager(
-        self, config: MarketMakerConfig | None = None
+        self,
+        config: MarketMakerConfig | None = None,
+        *,
+        sleep=None,
     ) -> MarketMakerOrderManager:
+        values = {
+            "monotonic": self.clock,
+        }
+        if sleep is not None:
+            values["sleep"] = sleep
         return MarketMakerOrderManager(
             self.adapter,
             config or self.config,
             self.metadata,
-            monotonic=self.clock,
+            **values,
         )
+
+    def active_unwind_config(self, **overrides) -> MarketMakerConfig:
+        values = {
+            "symbol": "BTC",
+            "order_size": Decimal("0.2"),
+            "max_position": Decimal("1"),
+            "maker_fee_rate": Decimal("0.00012"),
+            "taker_fee_rate": Decimal("0.0004"),
+            "min_order_lifetime_ms": 1000,
+            "dry_run": False,
+            "ping_pong_enabled": True,
+            "soft_exit_after_seconds": 10,
+            "soft_exit_net_turnover_bps": Decimal("-0.5"),
+            "min_completed_net_turnover_bps": Decimal("0.1"),
+            "active_unwind_enabled": True,
+            "active_unwind_after_seconds": 30,
+            "active_unwind_loss_trigger": Decimal("0.20"),
+            "active_unwind_max_slippage_ticks": 2,
+            "active_unwind_max_attempts": 2,
+            "active_unwind_confirmation_timeout_seconds": 1,
+            "max_episode_loss_for_unwind": Decimal("0.30"),
+            "max_session_loss_for_unwind": Decimal("0.40"),
+            "max_session_loss_for_maker_exit": Decimal("0.15"),
+            "account_audit_interval_seconds": 15,
+            "max_session_drawdown": Decimal("0.50"),
+            "require_flat_start": True,
+        }
+        values.update(overrides)
+        return MarketMakerConfig(**values)
+
+    async def prepare_active_unwind(
+        self,
+        manager: MarketMakerOrderManager,
+        order: DesiredOrder,
+    ) -> int:
+        result = await manager.execute_active_unwind(order)
+        generation = manager.active_unwind_prepared_generation
+        self.assertTrue(result.position_refresh_required)
+        self.assertIsNotNone(generation)
+        return generation
 
     async def _create_order(
         self,
@@ -152,6 +200,456 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             status=OrderStatus.CANCELED,
             params={"cancel_terminal": True},
         )
+
+    async def test_active_unwind_cancels_before_single_bounded_ioc(self) -> None:
+        events = []
+
+        async def cancel(order_id, symbol):
+            events.append(("cancel", str(order_id)))
+            return exchange_order(
+                str(order_id),
+                OrderSide.SELL,
+                status=OrderStatus.CANCELED,
+                params={"cancel_terminal": True},
+            )
+
+        async def create(symbol, side, order_type, amount, price, params):
+            events.append(("create", side.value))
+            self.assertIs(order_type, OrderType.LIMIT)
+            self.assertEqual(params["time_in_force"], "IOC")
+            self.assertIs(params["reduce_only"], True)
+            return exchange_order(
+                "active-1",
+                side,
+                status=OrderStatus.PENDING,
+                price=str(price),
+                amount=str(amount),
+                params=params,
+            )
+
+        async def no_wait(_seconds):
+            return None
+
+        self.adapter.cancel_order.side_effect = cancel
+        self.adapter.create_order.side_effect = create
+        self.adapter.get_open_orders.return_value = []
+        self.adapter.get_order_history.return_value = [
+            exchange_order(
+                "active-1",
+                OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                price="101",
+                amount="0.2",
+                remaining="0",
+                params={"time_in_force": "IOC", "reduce_only": True},
+            )
+        ]
+        manager = self.make_manager(
+            self.active_unwind_config(), sleep=no_wait
+        )
+        manager._slots[OrderSide.SELL] = ManagedOrder(
+            side=OrderSide.SELL,
+            state=OrderSlotState.LIVE,
+            order_id="maker-1",
+            client_id="client-maker-1",
+            price=Decimal("100.1"),
+            amount=Decimal("0.2"),
+            remaining=Decimal("0.2"),
+            reduce_only=True,
+            created_monotonic=self.clock(),
+            updated_monotonic=self.clock(),
+        )
+
+        stale_order = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101"),
+            Decimal("0.2"),
+            True,
+            "loss barrier",
+        )
+        prepare = await manager.execute_active_unwind(stale_order)
+        generation = manager.active_unwind_prepared_generation
+
+        self.assertEqual(events, [("cancel", "maker-1")])
+        self.assertTrue(prepare.position_refresh_required)
+        self.assertFalse(prepare.errors)
+        self.assertIsNotNone(generation)
+
+        # The caller constructs a fresh intent only after refreshing the
+        # post-cancel book, position, and authenticated economics.
+        fresh_order = replace(stale_order, reason="fresh loss barrier")
+        result = await manager.execute_active_unwind(
+            fresh_order, prepared_generation=generation
+        )
+
+        self.assertEqual(events, [("cancel", "maker-1"), ("create", "buy")])
+        self.assertFalse(result.errors)
+        self.assertTrue(result.fill_observed)
+        self.assertTrue(result.position_refresh_required)
+        self.assertEqual(manager.active_unwind_order_ids, {"active-1"})
+        self.assertFalse(manager.active_unwind_pending)
+
+    async def test_active_unwind_exact_no_fill_and_partial_cancel_are_clean(self) -> None:
+        for remaining, filled in (("0.2", False), ("0.1", True)):
+            with self.subTest(remaining=remaining):
+                async def no_wait(_seconds):
+                    return None
+
+                manager = self.make_manager(
+                    self.active_unwind_config(), sleep=no_wait
+                )
+                self.adapter.create_order.side_effect = None
+                self.adapter.create_order.return_value = exchange_order(
+                    "active",
+                    OrderSide.BUY,
+                    status=OrderStatus.PENDING,
+                    price="101",
+                    params={"time_in_force": "IOC", "reduce_only": True},
+                )
+                self.adapter.get_order_history.return_value = [
+                    exchange_order(
+                        "active",
+                        OrderSide.BUY,
+                        status=OrderStatus.CANCELED,
+                        price="101",
+                        remaining=remaining,
+                        params={"time_in_force": "IOC", "reduce_only": True},
+                    )
+                ]
+                order = DesiredOrder(
+                    OrderSide.BUY,
+                    Decimal("101"),
+                    Decimal("0.2"),
+                    True,
+                    "time barrier",
+                )
+                generation = await self.prepare_active_unwind(manager, order)
+                result = await manager.execute_active_unwind(
+                    order, prepared_generation=generation
+                )
+                self.assertFalse(result.errors)
+                self.assertEqual(result.fill_observed, filled)
+                self.assertTrue(result.position_refresh_required)
+
+    async def test_active_unwind_without_terminal_proof_blocks_retry(self) -> None:
+        async def no_wait(_seconds):
+            return None
+
+        manager = self.make_manager(
+            self.active_unwind_config(), sleep=no_wait
+        )
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = exchange_order(
+            "active",
+            OrderSide.BUY,
+            status=OrderStatus.PENDING,
+            price="101",
+            params={"time_in_force": "IOC", "reduce_only": True},
+        )
+        self.adapter.get_order_history.return_value = []
+        order = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101"),
+            Decimal("0.2"),
+            True,
+            "time barrier",
+        )
+
+        generation = await self.prepare_active_unwind(manager, order)
+        first = await manager.execute_active_unwind(
+            order, prepared_generation=generation
+        )
+        second = await manager.execute_active_unwind(order)
+
+        self.assertIn("terminal proof", "; ".join(first.errors))
+        self.assertTrue(manager.has_uncertain_state)
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+        self.assertFalse(any(a.operation == "active_unwind" for a in second.actions))
+
+    async def test_active_unwind_direct_fill_is_exact_and_attributed(self) -> None:
+        manager = self.make_manager(self.active_unwind_config())
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = exchange_order(
+            "active-direct",
+            OrderSide.BUY,
+            status=OrderStatus.FILLED,
+            price="101",
+            amount="0.2",
+            remaining="0",
+            params={"time_in_force": "IOC", "reduce_only": True},
+        )
+
+        order = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101"),
+            Decimal("0.2"),
+            True,
+            "loss barrier",
+        )
+        generation = await self.prepare_active_unwind(manager, order)
+        result = await manager.execute_active_unwind(
+            order, prepared_generation=generation
+        )
+
+        self.assertTrue(result.fill_observed)
+        self.assertTrue(result.position_refresh_required)
+        self.assertEqual(
+            manager.active_unwind_order_ids, {"active-direct"}
+        )
+        self.adapter.get_order_history.assert_not_awaited()
+
+    async def test_active_unwind_uncertain_placeholder_preserves_namespace_until_exact_terminal(
+        self,
+    ) -> None:
+        manager = self.make_manager(self.active_unwind_config())
+        order = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101"),
+            Decimal("0.2"),
+            True,
+            "loss barrier",
+        )
+        client_id = "active-client-namespace"
+        placeholder = replace(
+            exchange_order(
+                "placeholder",
+                OrderSide.BUY,
+                status=OrderStatus.PENDING,
+                price="101",
+                client_id=client_id,
+                params={
+                    "submission_uncertain": True,
+                    "client_order_id": client_id,
+                    "time_in_force": "IOC",
+                    "reduce_only": True,
+                },
+                raw_data={
+                    "submission_uncertain": True,
+                    "client_order_id": client_id,
+                },
+            ),
+            id=None,
+        )
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = placeholder
+
+        generation = await self.prepare_active_unwind(manager, order)
+        result = await manager.execute_active_unwind(
+            order, prepared_generation=generation
+        )
+
+        slot = manager.slots[OrderSide.BUY]
+        self.assertIn("submission outcome is uncertain", "; ".join(result.errors))
+        self.assertIsNotNone(slot)
+        self.assertIsNone(slot.order_id)
+        self.assertEqual(slot.client_id, client_id)
+        self.assertTrue(slot.submission_uncertain)
+        self.assertEqual(slot.state, OrderSlotState.UNCERTAIN_SUBMISSION)
+        self.assertEqual(manager.known_order_ids, frozenset())
+        self.assertEqual(manager.active_unwind_order_ids, frozenset())
+
+        await manager.execute_active_unwind(order)
+        self.adapter.create_order.assert_awaited_once()
+
+        self.adapter.resolve_unresolved_submissions.return_value = [
+            exchange_order(
+                "active-exact",
+                OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                price="101",
+                amount="0.2",
+                remaining="0",
+                client_id=client_id,
+                params={"time_in_force": "IOC", "reduce_only": True},
+            )
+        ]
+        await manager.resolve_unresolved_submissions()
+
+        self.assertIsNone(manager.slots[OrderSide.BUY])
+        self.assertEqual(manager.known_order_ids, {"active-exact"})
+        self.assertEqual(manager.active_unwind_order_ids, {"active-exact"})
+        self.assertFalse(manager.has_uncertain_state)
+
+    async def test_active_unwind_uncertain_placeholder_rejects_mismatched_terminal(
+        self,
+    ) -> None:
+        manager = self.make_manager(self.active_unwind_config())
+        order = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101"),
+            Decimal("0.2"),
+            True,
+            "loss barrier",
+        )
+        client_id = "active-client-exact"
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = replace(
+            exchange_order(
+                "placeholder",
+                OrderSide.BUY,
+                status=OrderStatus.PENDING,
+                price="101",
+                client_id=client_id,
+                params={
+                    "submission_uncertain": True,
+                    "client_order_id": client_id,
+                    "time_in_force": "IOC",
+                    "reduce_only": True,
+                },
+                raw_data={
+                    "submission_uncertain": True,
+                    "client_order_id": client_id,
+                },
+            ),
+            id=None,
+        )
+        generation = await self.prepare_active_unwind(manager, order)
+        await manager.execute_active_unwind(
+            order, prepared_generation=generation
+        )
+        self.adapter.resolve_unresolved_submissions.return_value = [
+            exchange_order(
+                "active-mismatch",
+                OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                price="101",
+                amount="0.2",
+                remaining="0",
+                client_id="different-client",
+                params={"time_in_force": "IOC", "reduce_only": True},
+            )
+        ]
+
+        await manager.resolve_unresolved_submissions()
+        await manager.execute_active_unwind(order)
+
+        slot = manager.slots[OrderSide.BUY]
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.client_id, client_id)
+        self.assertTrue(slot.submission_uncertain)
+        self.assertEqual(manager.known_order_ids, frozenset())
+        self.assertEqual(manager.active_unwind_order_ids, frozenset())
+        self.assertTrue(manager.has_uncertain_state)
+        self.adapter.create_order.assert_awaited_once()
+
+    async def test_active_unwind_ws_terminal_requires_exact_immutable_fields(
+        self,
+    ) -> None:
+        manager = self.make_manager(self.active_unwind_config())
+        manager._slots[OrderSide.BUY] = ManagedOrder(
+            side=OrderSide.BUY,
+            state=OrderSlotState.LIVE,
+            order_id="active-ws",
+            client_id="active-client",
+            price=Decimal("101"),
+            amount=Decimal("0.2"),
+            remaining=Decimal("0.2"),
+            reduce_only=True,
+            created_monotonic=self.clock(),
+            updated_monotonic=self.clock(),
+        )
+        manager._active_unwind_side = OrderSide.BUY
+        mismatched = exchange_order(
+            "active-ws",
+            OrderSide.BUY,
+            status=OrderStatus.FILLED,
+            price="102",
+            amount="0.2",
+            remaining="0",
+            client_id="active-client",
+            params={"time_in_force": "IOC", "reduce_only": True},
+        )
+
+        fill_observed = await manager.handle_order_update(mismatched)
+
+        slot = manager.slots[OrderSide.BUY]
+        self.assertFalse(fill_observed)
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.state, OrderSlotState.UNCERTAIN_SUBMISSION)
+        self.assertTrue(slot.submission_uncertain)
+        self.assertTrue(manager.has_uncertain_state)
+        self.assertEqual(manager.active_unwind_order_ids, frozenset())
+
+    async def test_active_unwind_terminal_history_hang_times_out_fail_closed(
+        self,
+    ) -> None:
+        manager = self.make_manager(self.active_unwind_config())
+        order = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101"),
+            Decimal("0.2"),
+            True,
+            "time barrier",
+        )
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = exchange_order(
+            "active-hang",
+            OrderSide.BUY,
+            status=OrderStatus.PENDING,
+            price="101",
+            params={"time_in_force": "IOC", "reduce_only": True},
+        )
+
+        async def hang(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        self.adapter.get_order_history.side_effect = hang
+        generation = await self.prepare_active_unwind(manager, order)
+        started = asyncio.get_running_loop().time()
+        result = await asyncio.wait_for(
+            manager.execute_active_unwind(
+                order, prepared_generation=generation
+            ),
+            timeout=2,
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        self.assertGreaterEqual(elapsed, 0.8)
+        self.assertLess(elapsed, 2)
+        self.assertIn("timed out", "; ".join(result.errors))
+        self.assertTrue(manager.has_uncertain_state)
+        self.assertTrue(manager.active_unwind_pending)
+        self.adapter.create_order.assert_awaited_once()
+        self.adapter.get_order_history.assert_awaited_once()
+
+    async def test_active_unwind_terminal_poll_has_ten_call_upper_bound(
+        self,
+    ) -> None:
+        async def no_wait(_seconds):
+            return None
+
+        manager = self.make_manager(
+            self.active_unwind_config(
+                active_unwind_confirmation_timeout_seconds=5
+            ),
+            sleep=no_wait,
+        )
+        order = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101"),
+            Decimal("0.2"),
+            True,
+            "time barrier",
+        )
+        self.adapter.create_order.side_effect = None
+        self.adapter.create_order.return_value = exchange_order(
+            "active-poll",
+            OrderSide.BUY,
+            status=OrderStatus.PENDING,
+            price="101",
+            params={"time_in_force": "IOC", "reduce_only": True},
+        )
+        self.adapter.get_order_history.return_value = []
+
+        generation = await self.prepare_active_unwind(manager, order)
+        result = await manager.execute_active_unwind(
+            order, prepared_generation=generation
+        )
+
+        self.assertIn("terminal proof", "; ".join(result.errors))
+        self.assertEqual(self.adapter.get_order_history.await_count, 10)
+        self.assertLess(self.adapter.get_order_history.await_count, 50)
+        self.assertTrue(manager.has_uncertain_state)
 
     @staticmethod
     def desired(

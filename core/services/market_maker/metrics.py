@@ -29,6 +29,13 @@ def _default_counters() -> dict[str, int]:
             "unknown_orders",
             "mutation_limiter_blocks",
             "http_429",
+            "active_unwind_attempts",
+            "active_unwind_success",
+            "active_unwind_no_fill",
+            "active_unwind_partial_fill",
+            "active_unwind_ambiguous",
+            "active_unwind_blocks",
+            "would_active_unwind",
         )
     }
 
@@ -79,6 +86,7 @@ class MarketMakerMetrics:
     reduce_only_mode: bool = False
     counters: dict[str, int] = field(default_factory=_default_counters)
     account_audit: dict[str, Any] = field(default_factory=dict)
+    inventory_unwind: dict[str, Any] = field(default_factory=dict)
 
     def transition(self, state: RuntimeState, reason: str | None = None) -> None:
         if state is not self.runtime_state:
@@ -145,4 +153,5 @@ class MarketMakerMetrics:
             "reduce_only_mode": self.reduce_only_mode,
             "counters": dict(self.counters),
             "account_audit": dict(self.account_audit),
+            "inventory_unwind": dict(self.inventory_unwind),
         }

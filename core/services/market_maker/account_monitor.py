@@ -115,6 +115,7 @@ class _Fill:
     fee: Decimal
     gross: Decimal
     sort_key: tuple[int, int]
+    active_unwind: bool = False
 
     @property
     def signed_amount(self) -> Decimal:
@@ -125,6 +126,8 @@ def _fill_from_trade(
     trade: Any,
     expected_fee_rate: Decimal,
     *,
+    taker_fee_rate: Decimal = _ZERO,
+    active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
     allow_unreported_zero_integrator_fee: bool = False,
 ) -> _Fill:
     trade_id = str(getattr(trade, "id", "") or "")
@@ -143,12 +146,20 @@ def _fill_from_trade(
     raw_data = getattr(trade, "raw_data", None)
     if not isinstance(fee_data, dict) or not isinstance(raw_data, dict):
         raise AccountAuditError("account trade fee metadata is unavailable")
-    if fee_data.get("role") != "maker":
-        raise AccountAuditError("non-maker account trade detected")
-    fee_rate = _decimal(fee_data.get("rate"), "trade fee rate")
-    if fee_rate != expected_fee_rate:
+    active_unwind = order_id in active_unwind_order_ids
+    expected_role = "taker" if active_unwind else "maker"
+    if fee_data.get("role") != expected_role:
         raise AccountAuditError(
-            f"maker fee changed: expected {expected_fee_rate}, observed {fee_rate}"
+            "active unwind trade is not taker"
+            if active_unwind
+            else "non-maker account trade detected"
+        )
+    expected_rate = taker_fee_rate if active_unwind else expected_fee_rate
+    fee_rate = _decimal(fee_data.get("rate"), "trade fee rate")
+    if fee_rate != expected_rate:
+        raise AccountAuditError(
+            f"{'taker' if active_unwind else 'maker'} fee changed: "
+            f"expected {expected_rate}, observed {fee_rate}"
         )
     fee = _decimal(fee_data.get("cost"), "trade fee")
     gross = _decimal(raw_data.get("realized_pnl"), "trade realized pnl")
@@ -181,6 +192,7 @@ def _fill_from_trade(
         fee=fee,
         gross=gross,
         sort_key=(timestamp, trade_sequence),
+        active_unwind=active_unwind,
     )
 
 
@@ -191,6 +203,8 @@ class SessionEconomics:
     seen_trade_ids: set[str] = field(default_factory=set)
     ledger_position: Decimal = _ZERO
     unique_maker_fills: int = 0
+    unique_taker_fills: int = 0
+    maker_turnover: Decimal = _ZERO
     turnover: Decimal = _ZERO
     exact_fee: Decimal = _ZERO
     gross: Decimal = _ZERO
@@ -199,6 +213,9 @@ class SessionEconomics:
     completed_turnover: Decimal = _ZERO
     completed_exact_fee: Decimal = _ZERO
     completed_gross: Decimal = _ZERO
+    active_unwind_turnover: Decimal = _ZERO
+    active_unwind_exact_fee: Decimal = _ZERO
+    active_unwind_gross: Decimal = _ZERO
     _episode_fills: int = 0
     _episode_turnover: Decimal = _ZERO
     _episode_fee: Decimal = _ZERO
@@ -223,6 +240,7 @@ class SessionEconomics:
         current_position: Decimal,
         current_equity: Decimal,
         managed_order_ids: set[str],
+        active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
         allow_unreported_zero_integrator_fee: bool = False,
     ) -> None:
         new_fills = sorted(
@@ -230,6 +248,8 @@ class SessionEconomics:
                 _fill_from_trade(
                     trade,
                     self.config.maker_fee_rate,
+                    taker_fee_rate=self.config.taker_fee_rate,
+                    active_unwind_order_ids=active_unwind_order_ids,
                     allow_unreported_zero_integrator_fee=(
                         allow_unreported_zero_integrator_fee
                     ),
@@ -242,7 +262,10 @@ class SessionEconomics:
         )
         if len(new_fills) >= 100:
             raise AccountAuditError("account trade audit window exhausted")
-        if any(fill.order_id not in managed_order_ids for fill in new_fills):
+        attributable_order_ids = managed_order_ids | set(active_unwind_order_ids)
+        if any(
+            fill.order_id not in attributable_order_ids for fill in new_fills
+        ):
             raise AccountAuditError("account trade is not attributable to this runtime")
         expected_position = self.ledger_position + sum(
             (fill.signed_amount for fill in new_fills), _ZERO
@@ -253,14 +276,39 @@ class SessionEconomics:
             )
 
         for fill in new_fills:
-            next_position = self.ledger_position + fill.signed_amount
+            prior_position = self.ledger_position
+            next_position = prior_position + fill.signed_amount
+            if fill.active_unwind:
+                if prior_position == 0:
+                    raise AccountAuditError(
+                        "active unwind requires nonzero inventory"
+                    )
+                if prior_position * fill.signed_amount >= 0:
+                    raise AccountAuditError(
+                        "active unwind direction does not reduce inventory"
+                    )
+                if prior_position * next_position < 0:
+                    raise AccountAuditError(
+                        "active unwind must not flip inventory"
+                    )
+                if abs(next_position) >= abs(prior_position):
+                    raise AccountAuditError(
+                        "active unwind must strictly reduce inventory"
+                    )
             self.seen_trade_ids.add(fill.trade_id)
             self.ledger_position = next_position
-            self.unique_maker_fills += 1
+            if fill.active_unwind:
+                self.unique_taker_fills += 1
+                self.active_unwind_turnover += fill.turnover
+                self.active_unwind_exact_fee += fill.fee
+                self.active_unwind_gross += fill.gross
+            else:
+                self.unique_maker_fills += 1
+                self.maker_turnover += fill.turnover
             self.turnover += fill.turnover
             self.exact_fee += fill.fee
             self.gross += fill.gross
-            self._episode_fills += 1
+            self._episode_fills += int(not fill.active_unwind)
             self._episode_turnover += fill.turnover
             self._episode_fee += fill.fee
             self._episode_gross += fill.gross
@@ -284,7 +332,11 @@ class SessionEconomics:
         self._evaluate()
 
     def _evaluate(self) -> None:
-        loss_budget = self.config.max_session_loss_for_maker_exit
+        loss_budget = (
+            self.config.max_session_loss_for_unwind
+            if self.config.active_unwind_enabled
+            else self.config.max_session_loss_for_maker_exit
+        )
         session_loss = self.session_loss_for_maker_exit
         if loss_budget > 0 and session_loss > loss_budget:
             self.economic_state = "no_go"
@@ -392,6 +444,8 @@ class SessionEconomics:
             "baseline_equity": self.baseline_equity,
             "current_equity": self.current_equity,
             "unique_maker_fills": self.unique_maker_fills,
+            "unique_taker_fills": self.unique_taker_fills,
+            "maker_turnover": self.maker_turnover,
             "turnover": self.turnover,
             "exact_fee": self.exact_fee,
             "gross": self.gross,
@@ -400,6 +454,9 @@ class SessionEconomics:
             "completed_turnover": self.completed_turnover,
             "completed_exact_fee": self.completed_exact_fee,
             "completed_gross": self.completed_gross,
+            "active_unwind_turnover": self.active_unwind_turnover,
+            "active_unwind_exact_fee": self.active_unwind_exact_fee,
+            "active_unwind_gross": self.active_unwind_gross,
             "completed_net_ex_funding": self.completed_net,
             "open_episode_turnover": self._episode_turnover,
             "open_episode_net_ex_funding": (
@@ -422,6 +479,18 @@ class SessionEconomics:
                     - self.session_loss_for_maker_exit,
                 )
                 if self.config.max_session_loss_for_maker_exit > 0
+                else None
+            ),
+            "max_session_loss_for_unwind": (
+                self.config.max_session_loss_for_unwind
+            ),
+            "remaining_session_loss_for_unwind": (
+                max(
+                    _ZERO,
+                    self.config.max_session_loss_for_unwind
+                    - self.session_loss_for_maker_exit,
+                )
+                if self.config.max_session_loss_for_unwind > 0
                 else None
             ),
             "unattributed_flat_cashflow": (
@@ -456,6 +525,8 @@ class MarketMakerAccountMonitor:
         self.total_read_failures = 0
         self.current_drawdown = _ZERO
         self.max_observed_drawdown = _ZERO
+        self.audited_position: Decimal | None = None
+        self.audited_unrealized_pnl: Decimal | None = None
         self.state = "starting"
         self.reason: str | None = None
 
@@ -475,22 +546,32 @@ class MarketMakerAccountMonitor:
         self.economics.ledger_position = snapshot["position"]
         self.economics.seed(snapshot["trades"])
         self.economics.current_equity = snapshot["equity"]
+        self.audited_position = snapshot["position"]
+        self.audited_unrealized_pnl = snapshot["unrealized_pnl"]
         self.started_monotonic = self._monotonic()
         self.last_audit_monotonic = self.started_monotonic
         self.state = "healthy"
 
-    async def audit(self, managed_order_ids: set[str]) -> None:
+    async def audit(
+        self,
+        managed_order_ids: set[str],
+        *,
+        active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
         if self.economics is None:
             raise AccountAuditError("account monitor is not initialized")
         try:
             snapshot = await self._read_consistent(
-                managed_order_ids, baseline=False
+                managed_order_ids,
+                baseline=False,
+                active_unwind_order_ids=active_unwind_order_ids,
             )
             self.economics.apply(
                 snapshot["trades"],
                 current_position=snapshot["position"],
                 current_equity=snapshot["equity"],
                 managed_order_ids=managed_order_ids,
+                active_unwind_order_ids=active_unwind_order_ids,
                 allow_unreported_zero_integrator_fee=(
                     _has_zero_integrator_fee_signing_proof(self.adapter)
                 ),
@@ -499,6 +580,8 @@ class MarketMakerAccountMonitor:
         except AccountAuditError as exc:
             self.mark_hard_stop(str(exc))
             raise
+        self.audited_position = snapshot["position"]
+        self.audited_unrealized_pnl = snapshot["unrealized_pnl"]
         self.last_audit_monotonic = self._monotonic()
         self.state = "healthy"
         self.reason = None
@@ -508,7 +591,11 @@ class MarketMakerAccountMonitor:
         self.reason = reason
 
     async def _read_consistent(
-        self, managed_order_ids: set[str], *, baseline: bool
+        self,
+        managed_order_ids: set[str],
+        *,
+        baseline: bool,
+        active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         last_error: BaseException | None = None
         for attempt in range(_READ_ATTEMPTS):
@@ -544,6 +631,8 @@ class MarketMakerAccountMonitor:
                         _fill_from_trade(
                             trade,
                             self.config.maker_fee_rate,
+                            taker_fee_rate=self.config.taker_fee_rate,
+                            active_unwind_order_ids=active_unwind_order_ids,
                             allow_unreported_zero_integrator_fee=(
                                 _has_zero_integrator_fee_signing_proof(
                                     self.adapter
@@ -569,6 +658,7 @@ class MarketMakerAccountMonitor:
                     "equity": equity,
                     "collateral": collateral,
                     "position": position,
+                    "unrealized_pnl": unrealized_pnl,
                     "trades": trades,
                 }
             except AccountAuditError:
@@ -624,7 +714,7 @@ class MarketMakerAccountMonitor:
             if session_age is not None and session_age > 0
             else None
         )
-        turnover = economics.get("turnover")
+        turnover = economics.get("maker_turnover")
         fills = economics.get("unique_maker_fills")
         return {
             "state": self.state,
@@ -638,6 +728,8 @@ class MarketMakerAccountMonitor:
             "total_read_failures": self.total_read_failures,
             "current_drawdown": self.current_drawdown,
             "max_observed_drawdown": self.max_observed_drawdown,
+            "audited_position": self.audited_position,
+            "audited_unrealized_pnl": self.audited_unrealized_pnl,
             "maker_turnover_per_wall_hour": (
                 turnover / hours
                 if hours is not None and isinstance(turnover, Decimal)

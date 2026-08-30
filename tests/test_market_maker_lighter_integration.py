@@ -29,7 +29,12 @@ from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
 from core.services.market_maker.config import MarketMakerConfig
 from core.services.market_maker.coordinator import MarketMakerCoordinator
-from core.services.market_maker.models import RuntimeState
+from core.services.market_maker.models import (
+    DesiredOrder,
+    MarketMetadata,
+    RuntimeState,
+)
+from core.services.market_maker.order_manager import MarketMakerOrderManager
 
 
 def _order(
@@ -142,7 +147,11 @@ class FakeLighterAdapter:
         self.events.append(("open_orders", symbol, tuple(self.active)))
         return snapshot
 
-    async def get_order_history(self, symbol: str | None = None) -> list[OrderData]:
+    async def get_order_history(
+        self,
+        symbol: str | None = None,
+        limit: int | None = None,
+    ) -> list[OrderData]:
         self.events.append(("order_history", symbol))
         return list(self.history)
 
@@ -262,6 +271,128 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             stop_event=stop,
         )
         return adapter, coordinator, factory_in_loop
+
+    @staticmethod
+    def active_metadata() -> MarketMetadata:
+        return MarketMetadata(
+            symbol="BTC",
+            price_decimals=1,
+            size_decimals=3,
+            price_tick=Decimal("0.1"),
+            quantity_step=Decimal("0.001"),
+            min_base_amount=Decimal("0.001"),
+            min_quote_amount=Decimal("0"),
+        )
+
+    def active_config(self, *, enabled: bool) -> MarketMakerConfig:
+        return replace(
+            self.config(dry_run=False),
+            ping_pong_enabled=True,
+            soft_exit_after_seconds=10,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            min_completed_net_turnover_bps=Decimal("0.1"),
+            active_unwind_enabled=enabled,
+            active_unwind_after_seconds=30 if enabled else 0,
+            active_unwind_loss_trigger=(
+                Decimal("0.20") if enabled else Decimal("0")
+            ),
+            active_unwind_max_slippage_ticks=2 if enabled else 0,
+            active_unwind_max_attempts=2 if enabled else 1,
+            active_unwind_confirmation_timeout_seconds=1,
+            taker_fee_rate=Decimal("0.0004"),
+            max_episode_loss_for_unwind=(
+                Decimal("0.30") if enabled else Decimal("0")
+            ),
+            max_session_loss_for_unwind=(
+                Decimal("0.40") if enabled else Decimal("0")
+            ),
+            max_session_loss_for_maker_exit=(
+                Decimal("0.15") if enabled else Decimal("0")
+            ),
+            max_session_drawdown=Decimal("0.50"),
+        )
+
+    async def test_active_lane_sends_only_limit_ioc_reduce_only_to_lighter(
+        self,
+    ) -> None:
+        async def no_wait(_seconds: float) -> None:
+            return None
+
+        adapter = FakeLighterAdapter()
+        manager = MarketMakerOrderManager(
+            adapter,
+            self.active_config(enabled=True),
+            self.active_metadata(),
+            sleep=no_wait,
+        )
+        desired = DesiredOrder(
+            OrderSide.BUY,
+            Decimal("101.0"),
+            Decimal("0.001"),
+            True,
+            "active loss barrier",
+        )
+        adapter.history = [
+            replace(
+                _order(
+                    "1",
+                    OrderSide.BUY,
+                    Decimal("101.0"),
+                    Decimal("0.001"),
+                    OrderStatus.FILLED,
+                    {"time_in_force": "IOC", "reduce_only": True},
+                ),
+                filled=Decimal("0.001"),
+                remaining=Decimal("0"),
+            )
+        ]
+
+        prepare = await manager.execute_active_unwind(desired)
+        generation = manager.active_unwind_prepared_generation
+        self.assertTrue(prepare.position_refresh_required)
+        self.assertIsNotNone(generation)
+
+        result = await manager.execute_active_unwind(
+            desired,
+            prepared_generation=generation,
+        )
+
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(adapter.create_calls), 1)
+        symbol, side, order_type, amount, price, params = adapter.create_calls[0]
+        self.assertEqual(symbol, "BTC")
+        self.assertIs(side, OrderSide.BUY)
+        self.assertIs(order_type, OrderType.LIMIT)
+        self.assertEqual(amount, Decimal("0.001"))
+        self.assertEqual(price, Decimal("101.0"))
+        self.assertEqual(
+            params,
+            {"time_in_force": "IOC", "reduce_only": True},
+        )
+        self.assertEqual(manager.active_unwind_order_ids, {"1"})
+
+    async def test_disabled_active_lane_sends_nothing_to_lighter(self) -> None:
+        adapter = FakeLighterAdapter()
+        manager = MarketMakerOrderManager(
+            adapter,
+            self.active_config(enabled=False),
+            self.active_metadata(),
+        )
+
+        result = await manager.execute_active_unwind(
+            DesiredOrder(
+                OrderSide.BUY,
+                Decimal("101.0"),
+                Decimal("0.001"),
+                True,
+                "disabled active lane",
+            )
+        )
+
+        self.assertIn("disabled", "; ".join(result.errors))
+        self.assertEqual(adapter.create_calls, [])
+        self.assertNotIn("create", [event[0] for event in adapter.events])
+        self.assertIsNone(manager.active_unwind_prepared_generation)
 
     async def test_live_fake_covers_lifecycle_and_exact_order_contract(self) -> None:
         adapter, coordinator, factory_in_loop = await self.run_fake(dry_run=False)

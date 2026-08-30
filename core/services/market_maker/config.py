@@ -68,6 +68,7 @@ class MarketMakerConfig:
     trend_guard_window_seconds: int = 0
     trend_guard_threshold_ticks: int = 0
     maker_fee_rate: Decimal = Decimal("0")
+    taker_fee_rate: Decimal = Decimal("0")
     min_profit_buffer_bps: Decimal = Decimal("0.5")
     max_position: Decimal = Decimal("0.00200")
     soft_position_ratio: Decimal = Decimal("0.50")
@@ -86,6 +87,14 @@ class MarketMakerConfig:
     max_mutations_per_minute: int = 30
     max_session_drawdown: Decimal = Decimal("0")
     max_session_loss_for_maker_exit: Decimal = Decimal("0")
+    active_unwind_enabled: bool = False
+    active_unwind_after_seconds: int = 0
+    active_unwind_loss_trigger: Decimal = Decimal("0")
+    active_unwind_max_slippage_ticks: int = 0
+    active_unwind_max_attempts: int = 1
+    active_unwind_confirmation_timeout_seconds: int = 5
+    max_episode_loss_for_unwind: Decimal = Decimal("0")
+    max_session_loss_for_unwind: Decimal = Decimal("0")
     economic_min_fills: int = 8
     min_completed_net_turnover_bps: Decimal = Decimal("0")
     soft_exit_after_seconds: int = 0
@@ -105,9 +114,13 @@ class MarketMakerConfig:
             "order_size",
             "max_raw_spread_bps",
             "maker_fee_rate",
+            "taker_fee_rate",
             "min_profit_buffer_bps",
             "max_session_drawdown",
             "max_session_loss_for_maker_exit",
+            "active_unwind_loss_trigger",
+            "max_episode_loss_for_unwind",
+            "max_session_loss_for_unwind",
             "min_completed_net_turnover_bps",
             "soft_exit_net_turnover_bps",
             "soft_exit_surplus_reserve_bps",
@@ -150,6 +163,8 @@ class MarketMakerConfig:
             raise ValueError("max_raw_spread_bps must be positive")
         if self.maker_fee_rate < 0:
             raise ValueError("maker_fee_rate cannot be negative")
+        if not Decimal("0") <= self.taker_fee_rate < Decimal("1"):
+            raise ValueError("taker_fee_rate must be between 0 and 1")
         if self.min_profit_buffer_bps < 0:
             raise ValueError("min_profit_buffer_bps cannot be negative")
         if self.max_session_drawdown < 0:
@@ -158,6 +173,13 @@ class MarketMakerConfig:
             raise ValueError(
                 "max_session_loss_for_maker_exit cannot be negative"
             )
+        for name in (
+            "active_unwind_loss_trigger",
+            "max_episode_loss_for_unwind",
+            "max_session_loss_for_unwind",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} cannot be negative")
         if self.min_completed_net_turnover_bps < 0:
             raise ValueError(
                 "min_completed_net_turnover_bps cannot be negative"
@@ -167,6 +189,12 @@ class MarketMakerConfig:
                 "soft_exit_surplus_reserve_bps cannot be negative"
             )
         self._validate_int("soft_exit_after_seconds", minimum=0)
+        self._validate_int("active_unwind_after_seconds", minimum=0)
+        self._validate_int("active_unwind_max_slippage_ticks", minimum=0)
+        self._validate_int("active_unwind_max_attempts", minimum=1)
+        self._validate_int(
+            "active_unwind_confirmation_timeout_seconds", minimum=1
+        )
         if self.soft_exit_after_seconds:
             if (
                 self.soft_exit_net_turnover_bps
@@ -220,6 +248,66 @@ class MarketMakerConfig:
                     "max_session_loss_for_maker_exit must be below "
                     "max_session_drawdown"
                 )
+        if self.active_unwind_enabled:
+            if not self.exclusive_symbol_control:
+                raise ValueError(
+                    "active unwind requires exclusive_symbol_control"
+                )
+            if not self.cancel_on_shutdown:
+                raise ValueError("active unwind requires cancel_on_shutdown")
+            if self.taker_fee_rate <= 0:
+                raise ValueError(
+                    "active unwind requires a positive authenticated taker fee rate"
+                )
+            if not self.ping_pong_enabled:
+                raise ValueError(
+                    "active unwind requires ping_pong_enabled"
+                )
+            if not self.account_audit_interval_seconds:
+                raise ValueError("active unwind requires account audit")
+            if not self.soft_exit_after_seconds:
+                raise ValueError("active unwind requires soft exit")
+            if self.max_session_loss_for_maker_exit <= 0:
+                raise ValueError(
+                    "active unwind requires a positive maker exit loss budget"
+                )
+            if self.active_unwind_after_seconds <= self.soft_exit_after_seconds:
+                raise ValueError(
+                    "active_unwind_after_seconds must be after soft exit"
+                )
+            if self.active_unwind_max_slippage_ticks <= 0:
+                raise ValueError(
+                    "active unwind slippage ticks must be positive"
+                )
+            if not (
+                Decimal("0")
+                < self.active_unwind_loss_trigger
+                < self.max_episode_loss_for_unwind
+            ):
+                raise ValueError(
+                    "active unwind loss trigger must be positive and below episode loss"
+                )
+            if not (
+                Decimal("0")
+                < self.max_episode_loss_for_unwind
+                <= self.max_session_loss_for_unwind
+            ):
+                raise ValueError(
+                    "active unwind episode loss must be positive and no greater "
+                    "than session loss"
+                )
+            if (
+                self.max_session_drawdown <= 0
+                or self.max_session_loss_for_unwind
+                >= self.max_session_drawdown
+            ):
+                raise ValueError(
+                    "active unwind session loss must be below max_session_drawdown"
+                )
+            if self.max_session_loss_for_maker_exit > self.max_session_loss_for_unwind:
+                raise ValueError(
+                    "maker exit loss cannot exceed active unwind session loss"
+                )
         self._validate_int("economic_min_fills", minimum=2)
         if not (
             Decimal("0")
@@ -254,6 +342,7 @@ class MarketMakerConfig:
             "dry_run",
             "require_flat_start",
             "ping_pong_enabled",
+            "active_unwind_enabled",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")

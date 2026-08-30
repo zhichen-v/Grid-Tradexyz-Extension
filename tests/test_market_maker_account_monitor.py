@@ -7,6 +7,7 @@ from core.adapters.exchanges.models import OrderSide, PositionSide
 from core.services.market_maker.account_monitor import (
     AccountAuditError,
     MarketMakerAccountMonitor,
+    SessionEconomics,
 )
 from core.services.market_maker.config import MarketMakerConfig
 
@@ -109,6 +110,226 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
             monotonic=lambda: self.now,
             sleep=no_wait,
         )
+
+    def active_unwind_config(self, **overrides) -> MarketMakerConfig:
+        values = {
+            "ping_pong_enabled": True,
+            "soft_exit_after_seconds": 10,
+            "soft_exit_net_turnover_bps": Decimal("-0.5"),
+            "max_session_loss_for_maker_exit": Decimal("0.10"),
+            "active_unwind_enabled": True,
+            "active_unwind_after_seconds": 30,
+            "active_unwind_loss_trigger": Decimal("0.20"),
+            "active_unwind_max_slippage_ticks": 2,
+            "max_episode_loss_for_unwind": Decimal("0.30"),
+            "max_session_loss_for_unwind": Decimal("0.40"),
+            "taker_fee_rate": Decimal("0.0004"),
+        }
+        values.update(overrides)
+        return self.config(**values)
+
+    async def test_authorized_active_unwind_taker_is_separately_attributed(self):
+        config = self.active_unwind_config()
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        fills = [
+            trade(
+                "1", "maker-open", OrderSide.BUY, "0.2", "20", "0",
+                timestamp=1,
+            ),
+            trade(
+                "2", "active-close", OrderSide.SELL, "0.2", "19.9", "-0.1",
+                role="taker", fee_rate="0.0004", timestamp=2,
+            ),
+        ]
+        adapter.get_account_trades.return_value = fills
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("299.88964"))
+        ]
+
+        await monitor.audit(
+            {"maker-open"},
+            active_unwind_order_ids={"active-close"},
+        )
+
+        snapshot = monitor.snapshot(self.now)
+        self.assertEqual(snapshot["unique_maker_fills"], 1)
+        self.assertEqual(snapshot["unique_taker_fills"], 1)
+        self.assertEqual(snapshot["completed_fills"], 1)
+        self.assertEqual(snapshot["active_unwind_turnover"], Decimal("19.9"))
+        self.assertEqual(
+            snapshot["active_unwind_exact_fee"], Decimal("0.00796")
+        )
+        self.assertEqual(snapshot["ledger_position"], Decimal("0"))
+
+    async def test_snapshot_exposes_same_generation_position_and_unrealized(self):
+        adapter = self.adapter()
+        monitor = self.monitor(adapter)
+        await monitor.initialize()
+
+        baseline = monitor.snapshot(self.now)
+        self.assertEqual(baseline["audited_position"], Decimal("0"))
+        self.assertEqual(
+            baseline["audited_unrealized_pnl"], Decimal("0")
+        )
+
+        adapter.get_account_trades.return_value = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "20", "0")
+        ]
+        adapter.get_positions.return_value = [
+            position(
+                "0.2",
+                PositionSide.LONG,
+                unrealized_pnl="-1.25",
+            )
+        ]
+        await monitor.audit({"buy"})
+
+        audited = monitor.snapshot(self.now)
+        self.assertEqual(audited["audited_position"], Decimal("0.2"))
+        self.assertEqual(
+            audited["audited_unrealized_pnl"], Decimal("-1.25")
+        )
+
+    def test_active_unwind_requires_strict_inventory_reduction(self):
+        cases = (
+            (
+                "flat",
+                "0",
+                OrderSide.BUY,
+                "0.1",
+                "0.1",
+                "requires nonzero inventory",
+            ),
+            (
+                "long increase",
+                "0.2",
+                OrderSide.BUY,
+                "0.1",
+                "0.3",
+                "direction does not reduce inventory",
+            ),
+            (
+                "short increase",
+                "-0.2",
+                OrderSide.SELL,
+                "0.1",
+                "-0.3",
+                "direction does not reduce inventory",
+            ),
+            (
+                "long flip",
+                "0.2",
+                OrderSide.SELL,
+                "0.3",
+                "-0.1",
+                "must not flip inventory",
+            ),
+            (
+                "short flip",
+                "-0.2",
+                OrderSide.BUY,
+                "0.3",
+                "0.1",
+                "must not flip inventory",
+            ),
+        )
+        for name, prior, side, amount, current, message in cases:
+            with self.subTest(name=name):
+                economics = SessionEconomics(
+                    self.active_unwind_config(),
+                    baseline_equity=Decimal("300"),
+                    ledger_position=Decimal(prior),
+                )
+                before = economics.snapshot()
+                with self.assertRaisesRegex(AccountAuditError, message):
+                    economics.apply(
+                        [
+                            trade(
+                                "1",
+                                "active-close",
+                                side,
+                                amount,
+                                "10",
+                                "0",
+                                role="taker",
+                                fee_rate="0.0004",
+                            )
+                        ],
+                        current_position=Decimal(current),
+                        current_equity=Decimal("300"),
+                        managed_order_ids={"active-close"},
+                        active_unwind_order_ids={"active-close"},
+                    )
+
+                self.assertEqual(economics.snapshot(), before)
+                self.assertEqual(economics.seen_trade_ids, set())
+
+    def test_active_unwind_partial_fill_reduces_long_and_short_inventory(self):
+        for prior, side, current in (
+            ("0.2", OrderSide.SELL, "0.1"),
+            ("-0.2", OrderSide.BUY, "-0.1"),
+        ):
+            with self.subTest(prior=prior):
+                economics = SessionEconomics(
+                    self.active_unwind_config(),
+                    baseline_equity=Decimal("300"),
+                    ledger_position=Decimal(prior),
+                )
+                economics.apply(
+                    [
+                        trade(
+                            "1",
+                            "active-close",
+                            side,
+                            "0.1",
+                            "10",
+                            "0",
+                            role="taker",
+                            fee_rate="0.0004",
+                        )
+                    ],
+                    current_position=Decimal(current),
+                    current_equity=Decimal("300"),
+                    managed_order_ids={"active-close"},
+                    active_unwind_order_ids={"active-close"},
+                )
+
+                self.assertEqual(economics.ledger_position, Decimal(current))
+                self.assertEqual(economics.unique_taker_fills, 1)
+                self.assertEqual(economics.seen_trade_ids, {"1"})
+
+    async def test_unattributed_or_wrong_fee_taker_remains_fatal(self):
+        for active_ids, fee_rate, message in (
+            (set(), "0.0004", "non-maker"),
+            ({"active-close"}, "0.0005", "taker fee changed"),
+        ):
+            with self.subTest(message=message):
+                config = self.active_unwind_config()
+                adapter = self.adapter()
+                monitor = self.monitor(adapter, config)
+                await monitor.initialize()
+                adapter.get_account_trades.return_value = [
+                    trade(
+                        "1",
+                        "active-close",
+                        OrderSide.BUY,
+                        "0.2",
+                        "20",
+                        "0",
+                        role="taker",
+                        fee_rate=fee_rate,
+                    )
+                ]
+                adapter.get_positions.return_value = [
+                    position("0.2", PositionSide.LONG)
+                ]
+                with self.assertRaisesRegex(AccountAuditError, message):
+                    await monitor.audit(
+                        {"active-close"},
+                        active_unwind_order_ids=active_ids,
+                    )
 
     async def test_completed_maker_round_trip_reports_exact_economics(self):
         adapter = self.adapter()
@@ -265,6 +486,37 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
                         monitor.economics.economic_state,
                         "bounded_economic_recovery",
                     )
+
+    async def test_disabled_active_unwind_budget_cannot_relax_economic_no_go(
+        self,
+    ) -> None:
+        config = self.config(
+            max_session_loss_for_maker_exit=Decimal("0"),
+            active_unwind_enabled=False,
+            max_session_loss_for_unwind=Decimal("0.40"),
+        )
+        adapter = self.adapter(equity="299.976")
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        adapter.get_account_trades.return_value = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade(
+                "2",
+                "sell",
+                OrderSide.SELL,
+                "0.2",
+                "100",
+                "0",
+                timestamp=2,
+            ),
+        ]
+
+        with self.assertRaisesRegex(
+            AccountAuditError, "completed gross does not cover exact fees"
+        ):
+            await monitor.audit({"buy", "sell"})
+
+        self.assertEqual(monitor.state, "hard_stop")
 
     async def test_bounded_session_loss_uses_worse_flat_equity_evidence(self):
         config = self.config(

@@ -67,6 +67,30 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         values.update(overrides)
         return MarketMakerConfig(**values)
 
+    def active_unwind_config(self, **overrides) -> MarketMakerConfig:
+        values = {
+            "ping_pong_enabled": True,
+            "maker_fee_rate": "0.00012",
+            "taker_fee_rate": "0.0004",
+            "soft_exit_after_seconds": 10,
+            "soft_exit_net_turnover_bps": "-0.5",
+            "min_completed_net_turnover_bps": "0.1",
+            "max_session_loss_for_maker_exit": "0.15",
+            "active_unwind_enabled": True,
+            "active_unwind_after_seconds": 30,
+            "active_unwind_loss_trigger": "0.20",
+            "active_unwind_max_slippage_ticks": 2,
+            "active_unwind_max_attempts": 2,
+            "active_unwind_confirmation_timeout_seconds": 5,
+            "max_episode_loss_for_unwind": "0.30",
+            "max_session_loss_for_unwind": "0.40",
+            "account_audit_interval_seconds": 15,
+            "max_session_drawdown": "0.50",
+            "require_flat_start": True,
+        }
+        values.update(overrides)
+        return self.config(**values)
+
     def market(self, received: float | None = None) -> MarketSnapshot:
         return MarketSnapshot(
             symbol="BTC",
@@ -214,11 +238,17 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     errors=(), runtime_state=RuntimeState.ACTIVE
                 )
             ),
+            execute_active_unwind=AsyncMock(),
             handle_order_update=AsyncMock(),
             sync_open_orders=AsyncMock(),
             cancel_managed_orders=AsyncMock(),
             shutdown=AsyncMock(),
             snapshot=Mock(return_value=()),
+            known_order_ids=frozenset(),
+            active_unwind_order_ids=frozenset(),
+            active_unwind_pending=False,
+            mutation_generation=0,
+            active_unwind_prepared_generation=1,
             pause_reason=None,
             has_uncertain_state=False,
         )
@@ -230,6 +260,8 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         config=None,
         order_manager=None,
         metadata=None,
+        account_monitor=None,
+        inventory_executor=None,
     ) -> MarketMakerCoordinator:
         adapter = adapter or self.adapter()
         order_manager = order_manager or self.order_manager()
@@ -238,6 +270,8 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             config or self.config(),
             metadata=metadata,
             order_manager=order_manager,
+            account_monitor=account_monitor,
+            inventory_executor=inventory_executor,
             risk_manager=SimpleNamespace(evaluate=Mock(return_value=self.risk())),
             strategy=SimpleNamespace(
                 calculate_quotes=Mock(return_value=self.desired())
@@ -269,6 +303,29 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 soft_exit_surplus_reserve_bps=Decimal("0.02"),
             )
         )
+
+    @staticmethod
+    def active_account_snapshot(position: str) -> dict:
+        signed = Decimal(position)
+        return {
+            "state": "healthy",
+            "age_seconds": 0.5,
+            "ledger_position": signed,
+            "audited_position": signed,
+            "audited_unrealized_pnl": Decimal("0"),
+            "completed_turnover": Decimal("10"),
+            "completed_net_ex_funding": Decimal("0"),
+            "completed_fills": 2,
+            "last_flat_completed_fills": 2,
+            "last_flat_equity_change": Decimal("0"),
+            "open_episode_turnover": Decimal("20") if signed else Decimal("0"),
+            "open_episode_net_ex_funding": Decimal("-0.0024") if signed else Decimal("0"),
+            "current_drawdown": Decimal("0.05"),
+            "baseline_equity": Decimal("300"),
+            "current_equity": Decimal("299.95") if signed else Decimal("300"),
+            "turnover": Decimal("10"),
+            "unique_maker_fills": 2,
+        }
         coordinator._position = self.position(signed_size=Decimal("0.2"))
         coordinator._account_monitor_initialized = True
         coordinator.account_monitor = SimpleNamespace(
@@ -645,6 +702,307 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 order_manager.reconcile.assert_not_awaited()
                 self.assertIs(coordinator._state, RuntimeState.PAUSED_ERROR)
                 self.assertEqual(coordinator.metrics.quote_reason, reason)
+
+    async def test_active_unwind_suppresses_stranded_quote_before_barrier(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.active_account_snapshot("-0.2")),
+            audit=AsyncMock(),
+            mark_hard_stop=Mock(),
+            last_audit_monotonic=self.now,
+        )
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(),
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator._audited_fill_generation = 0
+        coordinator._processed_fill_generation = 0
+        coordinator.metrics.account_audit = self.active_account_snapshot("-0.2")
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+        coordinator._market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("100.5"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("100.7"), Decimal("1")),),
+            best_bid=Decimal("100.5"),
+            best_ask=Decimal("100.7"),
+            exchange_timestamp=None,
+            received_monotonic=self.now,
+        )
+        coordinator.risk_manager.evaluate.return_value = replace(
+            self.risk(),
+            buy_amount=Decimal("0.2"),
+            sell_amount=None,
+            buy_reduce_only=True,
+            soft_exit_latched=True,
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+        coordinator.strategy.calculate_quotes.return_value = replace(
+            self.desired(),
+            bid=DesiredOrder(
+                OrderSide.BUY,
+                Decimal("99.8"),
+                Decimal("0.2"),
+                True,
+                "soft_exit_hard_fallback",
+            ),
+            ask=None,
+            reference_price=Decimal("100.6"),
+            reservation_price=Decimal("100.6"),
+            half_spread=Decimal("0.1"),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        reconciled = manager.reconcile.await_args.args[0]
+        self.assertIsNone(reconciled.bid)
+        self.assertIsNone(reconciled.ask)
+        manager.execute_active_unwind.assert_not_awaited()
+        self.assertEqual(
+            coordinator.metrics.inventory_unwind["state"], "passive_wait"
+        )
+
+    async def test_active_unwind_recomputes_only_after_fresh_cancel_truth(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        manager.execute_active_unwind.side_effect = (
+            ReconcileResult(
+                (
+                    ReconcileAction(
+                        OrderSide.BUY,
+                        "prepare_active_unwind",
+                        "zero symbol orders proved; fresh truth required",
+                        success=True,
+                    ),
+                ),
+                RuntimeState.RISK_REDUCTION,
+                position_refresh_required=True,
+            ),
+            ReconcileResult(
+                (
+                    ReconcileAction(
+                        OrderSide.BUY,
+                        "blocked",
+                        "mutation budget exhausted",
+                        success=False,
+                    ),
+                ),
+                RuntimeState.RISK_REDUCTION,
+            ),
+        )
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            mark_hard_stop=Mock(),
+            last_audit_monotonic=self.now,
+        )
+        adapter = self.adapter()
+        coordinator = self.prepare_running(
+            adapter=adapter,
+            config=self.active_unwind_config(),
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        monitor.snapshot = Mock(
+            side_effect=lambda _now: self.active_account_snapshot(
+                "-0.2" if coordinator._position is None or coordinator._position.signed_size else "0"
+            )
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator.metrics.account_audit = self.active_account_snapshot("-0.2")
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+        initial_market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("100.5"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("100.7"), Decimal("1")),),
+            best_bid=Decimal("100.5"),
+            best_ask=Decimal("100.7"),
+            exchange_timestamp=None,
+            received_monotonic=self.now,
+        )
+        coordinator._market = initial_market
+        coordinator.risk_manager.evaluate.return_value = replace(
+            self.risk(),
+            buy_amount=Decimal("0.2"),
+            sell_amount=None,
+            buy_reduce_only=True,
+            soft_exit_latched=True,
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+        coordinator.strategy.calculate_quotes.return_value = replace(
+            self.desired(),
+            bid=DesiredOrder(
+                OrderSide.BUY, Decimal("99.8"), Decimal("0.2"), True, "soft"
+            ),
+            ask=None,
+            reference_price=Decimal("100.6"),
+            reservation_price=Decimal("100.6"),
+            half_spread=Decimal("0.1"),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+
+        await coordinator.run_one_cycle(force=True)
+        self.now = 131.0
+        coordinator._market = replace(initial_market, received_monotonic=self.now)
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+        refreshed_market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("100.7"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("100.9"), Decimal("1")),),
+            best_bid=Decimal("100.7"),
+            best_ask=Decimal("100.9"),
+            exchange_timestamp=None,
+            received_monotonic=self.now,
+        )
+        adapter.get_orderbook.return_value = refreshed_market
+        adapter.get_positions.return_value = [
+            self.position(signed_size=Decimal("-0.2"))
+        ]
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(manager.execute_active_unwind.await_count, 1)
+        monitor.audit.assert_awaited_once()
+        self.now = 132.0
+        await coordinator.run_one_cycle(force=True)
+
+        intents = [call.args[0] for call in manager.execute_active_unwind.await_args_list]
+        self.assertEqual([intent.price for intent in intents], [Decimal("100.9"), Decimal("101.1")])
+        self.assertIsNone(
+            manager.execute_active_unwind.await_args_list[0].kwargs[
+                "prepared_generation"
+            ]
+        )
+        self.assertEqual(
+            manager.execute_active_unwind.await_args_list[1].kwargs[
+                "prepared_generation"
+            ],
+            1,
+        )
+        self.assertEqual(
+            coordinator.inventory_executor._active_attempts, 0
+        )
+
+    def test_active_unwind_truth_token_is_one_shot_and_rejects_drift(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.active_account_snapshot("-0.2")),
+            last_audit_monotonic=self.now,
+        )
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(),
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator._audited_fill_generation = 0
+        coordinator._processed_fill_generation = 0
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+
+        self.assertTrue(coordinator._arm_active_unwind_truth(7))
+        self.assertEqual(coordinator._consume_active_unwind_truth(7, self.now), 1)
+        self.assertIsNone(coordinator._consume_active_unwind_truth(7, self.now))
+
+        self.assertTrue(coordinator._arm_active_unwind_truth(7))
+        manager.mutation_generation += 1
+        self.assertIsNone(coordinator._consume_active_unwind_truth(7, self.now))
+
+    async def test_exact_active_terminal_is_audited_with_taker_role_ids(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"ioc-1"})
+        manager.active_unwind_order_ids = frozenset({"ioc-1"})
+        manager.execute_active_unwind.return_value = ReconcileResult(
+            (
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "active_unwind",
+                    "active unwind filled",
+                    Decimal("100.9"),
+                    Decimal("0.2"),
+                    True,
+                    True,
+                ),
+            ),
+            RuntimeState.RISK_REDUCTION,
+            position_refresh_required=True,
+            fill_observed=True,
+        )
+        monitor = SimpleNamespace(
+            audit=AsyncMock(),
+            mark_hard_stop=Mock(),
+            last_audit_monotonic=self.now,
+        )
+        adapter = self.adapter()
+        coordinator = self.prepare_running(
+            adapter=adapter,
+            config=self.active_unwind_config(),
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        monitor.snapshot = Mock(
+            side_effect=lambda _now: self.active_account_snapshot(
+                "-0.2" if coordinator._position is None or coordinator._position.signed_size else "0"
+            )
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator.metrics.account_audit = self.active_account_snapshot("-0.2")
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+        coordinator._market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("100.5"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("100.7"), Decimal("1")),),
+            best_bid=Decimal("100.5"),
+            best_ask=Decimal("100.7"),
+            exchange_timestamp=None,
+            received_monotonic=self.now,
+        )
+        coordinator.risk_manager.evaluate.return_value = replace(
+            self.risk(),
+            buy_amount=Decimal("0.2"),
+            sell_amount=None,
+            buy_reduce_only=True,
+            soft_exit_latched=True,
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+        coordinator.strategy.calculate_quotes.return_value = replace(
+            self.desired(),
+            bid=DesiredOrder(
+                OrderSide.BUY, Decimal("99.8"), Decimal("0.2"), True, "soft"
+            ),
+            ask=None,
+            reference_price=Decimal("100.6"),
+            reservation_price=Decimal("100.6"),
+            half_spread=Decimal("0.1"),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+
+        await coordinator.run_one_cycle(force=True)
+        self.now = 131.0
+        coordinator._market = replace(
+            coordinator._market, received_monotonic=self.now
+        )
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+        adapter.get_orderbook.return_value = replace(
+            coordinator._market, received_monotonic=self.now
+        )
+        adapter.get_positions.return_value = [self.position(signed_size=Decimal("0"))]
+
+        await coordinator.run_one_cycle(force=True)
+
+        monitor.audit.assert_awaited_once_with(
+            {"ioc-1"}, active_unwind_order_ids=frozenset({"ioc-1"})
+        )
+        self.assertEqual(coordinator._processed_fill_generation, 1)
+        self.assertEqual(coordinator._audited_fill_generation, 1)
+        self.assertEqual(coordinator.metrics.counters["active_unwind_success"], 1)
 
     async def test_stranded_soft_exit_guard_preserves_normal_band(self) -> None:
         cases = (

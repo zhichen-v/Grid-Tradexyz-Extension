@@ -4,8 +4,9 @@
 
 ## 1. 不可放寬的規則
 
-- 一般與 recovery quote 一律 `POST_ONLY`；禁止 taker／IOC、self-trade、跨帳戶互成交或任何形式的洗量。
+- 一般、passive unwind 與停機後人工 recovery quote 一律 `POST_ONLY`。唯一可成為 taker 的例外是**明確 opt-in 且預設關閉**的 active-unwind lane；該 lane 只能送 `reduce_only LIMIT + IOC`，禁止 market／FOK、加倉、反手、self-trade、跨帳戶互成交或任何形式的洗量。
 - Live 每一輪都需操作者明確授權；縮短 dry-run 不等於沿用 live 授權。
+- `active_unwind_enabled` 預設必須為 `false`；啟用 active lane 屬於新的 live 風險授權，不得從既有 maker-only 授權推定。
 - 目標 account／symbol 必須獨占，且啟動前為 flat、open orders `0`、無其他 bot 或手動策略。
 - Stale／untrusted data、unknown order、uncertain mutation、reconciliation failure、account audit hard stop、position／drawdown breach 都須 fail closed。
 - 停止先撤單，不自動平倉。若另有明確授權，只能用有界 `POST_ONLY + reduce_only` 處理殘倉；不得用 taker 加速。
@@ -47,6 +48,7 @@ Live 前以 authenticated read-only preflight 核對：
 | 同步 | `position_poll_interval_seconds`、`order_sync_interval_seconds`、`health_check_interval_seconds`；unknown position 不得當成 `0`。 |
 | 帳戶審計 | `account_audit_interval_seconds`、`account_audit_timeout_seconds`、`require_flat_start`、`max_session_drawdown`；live 不可關閉 audit。 |
 | 經濟門檻 | `maker_fee_rate`、`min_profit_buffer_bps`、`economic_min_fills`、`min_completed_net_turnover_bps`、`max_session_loss_for_maker_exit`；completed ledger 與自然 flat equity 都需過門檻，loss budget不是GO豁免。 |
+| Inventory unwind | `active_unwind_enabled` 預設 `false`。明確 opt-in 時須維持 `exclusive_symbol_control: true`、`cancel_on_shutdown: true`，並逐次核對**正值且已驗證**的 `taker_fee_rate`、`active_unwind_after_seconds`、`active_unwind_loss_trigger`、`active_unwind_max_slippage_ticks`、`active_unwind_max_attempts`、`active_unwind_confirmation_timeout_seconds`、`max_episode_loss_for_unwind`、`max_session_loss_for_unwind`；active deadline須晚於soft exit，maker-exit budget須為正，loss trigger `<` episode cap `<=` session cap `<` drawdown。目前沒有authenticated zero-taker-fee proof，因此不得以`0`啟用。 |
 | 錯誤／流量 | `max_consecutive_errors`、`error_cooldown_seconds`、`max_mutations_per_minute`；安全撤單優先，禁止 busy retry。 |
 | Ownership | `exclusive_symbol_control: true`、`startup_open_order_policy: abort`、`unknown_order_policy: pause`。未知單不可猜測為本策略所有。 |
 | 必要開關 | `post_only: true`、`cancel_on_shutdown: true`；source config 維持 `dry_run: true`。 |
@@ -87,12 +89,26 @@ Live 只在 fresh preflight 與相稱 dry-run 通過後啟動：
 短 gate 最長 60 分鐘，必須同時滿足：
 
 1. 至少 `30 completed maker fills`，並自然回到 flat。
-2. Taker、unknown order、未解決 uncertain mutation、reconciliation failure、account hard stop、429／reconnect storm、position／drawdown breach皆為 `0`。
+2. 未授權或非 active-unwind lane 的 taker、unknown order、未解決 uncertain mutation、reconciliation failure、account hard stop、429／reconnect storm、position／drawdown breach皆為 `0`。若明確啟用 active unwind，其 IOC fill 必須可歸屬到精確 active order ID、計入 taker fee 與 episode／session loss，且不得視為 maker fill。
    Cancellation 判定看目前狀態：`unresolved_cancellations=0`，且累計 `ambiguous_cancellations` 必須被同等數量的 `resolved_ambiguous_cancellations` 以 exact terminal proof 對消；未對消差額立即 hard stop。歷史已解決事件仍保留在 log，不得直接把累計 ambiguity 清零。
 3. Exact fee cover `>= 1`，completed net／turnover與 flat equity／turnover都 `>= +0.02 bps`。
 4. Graceful shutdown 後程序消失，兩次 authenticated postflight 都為 position／orders／unresolved `0/0/0`。
 
 `max_session_loss_for_maker_exit`若非`0`，只允許已鎖定的`POST_ONLY reduce-only`退出使用，且必須採 exact trade P&L 與同 generation 的最後flat-equity證據較差者；證據缺失／過期時退回嚴格fee-aware價格，超限即hard stop。`bounded_economic_recovery`明確不是GO。現行候選為`0`，不啟用此loss budget。
+
+### 5.1 Active inventory unwind（default OFF）
+
+Active unwind 是每個非零 inventory episode 的最後一道有界退出機制，不是一般報價或提高成交量的捷徑。狀態順序固定為：嚴格 fee-aware profit exit → soft-exit 後在 maker budget 內逐步追價／解鎖虧損 → 到達 active deadline 或 authenticated loss trigger 才考慮 active lane。`active_unwind_enabled: false` 時，active lane 不存在，既有 maker-only 行為與 stranded guard 保持不變。
+
+明確 opt-in 後仍須遵守兩階段 barrier，不能在同一階段「先撤單、立刻 IOC」：
+
+1. **Prepare phase**：先解決既有 uncertainty，以 exact terminal proof 撤除所有 managed orders，再用 authenticated symbol open-orders read 證明為 `0`。任何 uncertainty、foreign／unknown order、撤單 proof 缺失或 read failure都立即 fail closed；此階段不得送 active order。
+2. **Fresh-truth phase**：撤單完成後重新取得 trusted BBO、authenticated position 與 account audit。一次性 truth token 必須綁定同一 episode、position方向／數量、audited fill generation、audit時間、book freshness及mutation／prepare generation；其中任一證據漂移就丟棄token並回到prepare，不得沿用舊價格或舊持倉。
+3. **Active phase**：重新計算 barrier 後，只能送與持倉相反方向、數量不超過現有持倉的 `reduce_only LIMIT + IOC`。價格同時受 `active_unwind_max_slippage_ticks`、episode loss、maker+taker session loss及drawdown cap約束；attempt數與terminal confirmation分別受 `active_unwind_max_attempts`與`active_unwind_confirmation_timeout_seconds`限制。
+
+Submission uncertain、identity／immutable-field不符、terminal proof timeout、position flip、非減倉fill、loss／slippage超限或attempt用盡都須 fail closed，且不得換 client ID盲重送。IOC的exact terminal結果可以是 no-fill、partial或full fill；每次結果後都要重新 authenticated position／audit，再決定是否仍有下一個有界attempt。
+
+Telemetry 的 `active_unwind_success` **只表示該次 active order取得乾淨的 exact terminal proof**，不表示該order一定成交，也不表示episode已flat。只有後續 authenticated position為`0`，且同generation ledger／audit確認自然flat，才可關閉episode、形成完整flat checkpoint並恢復一般雙邊報價。Active unwind不豁免30 completed maker fills、fee cover或flat-equity gate；其 taker fee與實現損益必須完整計入。
 
 任一 hard-safety 失敗立即停止並保留證據；不得為湊成交數而忽略。Economic NO-GO 只淘汰該參數候選，門檻不得降低。只有短 gate 完整 GO 才可從新的 fresh-flat session 啟動數小時 long-run。
 
@@ -128,9 +144,9 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 | B | 單邊最小 live | `bid_only` 或 `ask_only`；逐一證明 POST_ONLY create、cancel、terminal 與 shutdown。 |
 | C | 雙邊最小 live | `both`、最小 size、保守 spread／mutation；30–60 分鐘監看 exposure、fills 與 pause。 |
 | D | 小額長時間 | 只在短 gate GO 後執行數小時；觀察 drift、latency、fee、funding、資源與事故密度。 |
-| E | 單變因調參 | 一次只改 spread、size、skew、ratio 或 refresh 其中一項；每次重新驗證。 |
+| E | 單變因調參 | 一次只改 spread、size、skew、ratio 或 refresh 其中一項；每次重新驗證。Active unwind另走預設關閉的獨立rollout，不得和一般quote調參同場混合。 |
 
-## 8. 本地 checkpoint（2026-08-30 07:35 Asia/Taipei）
+## 8. 本地 checkpoint（2026-08-30 inventory-unwind code-only）
 
 ### 8.1 候選與邊界
 
@@ -138,9 +154,10 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 |---|---|
 | 帳戶／市場 | 隔離 Lighter sub-account、Robinhood mainnet、BTC 獨占 |
 | Source config | `config/market_maker/test_lighter_btc_mvp.yaml`，`dry_run: true`、`ping_pong_enabled: true`、`max_session_loss_for_maker_exit: "0"`，SHA-256 `9162163CC3B65153CF8FDFE34C3FCC92D28C5DEF0D3590B90F5E3A18984DF711` |
-| Current runtime fingerprint | SHA-256 `BD7F8A8CD9F08149E9FE4FAB53110D12702C07CEAB94120389D952980BC41F48`；invalid-nonce definitive rejection與stranded-soft-exit guard均已通過offline與fresh T3；目前runtime已停止 |
+| Last live-tested runtime fingerprint | SHA-256 `BD7F8A8CD9F08149E9FE4FAB53110D12702C07CEAB94120389D952980BC41F48`；invalid-nonce definitive rejection與stranded-soft-exit guard均已通過offline與fresh T3；目前runtime已停止。後續inventory-unwind code batch尚無live fingerprint或live validation，不得沿用此證據。 |
 | Quote／risk | `both / position-based ping-pong / 250 ticks / 0.00020 / max position 0.00040 / trend 60s/125 ticks / 1x cross / drawdown 0.50 USDG / 8 mutations/min` |
 | Fee／exit | maker `1.2 bps`、soft exit `120s`、session-loss maker exit停用（`0`），回到既有fee／authenticated-surplus aware `POST_ONLY reduce-only` exit |
+| Active inventory unwind | 程式與example config已加入per-episode barrier、passive chase及有界`reduce_only LIMIT + IOC` lane；**預設 `active_unwind_enabled: false`，尚未fresh T3或live validation，rollout blocked**。現行source config仍以default-off解析，不得自行產生live copy啟用。 |
 | Economic gate | `30 completed`、fee cover `>=1`、completed與flat-equity皆 `>=+0.02 bps` |
 
 ### 8.2 本輪結果
@@ -173,6 +190,6 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 
 ### 8.3 當前決策
 
-**OPERATION STOPPED / RUNTIME 0 / OPEN ORDERS 0 / FLAT AFTER AUTHORIZED MAKER-ONLY RECOVERY / NO FURTHER SAME-CANDIDATE AUTO-RERUN。** Stranded guard的安全行為已兩次live按設計證明，但固定候選會在單一entry後進入normal quote band外的latched exit，無法累積30 completed且authenticated natural-flat的有意義4小時經濟證據。Recovery成交不併入場內樣本；若要繼續，須另行明確授權單變因候選並重走offline／T3／live gate，不得放寬fee/equity或maker-only邊界。
+**OPERATION STOPPED / RUNTIME 0 / OPEN ORDERS 0 / FLAT AFTER AUTHORIZED MAKER-ONLY RECOVERY / ACTIVE UNWIND DEFAULT OFF / LIVE ROLLOUT BLOCKED。** 舊控制面與stranded guard可穩定、決定性地安全停止，但固定maker-only lifecycle會在單邊行情留下normal quote band外的latched inventory，無法累積30 completed且authenticated natural-flat的有意義4小時證據。本次已用code-only／offline方式補上per-episode passive與bounded active unwind；尚未fresh T3或live validation，不得視為promotion。下一步須先完成全套回歸與fresh T3，再由使用者明確授權active-unwind live gate；不得放寬fee/equity、loss、slippage、attempt或truth barrier。
 
 VPS 同步與測試仍不在本階段。歷史事故與舊 fingerprint 僅見 [驗證歷史](market_maker_mvp_validation_history.md)，不能代替 fresh preflight。

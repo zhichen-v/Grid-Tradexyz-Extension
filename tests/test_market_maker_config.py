@@ -48,6 +48,19 @@ market_maker:
             config.soft_exit_surplus_reserve_bps, Decimal("0.03")
         )
 
+    def test_example_yaml_loads_with_active_unwind_default_off(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "market_maker"
+            / "lighter_btc_mvp.example.yaml"
+        )
+
+        config = load_market_maker_config(path)
+
+        self.assertTrue(config.dry_run)
+        self.assertFalse(config.active_unwind_enabled)
+
     def test_requires_market_maker_block(self) -> None:
         with self.assertRaisesRegex(ValueError, "market_maker"):
             self.load_yaml("exchange: lighter")
@@ -143,6 +156,68 @@ market_maker:
                 {**values, "max_session_loss_for_maker_exit": "0.50"},
                 "below max_session_drawdown",
             ),
+        )
+        for invalid, message in invalid_cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    MarketMakerConfig(**invalid)
+
+    def test_active_unwind_is_default_off_and_requires_bounded_policy(
+        self,
+    ) -> None:
+        disabled = MarketMakerConfig()
+        self.assertFalse(disabled.active_unwind_enabled)
+        self.assertEqual(disabled.taker_fee_rate, Decimal("0"))
+
+        values = {
+            "active_unwind_enabled": True,
+            "active_unwind_after_seconds": 300,
+            "active_unwind_loss_trigger": "0.20",
+            "active_unwind_max_slippage_ticks": 3,
+            "active_unwind_max_attempts": 2,
+            "active_unwind_confirmation_timeout_seconds": 5,
+            "taker_fee_rate": "0.0004",
+            "max_episode_loss_for_unwind": "0.30",
+            "max_session_loss_for_unwind": "0.40",
+            "max_session_loss_for_maker_exit": "0.15",
+            "soft_exit_after_seconds": 120,
+            "soft_exit_net_turnover_bps": "-0.5",
+            "min_completed_net_turnover_bps": "0.1",
+            "account_audit_interval_seconds": 15,
+            "max_session_drawdown": "0.50",
+            "require_flat_start": True,
+            "ping_pong_enabled": True,
+        }
+        enabled = MarketMakerConfig(**values)
+        self.assertEqual(enabled.taker_fee_rate, Decimal("0.0004"))
+        self.assertEqual(
+            enabled.active_unwind_loss_trigger, Decimal("0.20")
+        )
+        self.assertEqual(
+            enabled.max_episode_loss_for_unwind, Decimal("0.30")
+        )
+
+        invalid_cases = (
+            (
+                {**values, "exclusive_symbol_control": False},
+                "exclusive_symbol_control",
+            ),
+            (
+                {**values, "cancel_on_shutdown": False},
+                "cancel_on_shutdown",
+            ),
+            ({**values, "taker_fee_rate": "0"}, "positive authenticated"),
+            ({**values, "ping_pong_enabled": False}, "ping_pong_enabled"),
+            ({**values, "active_unwind_after_seconds": 120}, "after soft exit"),
+            ({**values, "active_unwind_loss_trigger": "0.30"}, "below episode"),
+            ({**values, "max_episode_loss_for_unwind": "0.41"}, "episode loss"),
+            ({**values, "max_session_loss_for_unwind": "0.50"}, "drawdown"),
+            ({**values, "active_unwind_max_slippage_ticks": 0}, "slippage"),
+            (
+                {**values, "max_session_loss_for_maker_exit": "0"},
+                "maker exit loss budget",
+            ),
+            ({**values, "taker_fee_rate": "NaN"}, "finite"),
         )
         for invalid, message in invalid_cases:
             with self.subTest(message=message):

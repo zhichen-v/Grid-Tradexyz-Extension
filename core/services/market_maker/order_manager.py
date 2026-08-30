@@ -5,7 +5,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from ...adapters.exchanges.exceptions import (
     OrderSubmissionNotSentError,
@@ -34,6 +34,8 @@ _UNCERTAIN_STATES = {
     OrderSlotState.UNCERTAIN_SUBMISSION,
     OrderSlotState.UNCERTAIN_CANCELLATION,
 }
+_ACTIVE_TERMINAL_MAX_POLLS = 10
+_ACTIVE_TERMINAL_POLL_SECONDS = 0.5
 
 
 def _error_category(exc: BaseException) -> str:
@@ -174,11 +176,13 @@ class MarketMakerOrderManager:
         metadata: MarketMetadata,
         *,
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.adapter = adapter
         self.config = config
         self.metadata = metadata
         self._monotonic = monotonic
+        self._sleep = sleep
         self._lock = asyncio.Lock()
         self._slots: dict[OrderSide, ManagedOrder | None] = {
             OrderSide.BUY: None,
@@ -192,7 +196,14 @@ class MarketMakerOrderManager:
         self._pending_post_only_cancellations = 0
         self._post_only_create_not_before = 0.0
         self._risk_reducing_create_not_before = 0.0
+        self._mutation_generation = 0
         self._known_order_ids: set[str] = set()
+        self._active_unwind_order_ids: set[str] = set()
+        self._active_unwind_side: OrderSide | None = None
+        self._active_unwind_prepare_sequence = 0
+        self._active_unwind_prepared_generation: int | None = None
+        self._active_unwind_not_sent_failures = 0
+        self._active_unwind_not_sent_until = 0.0
         self._terminal_orders: dict[
             tuple[OrderSide, str, str], ManagedOrder
         ] = {}
@@ -217,6 +228,24 @@ class MarketMakerOrderManager:
     def known_order_ids(self) -> frozenset[str]:
         """Confirmed order ids attributable to this manager runtime."""
         return frozenset(self._known_order_ids)
+
+    @property
+    def active_unwind_order_ids(self) -> frozenset[str]:
+        """Order ids authorized as taker only after exact terminal proof."""
+        return frozenset(self._active_unwind_order_ids)
+
+    @property
+    def active_unwind_pending(self) -> bool:
+        return self._active_unwind_side is not None
+
+    @property
+    def mutation_generation(self) -> int:
+        return self._mutation_generation
+
+    @property
+    def active_unwind_prepared_generation(self) -> int | None:
+        """One-shot zero-open-order proof awaiting fresh external truth."""
+        return self._active_unwind_prepared_generation
 
     @property
     def has_uncertain_state(self) -> bool:
@@ -309,6 +338,9 @@ class MarketMakerOrderManager:
 
     async def initialize(self) -> None:
         async with self._lock:
+            self._invalidate_active_unwind_preparation()
+            self._active_unwind_not_sent_failures = 0
+            self._active_unwind_not_sent_until = 0.0
             resolver = getattr(
                 self.adapter, "resolve_unresolved_submissions", None
             )
@@ -368,6 +400,7 @@ class MarketMakerOrderManager:
         risk: RiskDecision,
     ) -> ReconcileResult:
         async with self._lock:
+            self._invalidate_active_unwind_preparation()
             actions: list[ReconcileAction] = []
             errors: list[str] = []
             effect = _OrderEffect()
@@ -553,8 +586,339 @@ class MarketMakerOrderManager:
                 self.runtime_state = desired.runtime_state
             return self._result(actions, errors, effect)
 
+    async def execute_active_unwind(
+        self,
+        desired: DesiredOrder,
+        *,
+        prepared_generation: int | None = None,
+    ) -> ReconcileResult:
+        """Execute one bounded reduce-only IOC through an isolated lane."""
+        async with self._lock:
+            actions: list[ReconcileAction] = []
+            errors: list[str] = []
+            effect = _OrderEffect()
+            if self._shutting_down:
+                return self._result(actions, ("order manager is stopping",))
+            if not self.config.active_unwind_enabled:
+                self._pause("active unwind is disabled")
+                return self._result(actions, (self.pause_reason or "disabled",))
+
+            resolved = await self._resolve_uncertain_locked()
+            effect.fill_observed = any(
+                _has_visible_fill(order) for order in resolved
+            )
+            effect.position_refresh_required = bool(resolved)
+            blocking = self._blocking_reason()
+            if blocking:
+                self._pause(blocking)
+                errors.append(blocking)
+                effect.include(
+                    await self._cancel_confirmable_locked(
+                        "active unwind blocked by uncertain state",
+                        actions,
+                        errors,
+                    )
+                )
+                return self._result(actions, errors, effect)
+            if effect.position_refresh_required:
+                return self._result(actions, errors, effect)
+
+            validation_error = self._validate_active_unwind(desired)
+            if validation_error:
+                self._pause(validation_error)
+                return self._result(
+                    actions, (self.pause_reason or validation_error,), effect
+                )
+
+            # The first call is always prepare-only.  It proves managed and
+            # authenticated symbol orders are empty; the caller must then
+            # refresh BBO, position, and account truth before consuming the
+            # returned one-shot generation on a later call.
+            if prepared_generation is None:
+                self._invalidate_active_unwind_preparation()
+                if any(slot is not None for slot in self._slots.values()):
+                    effect.include(
+                        await self._cancel_confirmable_locked(
+                            "prepare active unwind", actions, errors
+                        )
+                    )
+                blocking = self._blocking_reason()
+                if errors or blocking:
+                    if blocking:
+                        self._pause(blocking)
+                        errors.append(blocking)
+                    return self._result(actions, errors, effect)
+                proof_error = await self._active_unwind_zero_order_proof()
+                if proof_error:
+                    self._pause(proof_error)
+                    errors.append(proof_error)
+                    return self._result(actions, errors, effect)
+                self._active_unwind_prepare_sequence += 1
+                self._active_unwind_prepared_generation = (
+                    self._active_unwind_prepare_sequence
+                )
+                actions.append(
+                    ReconcileAction(
+                        desired.side,
+                        "prepare_active_unwind",
+                        "zero symbol orders proved; fresh truth required",
+                        desired.price,
+                        desired.amount,
+                        True,
+                        True,
+                    )
+                )
+                effect.position_refresh_required = True
+                return self._result(actions, errors, effect)
+
+            if (
+                type(prepared_generation) is not int
+                or prepared_generation
+                != self._active_unwind_prepared_generation
+            ):
+                reason = "active unwind requires a fresh one-shot preparation"
+                self._pause(reason)
+                return self._result(actions, (reason,), effect)
+            self._active_unwind_prepared_generation = None
+            if any(slot is not None for slot in self._slots.values()):
+                reason = "active unwind order state changed after preparation"
+                self._pause(reason)
+                return self._result(actions, (reason,), effect)
+
+            action = ReconcileAction(
+                desired.side,
+                "would_active_unwind" if self.config.dry_run else "active_unwind",
+                desired.reason,
+                desired.price,
+                desired.amount,
+                True,
+            )
+            if self.config.dry_run:
+                actions.append(replace(action, success=True))
+                return self._result(actions, errors, effect)
+
+            proof_error = await self._active_unwind_zero_order_proof()
+            if proof_error:
+                self._pause(proof_error)
+                errors.append(proof_error)
+                return self._result(actions, errors, effect)
+
+            now = self._monotonic()
+            if self._active_unwind_not_sent_failures >= (
+                self.config.active_unwind_max_attempts
+            ):
+                reason = "active unwind pre-send failure limit exhausted"
+                self._pause(reason)
+                return self._result(actions, (reason,), effect)
+            if now < self._active_unwind_not_sent_until:
+                actions.append(
+                    replace(
+                        action,
+                        operation="blocked",
+                        reason="active unwind pre-send cooldown is active",
+                        success=False,
+                    )
+                )
+                return self._result(actions, errors, effect)
+            normal_budget_available = self._create_budget_available()
+            emergency_budget_available = (
+                not normal_budget_available
+                and now >= self._risk_reducing_create_not_before
+            )
+            if not normal_budget_available and not emergency_budget_available:
+                actions.append(
+                    replace(
+                        action,
+                        operation="blocked",
+                        reason="mutation budget exhausted",
+                        success=False,
+                    )
+                )
+                return self._result(actions, errors, effect)
+            if emergency_budget_available:
+                self._risk_reducing_create_not_before = now + 60
+
+            self._slots[desired.side] = ManagedOrder(
+                side=desired.side,
+                state=OrderSlotState.SUBMITTING,
+                order_id=None,
+                client_id=None,
+                price=desired.price,
+                amount=desired.amount,
+                remaining=desired.amount,
+                reduce_only=True,
+                created_monotonic=now,
+                updated_monotonic=now,
+            )
+            self._active_unwind_side = desired.side
+            mutation_timestamp = self._record_mutation()
+            actions.append(action)
+            action_index = len(actions) - 1
+            order_params = {"time_in_force": "IOC", "reduce_only": True}
+            if getattr(
+                self.adapter, "supports_definitive_pre_send_failure", False
+            ) is True:
+                order_params["_raise_on_definitive_pre_send_failure"] = True
+            if getattr(
+                self.adapter,
+                "supports_definitive_submission_rejection",
+                False,
+            ) is True:
+                order_params["_raise_on_definitive_submission_rejection"] = True
+            try:
+                order = await self.adapter.create_order(
+                    self.config.symbol,
+                    desired.side,
+                    OrderType.LIMIT,
+                    desired.amount,
+                    desired.price,
+                    params=order_params,
+                )
+            except asyncio.CancelledError:
+                self._mark_submission_uncertain(
+                    desired.side,
+                    "active unwind create task was cancelled before confirmation",
+                )
+                raise
+            except OrderSubmissionNotSentError:
+                self._rollback_mutation(mutation_timestamp)
+                self._active_unwind_not_sent_failures += 1
+                self._active_unwind_not_sent_until = (
+                    self._monotonic() + self.config.error_cooldown_seconds
+                )
+                actions[action_index] = replace(
+                    action,
+                    reason="active unwind submission was not sent",
+                    success=False,
+                )
+                self._slots[desired.side] = None
+                self._active_unwind_side = None
+                if self._active_unwind_not_sent_failures >= (
+                    self.config.active_unwind_max_attempts
+                ):
+                    reason = "active unwind pre-send failure limit exhausted"
+                    self._pause(reason)
+                    errors.append(reason)
+                return self._result(actions, errors, effect)
+            except OrderSubmissionRejectedError:
+                self._active_unwind_not_sent_failures = 0
+                actions[action_index] = replace(
+                    action,
+                    reason="active unwind submission was rejected",
+                    success=False,
+                )
+                self._slots[desired.side] = None
+                self._active_unwind_side = None
+                effect.position_refresh_required = True
+                return self._result(actions, errors, effect)
+            except Exception as exc:
+                category = _error_category(exc)
+                self._mark_submission_uncertain(desired.side, category)
+                errors.append(
+                    f"active unwind terminal proof is unavailable: {category}"
+                )
+                return self._result(actions, errors, effect)
+
+            if self._valid_active_uncertain_placeholder(order, desired):
+                slot = self._slots[desired.side]
+                if slot is not None:
+                    slot.client_id = str(order.client_id)
+                    slot.updated_monotonic = self._monotonic()
+                self._mark_submission_uncertain(
+                    desired.side,
+                    "active unwind submission awaits exact client-id terminal proof",
+                )
+                errors.append(
+                    "active unwind terminal proof is unavailable: "
+                    "submission outcome is uncertain"
+                )
+                return self._result(actions, errors, effect)
+            if not self._valid_active_confirmation(order, desired):
+                self._mark_submission_uncertain(
+                    desired.side, "invalid active unwind confirmation"
+                )
+                errors.append(
+                    "active unwind terminal proof is unavailable: invalid confirmation"
+                )
+                return self._result(actions, errors, effect)
+
+            slot = self._slots[desired.side]
+            if slot is None:
+                self._mark_submission_uncertain(
+                    desired.side, "active unwind slot disappeared"
+                )
+                errors.append("active unwind terminal proof is unavailable")
+                return self._result(actions, errors, effect)
+            slot.order_id = str(order.id)
+            slot.client_id = (
+                str(order.client_id) if order.client_id not in (None, "") else None
+            )
+            slot.remaining = Decimal(str(order.remaining))
+            slot.updated_monotonic = self._monotonic()
+
+            terminal = order if order.status in _TERMINAL_STATUSES else None
+            if terminal is None:
+                try:
+                    terminal = await asyncio.wait_for(
+                        self._poll_active_terminal(slot),
+                        timeout=float(
+                            self.config.active_unwind_confirmation_timeout_seconds
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    self._mark_submission_uncertain(
+                        desired.side,
+                        "active unwind terminal proof task was cancelled",
+                    )
+                    raise
+                except TimeoutError:
+                    self._mark_submission_uncertain(
+                        desired.side,
+                        "active unwind exact terminal proof timed out",
+                    )
+                    errors.append("active unwind exact terminal proof timed out")
+                    return self._result(actions, errors, effect)
+                except Exception as exc:
+                    category = _error_category(exc)
+                    self._mark_submission_uncertain(
+                        desired.side,
+                        f"active unwind terminal proof failed: {category}",
+                    )
+                    errors.append(
+                        f"active unwind terminal proof is unavailable: {category}"
+                    )
+                    return self._result(actions, errors, effect)
+
+            if terminal is None:
+                self._mark_submission_uncertain(
+                    desired.side, "active unwind exact terminal proof is missing"
+                )
+                errors.append("active unwind exact terminal proof is missing")
+                return self._result(actions, errors, effect)
+
+            fill_observed = _has_visible_fill(
+                terminal, previous_remaining=desired.amount
+            )
+            self._active_unwind_not_sent_failures = 0
+            self._apply_order_update(desired.side, terminal)
+            actions[action_index] = replace(
+                action,
+                reason=(
+                    "active unwind filled"
+                    if terminal.status is OrderStatus.FILLED
+                    else "active unwind terminal partial fill"
+                    if fill_observed
+                    else f"active unwind terminal {terminal.status.value}"
+                ),
+                success=terminal.status is not OrderStatus.REJECTED,
+            )
+            effect.position_refresh_required = True
+            effect.fill_observed = fill_observed
+            return self._result(actions, errors, effect)
+
     async def handle_order_update(self, order: OrderData) -> bool:
         async with self._lock:
+            self._invalidate_active_unwind_preparation()
             if order.symbol != self.config.symbol:
                 return False
             side = order.side
@@ -571,6 +935,14 @@ class MarketMakerOrderManager:
                         return fill_observed
                     self._pause(f"unknown open order update: {order.id}")
                 return False
+            if (
+                self._active_unwind_side is side
+                and not self._valid_active_resolution(slot, order)
+            ):
+                self._mark_submission_uncertain(
+                    side, "invalid active unwind order update proof"
+                )
+                return False
             fill_observed = _has_visible_fill(
                 order, previous_remaining=slot.remaining
             )
@@ -579,10 +951,12 @@ class MarketMakerOrderManager:
 
     async def resolve_unresolved_submissions(self) -> list[OrderData]:
         async with self._lock:
+            self._invalidate_active_unwind_preparation()
             return await self._resolve_uncertain_locked()
 
     async def sync_open_orders(self) -> bool:
         async with self._lock:
+            self._invalidate_active_unwind_preparation()
             resolved = await self._resolve_uncertain_locked()
             position_refresh_required = any(
                 order.symbol == self.config.symbol
@@ -606,6 +980,17 @@ class MarketMakerOrderManager:
                     continue
                 if matches:
                     matched_ids.add(id(matches[0]))
+                    if (
+                        self._active_unwind_side is side
+                        and not self._valid_active_resolution(
+                            slot, matches[0]
+                        )
+                    ):
+                        self._mark_submission_uncertain(
+                            side,
+                            "invalid active unwind open-order proof",
+                        )
+                        continue
                     position_refresh_required = (
                         _has_visible_fill(
                             matches[0], previous_remaining=slot.remaining
@@ -662,6 +1047,7 @@ class MarketMakerOrderManager:
 
     async def _shutdown(self) -> None:
         async with self._lock:
+            self._invalidate_active_unwind_preparation()
             if self.runtime_state is RuntimeState.STOPPED:
                 return
             self._shutting_down = True
@@ -1094,11 +1480,26 @@ class MarketMakerOrderManager:
                 for order in self._slots.values()
             )
         ):
-            resolved = list(await resolver())
-            for order in resolved:
+            candidates = list(await resolver())
+            for order in candidates:
                 slot = self._slots.get(order.side)
-                if slot is not None and self._order_matches(slot, order):
-                    self._apply_order_update(order.side, order)
+                if slot is None or not self._order_matches(slot, order):
+                    continue
+                if self._active_unwind_side is order.side:
+                    if not self._valid_active_resolution(slot, order):
+                        continue
+                    if order.status in _TERMINAL_STATUSES:
+                        self._apply_order_update(order.side, order)
+                    else:
+                        slot.order_id = (
+                            str(order.id) if order.id not in (None, "") else None
+                        )
+                        slot.client_id = str(order.client_id)
+                        slot.updated_monotonic = self._monotonic()
+                    resolved.append(order)
+                    continue
+                self._apply_order_update(order.side, order)
+                resolved.append(order)
         self._clear_resolved_uncertainty_pause()
         return resolved
 
@@ -1116,6 +1517,10 @@ class MarketMakerOrderManager:
                 if order.side is side
                 and self._order_matches(slot, order)
                 and order.status in _TERMINAL_STATUSES
+                and (
+                    self._active_unwind_side is not side
+                    or self._valid_active_resolution(slot, order)
+                )
             ),
             None,
         )
@@ -1169,6 +1574,19 @@ class MarketMakerOrderManager:
                 self._pause(f"invalid {side.value} order update")
                 return
             slot = self._slots[side]
+            if (
+                slot is not None
+                and self._active_unwind_side is side
+                and self._order_matches(slot, order)
+            ):
+                active_id = str(order.id or "").strip()
+                if not active_id:
+                    self._mark_submission_uncertain(
+                        side, "active unwind terminal order id is missing"
+                    )
+                    return
+                self._active_unwind_order_ids.add(active_id)
+                self._active_unwind_side = None
             if slot is not None and (
                 slot.state is OrderSlotState.UNCERTAIN_CANCELLATION
                 or slot.cancellation_uncertain
@@ -1219,7 +1637,7 @@ class MarketMakerOrderManager:
                 previous.updated_monotonic = now
             self._pause(f"invalid {side.value} order update")
             return
-        if order.id is not None:
+        if order.id is not None and self._active_unwind_side is not side:
             self._known_order_ids.add(str(order.id))
         cancellation_uncertain = bool(
             previous is not None
@@ -1295,6 +1713,151 @@ class MarketMakerOrderManager:
         ) or "order disappeared without terminal proof" in self.pause_reason:
             self.pause_reason = None
             self.runtime_state = RuntimeState.SYNCING
+
+    def _validate_active_unwind(self, desired: DesiredOrder) -> str | None:
+        if not desired.reduce_only:
+            return "active unwind must be reduce-only"
+        if (
+            not isinstance(desired.amount, Decimal)
+            or not isinstance(desired.price, Decimal)
+            or not desired.amount.is_finite()
+            or not desired.price.is_finite()
+            or desired.amount <= 0
+            or desired.amount > self.config.max_position
+            or desired.price <= 0
+            or not is_step_aligned(
+                desired.amount, self.metadata.quantity_step
+            )
+            or not is_step_aligned(desired.price, self.metadata.price_tick)
+            or desired.amount < self.metadata.min_base_amount
+            or desired.amount * desired.price < self.metadata.min_quote_amount
+        ):
+            return "active unwind desired price/amount is invalid"
+        return None
+
+    def _valid_active_confirmation(
+        self, order: OrderData | None, desired: DesiredOrder
+    ) -> bool:
+        if order is None:
+            return False
+        try:
+            amount = Decimal(str(order.amount))
+            price = Decimal(str(order.price))
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        return (
+            order.symbol == self.config.symbol
+            and order.side is desired.side
+            and order.type is OrderType.LIMIT
+            and order.status is not OrderStatus.UNKNOWN
+            and bool(str(order.id or "").strip())
+            and amount == desired.amount
+            and price == desired.price
+            and _valid_limit_order_values(order)
+        )
+
+    def _valid_active_uncertain_placeholder(
+        self, order: OrderData | None, desired: DesiredOrder
+    ) -> bool:
+        if order is None:
+            return False
+        params = order.params if isinstance(order.params, dict) else {}
+        raw = order.raw_data if isinstance(order.raw_data, dict) else {}
+        client_id = str(order.client_id or "").strip()
+        try:
+            amount = Decimal(str(order.amount))
+            price = Decimal(str(order.price))
+            remaining = Decimal(str(order.remaining))
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        return (
+            order.id in (None, "")
+            and bool(client_id)
+            and order.symbol == self.config.symbol
+            and order.side is desired.side
+            and order.type is OrderType.LIMIT
+            and order.status is OrderStatus.PENDING
+            and amount == desired.amount
+            and price == desired.price
+            and remaining == desired.amount
+            and params.get("submission_uncertain") is True
+            and raw.get("submission_uncertain") is True
+            and str(params.get("client_order_id", "")) == client_id
+            and str(raw.get("client_order_id", "")) == client_id
+            and params.get("reduce_only") is True
+            and str(params.get("time_in_force", "")).upper() == "IOC"
+        )
+
+    def _valid_active_resolution(
+        self, slot: ManagedOrder, order: OrderData
+    ) -> bool:
+        try:
+            amount = Decimal(str(order.amount))
+            price = Decimal(str(order.price))
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        if (
+            order.symbol != self.config.symbol
+            or order.side is not slot.side
+            or order.type is not OrderType.LIMIT
+            or order.status is OrderStatus.UNKNOWN
+            or not self._order_matches(slot, order)
+            or amount != slot.amount
+            or price != slot.price
+            or not _valid_limit_order_values(order)
+        ):
+            return False
+        if order.status in _TERMINAL_STATUSES:
+            return bool(str(order.id or "").strip())
+        return order.status in {OrderStatus.OPEN, OrderStatus.PENDING}
+
+    async def _active_unwind_zero_order_proof(self) -> str | None:
+        try:
+            open_orders = self._active_symbol_orders(
+                await self.adapter.get_open_orders(self.config.symbol)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return (
+                "active unwind open-order proof failed: "
+                f"{_error_category(exc)}"
+            )
+        if open_orders:
+            return "active unwind requires zero authenticated symbol open orders"
+        return None
+
+    def _matching_active_terminal(
+        self,
+        slot: ManagedOrder,
+        orders: Iterable[OrderData] | None,
+    ) -> OrderData | None:
+        for order in orders or ():
+            if (
+                order.status in _TERMINAL_STATUSES
+                and self._valid_active_resolution(slot, order)
+            ):
+                return order
+        return None
+
+    async def _poll_active_terminal(
+        self, slot: ManagedOrder
+    ) -> OrderData | None:
+        timeout = self.config.active_unwind_confirmation_timeout_seconds
+        attempts = min(
+            _ACTIVE_TERMINAL_MAX_POLLS,
+            max(1, int(timeout / _ACTIVE_TERMINAL_POLL_SECONDS)),
+        )
+        for attempt in range(attempts):
+            history = await self.adapter.get_order_history(
+                self.config.symbol, limit=100
+            )
+            terminal = self._matching_active_terminal(slot, history)
+            if terminal is not None:
+                return terminal
+            if attempt + 1 < attempts:
+                await self._sleep(_ACTIVE_TERMINAL_POLL_SECONDS)
+        return None
 
     def _validate_desired(
         self, desired: DesiredOrder, risk: RiskDecision
@@ -1542,9 +2105,23 @@ class MarketMakerOrderManager:
     def _create_budget_available(self) -> bool:
         return self._mutation_budget_available()
 
-    def _record_mutation(self) -> None:
+    def _record_mutation(self) -> float:
         self._purge_mutations()
-        self._mutation_timestamps.append(self._monotonic())
+        timestamp = self._monotonic()
+        self._mutation_timestamps.append(timestamp)
+        self._mutation_generation += 1
+        self._invalidate_active_unwind_preparation()
+        return timestamp
+
+    def _rollback_mutation(self, timestamp: float) -> None:
+        if (
+            self._mutation_timestamps
+            and self._mutation_timestamps[-1] == timestamp
+        ):
+            self._mutation_timestamps.pop()
+
+    def _invalidate_active_unwind_preparation(self) -> None:
+        self._active_unwind_prepared_generation = None
 
     def _purge_mutations(self) -> None:
         cutoff = self._monotonic() - 60
