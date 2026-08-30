@@ -677,6 +677,35 @@ class MarketMakerCoordinator:
                 self.metrics.quote_spread_ticks = None
                 self.metrics.quote_spread_bps = None
                 self.metrics.quote_edge_after_fees_bps = None
+            if desired.runtime_state is RuntimeState.PAUSED_ERROR:
+                await self._fail_closed(RuntimeState.PAUSED_ERROR, desired.reason)
+                raise RuntimeError(f"strategy hard stop: {desired.reason}")
+            stranded_distance = desired.half_spread + self.metadata.price_tick
+            stranded_soft_exit = (
+                getattr(risk, "soft_exit_latched", False) is True
+                and (
+                    (
+                        desired.bid is not None
+                        and desired.bid.reduce_only
+                        and desired.reference_price - desired.bid.price
+                        > stranded_distance
+                    )
+                    or (
+                        desired.ask is not None
+                        and desired.ask.reduce_only
+                        and desired.ask.price - desired.reference_price
+                        > stranded_distance
+                    )
+                )
+            )
+            if stranded_soft_exit:
+                reason = (
+                    "soft exit is stranded outside the normal passive quote "
+                    "band by the economic gate"
+                )
+                self.metrics.quote_reason = reason
+                await self._fail_closed(RuntimeState.PAUSED_ERROR, reason)
+                raise RuntimeError(f"strategy hard stop: {reason}")
             result = await self.order_manager.reconcile(desired, risk)
             self._record_reconcile_actions(getattr(result, "actions", ()))
             current_orders = self.order_manager.snapshot()

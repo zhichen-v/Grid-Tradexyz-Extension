@@ -1,6 +1,6 @@
 # Market Maker 現況與優化方向
 
-> 更新：2026-08-29 01:07（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
+> 更新：2026-08-30 07:35（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
 
 ## 現況
 
@@ -16,6 +16,7 @@ Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/marke
 - RiskManager 是 inventory age與soft-exit latch唯一來源，data/error recovery不重啟計時。
 - Authenticated account audit：唯一maker fills、exact fee、flat-to-flat net/equity、fee tier、`1x cross`與帳戶獨占。
 - Stale/untrusted data、unknown order、uncertain mutation、reconciliation failure與drawdown超限時 fail closed。
+- `soft_exit_latched`後若正確方向的reduce-only實際報價超出reference的normal half-spread加1 tick，先fail-closed撤managed orders再fatal stop；不改strategy算價、economic gate或maker-only限制。
 
 現行候選固定為：
 
@@ -25,6 +26,14 @@ Fee gate：maker `1.2 bps`、至少 `30 completed maker fills`、fee cover `>=1`
 
 ## 最新判定
 
+- Invalid-nonce definitive-rejection修復只接受精確`21104 / invalid nonce / {}`且需MM opt-in，hard-refresh nonce後最多下一cycle重試；其他錯誤仍fail closed。23:15:28–23:49:40 T3為`390/390`、真實mutation與全部hard-safety counters`0`，evidence `logs/market_maker_t3_invalid_nonce_20260829-234937.log`。
+- 23:50:37–03:50:37首輪4小時雖為`2789/2789`且6 completed／3 round trips的completed net為`+0.0240908 bps`、cover`1.02008`，但少於30且final short`0.00020`，只能記`incomplete_nonflat`；依授權以單向`BUY LIMIT + POST_ONLY + reduce_only`於`78139.1` exact fill回到flat。
+- 已完成stranded-soft-exit最小guard與deterministic mirror tests；MM`333/333`，full repo`580`維持既知Grid `8F+4E`。04:20:10–04:53:16 T3為`379/379`、真實mutation與hard-safety counters全`0`，evidence `logs/market_maker_t3_stranded_guard_20260830-045312.log`。
+- 第一次live於05:49由guard按設計中止：`705/705`、failed與其他hard-safety counters`0`，short`0.00020`且orders已撤為`0`；maker-only recovery回到flat後，05:57:11–06:28:11 fresh T3 final再以`354/354` GO。Stop與T3 evidence分別為`logs/market_maker_long_run_stranded_stop_20260830-055234.log`、`logs/market_maker_t3_post_recovery_20260830-062753.log`。
+- 第二次live於07:29:09決定性重現同一intended guard：`775/775`、1 maker fill／0 completed、economic state `incomplete_nonflat`、short`0.00020`、orders與runtime均`0`，全部hard-safety counters仍`0`。依授權只用單向`BUY LIMIT + POST_ONLY + reduce_only`在`78215.5`取得exact terminal fill；07:34兩次authenticated postflight均position／orders=`0/0`、used collateral=`0`、equity`299.299693`。同候選不再自動重跑；evidence `logs/market_maker_long_run_stranded_stop_repeat_20260830-072909.log`、`logs/market_maker_recovery_repeat_20260830-073412.txt`。
+- 18:27 long-run依當時monitor規則停止，正式紀錄仍是Operational NO-GO／economic evidence unavailable；但鑑識已定位為觀測誤報：18:33:36.467 status讀到adapter剛登記的cancel proof marker，18:33:36.557同一cancel已由exact terminal history證明並清除，只有約90ms，runtime本身沒有failed cycle、unknown或reconciliation failure。
+- 已做MM-only最小修復：公開`unresolved_cancellation_count`不再把受管slot正處於`CANCELING`且尚未轉uncertain的同一key當成current unresolved。真正uncertain、adapter-only／mismatched key仍計數；`has_uncertain_state`與實際fail-closed阻擋不變，shared Lighter/Grid未修改。OrderManager`88/88`、MM`327/327`通過；full repo`574`維持既知Grid `8F+4E`。
+- 18:53:59–18:59:10以新fingerprint `7A3A8DB9...99F9DF`完成dry-run T1：final `60/60` cycles、真實create/cancel與全部hard-safety counters為`0`、全程flat。Runtime0，雙authenticated postflight position／orders=`0/0`；證據`logs/market_maker_t1_cancel_confirmation_metric_20260829-185910.log`。
 - E2z的false unknown-order根因已做MM-only最小修復：terminal後延遲WS replay必須匹配side、order/client namespace、amount與price；remaining low-watermark只下降，新增partial只觸發一次refresh，同一replay不重複計fill。Foreign／衝突order及REST active-after-terminal仍fail closed；shared Lighter adapter與Grid均未修改。
 - 本地候選只改一個經濟變因：`max_session_loss_for_maker_exit: "0"`，停用以固定session loss換成交，恢復既有fee／authenticated-surplus aware exit。Source仍`dry_run:true`，SHA`9162163C...84DF711`。
 - Offline/regression與fresh T3均GO：terminal replay`4/4`、order manager`87/87`、經濟分支`4/4`、Market Maker`326/326`；full repo`573`維持既知Grid baseline `8 failures + 4 errors`。00:08:13–00:38:39 T3保存狀態`348/348`，真實mutation、failed、ambiguity／unresolved、reconciliation failure、unknown、429、WS與account-read failure皆`0`，全程flat。Graceful stop後runtime0，00:39兩次authenticated postflight均position／orders=`0/0`、used collateral=`0`；證據`logs/market_maker_t3_terminal_replay_20260829-003823.log`，本輪沒有live mutation。
@@ -37,9 +46,9 @@ Fee gate：maker `1.2 bps`、至少 `30 completed maker fills`、fee cover `>=1`
 
 ## 下一步
 
-1. 固定`250 ticks`短場已達30 completed、自然flat與完整economic GO；不再自動重跑或同時改spread、size、風險額度。
-2. 下一階段是同fingerprint的有界long-run，但必須取得新的明確授權並先做fresh authenticated preflight；本輪短live授權不延伸到long-run。
-3. Terminal replay live path未自然觸發；保留offline deterministic coverage，不為製造證據而刻意觸發交易競態。
-4. 若long-run後仍需比較`200 ticks`，維持單變因流程；不以loss-budget、taker或未完成episode換取成交量。
+1. 保持flat、runtime0、open orders0，兩份本地候選config維持`dry_run:true`；禁止第三次同候選自動重跑。
+2. 目前固定候選會在單一entry後重現stranded soft-exit，無法形成有意義的4小時或30-completed自然flat經濟樣本；guard是安全GO，候選promotion仍被阻擋。
+3. 若要繼續，須由使用者另行授權一個單變因候選，並重新走offline regression、fresh T3與live gate；不得放寬fee/equity gate。
+4. 暫不調`250 ticks`、size、margin或風險額度；不以loss-budget、taker／IOC、market或未完成episode換取成交量。
 
 不以 taker／IOC、self-trade或隱藏未完成episode換取成交量。VPS仍不在本階段。

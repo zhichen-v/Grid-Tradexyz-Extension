@@ -64,6 +64,7 @@ class LighterAdapter(ExchangeAdapter):
     """Lighter交易所适配器 - 统一接口"""
 
     supports_definitive_pre_send_failure = True
+    supports_definitive_submission_rejection = True
 
     @property
     def managed_order_integrator_fee_tick(self) -> int:

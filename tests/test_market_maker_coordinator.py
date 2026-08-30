@@ -531,6 +531,167 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(economics, SoftExitEconomics)
         self.assertEqual(economics.completed_net, Decimal("0.003"))
 
+    async def test_strategy_hard_stop_cancels_before_reconcile(self) -> None:
+        reason = (
+            "soft exit is stranded outside the passive market "
+            "by the economic gate"
+        )
+        order_manager = self.order_manager()
+        order_manager.cancel_managed_orders.return_value = SimpleNamespace(
+            actions=(),
+            errors=(),
+            fill_observed=False,
+            position_refresh_required=False,
+        )
+        coordinator = self.prepare_running(order_manager=order_manager)
+        coordinator.strategy.calculate_quotes.return_value = replace(
+            self.desired(),
+            bid=None,
+            ask=None,
+            runtime_state=RuntimeState.PAUSED_ERROR,
+            reason=reason,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "strategy hard stop"):
+            await coordinator.run_one_cycle(force=True)
+
+        order_manager.cancel_managed_orders.assert_awaited_once_with(reason)
+        order_manager.reconcile.assert_not_awaited()
+        self.assertIs(coordinator._state, RuntimeState.PAUSED_ERROR)
+
+    async def test_stranded_soft_exit_cancels_before_reconcile(self) -> None:
+        reason = (
+            "soft exit is stranded outside the normal passive quote "
+            "band by the economic gate"
+        )
+        cases = (
+            (
+                Decimal("-0.2"),
+                replace(
+                    self.risk(),
+                    buy_amount=Decimal("0.2"),
+                    sell_amount=None,
+                    buy_reduce_only=True,
+                    soft_exit_latched=True,
+                    runtime_state=RuntimeState.RISK_REDUCTION,
+                ),
+                replace(
+                    self.desired(),
+                    bid=DesiredOrder(
+                        OrderSide.BUY,
+                        Decimal("77870.0"),
+                        Decimal("0.2"),
+                        True,
+                        "soft_exit_hard_fallback",
+                    ),
+                    ask=None,
+                    reference_price=Decimal("78139.2"),
+                    reservation_price=Decimal("78139.2"),
+                    half_spread=Decimal("25.0"),
+                    reason="soft_exit_hard_fallback",
+                    runtime_state=RuntimeState.RISK_REDUCTION,
+                ),
+            ),
+            (
+                Decimal("0.2"),
+                replace(
+                    self.risk(),
+                    buy_amount=None,
+                    sell_amount=Decimal("0.2"),
+                    sell_reduce_only=True,
+                    soft_exit_latched=True,
+                    runtime_state=RuntimeState.RISK_REDUCTION,
+                ),
+                replace(
+                    self.desired(),
+                    bid=None,
+                    ask=DesiredOrder(
+                        OrderSide.SELL,
+                        Decimal("77908.2"),
+                        Decimal("0.2"),
+                        True,
+                        "soft_exit_active",
+                    ),
+                    reference_price=Decimal("77600.1"),
+                    reservation_price=Decimal("77600.1"),
+                    half_spread=Decimal("25.0"),
+                    reason="soft_exit_active",
+                    runtime_state=RuntimeState.RISK_REDUCTION,
+                ),
+            ),
+        )
+        for position, risk, desired in cases:
+            with self.subTest(position=position):
+                order_manager = self.order_manager()
+                order_manager.cancel_managed_orders.return_value = (
+                    SimpleNamespace(
+                        actions=(),
+                        errors=(),
+                        fill_observed=False,
+                        position_refresh_required=False,
+                    )
+                )
+                coordinator = self.prepare_running(order_manager=order_manager)
+                coordinator._position = self.position(signed_size=position)
+                coordinator.risk_manager.evaluate.return_value = risk
+                coordinator.strategy.calculate_quotes.return_value = desired
+
+                with self.assertRaisesRegex(RuntimeError, "strategy hard stop"):
+                    await coordinator.run_one_cycle(force=True)
+
+                order_manager.cancel_managed_orders.assert_awaited_once_with(
+                    reason
+                )
+                order_manager.reconcile.assert_not_awaited()
+                self.assertIs(coordinator._state, RuntimeState.PAUSED_ERROR)
+                self.assertEqual(coordinator.metrics.quote_reason, reason)
+
+    async def test_stranded_soft_exit_guard_preserves_normal_band(self) -> None:
+        cases = (
+            (False, OrderSide.BUY, Decimal("-0.2"), Decimal("70")),
+            (False, OrderSide.SELL, Decimal("0.2"), Decimal("130")),
+            (True, OrderSide.BUY, Decimal("-0.2"), Decimal("89.9")),
+            (True, OrderSide.SELL, Decimal("0.2"), Decimal("110.1")),
+        )
+        for soft_exit_latched, side, position, price in cases:
+            with self.subTest(
+                soft_exit_latched=soft_exit_latched,
+                side=side,
+                price=price,
+            ):
+                is_buy = side is OrderSide.BUY
+                order_manager = self.order_manager()
+                coordinator = self.prepare_running(order_manager=order_manager)
+                coordinator._position = self.position(signed_size=position)
+                coordinator.risk_manager.evaluate.return_value = replace(
+                    self.risk(),
+                    buy_amount=Decimal("0.2") if is_buy else None,
+                    sell_amount=None if is_buy else Decimal("0.2"),
+                    buy_reduce_only=is_buy,
+                    sell_reduce_only=not is_buy,
+                    soft_exit_latched=soft_exit_latched,
+                    runtime_state=RuntimeState.RISK_REDUCTION,
+                )
+                order = DesiredOrder(
+                    side,
+                    price,
+                    Decimal("0.2"),
+                    True,
+                    "timed reduction",
+                )
+                coordinator.strategy.calculate_quotes.return_value = replace(
+                    self.desired(),
+                    bid=order if is_buy else None,
+                    ask=None if is_buy else order,
+                    half_spread=Decimal("10"),
+                    runtime_state=RuntimeState.RISK_REDUCTION,
+                )
+
+                await coordinator.run_one_cycle(force=True)
+
+                order_manager.cancel_managed_orders.assert_not_awaited()
+                order_manager.reconcile.assert_awaited_once()
+
     async def test_ping_pong_waits_for_authenticated_flat_checkpoint(
         self,
     ) -> None:

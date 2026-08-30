@@ -7,7 +7,10 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Callable, Iterable
 
-from ...adapters.exchanges.exceptions import OrderSubmissionNotSentError
+from ...adapters.exchanges.exceptions import (
+    OrderSubmissionNotSentError,
+    OrderSubmissionRejectedError,
+)
 from ...adapters.exchanges.models import OrderData, OrderSide, OrderStatus, OrderType
 from .config import MarketMakerConfig, is_step_aligned
 from .models import (
@@ -244,7 +247,15 @@ class MarketMakerOrderManager:
                 or order.cancellation_uncertain
             )
         }
-        unresolved.update(self.get_unresolved_cancellations())
+        confirming = {
+            (self.config.symbol, str(order.order_id))
+            for order in self._slots.values()
+            if order is not None
+            and order.order_id is not None
+            and order.state is OrderSlotState.CANCELING
+            and not order.cancellation_uncertain
+        }
+        unresolved.update(self.get_unresolved_cancellations() - confirming)
         return len(unresolved)
 
     @property
@@ -428,6 +439,8 @@ class MarketMakerOrderManager:
                             safety=True,
                         )
                     )
+                    if self.unresolved_cancellation_count:
+                        break
                     continue
                 if live.state not in {
                     OrderSlotState.LIVE,
@@ -450,6 +463,8 @@ class MarketMakerOrderManager:
                         safety=safety,
                     )
                 )
+                if self.unresolved_cancellation_count:
+                    break
 
             blocking = self._blocking_reason()
             if blocking:
@@ -780,6 +795,15 @@ class MarketMakerOrderManager:
             is True
         ):
             order_params["_raise_on_definitive_pre_send_failure"] = True
+        if (
+            getattr(
+                self.adapter,
+                "supports_definitive_submission_rejection",
+                False,
+            )
+            is True
+        ):
+            order_params["_raise_on_definitive_submission_rejection"] = True
         try:
             order = await self.adapter.create_order(
                 self.config.symbol,
@@ -798,6 +822,14 @@ class MarketMakerOrderManager:
             actions[action_index] = replace(
                 action,
                 reason="order submission was not sent",
+                success=False,
+            )
+            self._slots[desired.side] = None
+            return _OrderEffect()
+        except OrderSubmissionRejectedError:
+            actions[action_index] = replace(
+                action,
+                reason="order submission was rejected",
                 success=False,
             )
             self._slots[desired.side] = None
@@ -1030,10 +1062,13 @@ class MarketMakerOrderManager:
             slot = self._slots[side]
             if slot is None:
                 continue
-            if slot.state in {
-                OrderSlotState.UNCERTAIN_SUBMISSION,
-                OrderSlotState.UNCERTAIN_CANCELLATION,
-            }:
+            if (
+                slot.state is OrderSlotState.UNCERTAIN_CANCELLATION
+                or slot.cancellation_uncertain
+            ):
+                errors.append(f"{side.value} order state is uncertain")
+                break
+            if slot.state is OrderSlotState.UNCERTAIN_SUBMISSION:
                 errors.append(f"{side.value} order state is uncertain")
                 continue
             effect.include(
@@ -1041,6 +1076,8 @@ class MarketMakerOrderManager:
                     side, reason, actions, errors, safety=True
                 )
             )
+            if self.unresolved_cancellation_count:
+                break
         return effect
 
     async def _resolve_uncertain_locked(self) -> list[OrderData]:

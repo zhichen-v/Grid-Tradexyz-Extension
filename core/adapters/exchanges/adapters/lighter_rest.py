@@ -50,7 +50,10 @@ except ImportError:
     logging.warning("lighter SDK未安装。请执行: uv pip install lighter-sdk==1.1.2")
 
 from .lighter_base import LighterBase
-from ..exceptions import OrderSubmissionNotSentError
+from ..exceptions import (
+    OrderSubmissionNotSentError,
+    OrderSubmissionRejectedError,
+)
 from ..models import (
     TickerData, OrderBookData, TradeData, BalanceData,
     OrderData, PositionData, ExchangeInfo, OrderBookLevel, OrderSide, OrderType, OrderStatus
@@ -317,6 +320,20 @@ class LighterRest(LighterBase):
         # safe to classify from the exception alone; response/err objects are
         # handled separately by their callers.
         return LighterRest._is_rate_limited(exc)
+
+    @staticmethod
+    def _is_invalid_nonce_rejection(tx: Any, response: Any, error: Any) -> bool:
+        """Return whether Lighter explicitly rejected a submission's nonce."""
+        return (
+            tx is None
+            and response is None
+            and isinstance(error, str)
+            and error.strip()
+            == (
+                "HTTP response body: code=21104 message='invalid nonce' "
+                "additional_properties={}"
+            )
+        )
 
     def _is_configured_api_dns_failure(self, exc: Exception) -> bool:
         """Return whether DNS failed for this adapter's configured API host."""
@@ -2080,6 +2097,9 @@ class LighterRest(LighterBase):
         raise_on_pre_send_failure = bool(
             kwargs.pop("_raise_on_definitive_pre_send_failure", False)
         )
+        raise_on_submission_rejection = bool(
+            kwargs.pop("_raise_on_definitive_submission_rejection", False)
+        )
 
         # 转换参数
         params = self._convert_limit_order_params(
@@ -2130,6 +2150,14 @@ class LighterRest(LighterBase):
                 str(exc),
                 **kwargs,
             )
+
+        if (
+            raise_on_submission_rejection
+            and self._is_invalid_nonce_rejection(tx, response, err)
+        ):
+            raise OrderSubmissionRejectedError(
+                "order submission rejected: invalid nonce"
+            ) from None
 
         # Keep post-send response handling outside the pre-connect DNS catch.
         # A later confirmation read must never make an accepted submission
@@ -2538,7 +2566,7 @@ class LighterRest(LighterBase):
                     skip_order_index_query=skip_order_index_query, **kwargs
                 )
 
-        except OrderSubmissionNotSentError:
+        except (OrderSubmissionNotSentError, OrderSubmissionRejectedError):
             raise
         except Exception as e:
             if self._is_definitive_mutation_exception(e):

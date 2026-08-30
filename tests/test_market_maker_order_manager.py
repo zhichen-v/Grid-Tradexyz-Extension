@@ -8,7 +8,10 @@ from unittest.mock import AsyncMock, Mock
 
 from aiohttp import ClientConnectorDNSError
 
-from core.adapters.exchanges.exceptions import OrderSubmissionNotSentError
+from core.adapters.exchanges.exceptions import (
+    OrderSubmissionNotSentError,
+    OrderSubmissionRejectedError,
+)
 from core.adapters.exchanges.models import (
     OrderData,
     OrderSide,
@@ -1033,6 +1036,50 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             terminal
         )
 
+    async def test_inflight_cancel_confirmation_is_not_reported_unresolved(
+        self,
+    ) -> None:
+        await self.manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        self.clock.value += 2
+        cancel_started = asyncio.Event()
+        release_cancel = asyncio.Event()
+
+        async def cancel(order_id, symbol):
+            self.adapter.get_unresolved_cancellations.return_value = [
+                (symbol, str(order_id))
+            ]
+            cancel_started.set()
+            await release_cancel.wait()
+            self.adapter.get_unresolved_cancellations.return_value = []
+            return exchange_order(
+                str(order_id),
+                OrderSide.BUY,
+                status=OrderStatus.CANCELED,
+                params={"cancel_terminal": True},
+            )
+
+        self.adapter.cancel_order.side_effect = cancel
+        reconcile = asyncio.create_task(
+            self.manager.reconcile(
+                self.desired(bid_price="99.8", ask_price=None), self.risk()
+            )
+        )
+        await cancel_started.wait()
+
+        self.assertEqual(
+            self.manager.slots[OrderSide.BUY].state,
+            OrderSlotState.CANCELING,
+        )
+        self.assertTrue(self.manager.has_uncertain_state)
+        self.assertEqual(self.manager.unresolved_cancellation_count, 0)
+
+        release_cancel.set()
+        await reconcile
+        self.assertEqual(self.manager.unresolved_cancellation_count, 0)
+        self.assertFalse(self.manager.has_uncertain_state)
+
     async def test_nonterminal_cancel_placeholder_is_not_fill_proof(self) -> None:
         await self.manager.reconcile(
             self.desired(bid_price="99.9", ask_price=None), self.risk()
@@ -1772,6 +1819,44 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+    async def test_create_rejection_retries_without_reconcile_failure(
+        self,
+    ) -> None:
+        self.adapter.supports_definitive_submission_rejection = True
+        self.adapter.create_order.side_effect = OrderSubmissionRejectedError(
+            "order submission rejected: invalid nonce"
+        )
+
+        first = await self.manager.reconcile(
+            self.desired(ask_price=None), self.risk()
+        )
+
+        self.adapter.create_order.assert_awaited_once()
+        self.assertEqual(first.actions[0].success, False)
+        self.assertEqual(first.errors, ())
+        self.assertIsNone(self.manager.slots[OrderSide.BUY])
+        self.assertFalse(self.manager.has_uncertain_state)
+        self.assertTrue(
+            self.adapter.create_order.await_args.kwargs["params"][
+                "_raise_on_definitive_submission_rejection"
+            ]
+        )
+        self.assertNotEqual(
+            self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
+        )
+
+        self.adapter.create_order.side_effect = self._create_order
+        second = await self.manager.reconcile(
+            self.desired(ask_price=None), self.risk()
+        )
+
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.assertTrue(second.actions[0].success)
+        self.assertEqual(
+            self.manager.slots[OrderSide.BUY].state,
+            OrderSlotState.LIVE,
+        )
+
     async def test_dns_failure_during_cancel_stays_uncertain(self) -> None:
         slot = ManagedOrder(
             side=OrderSide.BUY,
@@ -2040,7 +2125,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             self.manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE
         )
 
-    async def test_uncertain_cancel_stops_create_and_cancels_other_side(
+    async def test_uncertain_cancel_stops_remaining_side_mutations(
         self,
     ) -> None:
         await self.manager.reconcile(self.desired(), self.risk())
@@ -2059,16 +2144,29 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.adapter.cancel_order.side_effect = cancel
         await self.manager.reconcile(
-            self.desired(bid_price="99.8"), self.risk()
+            self.desired(bid_price="99.8", ask_price="100.2"), self.risk()
         )
 
         self.assertEqual(self.adapter.create_order.await_count, 2)
-        self.assertEqual(self.adapter.cancel_order.await_count, 2)
+        self.assertEqual(self.adapter.cancel_order.await_count, 1)
         self.assertEqual(
             self.manager.slots[OrderSide.BUY].state,
             OrderSlotState.UNCERTAIN_CANCELLATION,
         )
-        self.assertIsNone(self.manager.slots[OrderSide.SELL])
+        self.assertEqual(
+            self.manager.slots[OrderSide.SELL].state,
+            OrderSlotState.LIVE,
+        )
+
+        await self.manager.reconcile(
+            self.desired(bid_price="99.8", ask_price="100.2"), self.risk()
+        )
+
+        self.assertEqual(self.adapter.cancel_order.await_count, 1)
+        self.assertEqual(
+            self.manager.slots[OrderSide.SELL].state,
+            OrderSlotState.LIVE,
+        )
 
     async def test_unsafe_risk_cancels_even_if_desired_still_has_quotes(
         self,

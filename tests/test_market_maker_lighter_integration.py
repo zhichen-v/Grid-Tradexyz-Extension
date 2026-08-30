@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import run_market_maker as entrypoint
+from core.adapters.exchanges.exceptions import OrderSubmissionRejectedError
 from core.adapters.exchanges.models import (
     ExchangeInfo,
     ExchangeType,
@@ -441,6 +442,111 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _submission_rest(result) -> LighterRest:
+        rest = object.__new__(LighterRest)
+        rest._validate_order_preconditions = Mock(return_value=True)
+        rest._get_market_info = AsyncMock(
+            return_value={"price_decimals": 1}
+        )
+        rest._validate_order_minimums = Mock()
+        rest._next_client_order_index = Mock(return_value=1)
+        rest._convert_limit_order_params = Mock(return_value={})
+        rest._call_api = AsyncMock(return_value=result)
+        rest._handle_ambiguous_order_submission = AsyncMock(
+            return_value=SimpleNamespace(id="uncertain")
+        )
+        rest.signer_client = SimpleNamespace(create_order=Mock())
+        return rest
+
+    async def test_invalid_nonce_is_a_sanitized_definitive_rejection(
+        self,
+    ) -> None:
+        rest = self._submission_rest(
+            (
+                None,
+                None,
+                "HTTP response body: code=21104 message='invalid nonce' "
+                "additional_properties={}",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            OrderSubmissionRejectedError,
+            "invalid nonce",
+        ) as raised:
+            await rest.place_order(
+                "BTC",
+                "sell",
+                "limit",
+                Decimal("0.00020"),
+                Decimal("77912.4"),
+                reduce_only=True,
+                time_in_force="POST_ONLY",
+                _raise_on_definitive_submission_rejection=True,
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "order submission rejected: invalid nonce",
+        )
+        rest._handle_ambiguous_order_submission.assert_not_awaited()
+
+    async def test_invalid_nonce_rejection_requires_exact_tuple_and_code(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "default-off",
+                None,
+                None,
+                "HTTP response body: code=21104 message='invalid nonce' "
+                "additional_properties={}",
+                False,
+            ),
+            (
+                "wrong-code",
+                None,
+                None,
+                "HTTP response body: code=21105 message='invalid nonce' "
+                "additional_properties={}",
+                True,
+            ),
+            (
+                "wrong-message",
+                None,
+                None,
+                "HTTP response body: code=21104 message='nonce unavailable' "
+                "additional_properties={}",
+                True,
+            ),
+            (
+                "extra-payload",
+                None,
+                None,
+                "HTTP response body: code=21104 message='invalid nonce' "
+                "additional_properties={} extra",
+                True,
+            ),
+        )
+        for label, tx, response, error, opt_in in cases:
+            with self.subTest(label=label):
+                rest = self._submission_rest((tx, response, error))
+
+                result = await rest.place_order(
+                    "BTC",
+                    "sell",
+                    "limit",
+                    Decimal("0.00020"),
+                    Decimal("77912.4"),
+                    reduce_only=True,
+                    time_in_force="POST_ONLY",
+                    _raise_on_definitive_submission_rejection=opt_in,
+                )
+
+                self.assertEqual(result.id, "uncertain")
+                rest._handle_ambiguous_order_submission.assert_awaited_once()
+
     async def test_fast_fill_order_index_falls_back_to_exact_history(
         self,
     ) -> None:
