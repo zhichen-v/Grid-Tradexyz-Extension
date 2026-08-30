@@ -146,7 +146,7 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 | D | 小額長時間 | 只在短 gate GO 後執行數小時；觀察 drift、latency、fee、funding、資源與事故密度。 |
 | E | 單變因調參 | 一次只改 spread、size、skew、ratio 或 refresh 其中一項；每次重新驗證。Active unwind另走預設關閉的獨立rollout，不得和一般quote調參同場混合。 |
 
-## 8. 本地 checkpoint（2026-08-30 active-unwind live incident closure）
+## 8. 本地 checkpoint（2026-08-30 active-unwind fixed live canary closure）
 
 ### 8.1 候選與邊界
 
@@ -155,10 +155,10 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 | 帳戶／市場 | 隔離 Lighter sub-account、Robinhood mainnet、BTC 獨占 |
 | Source config | `config/market_maker/test_lighter_btc_mvp.yaml`，`dry_run: true`、`ping_pong_enabled: true`、`max_session_loss_for_maker_exit: "0"`，SHA-256 `9162163CC3B65153CF8FDFE34C3FCC92D28C5DEF0D3590B90F5E3A18984DF711` |
 | Active validation configs | Dry source `config/market_maker/test_lighter_btc_mvp.active_unwind_20260830_1530.yaml`，SHA `73F53128787FA6B84ECCA7C147E894E81FB790F97A09AAE5EE50825809D6267E`；live copy只在獲授權場次暫為`dry_run:false`（當時SHA `508BB0854B151D8C16BA34E39FA7C11387242E6B89C63AE183B405F12BB959E3`），停機後已恢復`dry_run:true`並與dry source同SHA。 |
-| Runtime evidence scope | Active-enabled dry T3已GO；首次active-unwind live canary只證明到`active_ready`，沒有送出IOC。其後truth-token／preparation-generation修復已通過fresh T3，但尚無修復後live execution證據；不得沿用舊fingerprint宣稱active lane已live驗證。 |
+| Runtime evidence scope | Active-enabled dry T3已GO；truth-token／preparation-generation修復後60分鐘live canary亦已完成runtime／hard-safety驗證，但沒有自然形成符合active trigger的episode，active attempts／IOC／taker fills皆為`0`。因此active IOC execution仍未獲證明，不得把「未觸發」視為terminal／fill／flat path證據。 |
 | Quote／risk | `both / position-based ping-pong / 250 ticks / 0.00020 / max position 0.00040 / trend 60s/125 ticks / 1x cross / drawdown 0.50 USDG / 8 mutations/min` |
 | Fee／exit | maker `1.2 bps`、soft exit `120s`、session-loss maker exit停用（`0`），回到既有fee／authenticated-surplus aware `POST_ONLY reduce-only` exit |
-| Active inventory unwind | 程式與example config已加入per-episode barrier、passive chase及有界`reduce_only LIMIT + IOC` lane；**預設 `active_unwind_enabled: false`**。修復後active-enabled dry T3已GO，但IOC live execution仍未證明；只能在新的明確live授權後從fresh-flat重新驗證。 |
+| Active inventory unwind | 程式與example config已加入per-episode barrier、passive chase及有界`reduce_only LIMIT + IOC` lane；**預設 `active_unwind_enabled: false`**。修復後active-enabled dry T3與60分鐘live runtime-safety均GO，但因active trigger／attempt為`0`，IOC live execution仍未證明；任何後續live仍須新的明確授權與fresh-flat preflight。 |
 | Economic gate | `30 completed`、fee cover `>=1`、completed與flat-equity皆 `>=+0.02 bps` |
 
 ### 8.2 本輪結果
@@ -190,9 +190,10 @@ Long-run 每 30 分鐘保存：completed fills／round trips、turnover、exact 
 | 第二次intended guard stop與最終recovery | 06:29:03重新啟動；07:29:09同一guard決定性重現。Final `775/775`、1 maker fill／0 completed、economic `incomplete_nonflat`、short`0.00020`、orders`0`、runtime0；failed、ambiguity／unresolved、reconciliation failure、unknown、non-maker、429、WS與account hard counters全`0`。授權單向BUY `POST_ONLY + reduce_only`於`78215.5`取得exact terminal fill | **安全停止／不再同候選自動重跑**。07:34雙authenticated postflight position／orders=`0/0`、used collateral=`0`、equity`299.299693`；兩份config均恢復`dry_run:true`。Evidence `logs/market_maker_long_run_stranded_stop_repeat_20260830-072909.log`（SHA `63F75DBC...5C314`）、`logs/market_maker_recovery_repeat_20260830-073412.txt`（SHA `BBF8CD45...27429`）。 |
 | Active-enabled T3與首次live canary | 15:54:01–16:26:57 dry T3為`374/374`、`would_place=566`，真實mutation與全部hard-safety／active counters`0`。16:31:00 live啟動；第三個short episode進入`active_ready`約`478.516s`，position refresh累計`61`，但17:01停止前active attempts仍為`0`，沒有送出IOC；final `387/387`、failed`0`、5 unique／4 completed／2 round trips、economic `incomplete_nonflat`、short`0.00020`、orders`0` | **Dry safety GO；live active lane未獲證明**。Live evidence `logs/market_maker_active_unwind_live_active_ready_stall_final_20260830-170100.log`，SHA `E8C084F7...6FC1A`。 |
 | Active-ready stall recovery、最小修復與fresh T3 | 依授權只用單向`BUY LIMIT + POST_ONLY + reduce_only`，order `844424883363107` exact fill `0.00020 @ 78045.8`回到flat，未用IOC／market／taker；recovery evidence `logs/market_maker_active_unwind_stall_recovery_20260830-1704.txt`，SHA `EDF8DED1...F4F95`。根因是armed truth token被一般debounce吞掉，position update清token後又反覆reprepare；修復只讓armed token繞過一次debounce，並在既有generation仍有效時先fresh BBO／REST position／audit後re-arm，失敗仍fail closed。MM`370/370`；full repo`617`維持既知Grid `8F+4E`。17:18:44–17:51:06 fresh T3 final `370/370`、`would_place=580`，真實mutation及全部hard-safety／active counters`0` | **Offline／dry safety GO；等待新的明確live授權**。T3 evidence `logs/market_maker_active_unwind_fix_t3_20260830-175102.log`，SHA `64DF92235D4A5BFD143575FA8F023960448C3FA81F92F938BD0E6121C0FE9754`；graceful stop、runtime0，17:51雙authenticated postflight position／orders=`0/0`、used collateral=`0`、equity`299.278783`。 |
+| Truth lifecycle修復後60分鐘live canary | 18:20:29–19:20:55，final `756/756` cycles、failed`0`、10 completed maker fills／5 round trips、turnover`156.112160`、gross`0.004240`、exact fee`0.01873345920`、net`-0.01449345920`、completed／flat-equity`-0.928400 / -0.928435 bps`、cover`0.226333`、max DD`0.016619`。Final flat、orders`0`、runtime`0`；全部hard-safety counters、taker fills及active attempts／success／no-fill／partial／ambiguous／blocks皆`0` | **Runtime／hard-safety GO；economic collecting；active IOC path仍未證明**。10 fills未達30-fill gate，負bps不得判economic NO-GO；未觸發active lane亦不得當作IOC proof。Evidence `logs/market_maker_active_unwind_live_60m_final_20260830-192131.log`，SHA `74B673BC5E5BB3E01AD6AFCA04D437F6A2873EA4E3BB778B7EF7A19754C7B721`；雙authenticated postflight皆position／orders=`0/0`、used collateral=`0`、equity`299.264289`，live copy已恢復`dry_run:true`。 |
 
 ### 8.3 當前決策
 
-**OPERATION STOPPED / RUNTIME 0 / OPEN ORDERS 0 / FLAT / ACTIVE-UNWIND FIX T3 GO / LIVE IOC PATH STILL UNPROVEN。** 首次live canary安全到達`active_ready`，但因truth-token lifecycle缺陷沒有送出IOC；殘倉已用另行授權的maker-only recovery清平。最小修復、全套回歸與fresh 30分鐘T3均GO，但dry-run不能證明IOC terminal／fill／flat路徑。下一步只能在新的明確live授權後從fresh-flat重跑獨立active-unwind canary；不得放寬fee/equity、loss、slippage、attempt或truth barrier。
+**OPERATION STOPPED / RUNTIME 0 / OPEN ORDERS 0 / FLAT / 60M LIVE RUNTIME-SAFETY GO / ECONOMIC COLLECTING / ACTIVE IOC PATH STILL UNPROVEN。** 修復後60分鐘live canary全程依既有風險邊界運行並安全收尾，但只有10 completed fills，未達30-fill economic gate；負bps不能提前判economic GO／NO-GO。該場沒有自然觸發active attempt或IOC，因此也不能證明active terminal／fill／flat路徑。Source與ignored live copy均已回復`dry_run:true`，不得自動延長、重啟或為觸發而放寬fee/equity、loss、slippage、attempt或truth barrier；後續live仍需新的明確授權與fresh-flat preflight。
 
 VPS 同步與測試仍不在本階段。歷史事故與舊 fingerprint 僅見 [驗證歷史](market_maker_mvp_validation_history.md)，不能代替 fresh preflight。
