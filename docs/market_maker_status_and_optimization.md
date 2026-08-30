@@ -1,10 +1,10 @@
 # Market Maker 現況與優化方向
 
-> 更新：2026-08-30 active-unwind truth-lifecycle修復後60分鐘live canary closure（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
+> 更新：2026-08-30 IOC expiry修復與final live session-cap closure（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
 
 ## 現況
 
-Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/market_maker/`，與 Grid runtime 分離。本輪未修改 Grid production code；shared Lighter adapter只新增預設關閉的MM pre-send opt-in，以及MM使用的read-only／exact-terminal hooks，Grid預設行為不變。
+Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/market_maker/`，與 Grid runtime 分離。本輪未修改 Grid production code；shared Lighter adapter只修正IOC limit的SDK expiry mapping，POST_ONLY/GTT欄位與Grid預設行為不變，並以Grid POST_ONLY regression驗證。
 
 舊候選的控制面可穩定運行：單一mutation authority、ownership、uncertainty／reconciliation、account audit、shutdown與stranded guard均能按規則收斂或fail closed。缺口在**單邊行情下的inventory lifecycle**，不是程序穩定性：例如先成交short後價格持續上漲，既有fee/equity hard gate可能讓reduce-only maker quote長期停在normal band外；guard只能安全撤單停機，無法在同一episode內動態追價並有界地主動減倉。
 
@@ -27,16 +27,16 @@ Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/marke
 
 Fee gate：maker `1.2 bps`、至少 `30 completed maker fills`、fee cover `>=1`、completed與自然flat equity皆 `>=+0.02 bps`。Source YAML維持 `dry_run: true`；ignored live copy只能改成 `dry_run: false`。
 
-Active unwind目前為 **default OFF / explicit opt-in / 修復後60分鐘live runtime-safety GO / IOC未觸發且live execution仍未證明**。`active_unwind_success`只代表某次active order取得乾淨terminal proof，可能是no-fill或partial；只有新的authenticated flat checkpoint才代表episode完成。此功能不會自動取得live資格，也不改變現行source的dry-run狀態。
+Active unwind目前為 **default OFF / explicit opt-in / execution path live-proven / production rollout未通過**。`OrderExpiry is invalid`已修復，live已取得full、partial與residual IOC的exact terminal proof；但session unwind loss cap會在累積退出損失達邊界時阻擋下一筆active order並安全停機，可能留下非零inventory。`active_unwind_success`只代表某次active order取得乾淨terminal proof，可能是no-fill或partial；只有authenticated flat checkpoint才代表episode完成。此功能不會自動取得live資格，也不改變現行source的dry-run狀態。
 
 ## 最新判定
 
-- 對使用者提出的單邊庫存問題，判斷仍是「控制面穩定，但退出生命週期需要獨立active lane」。Active-enabled dry T3已GO；首次live canary安全到達`active_ready`，卻因truth token被一般debounce吞掉而沒有送出IOC，因此不能宣稱active execution已live驗證。
-- 16:31:00–17:01:00 live final為`387/387`、failed`0`、short`0.00020`、orders`0`，active attempts與全部hard-safety counters`0`。Evidence `logs/market_maker_active_unwind_live_active_ready_stall_final_20260830-170100.log`，SHA `E8C084F7...6FC1A`。
-- 殘倉依授權只用單向`BUY LIMIT + POST_ONLY + reduce_only`於`78045.8`取得exact fill回到flat，未用IOC／market／taker。兩次authenticated postflight確認position／orders=`0/0`、used collateral=`0`。
-- MM-only最小修復讓armed token只繞過一次normal debounce；token遺失但既有preparation generation仍有效時，先fresh BBO／REST position／account audit再re-arm，read／rearm失敗仍fail closed且不執行。MM`370/370`；full repo`617`維持既知Grid `8F+4E`。
-- 17:18:44–17:51:06修復後fresh T3 final為`370/370`、`would_place=580`，position／orders=`0/0`、真實create/cancel`0`，全部failed／hard-safety／active counters`0`。Evidence `logs/market_maker_active_unwind_fix_t3_20260830-175102.log`，SHA `64DF92235D4A5BFD143575FA8F023960448C3FA81F92F938BD0E6121C0FE9754`；runtime0，雙postflight全零。
-- 18:20:29–19:20:55修復後60分鐘live canary final為`756/756`、failed`0`、10 completed maker fills／5 round trips、final flat、orders與runtime`0`；全部hard-safety counters、taker fills及active attempts皆`0`。Turnover`156.112160`、gross`0.004240`、exact fee`0.01873345920`、net`-0.01449345920`、completed／flat-equity`-0.928400 / -0.928435 bps`、cover`0.226333`、max DD`0.016619`。正式判定為**runtime／hard-safety GO；economic collecting；active IOC path仍未證明**：10 fills未達30-fill gate，負bps不能提前判economic NO-GO；active未觸發也不能當IOC proof。Evidence `logs/market_maker_active_unwind_live_60m_final_20260830-192131.log`，SHA `74B673BC5E5BB3E01AD6AFCA04D437F6A2873EA4E3BB778B7EF7A19754C7B721`；雙authenticated postflight position／orders=`0/0`、used collateral=`0`、equity`299.264289`，live copy已恢復dry-run。
+- 單邊行情處理**確實有動作，但不是無條件平倉**：持倉後先抑制同向加碼、用反向POST_ONLY減倉；逾時／虧損觸發時才進入有界active IOC。若預估損失超過episode／session cap，安全規則會拒絕送單並停機。因此「沒有成交」可能是maker價未到，也可能是cap在submission前阻擋；不能把這解讀成完整的production inventory manager。
+- `OrderExpiry is invalid`根因是adapter未替IOC limit傳SDK要求的`DEFAULT_IOC_EXPIRY`。最小修復只改IOC mapping；無pre/post-send provenance的同字串仍保持ambiguous。Focused`3/3`、integration`33/33`、MM`371/371`、Grid POST_ONLY`3/3`通過；full repo`618`維持既知Grid `8F+4E`。
+- 21:14:18–21:47:45 fresh T3為`383/383`、`would_place=537`，真實mutation與全部hard-safety counters`0`。Evidence `logs/market_maker_t3_ioc_expiry_20260830-214745.log`，SHA `FEF6B22B44F25D099FDFB0083F71F5E1185735C96939A2632BB646E8636A6BF5`；runtime0且雙preflight flat／orders0。
+- 21:48:54 final live rerun啟動。22:22 checkpoint為`465/465`、9 maker／1 taker fills、5 trips、flat；首個active IOC full-fill取得exact proof。其後另一episode取得partial及residual IOC exact proof，累計active attempts／success／partial=`3/3/1`，active ambiguity`0`。
+- 22:49:54第10輪long`0.00020`達active deadline，但新IOC會越過`max_session_loss_for_unwind=0.10`，剩餘budget僅`0.003245`，因此在submission前block並fatal stop。Final `832/832`、failed`0`、18 unique maker／2 taker、9 trips，全部ambiguity／unresolved／reconciliation failure／unknown／non-maker／429／WS／account hard counters`0`；3次account read failure與數次短暫stale pause均自行恢復，沒有持續data／account hard failure。Max DD`0.102764 < 0.50`。Evidence `logs/market_maker_final4h_session_loss_cap_stop_20260830-224954.log`，SHA `FEC3343ED3D703482BC9F0DDFA46DFD0A1A6369B545093D31BC66E8E8E7BBF20`。
+- 這一輪證明active execution可用，也證明risk cap會安全阻擋；但只運行約61分鐘、17 completed maker fills且final nonflat，**不是4h完成、不是economic GO／NO-GO、也不是production promotion**。Runtime0、orders0；22:53雙authenticated postflight一致為BTC long`0.00020 @ 78707.9`、used collateral`15.741580`、equity`299.047812`。兩份config均已恢復`dry_run:true`，沒有新flatten授權，故未處置殘倉。
 
 - Invalid-nonce definitive-rejection修復只接受精確`21104 / invalid nonce / {}`且需MM opt-in，hard-refresh nonce後最多下一cycle重試；其他錯誤仍fail closed。23:15:28–23:49:40 T3為`390/390`、真實mutation與全部hard-safety counters`0`，evidence `logs/market_maker_t3_invalid_nonce_20260829-234937.log`。
 - 23:50:37–03:50:37首輪4小時雖為`2789/2789`且6 completed／3 round trips的completed net為`+0.0240908 bps`、cover`1.02008`，但少於30且final short`0.00020`，只能記`incomplete_nonflat`；依授權以單向`BUY LIMIT + POST_ONLY + reduce_only`於`78139.1` exact fill回到flat。
@@ -58,9 +58,9 @@ Active unwind目前為 **default OFF / explicit opt-in / 修復後60分鐘live r
 
 ## 下一步
 
-1. 保持flat、runtime0、open orders0，所有source／本地候選config維持`dry_run:true`；active lane仍default off，不自動延長或重啟live。
-2. 修復後MM `370/370`、fresh 30分鐘T3與60分鐘live runtime／hard-safety均GO；full repo `617`只保留既知Grid baseline `8F+4E`。Live場沒有active attempt，因此仍不證明IOC terminal path。
-3. 任何`active attempts=0`的live都不能當作IOC terminal proof。後續若要驗證`active_ready → bounded IOC → exact terminal → authenticated flat`，仍需使用者新的明確live授權與fresh-flat preflight；不得為製造觸發而放寬threshold或其他risk gate。
-4. 本場只有10 completed fills，economic state仍為`collecting`；雖然觀察值為負，也不得在30-fill gate前判economic NO-GO或據此promotion。後續live仍須維持symbol獨占、shutdown撤單、正值authenticated taker fee與全部deadline／loss／slippage／attempt／timeout cap，不得同時調`250 ticks`、size、margin或風險額度，也不得用market、self-trade或未完成episode換取成交量。
+1. 保持runtime0、open orders0；22:53證據snapshot為BTC long`0.00020`，不得寫成flat。Source與ignored live config均維持`dry_run:true`，active lane default off；current truth仍應以新的authenticated reads為準。
+2. IOC expiry已不是blocker，active exact-terminal path也已live證明。這次停止是`max_session_loss_for_unwind=0.10`的有意安全邊界，不得為湊滿4小時而放寬cap或把停止後續跑併成同一證據。
+3. 如fresh authenticated read仍為nonflat，任何flatten都需另行明確授權，且完成後再做雙postflight。任何新candidate或live都必須從fresh flat start重新取得授權與證據。
+4. 正式economic state為`incomplete_nonflat`：17 completed maker fills少於30且沒有final flat-equity checkpoint。`-3.404715 bps`與fee cover`-1.33947`是明確不利訊號，但不能冒充達門檻後的正式economic NO-GO。若要改善，應建立新candidate、一次只改一個inventory／loss-budget變因，維持symbol獨占、正值taker fee、全部deadline／loss／slippage／attempt／timeout cap，禁止market、self-trade或用未完成episode換取成交量。
 
 Active IOC是唯一、預設關閉且有界的taker例外，不是成交量工具。VPS仍不在本階段。

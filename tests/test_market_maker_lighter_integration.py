@@ -759,6 +759,25 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.id, "uncertain")
                 rest._handle_ambiguous_order_submission.assert_awaited_once()
 
+    async def test_invalid_order_expiry_without_provenance_remains_ambiguous(
+        self,
+    ) -> None:
+        rest = self._submission_rest((None, None, "OrderExpiry is invalid"))
+
+        result = await rest.place_order(
+            "BTC",
+            "buy",
+            "limit",
+            Decimal("0.00020"),
+            Decimal("78127.5"),
+            reduce_only=True,
+            time_in_force="IOC",
+            _raise_on_definitive_pre_send_failure=True,
+        )
+
+        self.assertEqual(result.id, "uncertain")
+        rest._handle_ambiguous_order_submission.assert_awaited_once()
+
     async def test_fast_fill_order_index_falls_back_to_exact_history(
         self,
     ) -> None:
@@ -853,11 +872,29 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
             lighter.SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
         )
         self.assertEqual(
+            params["order_expiry"], lighter.SignerClient.DEFAULT_IOC_EXPIRY
+        )
+        self.assertEqual(
             params["order_type"], lighter.SignerClient.ORDER_TYPE_LIMIT
         )
         self.assertTrue(params["reduce_only"])
 
+        post_only_params = rest._convert_limit_order_params(
+            {
+                "price_decimals": 1,
+                "price_multiplier": Decimal("10"),
+                "market_index": 1,
+            },
+            Decimal("0.00020"),
+            Decimal("65000.0"),
+            "sell",
+            time_in_force="POST_ONLY",
+        )
+        self.assertNotIn("order_expiry", post_only_params)
+
     async def test_limit_submission_passes_explicit_zero_integrator_fees(self) -> None:
+        import lighter
+
         rest = object.__new__(LighterRest)
         rest._convert_base_amount = Mock(return_value=2)
         rest._next_client_order_index = Mock(return_value=7)
@@ -888,6 +925,25 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted["integrator_account_index"], 0)
         self.assertEqual(submitted["integrator_taker_fee"], 0)
         self.assertEqual(submitted["integrator_maker_fee"], 0)
+        self.assertNotIn("order_expiry", submitted)
+
+        await rest._execute_limit_order(
+            "BTC",
+            "buy",
+            Decimal("0.00020"),
+            Decimal("65000.0"),
+            {
+                "price_decimals": 1,
+                "price_multiplier": Decimal("10"),
+                "market_index": 1,
+            },
+            time_in_force="IOC",
+        )
+
+        submitted = rest.signer_client.create_order.await_args.kwargs
+        self.assertEqual(
+            submitted["order_expiry"], lighter.SignerClient.DEFAULT_IOC_EXPIRY
+        )
 
     async def test_order_submission_429_is_sanitized_and_propagated(self) -> None:
         rest = object.__new__(LighterRest)

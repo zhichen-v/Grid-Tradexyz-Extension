@@ -1987,7 +1987,7 @@ class LighterRest(LighterBase):
         if client_order_index is None:
             client_order_index = self._next_client_order_index()
 
-        return {
+        params = {
             'market_index': market_info['market_index'],
             'client_order_index': client_order_index,
             'base_amount': base_amount_int,
@@ -2004,6 +2004,9 @@ class LighterRest(LighterBase):
             'integrator_taker_fee': self.MANAGED_ORDER_INTEGRATOR_FEE_TICK,
             'integrator_maker_fee': self.MANAGED_ORDER_INTEGRATOR_FEE_TICK,
         }
+        if time_in_force == "IOC":
+            params['order_expiry'] = lighter.SignerClient.DEFAULT_IOC_EXPIRY
+        return params
 
     async def _execute_market_order(
         self,
