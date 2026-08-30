@@ -248,7 +248,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             active_unwind_order_ids=frozenset(),
             active_unwind_pending=False,
             mutation_generation=0,
-            active_unwind_prepared_generation=1,
+            active_unwind_prepared_generation=None,
             pause_reason=None,
             has_uncertain_state=False,
         )
@@ -832,35 +832,43 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             coordinator.metrics.counters["reconciliation_failure"], 1
         )
 
-    async def test_active_unwind_recomputes_only_after_fresh_cancel_truth(
+    async def test_active_unwind_rearms_and_bypasses_debounce_after_truth_drift(
         self,
     ) -> None:
         manager = self.order_manager()
-        manager.execute_active_unwind.side_effect = (
-            ReconcileResult(
-                (
-                    ReconcileAction(
-                        OrderSide.BUY,
-                        "prepare_active_unwind",
-                        "zero symbol orders proved; fresh truth required",
-                        success=True,
-                    ),
+        prepare_result = ReconcileResult(
+            (
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "prepare_active_unwind",
+                    "zero symbol orders proved; fresh truth required",
+                    success=True,
                 ),
-                RuntimeState.RISK_REDUCTION,
-                position_refresh_required=True,
             ),
-            ReconcileResult(
-                (
-                    ReconcileAction(
-                        OrderSide.BUY,
-                        "blocked",
-                        "mutation budget exhausted",
-                        success=False,
-                    ),
-                ),
-                RuntimeState.RISK_REDUCTION,
-            ),
+            RuntimeState.RISK_REDUCTION,
+            position_refresh_required=True,
         )
+        execute_result = ReconcileResult(
+            (
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "active_unwind",
+                    "active unwind terminal no-fill",
+                    success=True,
+                ),
+            ),
+            RuntimeState.RISK_REDUCTION,
+        )
+
+        async def execute_active_unwind(_desired, *, prepared_generation=None):
+            if prepared_generation is None:
+                manager.active_unwind_prepared_generation = 1
+                return prepare_result
+            self.assertEqual(prepared_generation, 1)
+            manager.active_unwind_prepared_generation = None
+            return execute_result
+
+        manager.execute_active_unwind.side_effect = execute_active_unwind
         monitor = SimpleNamespace(
             audit=AsyncMock(),
             mark_hard_stop=Mock(),
@@ -933,8 +941,17 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manager.execute_active_unwind.await_count, 1)
         monitor.audit.assert_awaited_once()
+        await coordinator.on_position(
+            self.position(received=self.now, signed_size=Decimal("-0.2"))
+        )
+        self.assertIsNone(coordinator._active_unwind_truth_token)
         self.now = 132.0
         await coordinator.run_one_cycle(force=True)
+        self.assertEqual(manager.execute_active_unwind.await_count, 1)
+        self.assertEqual(monitor.audit.await_count, 2)
+        self.assertIsNotNone(coordinator._active_unwind_truth_token)
+
+        await coordinator.run_one_cycle()
 
         intents = [call.args[0] for call in manager.execute_active_unwind.await_args_list]
         self.assertEqual([intent.price for intent in intents], [Decimal("100.9"), Decimal("101.1")])
@@ -950,13 +967,98 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(
-            coordinator.inventory_executor._active_attempts, 0
+            coordinator.inventory_executor._active_attempts, 1
+        )
+        self.assertEqual(
+            coordinator.metrics.counters["active_unwind_attempts"], 1
+        )
+
+    async def test_cycle_debounce_still_applies_without_active_truth(self) -> None:
+        manager = self.order_manager()
+        coordinator = self.prepare_running(order_manager=manager)
+        coordinator._last_cycle_monotonic = self.now
+
+        await coordinator.run_one_cycle()
+
+        manager.reconcile.assert_not_awaited()
+        manager.execute_active_unwind.assert_not_awaited()
+
+    async def test_active_unwind_rearm_refresh_failure_fails_closed(self) -> None:
+        manager = self.order_manager()
+        manager.active_unwind_prepared_generation = 1
+        manager.cancel_managed_orders.return_value = ReconcileResult(
+            (), RuntimeState.PAUSED_ERROR
+        )
+        monitor = SimpleNamespace(
+            snapshot=Mock(return_value=self.active_account_snapshot("-0.2")),
+            audit=AsyncMock(),
+            mark_hard_stop=Mock(),
+            last_audit_monotonic=self.now,
+        )
+        adapter = self.adapter()
+        adapter.get_positions.side_effect = RuntimeError("position unavailable")
+        coordinator = self.prepare_running(
+            adapter=adapter,
+            config=self.active_unwind_config(
+                active_unwind_loss_trigger="0.001"
+            ),
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator.metrics.account_audit = self.active_account_snapshot("-0.2")
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+        coordinator._market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("100.5"), Decimal("1")),),
+            asks=(OrderBookLevel(Decimal("100.7"), Decimal("1")),),
+            best_bid=Decimal("100.5"),
+            best_ask=Decimal("100.7"),
+            exchange_timestamp=None,
+            received_monotonic=self.now,
+        )
+        coordinator.risk_manager.evaluate.return_value = replace(
+            self.risk(),
+            buy_amount=Decimal("0.2"),
+            sell_amount=None,
+            buy_reduce_only=True,
+            soft_exit_latched=True,
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+        coordinator.strategy.calculate_quotes.return_value = replace(
+            self.desired(),
+            bid=DesiredOrder(
+                OrderSide.BUY,
+                Decimal("99.8"),
+                Decimal("0.2"),
+                True,
+                "soft",
+            ),
+            ask=None,
+            reference_price=Decimal("100.6"),
+            reservation_price=Decimal("100.6"),
+            half_spread=Decimal("0.1"),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        manager.execute_active_unwind.assert_not_awaited()
+        adapter.get_positions.assert_awaited_once_with(["BTC"])
+        manager.cancel_managed_orders.assert_awaited_once()
+        monitor.mark_hard_stop.assert_called_once()
+        self.assertIs(coordinator.state, RuntimeState.PAUSED_ERROR)
+        self.assertIsNone(coordinator._active_unwind_truth_token)
+        self.assertEqual(coordinator.inventory_executor._active_attempts, 0)
+        self.assertEqual(
+            coordinator.metrics.counters["active_unwind_attempts"], 0
         )
 
     def test_active_unwind_truth_token_is_one_shot_and_rejects_drift(
         self,
     ) -> None:
         manager = self.order_manager()
+        manager.active_unwind_prepared_generation = 1
         monitor = SimpleNamespace(
             snapshot=Mock(return_value=self.active_account_snapshot("-0.2")),
             last_audit_monotonic=self.now,

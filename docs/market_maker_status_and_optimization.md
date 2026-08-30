@@ -1,6 +1,6 @@
 # Market Maker 現況與優化方向
 
-> 更新：2026-08-30 inventory-unwind code-only checkpoint（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
+> 更新：2026-08-30 active-unwind live stall closure與修復後T3 checkpoint（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
 
 ## 現況
 
@@ -27,11 +27,15 @@ Market Maker 入口為 `run_market_maker.py`，核心位於 `core/services/marke
 
 Fee gate：maker `1.2 bps`、至少 `30 completed maker fills`、fee cover `>=1`、completed與自然flat equity皆 `>=+0.02 bps`。Source YAML維持 `dry_run: true`；ignored live copy只能改成 `dry_run: false`。
 
-Active unwind目前為 **default OFF / explicit opt-in / code-only offline verified / 尚未live validation**。`active_unwind_success`只代表某次active order取得乾淨terminal proof，可能是no-fill或partial；只有新的authenticated flat checkpoint才代表episode完成。此功能不會自動取得live資格，也不改變現行source的dry-run狀態。
+Active unwind目前為 **default OFF / explicit opt-in / 修復後dry T3已GO / IOC live execution仍未證明**。`active_unwind_success`只代表某次active order取得乾淨terminal proof，可能是no-fill或partial；只有新的authenticated flat checkpoint才代表episode完成。此功能不會自動取得live資格，也不改變現行source的dry-run狀態。
 
 ## 最新判定
 
-- 對使用者提出的單邊庫存問題，判斷為「控制面穩定，但退出生命週期不完整」。本次已在MM範圍內加入per-episode triple barrier與bounded active unwind；一般quote仍`POST_ONLY`，active lane預設關閉且只允許`reduce_only LIMIT + IOC`。Two-phase prepare、authenticated zero-orders／fresh position+audit truth、exact terminal ownership及全部loss／slippage／attempt／timeout邊界已有deterministic offline coverage；尚未fresh T3或live，rollout維持blocked。
+- 對使用者提出的單邊庫存問題，判斷仍是「控制面穩定，但退出生命週期需要獨立active lane」。Active-enabled dry T3已GO；首次live canary安全到達`active_ready`，卻因truth token被一般debounce吞掉而沒有送出IOC，因此不能宣稱active execution已live驗證。
+- 16:31:00–17:01:00 live final為`387/387`、failed`0`、short`0.00020`、orders`0`，active attempts與全部hard-safety counters`0`。Evidence `logs/market_maker_active_unwind_live_active_ready_stall_final_20260830-170100.log`，SHA `E8C084F7...6FC1A`。
+- 殘倉依授權只用單向`BUY LIMIT + POST_ONLY + reduce_only`於`78045.8`取得exact fill回到flat，未用IOC／market／taker。兩次authenticated postflight確認position／orders=`0/0`、used collateral=`0`。
+- MM-only最小修復讓armed token只繞過一次normal debounce；token遺失但既有preparation generation仍有效時，先fresh BBO／REST position／account audit再re-arm，read／rearm失敗仍fail closed且不執行。MM`370/370`；full repo`617`維持既知Grid `8F+4E`。
+- 17:18:44–17:51:06修復後fresh T3 final為`370/370`、`would_place=580`，position／orders=`0/0`、真實create/cancel`0`，全部failed／hard-safety／active counters`0`。Evidence `logs/market_maker_active_unwind_fix_t3_20260830-175102.log`，SHA `64DF92235D4A5BFD143575FA8F023960448C3FA81F92F938BD0E6121C0FE9754`；runtime0，雙postflight全零。
 
 - Invalid-nonce definitive-rejection修復只接受精確`21104 / invalid nonce / {}`且需MM opt-in，hard-refresh nonce後最多下一cycle重試；其他錯誤仍fail closed。23:15:28–23:49:40 T3為`390/390`、真實mutation與全部hard-safety counters`0`，evidence `logs/market_maker_t3_invalid_nonce_20260829-234937.log`。
 - 23:50:37–03:50:37首輪4小時雖為`2789/2789`且6 completed／3 round trips的completed net為`+0.0240908 bps`、cover`1.02008`，但少於30且final short`0.00020`，只能記`incomplete_nonflat`；依授權以單向`BUY LIMIT + POST_ONLY + reduce_only`於`78139.1` exact fill回到flat。
@@ -53,9 +57,9 @@ Active unwind目前為 **default OFF / explicit opt-in / code-only offline verif
 
 ## 下一步
 
-1. 保持flat、runtime0、open orders0，所有source／本地候選config維持`dry_run:true`；`active_unwind_enabled`保持`false`，禁止第三次舊候選自動重跑。
-2. 本批Market Maker `364/364`通過；full repo `611`維持既知且同名的Grid baseline `8F+4E`，沒有新增失敗。離線通過不等於live GO。
-3. 後續驗證應分成兩軌：先以default-off精確config做fresh T3，證明一般maker路徑無回歸；再以另建、仍為`dry_run:true`的active-enabled config驗證prepare barrier、zero mutation與telemetry。兩軌都通過後，才可提出獨立、明確授權的active-unwind最小live gate。
-4. Live gate若獲授權，須維持symbol獨占與shutdown撤單，單獨核對正值authenticated taker fee與全部deadline／loss／slippage／attempt／timeout cap，從fresh-flat開始；不得同時調`250 ticks`、size、margin或風險額度，也不得用market、self-trade或未完成episode換取成交量。
+1. 保持flat、runtime0、open orders0，所有source／本地候選config維持`dry_run:true`；active lane仍default off，不自動重啟live。
+2. 修復後MM `370/370`與fresh 30分鐘T3均GO；full repo `617`只保留既知Grid baseline `8F+4E`。這只證明offline／dry safety，不證明IOC live terminal path。
+3. 下一步只能在使用者新的明確live授權後，從fresh-flat啟動獨立active-unwind最小canary，專門驗證`active_ready → bounded IOC → exact terminal → authenticated flat`；不得沿用本次未送單的live場次作為證據。
+4. 新live gate須維持symbol獨占與shutdown撤單，重驗正值authenticated taker fee與全部deadline／loss／slippage／attempt／timeout cap；不得同時調`250 ticks`、size、margin或風險額度，也不得用market、self-trade或未完成episode換取成交量。
 
 Active IOC是唯一、預設關閉且有界的taker例外，不是成交量工具。VPS仍不在本階段。

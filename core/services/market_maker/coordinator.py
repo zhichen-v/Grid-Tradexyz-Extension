@@ -535,6 +535,7 @@ class MarketMakerCoordinator:
             if (
                 not force
                 and not has_order_updates
+                and self._active_unwind_truth_token is None
                 and self._last_cycle_monotonic is not None
                 and now - self._last_cycle_monotonic < minimum_interval
             ):
@@ -756,6 +757,27 @@ class MarketMakerCoordinator:
                     prepared_generation = self._consume_active_unwind_truth(
                         unwind.episode_id, now
                     )
+                    manager_prepared_generation = getattr(
+                        self.order_manager,
+                        "active_unwind_prepared_generation",
+                        None,
+                    )
+                    if (
+                        prepared_generation is None
+                        and type(manager_prepared_generation) is int
+                    ):
+                        if not await self._refresh_active_unwind_truth():
+                            return
+                        if not self._arm_active_unwind_truth(unwind.episode_id):
+                            reason = (
+                                "active unwind fresh-truth token could not be re-armed"
+                            )
+                            await self._fail_closed(
+                                RuntimeState.PAUSED_ORDER_STATE, reason
+                            )
+                            return
+                        self._quote_event.set()
+                        return
                     result = await self.order_manager.execute_active_unwind(
                         unwind.active_order,
                         prepared_generation=prepared_generation,
