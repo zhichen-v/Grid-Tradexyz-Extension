@@ -677,9 +677,16 @@ class InventoryEpisodeExecutor:
             or now < 0
         ):
             return "inventory unwind inputs are invalid"
+        unrealized_pnl = position.unrealized_pnl
         if (
-            not isinstance(position.unrealized_pnl, Decimal)
-            or not position.unrealized_pnl.is_finite()
+            (unrealized_pnl is None and position.signed_size != 0)
+            or (
+                unrealized_pnl is not None
+                and (
+                    not isinstance(unrealized_pnl, Decimal)
+                    or not unrealized_pnl.is_finite()
+                )
+            )
         ):
             return "inventory unrealized pnl is invalid"
         if (

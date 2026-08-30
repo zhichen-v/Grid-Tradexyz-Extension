@@ -313,6 +313,58 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
         self.assertTrue(active["order_reduce_only"])
         self.assertEqual(active["order_time_in_force"], "IOC")
 
+    def test_flat_position_allows_absent_unrealized_pnl_only_when_flat(
+        self,
+    ) -> None:
+        flat = InventoryEpisodeExecutor(self.config).evaluate(
+            position=replace(self.position("0"), unrealized_pnl=None),
+            market=self.market(),
+            metadata=self.metadata,
+            account_snapshot=self.account("0"),
+            now_monotonic=0,
+            soft_exit_latched=False,
+            stranded_soft_exit=False,
+            authenticated_flat=True,
+            active_unwind_pending=False,
+            normal_passive_price=None,
+        )
+        self.assertEqual(flat.state, "flat")
+        self.assertFalse(flat.blocked)
+
+        nonflat = InventoryEpisodeExecutor(self.config).evaluate(
+            position=replace(self.position("-0.2"), unrealized_pnl=None),
+            market=self.market(),
+            metadata=self.metadata,
+            account_snapshot=self.account("-0.2"),
+            now_monotonic=0,
+            soft_exit_latched=True,
+            stranded_soft_exit=True,
+            authenticated_flat=False,
+            active_unwind_pending=False,
+            normal_passive_price=self.market().best_bid,
+        )
+        self.assertTrue(nonflat.blocked)
+        self.assertIn("unrealized pnl", nonflat.reason)
+
+        for invalid in (Decimal("NaN"), "garbage"):
+            with self.subTest(flat_invalid_unrealized_pnl=invalid):
+                decision = InventoryEpisodeExecutor(self.config).evaluate(
+                    position=replace(
+                        self.position("0"), unrealized_pnl=invalid
+                    ),
+                    market=self.market(),
+                    metadata=self.metadata,
+                    account_snapshot=self.account("0"),
+                    now_monotonic=0,
+                    soft_exit_latched=False,
+                    stranded_soft_exit=False,
+                    authenticated_flat=True,
+                    active_unwind_pending=False,
+                    normal_passive_price=None,
+                )
+                self.assertTrue(decision.blocked)
+                self.assertIn("unrealized pnl", decision.reason)
+
     def test_invalid_position_market_and_metadata_fail_closed(self) -> None:
         cases = (
             (
