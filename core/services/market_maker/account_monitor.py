@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Iterable
+from uuid import uuid4
 
 from ...adapters.exchanges.models import OrderSide
 from .config import MarketMakerConfig
@@ -14,8 +15,11 @@ _READ_ATTEMPTS = 6
 _READ_RETRY_SECONDS = 1.0
 _COMPLETED_EPISODE_LEDGER_LIMIT = 100
 _AUTHENTICATED_FILL_LEDGER_LIMIT = 500
-_ORDER_ROLE_BINDING_LIMIT = 1000
-_SEEN_TRADE_ID_LIMIT = 4096
+# The authenticated API returns at most 100 recent trades.  Keep a much larger
+# exact horizon and evict only proofs outside the current page/open episode.
+_SESSION_ATTRIBUTION_LIMIT = 8192
+_ORDER_ROLE_BINDING_LIMIT = _SESSION_ATTRIBUTION_LIMIT
+_SEEN_TRADE_ID_LIMIT = _SESSION_ATTRIBUTION_LIMIT
 
 
 class AccountAuditError(RuntimeError):
@@ -212,6 +216,7 @@ def _fill_from_trade(
 class SessionEconomics:
     config: MarketMakerConfig
     baseline_equity: Decimal
+    session_id: str = field(default_factory=lambda: uuid4().hex)
     seen_trade_ids: set[str] = field(default_factory=set)
     ledger_position: Decimal = _ZERO
     unique_maker_fills: int = 0
@@ -232,6 +237,12 @@ class SessionEconomics:
     _order_role_bindings: dict[
         str, tuple[str, str, int, bool]
     ] = field(default_factory=dict, repr=False)
+    _seen_trade_id_order: dict[str, None] = field(
+        default_factory=dict, repr=False
+    )
+    _episode_order_ids: set[str] = field(default_factory=set, repr=False)
+    seen_trade_id_evictions: int = 0
+    order_role_binding_evictions: int = 0
     _last_applied_fill_sort_key: tuple[int, int] | None = field(
         default=None, repr=False
     )
@@ -245,6 +256,7 @@ class SessionEconomics:
     _episode_taker_fee: Decimal = _ZERO
     _episode_gross: Decimal = _ZERO
     _episode_entry_side: str | None = None
+    _episode_opened_at: int | None = None
     _episode_active_unwind_used: bool = False
     _episode_sequence: int = 0
     _pending_economic_stop_reason: str | None = None
@@ -253,6 +265,47 @@ class SessionEconomics:
     last_flat_completed_fills: int = 0
     economic_state: str = "collecting"
     economic_reason: str | None = None
+
+    def _project_seen_trade_registry(
+        self,
+        page_trade_ids: set[str],
+        new_fills: list[_Fill],
+    ) -> tuple[set[str], dict[str, None], int]:
+        projected = set(self.seen_trade_ids)
+        order = {
+            trade_id: None
+            for trade_id in self._seen_trade_id_order
+            if trade_id in projected
+        }
+        for trade_id in sorted(projected - set(order)):
+            order[trade_id] = None
+        for trade_id in page_trade_ids:
+            if trade_id in projected:
+                order.pop(trade_id, None)
+                order[trade_id] = None
+
+        evictions = 0
+        while len(projected) + len(new_fills) > _SEEN_TRADE_ID_LIMIT:
+            candidate = next(
+                (
+                    trade_id
+                    for trade_id in order
+                    if trade_id not in page_trade_ids
+                ),
+                None,
+            )
+            if candidate is None:
+                raise AccountAuditError(
+                    "account trade identity registry exhausted"
+                )
+            order.pop(candidate)
+            projected.discard(candidate)
+            evictions += 1
+        for fill in new_fills:
+            projected.add(fill.trade_id)
+            order.pop(fill.trade_id, None)
+            order[fill.trade_id] = None
+        return projected, order, evictions
 
     def seed(self, trades: Iterable[Any]) -> None:
         trade_ids: list[str] = []
@@ -278,6 +331,9 @@ class SessionEconomics:
         ):
             raise AccountAuditError("account trade identity registry exhausted")
         self.seen_trade_ids.update(unique_trade_ids)
+        for trade_id in trade_ids:
+            self._seen_trade_id_order.pop(trade_id, None)
+            self._seen_trade_id_order[trade_id] = None
         if sort_keys:
             latest_sort_key = max(sort_keys)
             if (
@@ -294,8 +350,17 @@ class SessionEconomics:
         current_equity: Decimal,
         managed_order_ids: set[str],
         active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
+        open_order_ids: set[str] | frozenset[str] = frozenset(),
+        terminal_order_ids: set[str] | frozenset[str] = frozenset(),
         allow_unreported_zero_integrator_fee: bool = False,
     ) -> None:
+        trades = tuple(trades)
+        page_trade_ids = {
+            str(getattr(trade, "id", "") or "") for trade in trades
+        }
+        page_order_ids = {
+            str(getattr(trade, "order_id", "") or "") for trade in trades
+        }
         new_fills = sorted(
             (
                 _fill_from_trade(
@@ -318,8 +383,6 @@ class SessionEconomics:
         new_trade_ids = {fill.trade_id for fill in new_fills}
         if len(new_trade_ids) != len(new_fills):
             raise AccountAuditError("account trade response contains duplicate ids")
-        if len(self.seen_trade_ids) + len(new_trade_ids) > _SEEN_TRADE_ID_LIMIT:
-            raise AccountAuditError("account trade identity registry exhausted")
         previous_sort_key = self._last_applied_fill_sort_key
         for fill in new_fills:
             if previous_sort_key is not None and fill.sort_key <= previous_sort_key:
@@ -327,7 +390,11 @@ class SessionEconomics:
                     "account trade arrived out of authenticated ledger order"
                 )
             previous_sort_key = fill.sort_key
-        attributable_order_ids = managed_order_ids | set(active_unwind_order_ids)
+        attributable_order_ids = (
+            managed_order_ids
+            | set(active_unwind_order_ids)
+            | set(self._order_role_bindings)
+        )
         if any(
             fill.order_id not in attributable_order_ids for fill in new_fills
         ):
@@ -340,9 +407,18 @@ class SessionEconomics:
                 "account trades and position are from inconsistent snapshots"
             )
 
+        projected_seen_ids, projected_seen_order, trade_id_evictions = (
+            self._project_seen_trade_registry(page_trade_ids, new_fills)
+        )
+
         projected_position = self.ledger_position
         episode_sequence = self._episode_sequence
         known_orders = dict(self._order_role_bindings)
+        episode_order_ids = set(self._episode_order_ids)
+        pinned_order_ids = (
+            page_order_ids | set(open_order_ids) | episode_order_ids
+        )
+        role_binding_evictions = 0
         classified_fills: list[tuple[_Fill, dict[str, Any]]] = []
         for fill in new_fills:
             prior_position = projected_position
@@ -366,7 +442,7 @@ class SessionEconomics:
                         "active unwind must strictly reduce inventory"
                     )
 
-            known = known_orders.get(fill.order_id)
+            known = known_orders.pop(fill.order_id, None)
             if known is not None:
                 known_side, role, fill_episode_sequence, known_active = known
                 if prior_position == 0 or (
@@ -380,11 +456,24 @@ class SessionEconomics:
                     raise AccountAuditError(
                         "account order attribution changed across partial fills"
                     )
+                known_orders[fill.order_id] = known
             else:
-                if len(known_orders) >= _ORDER_ROLE_BINDING_LIMIT:
-                    raise AccountAuditError(
-                        "account order attribution registry exhausted"
+                while len(known_orders) >= _ORDER_ROLE_BINDING_LIMIT:
+                    candidate = next(
+                        (
+                            order_id
+                            for order_id in known_orders
+                            if order_id in terminal_order_ids
+                            and order_id not in pinned_order_ids
+                        ),
+                        None,
                     )
+                    if candidate is None:
+                        raise AccountAuditError(
+                            "account order attribution registry exhausted"
+                        )
+                    known_orders.pop(candidate)
+                    role_binding_evictions += 1
                 if prior_position == 0:
                     episode_sequence += 1
                     role = "entry"
@@ -406,6 +495,10 @@ class SessionEconomics:
                     fill_episode_sequence,
                     fill.active_unwind,
                 )
+            if prior_position == 0:
+                episode_order_ids.clear()
+            episode_order_ids.add(fill.order_id)
+            pinned_order_ids.add(fill.order_id)
             attribution = {
                 "trade_id": fill.trade_id,
                 "order_id": fill.order_id,
@@ -420,13 +513,15 @@ class SessionEconomics:
             }
             classified_fills.append((fill, attribution))
             projected_position = next_position
+            if next_position == 0:
+                episode_order_ids.clear()
 
         for fill, attribution in classified_fills:
             prior_position = attribution["prior_position"]
             next_position = attribution["next_position"]
             if prior_position == 0:
                 self._episode_entry_side = fill.side.value
-            self.seen_trade_ids.add(fill.trade_id)
+                self._episode_opened_at = fill.sort_key[0]
             self.ledger_position = next_position
             self._episode_sequence = attribution["episode_sequence"]
             self.authenticated_fill_attributions.append(attribution)
@@ -458,6 +553,10 @@ class SessionEconomics:
                 self.completed_gross += self._episode_gross
                 self.completed_episode_ledger.append(
                     {
+                        "session_id": self.session_id,
+                        "episode_sequence": attribution["episode_sequence"],
+                        "opened_at": self._episode_opened_at,
+                        "closed_at": fill.sort_key[0],
                         "maker_fills": self._episode_fills,
                         "entry_side": self._episode_entry_side,
                         "turnover": self._episode_turnover,
@@ -484,9 +583,15 @@ class SessionEconomics:
                 self._episode_taker_fee = _ZERO
                 self._episode_gross = _ZERO
                 self._episode_entry_side = None
+                self._episode_opened_at = None
                 self._episode_active_unwind_used = False
 
+        self.seen_trade_ids = projected_seen_ids
+        self._seen_trade_id_order = projected_seen_order
+        self.seen_trade_id_evictions += trade_id_evictions
         self._order_role_bindings = known_orders
+        self._episode_order_ids = episode_order_ids
+        self.order_role_binding_evictions += role_binding_evictions
         if new_fills:
             self._last_applied_fill_sort_key = new_fills[-1].sort_key
 
@@ -657,6 +762,14 @@ class SessionEconomics:
                 dict(attribution)
                 for attribution in self.authenticated_fill_attributions
             ],
+            "seen_trade_id_registry_size": len(self.seen_trade_ids),
+            "seen_trade_id_evictions": self.seen_trade_id_evictions,
+            "order_role_binding_registry_size": len(
+                self._order_role_bindings
+            ),
+            "order_role_binding_evictions": (
+                self.order_role_binding_evictions
+            ),
             "episode_flat_success": self.completed_round_trips,
             "episode_active_unwind_flat": self.episode_active_unwind_flat,
             "active_unwind_turnover": self.active_unwind_turnover,
@@ -763,6 +876,7 @@ class MarketMakerAccountMonitor:
         managed_order_ids: set[str],
         *,
         active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
+        terminal_order_ids: set[str] | frozenset[str] = frozenset(),
     ) -> None:
         if self.economics is None:
             raise AccountAuditError("account monitor is not initialized")
@@ -781,6 +895,8 @@ class MarketMakerAccountMonitor:
                 current_equity=snapshot["equity"],
                 managed_order_ids=managed_order_ids,
                 active_unwind_order_ids=active_unwind_order_ids,
+                open_order_ids=snapshot["open_order_ids"],
+                terminal_order_ids=terminal_order_ids,
                 allow_unreported_zero_integrator_fee=(
                     _has_zero_integrator_fee_signing_proof(self.adapter)
                 ),
@@ -888,6 +1004,10 @@ class MarketMakerAccountMonitor:
                     "position": position,
                     "unrealized_pnl": unrealized_pnl,
                     "trades": trades,
+                    "open_order_ids": {
+                        str(getattr(order, "id", "") or "")
+                        for order in orders
+                    },
                 }
             except AccountAuditError:
                 raise

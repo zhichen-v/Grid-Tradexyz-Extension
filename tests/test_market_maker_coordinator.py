@@ -26,6 +26,7 @@ from core.services.market_maker.models import (
     DesiredQuotes,
     MarketMetadata,
     MarketSnapshot,
+    OrderSlotState,
     PositionSnapshot,
     RuntimeState,
 )
@@ -287,6 +288,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             active_unwind_prepared_generation=None,
             pause_reason=None,
             has_uncertain_state=False,
+            has_unknown_order_state=False,
         )
 
     def coordinator(
@@ -1160,6 +1162,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         manager = self.order_manager()
         manager.known_order_ids = frozenset({"ioc-1"})
         manager.active_unwind_order_ids = frozenset({"ioc-1"})
+        manager.terminal_order_ids = frozenset({"ioc-1"})
         manager.execute_active_unwind.return_value = ReconcileResult(
             (
                 ReconcileAction(
@@ -1239,7 +1242,9 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.run_one_cycle(force=True)
 
         monitor.audit.assert_awaited_once_with(
-            {"ioc-1"}, active_unwind_order_ids=frozenset({"ioc-1"})
+            {"ioc-1"},
+            active_unwind_order_ids=frozenset({"ioc-1"}),
+            terminal_order_ids=frozenset({"ioc-1"}),
         )
         self.assertEqual(coordinator._processed_fill_generation, 1)
         self.assertEqual(coordinator._audited_fill_generation, 1)
@@ -1497,6 +1502,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 average_price=None,
                 now=0.0,
                 mid=Decimal("100"),
+                external_mid=Decimal("100"),
                 source="websocket_order_update",
                 terminal=True,
             )
@@ -1507,7 +1513,11 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             (15.0, Decimal("98")),
             (60.0, Decimal("102")),
         ):
-            metrics.update_fill_markouts(now=now, mid=mid)
+            metrics.update_fill_markouts(
+                now=now,
+                mid=mid,
+                external_mid=mid,
+            )
 
         snapshot = metrics.snapshot(60.0)
         buy, sell = snapshot["fill_markouts"]
@@ -1671,6 +1681,8 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["order_id"], "reconciled-fill")
         self.assertEqual(event["fill_price"], Decimal("100"))
         self.assertEqual(event["observation_source"], "reconciliation")
+        self.assertEqual(event["raw_mid_at_start"], Decimal("100.0"))
+        self.assertEqual(event["external_mid_at_start"], Decimal("100.0"))
 
     async def test_soft_exit_waits_for_audit_after_processed_fill_updates(
         self,
@@ -2161,6 +2173,119 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await coordinator.process_quote_event())
         manager.handle_order_update.assert_awaited_once()
         manager.reconcile.assert_awaited_once()
+
+    async def test_markout_uses_external_mid_after_own_order_subtraction(
+        self,
+    ) -> None:
+        own_ask = SimpleNamespace(
+            side=OrderSide.SELL,
+            price=Decimal("100.1"),
+            remaining=Decimal("1"),
+            state=OrderSlotState.LIVE,
+            submission_uncertain=False,
+            cancellation_uncertain=False,
+        )
+        manager = self.order_manager()
+        manager.snapshot.return_value = (own_ask,)
+        coordinator = self.prepare_running(order_manager=manager)
+        coordinator.metrics.record_maker_fill_markout(
+            order_id="external-mid",
+            side="buy",
+            cumulative_filled=Decimal("0.1"),
+            cumulative_cost=Decimal("10"),
+            average_price=None,
+            now=0.0,
+            mid=Decimal("100"),
+            external_mid=Decimal("100"),
+            source="websocket_order_update",
+            terminal=True,
+        )
+        market = MarketSnapshot(
+            symbol="BTC",
+            bids=(OrderBookLevel(Decimal("99.9"), Decimal("1")),),
+            asks=(
+                OrderBookLevel(Decimal("100.1"), Decimal("1")),
+                OrderBookLevel(Decimal("100.3"), Decimal("2")),
+            ),
+            best_bid=Decimal("99.9"),
+            best_ask=Decimal("100.1"),
+            exchange_timestamp=None,
+            received_monotonic=5.0,
+        )
+
+        await coordinator.on_orderbook(market)
+
+        event = coordinator.metrics.fill_markouts[0]
+        self.assertEqual(event["raw_mid_5s"], Decimal("100.0"))
+        self.assertEqual(event["external_mid_5s"], Decimal("100.1"))
+        self.assertEqual(event["markout_5s_bps"], Decimal("0.0"))
+        self.assertEqual(
+            event["external_mid_markout_5s_bps"], Decimal("10.0")
+        )
+
+    async def test_untrusted_external_markout_is_skipped_without_blocking_book(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        manager.snapshot.return_value = (
+            SimpleNamespace(
+                side=OrderSide.SELL,
+                price=Decimal("100.1"),
+                remaining=Decimal("1"),
+                state=OrderSlotState.UNCERTAIN_CANCELLATION,
+                submission_uncertain=False,
+                cancellation_uncertain=True,
+            ),
+        )
+        coordinator = self.prepare_running(order_manager=manager)
+        coordinator.metrics.record_maker_fill_markout(
+            order_id="untrusted-mid",
+            side="buy",
+            cumulative_filled=Decimal("0.1"),
+            cumulative_cost=Decimal("10"),
+            average_price=None,
+            now=0.0,
+            mid=Decimal("100"),
+            external_mid=Decimal("100"),
+            source="websocket_order_update",
+            terminal=True,
+        )
+
+        await coordinator.on_orderbook(self.market(received=5.0))
+
+        event = coordinator.metrics.fill_markouts[0]
+        self.assertEqual(event["markout_5s_bps"], Decimal("0"))
+        self.assertIsNone(event["external_mid_5s"])
+        self.assertTrue(coordinator.quote_event.is_set())
+        manager.snapshot.assert_called_once_with()
+
+    async def test_markout_telemetry_failure_does_not_block_book_callback(
+        self,
+    ) -> None:
+        coordinator = self.prepare_running()
+        coordinator.metrics.record_maker_fill_markout(
+            order_id="telemetry-error",
+            side="buy",
+            cumulative_filled=Decimal("0.1"),
+            cumulative_cost=Decimal("10"),
+            average_price=None,
+            now=0.0,
+            mid=Decimal("100"),
+            external_mid=Decimal("100"),
+            source="websocket_order_update",
+            terminal=True,
+        )
+        coordinator.metrics.update_fill_markouts = Mock(
+            side_effect=RuntimeError("telemetry failed")
+        )
+
+        await coordinator.on_orderbook(self.market(received=5.0))
+
+        self.assertEqual(coordinator.market_snapshot.best_bid, Decimal("99.9"))
+        self.assertTrue(coordinator.quote_event.is_set())
+        self.assertEqual(
+            coordinator.metrics.counters["markout_telemetry_errors"], 1
+        )
 
     async def test_invalid_target_book_immediately_fails_closed(self) -> None:
         manager = self.order_manager()

@@ -27,9 +27,15 @@ from .controllers import (
     ToxicityAwareEntryQuoteController,
 )
 from .inventory_unwind import InventoryEpisodeExecutor
-from .market_features import MarketFeatureStore
+from .market_features import MarketFeatureStore, build_external_book_view
 from .metrics import MarketMakerMetrics
-from .models import MarketMetadata, MarketSnapshot, PositionSnapshot, RuntimeState
+from .models import (
+    MarketMetadata,
+    MarketSnapshot,
+    OrderSlotState,
+    PositionSnapshot,
+    RuntimeState,
+)
 from .order_manager import MarketMakerOrderManager
 from .quote_arbiter import (
     QuoteArbiterContext,
@@ -502,10 +508,15 @@ class MarketMakerCoordinator:
                     self._quote_event.set()
             return
         mid = (self._market.best_bid + self._market.best_ask) / Decimal("2")
-        self.metrics.update_fill_markouts(
-            now=self._market.received_monotonic,
-            mid=mid,
-        )
+        if self.metrics.fill_markouts:
+            try:
+                self.metrics.update_fill_markouts(
+                    now=self._market.received_monotonic,
+                    mid=mid,
+                    external_mid=self._external_markout_mid(),
+                )
+            except Exception:
+                self.metrics.increment("markout_telemetry_errors")
         self._ws_book_event.set()
         if not self._stopping:
             self._quote_event.set()
@@ -1296,12 +1307,20 @@ class MarketMakerCoordinator:
         active_ids = frozenset(
             getattr(self.order_manager, "active_unwind_order_ids", ())
         )
+        raw_terminal_ids = getattr(
+            self.order_manager, "terminal_order_ids", ()
+        )
+        terminal_ids = (
+            frozenset(raw_terminal_ids)
+            if isinstance(raw_terminal_ids, (set, frozenset, list, tuple))
+            else frozenset()
+        )
+        audit_options: dict[str, Any] = {}
         if active_ids:
-            await self.account_monitor.audit(
-                managed_ids, active_unwind_order_ids=active_ids
-            )
-        else:
-            await self.account_monitor.audit(managed_ids)
+            audit_options["active_unwind_order_ids"] = active_ids
+        if terminal_ids:
+            audit_options["terminal_order_ids"] = terminal_ids
+        await self.account_monitor.audit(managed_ids, **audit_options)
         self._audited_fill_generation = self._processed_fill_generation
 
     async def _refresh_active_unwind_truth(self) -> bool:
@@ -1689,25 +1708,77 @@ class MarketMakerCoordinator:
         ):
             return
         mid = (self._market.best_bid + self._market.best_ask) / Decimal("2")
-        recorded = self.metrics.record_maker_fill_markout(
-            order_id=order_id,
-            side=order.side.value,
-            cumulative_filled=order.filled,
-            cumulative_cost=order.cost,
-            average_price=order.average or order.price,
-            now=now,
-            mid=mid,
-            source=source,
-            terminal=order.status
-            in {
-                OrderStatus.FILLED,
-                OrderStatus.CANCELED,
-                OrderStatus.REJECTED,
-                OrderStatus.EXPIRED,
-            },
-        )
+        try:
+            recorded = self.metrics.record_maker_fill_markout(
+                order_id=order_id,
+                side=order.side.value,
+                cumulative_filled=order.filled,
+                cumulative_cost=order.cost,
+                average_price=order.average or order.price,
+                now=now,
+                mid=mid,
+                external_mid=self._external_markout_mid(),
+                source=source,
+                terminal=order.status
+                in {
+                    OrderStatus.FILLED,
+                    OrderStatus.CANCELED,
+                    OrderStatus.REJECTED,
+                    OrderStatus.EXPIRED,
+                },
+            )
+        except Exception:
+            self.metrics.increment("markout_telemetry_errors")
+            return
         if recorded:
-            self.metrics.record_controller_fill_snapshot(order_id, now)
+            try:
+                self.metrics.record_controller_fill_snapshot(order_id, now)
+            except Exception:
+                self.metrics.increment("markout_telemetry_errors")
+
+    def _external_markout_mid(self) -> Decimal | None:
+        manager = self.order_manager
+        if self._market is None or manager is None:
+            return None
+        try:
+            for state_check in (
+                "has_uncertain_state",
+                "has_unknown_order_state",
+            ):
+                state = getattr(manager, state_check, None)
+                state = state() if callable(state) else state
+                if state is not False:
+                    return None
+            snapshot = getattr(manager, "snapshot", None)
+            if not callable(snapshot):
+                return None
+            orders = tuple(snapshot())
+            if any(
+                order.state
+                in {
+                    OrderSlotState.SUBMITTING,
+                    OrderSlotState.UNCERTAIN_SUBMISSION,
+                    OrderSlotState.UNCERTAIN_CANCELLATION,
+                }
+                or order.submission_uncertain
+                or order.cancellation_uncertain
+                for order in orders
+            ):
+                return None
+            view = build_external_book_view(
+                self._market,
+                orders,
+                self.config.toxicity_book_depth_levels,
+            )
+        except Exception:
+            return None
+        if (
+            not view.valid
+            or view.external_best_bid is None
+            or view.external_best_ask is None
+        ):
+            return None
+        return (view.external_best_bid + view.external_best_ask) / Decimal("2")
 
     def _authenticated_flat_checkpoint(self) -> bool:
         return bool(

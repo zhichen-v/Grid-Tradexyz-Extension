@@ -216,45 +216,146 @@ class AuthenticatedFillRoleTests(unittest.TestCase):
         self.apply(economics, [fill], str(position))
         self.assertEqual(len(economics.authenticated_fill_attributions), 500)
 
-    def test_trade_identity_registry_capacity_fails_closed(self) -> None:
+    def test_trade_identity_registry_evicts_beyond_current_page(self) -> None:
         economics = self.economics()
-        economics.seen_trade_ids = {str(index) for index in range(4095)}
+        economics.seen_trade_ids = {str(index) for index in range(8191)}
+        economics._last_applied_fill_sort_key = (8190, 8190)
         final_slot = trade(
-            "5000", "entry", OrderSide.BUY, "0.1", timestamp=5000
+            "9000", "entry", OrderSide.BUY, "0.1", timestamp=9000
         )
         self.apply(economics, [final_slot], "0.1")
         self.apply(economics, [final_slot], "0.1")
+        next_fill = trade(
+            "9001", "increase", OrderSide.BUY, "0.1", timestamp=9001
+        )
+        self.apply(economics, [next_fill], "0.2")
+
+        evicted_ids = (
+            {str(index) for index in range(8191)} | {"9000", "9001"}
+        ) - economics.seen_trade_ids
+        self.assertEqual(len(evicted_ids), 1)
+        self.assertEqual(len(economics.seen_trade_ids), 8192)
+        self.assertIn("9000", economics.seen_trade_ids)
+        self.assertIn("9001", economics.seen_trade_ids)
+        self.assertEqual(economics.seen_trade_id_evictions, 1)
+        self.assertEqual(economics.ledger_position, Decimal("0.2"))
+        self.apply(economics, [next_fill], "0.2")
+        self.assertEqual(economics.unique_maker_fills, 2)
+
+        evicted_id = evicted_ids.pop()
         before = (
             set(economics.seen_trade_ids),
+            dict(economics._seen_trade_id_order),
+            dict(economics._order_role_bindings),
             economics.ledger_position,
-            economics.maker_turnover,
-            economics.exact_fee,
-            list(economics.authenticated_fill_attributions),
-            economics._last_applied_fill_sort_key,
+            economics.unique_maker_fills,
+            economics.seen_trade_id_evictions,
+            economics.order_role_binding_evictions,
         )
-
-        with self.assertRaisesRegex(AccountAuditError, "registry exhausted"):
+        with self.assertRaisesRegex(AccountAuditError, "ledger order"):
             self.apply(
                 economics,
-                [trade("5001", "increase", OrderSide.BUY, "0.1", timestamp=5001)],
-                "0.2",
+                [
+                    trade(
+                        evicted_id,
+                        f"old-{evicted_id}",
+                        OrderSide.BUY,
+                        "0.1",
+                        timestamp=int(evicted_id),
+                    )
+                ],
+                "0.3",
             )
-
         self.assertEqual(
             (
                 set(economics.seen_trade_ids),
+                dict(economics._seen_trade_id_order),
+                dict(economics._order_role_bindings),
                 economics.ledger_position,
-                economics.maker_turnover,
-                economics.exact_fee,
-                list(economics.authenticated_fill_attributions),
-                economics._last_applied_fill_sort_key,
+                economics.unique_maker_fills,
+                economics.seen_trade_id_evictions,
+                economics.order_role_binding_evictions,
+            ),
+            before,
+        )
+
+    def test_role_registry_evicts_terminal_but_pins_open_episode(self) -> None:
+        economics = self.economics()
+        economics._order_role_bindings = {
+            f"old-{index}": ("buy", "entry", index + 1, False)
+            for index in range(8191)
+        }
+        economics._order_role_bindings["open-episode"] = (
+            "buy",
+            "entry",
+            8192,
+            False,
+        )
+        economics._episode_order_ids = {"open-episode"}
+        economics._episode_sequence = 8192
+        economics.ledger_position = Decimal("0.1")
+        terminal_ids = {
+            f"old-{index}" for index in range(8191) if index != 2
+        }
+
+        economics.apply(
+            [trade("9000", "increase", OrderSide.BUY, "0.1", timestamp=9000)],
+            current_position=Decimal("0.2"),
+            current_equity=Decimal("100"),
+            managed_order_ids={"increase"},
+            open_order_ids={"old-0"},
+            terminal_order_ids=terminal_ids,
+        )
+
+        self.assertEqual(len(economics._order_role_bindings), 8192)
+        self.assertIn("open-episode", economics._order_role_bindings)
+        self.assertIn("old-0", economics._order_role_bindings)
+        self.assertIn("old-2", economics._order_role_bindings)
+        self.assertIn("increase", economics._order_role_bindings)
+        self.assertNotIn("old-1", economics._order_role_bindings)
+        self.assertEqual(economics.order_role_binding_evictions, 1)
+
+        economics._episode_order_ids = set(economics._order_role_bindings)
+        economics.seen_trade_ids.update(str(index) for index in range(8191))
+        before = (
+            set(economics.seen_trade_ids),
+            dict(economics._seen_trade_id_order),
+            dict(economics._order_role_bindings),
+            economics.ledger_position,
+            economics.seen_trade_id_evictions,
+            economics.order_role_binding_evictions,
+        )
+        with self.assertRaisesRegex(AccountAuditError, "registry exhausted"):
+            economics.apply(
+                [
+                    trade(
+                        "9001",
+                        "all-pinned",
+                        OrderSide.BUY,
+                        "0.1",
+                        timestamp=9001,
+                    )
+                ],
+                current_position=Decimal("0.3"),
+                current_equity=Decimal("100"),
+                managed_order_ids={"all-pinned"},
+                terminal_order_ids=set(economics._order_role_bindings),
+            )
+        self.assertEqual(
+            (
+                set(economics.seen_trade_ids),
+                dict(economics._seen_trade_id_order),
+                dict(economics._order_role_bindings),
+                economics.ledger_position,
+                economics.seen_trade_id_evictions,
+                economics.order_role_binding_evictions,
             ),
             before,
         )
 
     def test_baseline_seed_validation_is_atomic(self) -> None:
         economics = self.economics()
-        economics.seen_trade_ids = {str(index) for index in range(4095)}
+        economics.seen_trade_ids = {str(index) for index in range(8191)}
         economics._last_applied_fill_sort_key = (100, 100)
         before = (
             set(economics.seen_trade_ids),
@@ -264,8 +365,8 @@ class AuthenticatedFillRoleTests(unittest.TestCase):
         with self.assertRaisesRegex(AccountAuditError, "registry exhausted"):
             economics.seed(
                 [
-                    trade("5000", "first", OrderSide.BUY, "0.1", timestamp=5000),
-                    trade("5001", "second", OrderSide.BUY, "0.1", timestamp=5001),
+                    trade("9000", "first", OrderSide.BUY, "0.1", timestamp=9000),
+                    trade("9001", "second", OrderSide.BUY, "0.1", timestamp=9001),
                 ]
             )
         self.assertEqual(
@@ -274,7 +375,7 @@ class AuthenticatedFillRoleTests(unittest.TestCase):
         )
 
         duplicate = trade(
-            "5000", "duplicate", OrderSide.BUY, "0.1", timestamp=5000
+            "9000", "duplicate", OrderSide.BUY, "0.1", timestamp=9000
         )
         with self.assertRaisesRegex(AccountAuditError, "duplicate ids"):
             economics.seed([duplicate, duplicate])
@@ -400,6 +501,7 @@ class MarkoutAttributionTests(unittest.TestCase):
                 average_price=None,
                 now=now,
                 mid=Decimal("100"),
+                external_mid=Decimal("100"),
                 source=source,
                 terminal=True,
             )
@@ -460,7 +562,11 @@ class MarkoutAttributionTests(unittest.TestCase):
         metrics.apply_authenticated_fill_attributions(attributions)
         metrics.apply_authenticated_fill_attributions(attributions)
         self.record(metrics, "unknown", "buy", now=2.0)
-        metrics.update_fill_markouts(now=20.0, mid=Decimal("99"))
+        metrics.update_fill_markouts(
+            now=20.0,
+            mid=Decimal("99"),
+            external_mid=Decimal("99"),
+        )
 
         self.assertEqual(len(metrics.fill_markouts), 3)
         self.assertEqual(len(metrics._authenticated_fill_attributions), 2)
@@ -643,7 +749,11 @@ class MarkoutAttributionTests(unittest.TestCase):
                 )
             )
         metrics.apply_authenticated_fill_attributions(attributions)
-        metrics.update_fill_markouts(now=15.0, mid=Decimal("99"))
+        metrics.update_fill_markouts(
+            now=15.0,
+            mid=Decimal("99"),
+            external_mid=Decimal("99"),
+        )
 
         snapshot = metrics.snapshot(15.0)
         feedback = snapshot["authenticated_entry_markout_feedback"]
@@ -653,6 +763,83 @@ class MarkoutAttributionTests(unittest.TestCase):
             snapshot["authenticated_markout_summary"]["sell"]["active_exit"]
             ["5s"]["count"],
             1,
+        )
+
+    def test_feedback_and_summaries_use_external_mid_markout_only(self) -> None:
+        metrics = self.metrics()
+        self.assertTrue(
+            metrics.record_maker_fill_markout(
+                order_id="external-entry",
+                side="buy",
+                cumulative_filled=Decimal("0.1"),
+                cumulative_cost=Decimal("10"),
+                average_price=None,
+                now=0.0,
+                mid=Decimal("100"),
+                external_mid=Decimal("100.1"),
+                source="websocket_order_update",
+                terminal=True,
+            )
+        )
+        metrics.apply_authenticated_fill_attributions(
+            [attribution("1", "external-entry", "buy", "entry")]
+        )
+        metrics.update_fill_markouts(
+            now=5.0,
+            mid=Decimal("99"),
+            external_mid=Decimal("101"),
+        )
+
+        event = metrics.fill_markouts[0]
+        self.assertEqual(event["raw_mid_at_start"], Decimal("100"))
+        self.assertEqual(event["external_mid_at_start"], Decimal("100.1"))
+        self.assertEqual(event["raw_mid_5s"], Decimal("99"))
+        self.assertEqual(event["external_mid_5s"], Decimal("101"))
+        self.assertEqual(event["markout_5s_bps"], Decimal("-100"))
+        self.assertEqual(
+            event["raw_mid_markout_5s_bps"], Decimal("-100")
+        )
+        self.assertEqual(
+            event["external_mid_markout_5s_bps"], Decimal("100")
+        )
+        snapshot = metrics.snapshot(5.0)
+        self.assertEqual(
+            snapshot["side_markout_summary"]["buy"]["5s"]["mean_bps"],
+            Decimal("100"),
+        )
+        self.assertEqual(
+            snapshot["authenticated_markout_summary"]["buy"]["entry"]
+            ["5s"]["mean_bps"],
+            Decimal("100"),
+        )
+        self.assertEqual(
+            snapshot["authenticated_entry_markout_feedback"]["buy"]["5s"]
+            ["mean_bps"],
+            Decimal("100"),
+        )
+
+    def test_untrusted_external_observation_is_not_backfilled(self) -> None:
+        metrics = self.metrics()
+        self.record(metrics, "missing-external", "buy")
+        metrics.apply_authenticated_fill_attributions(
+            [attribution("1", "missing-external", "buy", "entry")]
+        )
+        metrics.update_fill_markouts(now=5.0, mid=Decimal("99"))
+        metrics.update_fill_markouts(
+            now=15.0,
+            mid=Decimal("98"),
+            external_mid=Decimal("101"),
+        )
+
+        event = metrics.fill_markouts[0]
+        self.assertEqual(event["markout_5s_bps"], Decimal("-100"))
+        self.assertIsNone(event["external_mid_5s"])
+        self.assertIsNone(event["external_mid_markout_5s_bps"])
+        self.assertEqual(event["external_mid_15s"], Decimal("101"))
+        self.assertEqual(
+            metrics.authenticated_entry_markout_feedback()["buy"]["5s"]
+            ["count"],
+            0,
         )
 
     def test_metrics_attribution_registry_is_bounded(self) -> None:

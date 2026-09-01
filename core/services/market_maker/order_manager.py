@@ -235,6 +235,15 @@ class MarketMakerOrderManager:
         return frozenset(self._known_order_ids)
 
     @property
+    def terminal_order_ids(self) -> frozenset[str]:
+        """Order IDs backed by exact terminal exchange evidence."""
+        return frozenset(
+            proof.order_id
+            for proof in self._terminal_orders.values()
+            if proof.order_id
+        )
+
+    @property
     def active_unwind_order_ids(self) -> frozenset[str]:
         """Confirmed order ids attributable to the isolated taker lane."""
         return frozenset(self._active_unwind_order_ids)

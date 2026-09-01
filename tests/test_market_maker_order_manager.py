@@ -1951,6 +1951,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.errors, ())
         self.assertTrue(result.actions[0].success)
         self.assertIn("fast-fill", self.manager.known_order_ids)
+        self.assertIn("fast-fill", self.manager.terminal_order_ids)
         self.assertIsNone(self.manager.slots[OrderSide.BUY])
 
     async def test_duplicate_partial_order_update_reports_fill_once(self) -> None:

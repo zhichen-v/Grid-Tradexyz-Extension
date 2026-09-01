@@ -168,6 +168,10 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
             snapshot["completed_episode_ledger"],
             [
                 {
+                    "session_id": monitor.economics.session_id,
+                    "episode_sequence": 1,
+                    "opened_at": 1,
+                    "closed_at": 2,
                     "maker_fills": 1,
                     "entry_side": "buy",
                     "turnover": Decimal("39.9"),
@@ -358,6 +362,10 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
             snapshot["completed_episode_ledger"],
             [
                 {
+                    "session_id": economics.session_id,
+                    "episode_sequence": 1,
+                    "opened_at": 1,
+                    "closed_at": 3,
                     "maker_fills": 2,
                     "entry_side": "buy",
                     "turnover": Decimal("40.1"),
@@ -451,6 +459,10 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
             snapshot["completed_episode_ledger"],
             [
                 {
+                    "session_id": monitor.economics.session_id,
+                    "episode_sequence": 1,
+                    "opened_at": 1,
+                    "closed_at": 2,
                     "maker_fills": 2,
                     "entry_side": "buy",
                     "turnover": Decimal("200.04"),
@@ -1238,6 +1250,102 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(snapshot["completed_episode_ledger"]), 100)
         self.assertEqual(snapshot["episode_flat_success"], 101)
         self.assertEqual(snapshot["episode_active_unwind_flat"], 0)
+
+    def test_long_run_attribution_supports_four_thousand_distinct_orders(self):
+        economics = SessionEconomics(
+            self.config(
+                maker_fee_rate=Decimal("0"),
+                min_completed_net_turnover_bps=Decimal("0"),
+            ),
+            baseline_equity=Decimal("300"),
+        )
+        first_episode = None
+        for episode in range(2000):
+            buy_sequence = episode * 2 + 1
+            sell_sequence = buy_sequence + 1
+            fills = [
+                trade(
+                    str(buy_sequence),
+                    f"buy-{episode}",
+                    OrderSide.BUY,
+                    "0.1",
+                    "1",
+                    "0",
+                    fee_rate="0",
+                    timestamp=buy_sequence,
+                ),
+                trade(
+                    str(sell_sequence),
+                    f"sell-{episode}",
+                    OrderSide.SELL,
+                    "0.1",
+                    "1",
+                    "0",
+                    fee_rate="0",
+                    timestamp=sell_sequence,
+                ),
+            ]
+            if first_episode is None:
+                first_episode = fills
+            economics.apply(
+                fills,
+                current_position=Decimal("0"),
+                current_equity=Decimal("300"),
+                managed_order_ids={fill.order_id for fill in fills},
+            )
+
+        before_replay = economics.snapshot()
+        economics.apply(
+            first_episode,
+            current_position=Decimal("0"),
+            current_equity=Decimal("300"),
+            managed_order_ids={fill.order_id for fill in first_episode},
+        )
+        snapshot = economics.snapshot()
+
+        self.assertEqual(snapshot, before_replay)
+        self.assertEqual(snapshot["unique_maker_fills"], 4000)
+        self.assertEqual(snapshot["completed_round_trips"], 2000)
+        self.assertEqual(len(economics.seen_trade_ids), 4000)
+        self.assertEqual(len(economics._order_role_bindings), 4000)
+        self.assertEqual(snapshot["seen_trade_id_registry_size"], 4000)
+        self.assertEqual(snapshot["seen_trade_id_evictions"], 0)
+        self.assertEqual(snapshot["order_role_binding_registry_size"], 4000)
+        self.assertEqual(snapshot["order_role_binding_evictions"], 0)
+        self.assertEqual(len(snapshot["completed_episode_ledger"]), 100)
+        self.assertEqual(
+            {
+                episode["session_id"]
+                for episode in snapshot["completed_episode_ledger"]
+            },
+            {economics.session_id},
+        )
+        self.assertEqual(
+            [
+                episode["episode_sequence"]
+                for episode in snapshot["completed_episode_ledger"]
+            ],
+            list(range(1901, 2001)),
+        )
+        self.assertEqual(
+            snapshot["completed_episode_ledger"][-1],
+            {
+                "session_id": economics.session_id,
+                "episode_sequence": 2000,
+                "opened_at": 3999,
+                "closed_at": 4000,
+                "maker_fills": 2,
+                "entry_side": "buy",
+                "turnover": Decimal("2"),
+                "gross": Decimal("0"),
+                "exact_fee": Decimal("0"),
+                "maker_fee": Decimal("0"),
+                "taker_fee": Decimal("0"),
+                "net_ex_funding": Decimal("0"),
+                "active_unwind_used": False,
+                "close_type": "maker_flat",
+            },
+        )
 
     async def test_completed_fee_failure_is_not_hidden_by_open_tail(self):
         cases = (("0", "cover exact fees"), ("0.025", "threshold"))

@@ -269,6 +269,43 @@ class MarketFeatureStoreTests(unittest.TestCase):
         self.assertEqual(result.rms_1s_move_15s_ticks, expected)
         self.assertEqual(result.rms_1s_move_60s_ticks, expected)
 
+    def test_rms_normalizes_one_and_five_second_sampling(self) -> None:
+        results = []
+        for timestamps, mids in (
+            ((0, 1, 2, 3), (100, 101, 100, 101)),
+            ((0, 5, 10, 15), (100, 105, 100, 105)),
+        ):
+            feature_store = store(self.clock, warmup_seconds=1, min_samples=2)
+            for timestamp, mid in zip(timestamps, mids):
+                result = self.update(feature_store, timestamp, mid)
+            results.append(result.rms_1s_move_15s_ticks)
+
+        self.assertEqual(results[0], Decimal("1"))
+        self.assertEqual(results[1], Decimal("5").sqrt())
+
+    def test_rms_weights_irregular_sampling_by_elapsed_time(self) -> None:
+        feature_store = store(self.clock, warmup_seconds=1, min_samples=2)
+        for timestamp, mid in ((0, 100), (1, 102), (3, 101), (6, 105)):
+            result = self.update(feature_store, timestamp, mid)
+
+        expected = (Decimal("21") / Decimal("6")).sqrt()
+        self.assertEqual(result.rms_1s_move_15s_ticks, expected)
+        self.assertEqual(result.rms_1s_move_60s_ticks, expected)
+
+    def test_rms_does_not_bridge_reset_gap(self) -> None:
+        feature_store = store(
+            self.clock,
+            warmup_seconds=1,
+            min_samples=2,
+            reset_gap_seconds=5,
+        )
+        for timestamp, mid in ((0, 100), (1, 110), (20, 200), (25, 205)):
+            result = self.update(feature_store, timestamp, mid)
+
+        self.assertEqual(result.sample_count, 2)
+        self.assertEqual(result.rms_1s_move_15s_ticks, Decimal("5").sqrt())
+        self.assertEqual(result.rms_1s_move_60s_ticks, Decimal("5").sqrt())
+
     def test_microprice_and_top_n_imbalance_are_exact(self) -> None:
         feature_store = store(
             self.clock,

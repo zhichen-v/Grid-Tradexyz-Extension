@@ -362,20 +362,48 @@ def _event_role(event: dict[str, Any]) -> str | None:
 
 
 def _event_markouts(event: dict[str, Any]) -> dict[str, Any]:
-    nested = event.get("markouts") or event.get("markout_bps")
+    """Return only own-size-subtracted markouts used for strategy analysis."""
+
+    nested = event.get("external_mid_markouts")
     if isinstance(nested, dict):
         return nested
     return {
         match.group(1): value
         for key, value in event.items()
-        if (match := re.fullmatch(r"markout_(\d+)s_bps", str(key)))
+        if (
+            match := re.fullmatch(
+                r"external_mid_markout_(\d+)s_bps", str(key)
+            )
+        )
         and value is not None
     }
+
+
+def _event_raw_markouts(event: dict[str, Any]) -> dict[str, Any]:
+    """Return raw-book markouts for diagnostics, never promotion analysis."""
+
+    markouts = {
+        match.group(1): value
+        for key, value in event.items()
+        if (match := re.fullmatch(r"raw_mid_markout_(\d+)s_bps", str(key)))
+        and value is not None
+    }
+    nested = event.get("markouts") or event.get("markout_bps")
+    if isinstance(nested, dict):
+        for horizon, value in nested.items():
+            if value is not None:
+                markouts.setdefault(str(horizon), value)
+    for key, value in event.items():
+        match = re.fullmatch(r"markout_(\d+)s_bps", str(key))
+        if match and value is not None:
+            markouts.setdefault(match.group(1), value)
+    return markouts
 
 
 def _markout_analysis(events: list[dict[str, Any]], legacy_pending: int) -> dict[str, Any]:
     grouped: dict[str, dict[str, dict[str, Any]]] = {}
     event_pending = 0
+    external_reference_missing = 0
     sources: Counter[str] = Counter()
     for event in events:
         source = event.get("observation_source", event.get("source"))
@@ -386,8 +414,11 @@ def _markout_analysis(events: list[dict[str, Any]], legacy_pending: int) -> dict
         if role is None:
             event_pending += 1
             continue
-        role_group = grouped.setdefault(role, {}).setdefault(side, {})
         markouts = _event_markouts(event)
+        if not markouts:
+            external_reference_missing += 1
+            continue
+        role_group = grouped.setdefault(role, {}).setdefault(side, {})
         for horizon, value in markouts.items():
             if value is None:
                 continue
@@ -401,6 +432,7 @@ def _markout_analysis(events: list[dict[str, Any]], legacy_pending: int) -> dict
     }
     pending = max(legacy_pending, event_pending)
     return {
+        "analysis_reference": "external_mid_own_size_subtracted",
         "authenticated_by_role_side_horizon": summarized,
         "entry_by_side_horizon": summarized.get("entry", {}),
         "risk_increasing_by_side_horizon": summarized.get(
@@ -412,6 +444,7 @@ def _markout_analysis(events: list[dict[str, Any]], legacy_pending: int) -> dict
             if role in summarized
         },
         "pending_attribution_count": pending,
+        "external_reference_missing_count": external_reference_missing,
         "observation_source_distribution": dict(sorted(sources.items())),
     }
 
@@ -438,6 +471,71 @@ def _episode_analysis(episodes: Any) -> dict[str, Any]:
             if episode.get("active_unwind_used") is True
             or episode.get("active_involvement") is True
         ),
+    }
+
+
+def _episode_identity(episode: dict[str, Any]) -> tuple[str, str] | None:
+    session_id = episode.get("session_id")
+    sequence = episode.get("episode_sequence")
+    if session_id is None or not str(session_id).strip() or sequence is None:
+        return None
+    return str(session_id), _stable_text(sequence)
+
+
+def _merge_episodes(
+    records: list[dict[str, Any]], final: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    versions: dict[
+        tuple[str, str], list[tuple[tuple[Any, ...], dict[str, Any]]]
+    ] = {}
+    for record in records:
+        audit = record.get("account_audit")
+        if not isinstance(audit, dict):
+            continue
+        ledger = audit.get("completed_episode_ledger")
+        if not isinstance(ledger, list):
+            continue
+        for episode in ledger:
+            if not isinstance(episode, dict):
+                continue
+            identity = _episode_identity(episode)
+            if identity is not None:
+                versions.setdefault(identity, []).append(
+                    (_record_rank(record), episode)
+                )
+
+    identified = {
+        identity: dict(
+            max(
+                candidates,
+                key=lambda item: (
+                    item[0],
+                    sum(value is not None for value in item[1].values()),
+                    _stable_text(item[1]),
+                ),
+            )[1]
+        )
+        for identity, candidates in versions.items()
+    }
+
+    final_audit = final.get("account_audit")
+    if not isinstance(final_audit, dict):
+        final_audit = {}
+    final_ledger = final_audit.get("completed_episode_ledger")
+    legacy = (
+        [
+            dict(episode)
+            for episode in final_ledger
+            if isinstance(episode, dict) and _episode_identity(episode) is None
+        ]
+        if isinstance(final_ledger, list)
+        else []
+    )
+    episodes = [identified[key] for key in sorted(identified)] + legacy
+    return episodes, {
+        "merged_unique_episodes": len(episodes),
+        "identified_episodes": len(identified),
+        "legacy_final_snapshot_episodes": len(legacy),
     }
 
 
@@ -535,7 +633,60 @@ def _controller_analysis(
     }
 
 
-def _counterfactual(events: list[dict[str, Any]], pending: int) -> dict[str, Any]:
+def _later_shadow_change(
+    event: dict[str, Any],
+    context: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> str | None:
+    created = _decimal(context.get("created_monotonic"))
+    filled = _decimal(event.get("started_monotonic"))
+    side = {"buy": "bid", "sell": "ask"}.get(
+        str(event.get("side", "")).lower()
+    )
+    if created is None or filled is None or side is None or filled < created:
+        return None
+
+    placement_extra = _decimal(context.get("extra_spread_ticks"))
+    placement_shadow = _decimal(context.get("shadow_price"))
+    changes: list[tuple[Decimal, str]] = []
+    for decision in history:
+        recorded = _decimal(decision.get("recorded_monotonic"))
+        if recorded is None or not (created < recorded <= filled):
+            continue
+        if decision.get("ready") is False or decision.get("error") is not None:
+            changes.append((recorded, "later_shadow_unavailable"))
+            continue
+        if decision.get("entry_applicable") is False:
+            changes.append((recorded, "later_entry_inapplicable"))
+            continue
+        side_decision = decision.get(side)
+        if not isinstance(side_decision, dict):
+            continue
+        if side_decision.get("blocked") is True:
+            changes.append((recorded, "later_shadow_block"))
+            continue
+        if "shadow_price" in side_decision and (
+            later_shadow := _decimal(side_decision.get("shadow_price"))
+        ) != placement_shadow:
+            changes.append((recorded, "later_shadow_reprice"))
+            continue
+        later_extra = _decimal(side_decision.get("extra_spread_ticks"))
+        if (
+            placement_extra is not None
+            and later_extra is not None
+            and later_extra != placement_extra
+        ):
+            changes.append((recorded, "later_shadow_reprice"))
+    return min(changes)[1] if changes else None
+
+
+def _counterfactual(
+    events: list[dict[str, Any]],
+    pending: int,
+    history: list[dict[str, Any]],
+    *,
+    history_complete: bool,
+) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     represented_pending = 0
@@ -560,6 +711,11 @@ def _counterfactual(events: list[dict[str, Any]], pending: int) -> dict[str, Any
             if isinstance(context, dict)
             else None
         )
+        later_change = (
+            _later_shadow_change(event, context, history)
+            if authenticated_entry and isinstance(context, dict)
+            else None
+        )
         farther: bool | None = None
         if authenticated_entry and side in {"buy", "sell"}:
             if (
@@ -582,6 +738,11 @@ def _counterfactual(events: list[dict[str, Any]], pending: int) -> dict[str, Any
                     label = "still_reachable"
                 elif farther:
                     label = "likely_filtered"
+        if later_change is not None:
+            label = "indeterminate"
+        elif authenticated_entry and not history_complete:
+            label = "indeterminate"
+            later_change = "controller_history_incomplete"
         counts[label] += 1
         rows.append(
             {
@@ -596,14 +757,21 @@ def _counterfactual(events: list[dict[str, Any]], pending: int) -> dict[str, Any
                 "shadow_price": shadow,
                 "shadow_farther": farther,
                 "classification": label,
+                "classification_reason": later_change
+                or (
+                    "placement_shadow_proxy"
+                    if label != "indeterminate"
+                    else "insufficient_or_ineligible_evidence"
+                ),
                 "markouts": _event_markouts(event),
+                "raw_markouts": _event_raw_markouts(event),
             }
         )
     missing_pending = max(0, pending - represented_pending)
     if missing_pending:
         counts["indeterminate"] += missing_pending
     return {
-        "method": "counterfactual_proxy_not_backtest",
+        "method": "counterfactual_proxy_with_lifecycle_guard_not_backtest",
         "classification_counts": dict(counts),
         "fills": rows,
     }
@@ -628,10 +796,24 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
         default=0,
     )
     markouts = _markout_analysis(events, legacy_pending)
-    counterfactual = _counterfactual(
-        events, markouts["pending_attribution_count"]
+    reported_controller_history_total = max(
+        (
+            int(record.get("controller_decision_history_total", 0) or 0)
+            for record in records
+        ),
+        default=0,
     )
-    episodes = audit.get("completed_episode_ledger")
+    controller_history_complete = (
+        reported_controller_history_total == 0
+        or len(history) >= reported_controller_history_total
+    )
+    counterfactual = _counterfactual(
+        events,
+        markouts["pending_attribution_count"],
+        history,
+        history_complete=controller_history_complete,
+    )
+    episodes, episode_coverage = _merge_episodes(records, final)
     session_keys = (
         "unique_maker_fills",
         "unique_taker_fills",
@@ -644,6 +826,10 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
         "completed_net_turnover_bps",
         "completed_fee_cover_ratio",
         "economic_state",
+        "seen_trade_id_registry_size",
+        "seen_trade_id_evictions",
+        "order_role_binding_registry_size",
+        "order_role_binding_evictions",
     )
     session = {key: audit.get(key) for key in session_keys}
     session["completed_maker_fee"] = audit.get(
@@ -703,6 +889,15 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
             "retained_events": max(len(events), reported_retained),
             "merged_unique_events": len(events),
             "pending_attribution": markouts["pending_attribution_count"],
+            "external_reference_missing": markouts[
+                "external_reference_missing_count"
+            ],
+            "controller_history_merged": len(history),
+            "controller_history_reported_total": (
+                reported_controller_history_total
+            ),
+            "controller_history_complete": controller_history_complete,
+            **episode_coverage,
             "observation_sources": markouts["observation_source_distribution"],
             "legacy_source": (
                 legacy_sources[0]
@@ -736,6 +931,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "# Market Maker strategy analysis",
         "",
         "> Read-only local evidence. Shadow classifications are proxies, not a true queue-fill backtest.",
+        "> Strategy markout summaries use the own-size-subtracted external mid; raw-book markouts are diagnostic only.",
         "",
         "## Session",
         "",
@@ -750,6 +946,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"{session.get('completed_taker_fee')}",
         f"- Net turnover bps / fee cover: {session.get('completed_net_turnover_bps')} / "
         f"{session.get('completed_fee_cover_ratio')}",
+        f"- Trade-ID registry size / evictions: "
+        f"{session.get('seen_trade_id_registry_size')} / "
+        f"{session.get('seen_trade_id_evictions')}",
+        f"- Order-role registry size / evictions: "
+        f"{session.get('order_role_binding_registry_size')} / "
+        f"{session.get('order_role_binding_evictions')}",
         "",
         "## Episodes",
         "",
@@ -761,6 +963,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Authenticated entry markouts",
         "",
+        f"- Analysis reference: {markouts.get('analysis_reference')}",
         f"- By side / horizon: {markouts.get('entry_by_side_horizon')}",
         "",
         "## Exit markouts",
@@ -789,7 +992,9 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- {row.get('order_id')} {row.get('side')}: "
             f"fill={row.get('actual_fill_price')}, base={row.get('base_price')}, "
             f"shadow={row.get('shadow_price')}, farther={row.get('shadow_farther')}, "
-            f"classification={row.get('classification')}, markouts={row.get('markouts')}"
+            f"classification={row.get('classification')}, "
+            f"reason={row.get('classification_reason')}, "
+            f"external_markouts={row.get('markouts')}"
         )
     lines.extend(
         [
@@ -806,6 +1011,16 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             f"- Retained / merged unique / pending events: {coverage.get('retained_events')} / "
             f"{coverage.get('merged_unique_events')} / {coverage.get('pending_attribution')}",
+            f"- External-reference-missing events: "
+            f"{coverage.get('external_reference_missing')}",
+            f"- Controller history merged / reported / complete: "
+            f"{coverage.get('controller_history_merged')} / "
+            f"{coverage.get('controller_history_reported_total')} / "
+            f"{coverage.get('controller_history_complete')}",
+            f"- Merged / identified / legacy-final episodes: "
+            f"{coverage.get('merged_unique_episodes')} / "
+            f"{coverage.get('identified_episodes')} / "
+            f"{coverage.get('legacy_final_snapshot_episodes')}",
             f"- Observation sources: {coverage.get('observation_sources')}",
             f"- Legacy source: {coverage.get('legacy_source')}",
             "",

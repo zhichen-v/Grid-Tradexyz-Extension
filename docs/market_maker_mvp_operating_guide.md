@@ -206,11 +206,11 @@ Long-run 每 30 分鐘保存：completed fills／round trips、maker turnover、
 
 ### 8.3 當前決策
 
-最新live判定為：**P0 LIVE PREVENTION PROVEN / SHORT-LIVE PROMOTION NO-GO / 4H NOT STARTED / FORMAL 30-FILL ECONOMICS INCOMPLETE**。Entry reserve在第8個flat episode後正確阻擋第9輪，不能把「修復後繼續」解讀成可重置session loss或放寬cap。02:52兩次fresh authenticated postflight均為BTC position／orders=`0/0`、used collateral`0`、equity`299.069583`；兩份ignored overlay亦已恢復`dry_run:true`且同SHA `E60F3093E6FC2CC89875C2D79B27AC8E39C830F2FDBCC5CA1FA789573278C16D`。目前不得啟動4h；後續必須先針對雙側負markout與fee-cover不足形成新候選，完成offline regression／fresh T3，再取得新一輪明確live授權與fresh preflight。
+最新live判定為：**GATE C HARD NO-GO / 4H NOT STARTED / RECOVERY COMPLETE / ACCOUNT FLAT**。2026-09-02 Gate C shadow live在uptime `845.110s`因`soft exit is stranded outside the normal passive quote band by the economic gate`觸發設計中的fatal guard；本場只有8 completed maker fills／4 trips，未達30且stop時未authenticated-flat，不得將已完成子集的正數結果或shadow proxy用於promotion。取得明確授權後，02:30:55–02:31:09只用單向`BUY LIMIT + POST_ONLY + reduce_only 0.00020`於`76987.8`取得exact terminal fill；雙authenticated postflight皆為BTC position／orders=`0/0`、used collateral=`0`，runtime=`0`。Recovery只屬帳戶清理，不計入Gate C economics，也不解除Hard No-Go。兩份ignored overlay維持語意相同的`dry_run:true`、`quote_controller_mode:"fixed"`、`toxicity_feature_window_seconds:120`、`toxicity_min_samples:20`、`active_unwind_enabled:false`，source／local-live-copy SHA分別為`4467D479...94DDFE`／`164C883E...07BAB9`。
 
 VPS 同步與測試仍不在本階段。歷史事故與舊 fingerprint 僅見 [驗證歷史](market_maker_mvp_validation_history.md)，不能代替 fresh preflight。
 
-## 9. Toxicity-aware entry controller rollout（code-only）
+## 9. Toxicity-aware entry controller rollout
 
 本checkpoint新增bounded external-book feature store、authenticated fill-role attribution、`fixed/shadow/active` controller、entry-only arbiter、controller telemetry與本地offline analyzer。它沒有改Grid production code或shared adapter；OrderManager仍是唯一mutation authority，normal quote仍是`POST_ONLY`。Example YAML繼續保持`dry_run:true`、`active_unwind_enabled:false`、`quote_controller_mode:"fixed"`。
 
@@ -220,7 +220,7 @@ Controller硬邊界：
 - 只能向外widen或移除原本存在的side；不能縮spread、加size、改reference／reservation、改TIF或新增side。
 - Economic stop、entry reserve、RiskManager、inventory unwind與uncertain／reconciliation fail-closed均有優先權。
 - Active feature未ready、stale、invalid或feature pipeline exception時，flat entry關閉；non-flat exit仍可收斂。
-- Authenticated markout feedback只接受entry、非active unwind、WS／ordinary reconciliation及5／15秒資料；v1 active禁止使用feedback，shadow只供校準。
+- Markout event同時保存raw BBO與own-size-subtracted external mid；side／authenticated summaries、entry feedback與promotion analysis只接受external markout。External book或managed-order truth不可信時不補值，另以coverage／telemetry error揭露；v1 active仍禁止使用feedback，shadow只供校準。
 
 本地分析只讀既有log／metrics，不連線交易所：
 
@@ -228,7 +228,7 @@ Controller硬邊界：
 .\.venv\Scripts\python.exe .\scripts\analyze_market_maker_strategy.py <metrics-or-log> --json-output report.json --markdown-output report.md
 ```
 
-Shadow輸出是counterfactual proxy，不是queue-fill backtest。舊E2ay只有16筆未帶authenticated role join的markout，所以必須維持`pending=16 / indeterminate=16`，不能回溯推斷entry／exit。
+Shadow輸出是counterfactual proxy，不是queue-fill backtest。Analyzer只把external markout納入策略統計；raw markout僅供diagnostic。若placement後、實際fill前出現shadow block／reprice、controller unavailable或entry不再適用，該fill保守列為`indeterminate`。舊E2ay只有16筆未帶authenticated role join的markout，所以必須維持`pending=16 / indeterminate=16`，不能回溯推斷entry／exit。Periodic checkpoint中的completed episodes依`(session_id, episode_sequence)`合併；無穩定identity的舊schema只讀final snapshot，避免跨checkpoint重複計數。
 
 Promotion順序固定：
 
@@ -240,3 +240,33 @@ Promotion順序固定：
 6. Gate F：至少2–3次彼此獨立的fresh-flat short sessions通過後才做4小時；4小時GO後才考慮24小時／VPS。
 
 本checkpoint沒有執行Gate A–F、network、T3、live、flatten或account mutation，也不授權下一輪。E2ay維持「P0 prevention proof GO／short-live promotion NO-GO／4h未啟動／正式30-fill economics incomplete」。
+
+### Review remediation checkpoint（2026-09-01，code-only）
+
+針對commit `370cac4c`的3項P1與2項P2 review findings，採用以下有界修正：
+
+- `rms_1s_move_*`改為依相鄰有效樣本的實際`delta_t`計算每秒realized variance rate：`sqrt(sum(move_ticks^2) / sum(delta_t_seconds))`；不規則／5秒cadence不再被誤當成1秒取樣，既有reset gap仍不跨越。
+- Fill telemetry保留legacy raw `markout_*`／MAE／MFE，並新增raw／external start mid及各horizon mid／markout。External reference沿用feature store的managed own-size subtraction；不可信order state、invalid external book或缺值不會回填。Controller feedback、metrics summaries與offline analyzer只讀external markout。
+- Trade-ID replay proof與order-role binding各使用8,192筆bounded LRU。Trade ID只淘汰authenticated current 100-trade page之外的舊identity，watermark仍拒絕out-of-order新證據；role binding永久pin authenticated open orders、current trade page與尚未flat的open episode，且只有OrderManager已有exact terminal proof的最舊order才具淘汰資格，不能用「不在open orders」推定terminal。若全部候選仍被pin或沒有exact-terminal候選，維持fail closed且不提交局部registry變更。Synthetic long-run涵蓋4,000個不同filled order IDs／2,000 episodes、retained old-trade replay no-op，另覆蓋實際被淘汰trade的watermark拒絕、terminal／nonterminal／open／episode pinning與cap失敗atomicity；runtime completed ledger仍只保留最近100筆。
+- 每筆completed episode新增穩定`session_id`、`episode_sequence`、authenticated `opened_at`／`closed_at`與`entry_side`；offline analyzer可跨periodic checkpoints去重合併完整分布。
+- Controller history保存各side的base／shadow／applied price，並把shadow reprice與`entry_applicable`變更視為transition；total／retained coverage亦明確輸出。Analyzer若在placement至fill時間窗內看到後續reprice、block、unavailable或inapplicable，或輸入checkpoint未完整覆蓋已報告的history total，一律不使用placement-only結論，改列`indeterminate`。
+
+Offline驗證：review-focused整合`333/333`、全部Market Maker `493/493`；full repo `740`維持原HEAD既知Grid／Lighter lifecycle baseline `8F+4E`，失敗／錯誤名稱完全一致，沒有新增回歸。兩次獨立read-only runtime review均未發現blocking finding。既有OrderManager `_terminal_orders`／`_known_order_ids`仍是session-unbounded proof source，24h gate容量可接受，但在宣稱indefinite bounded-memory production前必須另案治理。
+
+本checkpoint未執行fresh fixed T3、shadow T3、network、live、flatten或任何帳戶mutation，維持code-only；其後仍須依Gate A、Gate B取得fresh runtime evidence，active controller live不因本次程式修正自動promotion。
+
+### Gate A／B fresh dry T3（2026-09-02）
+
+- **Gate A fixed GO**：23:29:04–23:59:15，uptime `1803.953s`、`346/346` cycles、failed `0`、`would_place=432`；真實create／cancel、reconciliation failure、unknown、ambiguity／unresolved、mutation block、429、WS reconnect、account-read、controller與markout error全為`0`，全程flat／audit healthy。Fixed base／applied quote保持一致，analyzer history `331/331 complete`；history上限`200`後RSS約`144–146 MiB`。Raw evidence `logs/market_maker_t3_controller_fixed_20260901-235915.log`，SHA `F5DF8799A8C173C99E0396AF72B289711F9C3D330A6A80DE29862FF4C897B168`。
+- **Gate B首次readiness NO-GO，非hard-safety事故**：00:01:01–00:05:03為`46/46`且全部hard counters為`0`，但`refresh_interval_ms=5000`搭配60秒retention最多只保留約13筆，無法達到`toxicity_min_samples=20`，controller會永久warming。只把feature retention由60秒擴為120秒，保留20筆門檻及既有5／15／60秒公式；focused config／feature／telemetry `47/47`通過。Diagnostic evidence `logs/market_maker_t3_controller_shadow_readiness_nogo_20260902-000503.log`，SHA `565D80F67A6E9BDEBDFB121B0630503EFFF874D46B05FCBBEB680F144A75386C`。
+- **Gate B repaired shadow GO**：第一段uptime `902.875s`、`173/173`；PTY在累積約10 MB輸出後結束，程式最後狀態沒有exception、failed或hard-counter異常，故保存為harness interruption，fresh authenticated restart preflight仍為position／orders=`0/0`。以輸出重導續跑第二段uptime `1272.703s`、`243/243`；合計有效時間 `2175.578s`（約36分16秒）、`416/416`、failed `0`、`would_place=482`，真實create／cancel及全部hard counters仍為`0`。兩段feature約99秒後ready並穩定於24–25 samples；retained history達`200`後保持封頂，第二段400個保留base／applied price欄位零差異，status約299 KiB、RSS約146 MiB。Raw evidence為`logs/market_maker_t3_controller_shadow_part1_pty_limit_20260902-002315.log`（SHA `48A821E7034A5C1E863E83597C07A5E47C58BB7B65D60982FA1C96EBAA87C7AF`）及`logs/market_maker_t3_controller_shadow_part2_20260902-004655.log`（SHA `098E6555F84A212EEE2A3247534741F1CFCA767C27F9AFD23D332762A3FD2D21`）。
+- Part 2單次Ctrl+C後runtime為`0`；兩次authenticated postflight皆為BTC position／orders=`0/0`、used collateral`0`、equity`299.069583`。本輪全程CLI強制dry-run，沒有live、fills、flatten或帳戶mutation。Analyzer history fixed／shadow-part1／shadow-part2分別為`331/331`、`153/153`、`223/223 complete`；因此Gate A／B只證明runtime safety、shadow parity與資源有界，**不證明queue fill或收益**。
+- Current rollout state：**Gate A GO / Gate B GO / Gate C HARD NO-GO / Gate D–F NOT RUN；recovery完成且account flat**。未完成根因修復與相稱offline／fresh dry T3前不得重跑；active controller不因既有dry T3或本次recovery自動promotion。
+
+### Gate C shadow live hard stop（2026-09-02）
+
+- 01:51:12–02:05:12，uptime `845.110s`、`198/198` cycles、failed `0`；真實create／cancel=`27/18`且全成功，maker／taker fills=`9/0`，completed=`8`、round trips=`4`。兩次短暫stale-book pause均撤空managed quote、在下一個authenticated audit checkpoint內恢復；reconciliation failure、unknown、ambiguity／unresolved、mutation block、429、WS reconnect、account read、controller、markout與active counters全為`0`。Shadow history `128/128 complete`，base／applied parity零差異。
+- Completed turnover／gross／exact fee／net=`123.670880 / 0.022800 / 0.01484050560 / +0.00795949440`，completed net=`+0.6436029565 bps`、fee cover=`1.5363357971`，max DD=`0.004453 < 0.50`。但只有`8/30` completed fills且第五個episode未flat，正式economic gate未形成。External markout retained／merged／pending=`9/9/0`，9筆shadow proxy全部因後續reprice或exit eligibility保守列為`indeterminate`，不能用來選side。
+- 02:05:12 fatal stop原因為`strategy hard stop: soft exit is stranded outside the normal passive quote band by the economic gate`。Shutdown後runtime／orders=`0/0`，兩次authenticated postflight一致為BTC short `0.00020 @ 77207.4`；未做recovery mutation。Raw evidence `logs/market_maker_gate_c_shadow_live_stranded_stop_20260902-020512.log`，SHA `6B96B04ECFA8102773355DC1B372CCFBFCE22D8E7CCF5428DAAE5D929B6D7519`；analyzer history `128/128 complete`。
+- 取得明確授權後，02:30:55–02:31:09以未變更的既有helper（SHA `2303F87C...172`）執行單向maker-only recovery；order `844424878317012`為`BUY LIMIT + POST_ONLY + reduce_only 0.00020 @ 76987.8`，exact history為filled `0.00020`、remaining `0`。02:31:26／02:31:36雙authenticated postflight皆position／orders=`0/0`、used collateral=`0`、equity=`299.117762`；runtime=`0`，兩份config仍為`dry_run:true`。Sanitized evidence `logs/market_maker_gate_c_recovery_20260902-0231.txt`，SHA `A22999B200AB1384B9B439DBEB805DC36D11559057EB06974EECE0365E2F1EAC`；recovery不計入Gate C economics。
+- 判定：**Gate C hard No-Go；4h未啟動；recovery完成且account flat**。這是設計中的安全停止，不得在live內熱修、放寬economic gate或直接續跑。後續順序為根因修復→offline／fresh dry T3→從Gate C重跑，不能跳過Gate D–F。

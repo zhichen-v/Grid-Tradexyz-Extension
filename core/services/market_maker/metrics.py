@@ -78,6 +78,7 @@ def _default_counters() -> dict[str, int]:
             "active_unwind_blocks",
             "would_active_unwind",
             "episode_cap_blocked",
+            "markout_telemetry_errors",
         )
     }
 
@@ -133,6 +134,7 @@ class MarketMakerMetrics:
     controller_decision_history: list[dict[str, Any]] = field(
         default_factory=list
     )
+    controller_decision_history_total: int = 0
     controller_error_count: int = 0
     controller_ready_seconds: float = 0.0
     controller_warming_seconds: float = 0.0
@@ -223,6 +225,9 @@ class MarketMakerMetrics:
             "reason": getattr(decision, "reason", None),
             "decision_id": getattr(decision, "decision_id", None),
             "bid": {
+                "base_price": base_bid,
+                "shadow_price": shadow_bid,
+                "applied_price": applied_bid,
                 "extra_spread_ticks": bid_extra,
                 "blocked": bid_blocked,
                 "toxicity_score_ticks": getattr(
@@ -234,6 +239,9 @@ class MarketMakerMetrics:
                 "reason": getattr(bid, "reason", None),
             },
             "ask": {
+                "base_price": base_ask,
+                "shadow_price": shadow_ask,
+                "applied_price": applied_ask,
                 "extra_spread_ticks": ask_extra,
                 "blocked": ask_blocked,
                 "toxicity_score_ticks": getattr(
@@ -283,9 +291,13 @@ class MarketMakerMetrics:
             ask_blocked,
             self.controller_bid_extra_ticks,
             self.controller_ask_extra_ticks,
+            current["entry_applicable"],
+            shadow_bid,
+            shadow_ask,
             error,
         )
         if history_key != self._controller_history_key or error is not None:
+            self.controller_decision_history_total += 1
             self.controller_decision_history.append(dict(current))
             del self.controller_decision_history[:-_CONTROLLER_HISTORY_LIMIT]
             self._controller_history_key = history_key
@@ -302,6 +314,7 @@ class MarketMakerMetrics:
             placement_quote_context=(dict(context) if context is not None else None),
             recorded_monotonic=float(now),
         )
+        self.controller_decision_history_total += 1
         self.controller_decision_history.append(snapshot)
         del self.controller_decision_history[:-_CONTROLLER_HISTORY_LIMIT]
 
@@ -355,6 +368,7 @@ class MarketMakerMetrics:
         average_price: Decimal | None,
         now: float,
         mid: Decimal,
+        external_mid: Decimal | None = None,
         source: str,
         terminal: bool,
     ) -> bool:
@@ -429,6 +443,18 @@ class MarketMakerMetrics:
             "fill_price": fill_price,
             "observation_source": source,
             "started_monotonic": now,
+            "raw_mid_at_start": (
+                mid
+                if isinstance(mid, Decimal) and mid.is_finite() and mid > 0
+                else None
+            ),
+            "external_mid_at_start": (
+                external_mid
+                if isinstance(external_mid, Decimal)
+                and external_mid.is_finite()
+                and external_mid > 0
+                else None
+            ),
             "mae_bps": None,
             "mfe_bps": None,
             "attribution_state": "pending",
@@ -445,10 +471,18 @@ class MarketMakerMetrics:
         }
         for horizon in _MARKOUT_HORIZONS:
             event[f"markout_{horizon}s_bps"] = None
+            event[f"raw_mid_{horizon}s"] = None
+            event[f"raw_mid_markout_{horizon}s_bps"] = None
+            event[f"external_mid_{horizon}s"] = None
+            event[f"external_mid_markout_{horizon}s_bps"] = None
         self._annotate_markout_event(event)
         self.fill_markouts.append(event)
         del self.fill_markouts[:-_MARKOUT_EVENT_LIMIT]
-        self.update_fill_markouts(now=now, mid=mid)
+        self.update_fill_markouts(
+            now=now,
+            mid=mid,
+            external_mid=external_mid,
+        )
         return True
 
     def apply_authenticated_fill_attributions(
@@ -616,33 +650,60 @@ class MarketMakerMetrics:
         self._maker_fill_open_ids.intersection_update(order_ids)
         self._trim_maker_fill_progress()
 
-    def update_fill_markouts(self, *, now: float, mid: Decimal) -> None:
+    def update_fill_markouts(
+        self,
+        *,
+        now: float,
+        mid: Decimal,
+        external_mid: Decimal | None = None,
+    ) -> None:
         if not isinstance(mid, Decimal) or not mid.is_finite() or mid <= 0:
             return
+        valid_external_mid = (
+            isinstance(external_mid, Decimal)
+            and external_mid.is_finite()
+            and external_mid > 0
+        )
         for event in self.fill_markouts:
             if event["markout_60s_bps"] is not None:
                 continue
             age = max(0.0, now - event["started_monotonic"])
             fill_price = event["fill_price"]
-            markout = (
+            raw_markout = (
                 (mid - fill_price) / fill_price * _TEN_THOUSAND
                 if event["side"] == "buy"
                 else (fill_price - mid) / fill_price * _TEN_THOUSAND
             )
             event["mae_bps"] = (
-                markout
+                raw_markout
                 if event["mae_bps"] is None
-                else min(event["mae_bps"], markout)
+                else min(event["mae_bps"], raw_markout)
             )
             event["mfe_bps"] = (
-                markout
+                raw_markout
                 if event["mfe_bps"] is None
-                else max(event["mfe_bps"], markout)
+                else max(event["mfe_bps"], raw_markout)
             )
             for horizon in _MARKOUT_HORIZONS:
                 key = f"markout_{horizon}s_bps"
                 if event[key] is None and age >= horizon:
-                    event[key] = markout
+                    event[key] = raw_markout
+                    event[f"raw_mid_{horizon}s"] = mid
+                    event[f"raw_mid_markout_{horizon}s_bps"] = raw_markout
+                    if valid_external_mid:
+                        external_markout = (
+                            (external_mid - fill_price)
+                            / fill_price
+                            * _TEN_THOUSAND
+                            if event["side"] == "buy"
+                            else (fill_price - external_mid)
+                            / fill_price
+                            * _TEN_THOUSAND
+                        )
+                        event[f"external_mid_{horizon}s"] = external_mid
+                        event[
+                            f"external_mid_markout_{horizon}s_bps"
+                        ] = external_markout
 
     def _side_markout_summary(self) -> dict[str, Any]:
         summary: dict[str, Any] = {}
@@ -653,9 +714,10 @@ class MarketMakerMetrics:
             ]
             for horizon in _MARKOUT_HORIZONS:
                 values = [
-                    event[f"markout_{horizon}s_bps"]
+                    event.get(f"external_mid_markout_{horizon}s_bps")
                     for event in side_events
-                    if event[f"markout_{horizon}s_bps"] is not None
+                    if event.get(f"external_mid_markout_{horizon}s_bps")
+                    is not None
                 ]
                 side_summary[f"{horizon}s"] = {
                     "count": len(values),
@@ -693,7 +755,9 @@ class MarketMakerMetrics:
                             value
                             for event in role_events
                             if (
-                                value := event[f"markout_{horizon}s_bps"]
+                                value := event.get(
+                                    f"external_mid_markout_{horizon}s_bps"
+                                )
                             )
                             is not None
                         ]
@@ -732,10 +796,14 @@ class MarketMakerMetrics:
                 observed = [
                     event
                     for event in events
-                    if event[f"markout_{horizon}s_bps"] is not None
+                    if event.get(f"external_mid_markout_{horizon}s_bps")
+                    is not None
                 ]
                 stats = _markout_stats(
-                    [event[f"markout_{horizon}s_bps"] for event in observed]
+                    [
+                        event.get(f"external_mid_markout_{horizon}s_bps")
+                        for event in observed
+                    ]
                 )
                 stats["ewma_bps"] = None
                 if use_decay and observed:
@@ -756,7 +824,10 @@ class MarketMakerMetrics:
                             -Decimal("2").ln() * age / half_life
                         ).exp()
                         weighted_sum += (
-                            event[f"markout_{horizon}s_bps"] * weight
+                            event.get(
+                                f"external_mid_markout_{horizon}s_bps"
+                            )
+                            * weight
                         )
                         total_weight += weight
                     if total_weight > 0:
@@ -815,6 +886,9 @@ class MarketMakerMetrics:
             "controller_decision_history": [
                 dict(item) for item in self.controller_decision_history
             ],
+            "controller_decision_history_total": (
+                self.controller_decision_history_total
+            ),
             "controller_error_count": self.controller_error_count,
             "controller_ready_seconds": self.controller_ready_seconds,
             "controller_warming_seconds": self.controller_warming_seconds,

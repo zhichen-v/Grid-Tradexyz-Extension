@@ -40,6 +40,7 @@ class MarketMakerControllerTelemetryTests(unittest.TestCase):
         now: float,
         *,
         entry_applicable: bool = True,
+        shadow_bid: Decimal = Decimal("99.8"),
     ) -> None:
         if metrics.runtime_state is not RuntimeState.ACTIVE:
             metrics.transition(RuntimeState.ACTIVE)
@@ -48,7 +49,7 @@ class MarketMakerControllerTelemetryTests(unittest.TestCase):
             now=now,
             base_bid=Decimal("99.9"),
             base_ask=Decimal("100.1"),
-            shadow_bid=Decimal("99.8"),
+            shadow_bid=shadow_bid,
             shadow_ask=Decimal("100.1"),
             applied_bid=Decimal("99.9"),
             applied_ask=Decimal("100.1"),
@@ -73,6 +74,32 @@ class MarketMakerControllerTelemetryTests(unittest.TestCase):
         self.assertEqual(
             metrics.controller_decision_history[-1]["decision_id"], 252
         )
+        self.assertEqual(metrics.controller_decision_history_total, 250)
+
+    def test_history_records_shadow_reprice_and_applicability_change(self) -> None:
+        metrics = MarketMakerMetrics(0.0)
+        self.record(metrics, self.decision(1), 0.0)
+        self.record(
+            metrics,
+            self.decision(2),
+            1.0,
+            shadow_bid=Decimal("99.7"),
+        )
+        self.record(
+            metrics,
+            self.decision(3),
+            2.0,
+            shadow_bid=Decimal("99.7"),
+            entry_applicable=False,
+        )
+
+        history = metrics.controller_decision_history
+        self.assertEqual(len(history), 3)
+        self.assertEqual(
+            metrics.snapshot(2.0)["controller_decision_history_total"], 3
+        )
+        self.assertEqual(history[1]["bid"]["shadow_price"], Decimal("99.7"))
+        self.assertFalse(history[2]["entry_applicable"])
 
     def test_ready_warming_and_blocked_seconds_accrue(self) -> None:
         metrics = MarketMakerMetrics(0.0)
@@ -157,6 +184,7 @@ class MarketMakerControllerTelemetryTests(unittest.TestCase):
             metrics.controller_decision_history[-1]["placement_quote_context"]
         )
         self.assertEqual(len(metrics.controller_decision_history), 3)
+        self.assertEqual(metrics.controller_decision_history_total, 3)
 
     def test_seconds_exclude_inapplicable_and_stopped_intervals(self) -> None:
         metrics = MarketMakerMetrics(0.0)
@@ -189,18 +217,18 @@ class MarketMakerControllerTelemetryTests(unittest.TestCase):
             "fill_role": "entry",
             "active_unwind": False,
             "observation_source": "websocket_order_update",
-            "markout_15s_bps": Decimal("0"),
+            "external_mid_markout_15s_bps": Decimal("0"),
         }
         metrics.fill_markouts = [
             {
                 **template,
                 "started_monotonic": 0.0,
-                "markout_5s_bps": Decimal("-10"),
+                "external_mid_markout_5s_bps": Decimal("-10"),
             },
             {
                 **template,
                 "started_monotonic": 90.0,
-                "markout_5s_bps": Decimal("-2"),
+                "external_mid_markout_5s_bps": Decimal("-2"),
             },
         ]
 

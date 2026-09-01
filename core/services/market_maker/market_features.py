@@ -375,22 +375,22 @@ class MarketFeatureStore:
     def _rms_ticks(self, received: float, window_seconds: int) -> Decimal | None:
         points = tuple(self._history)
         cutoff = received - window_seconds
-        prior_index = -1
-        squared_moves: list[Decimal] = []
-        for end_index, (end_timestamp, end_mid) in enumerate(points):
-            target = end_timestamp - 1
-            while (
-                prior_index + 1 < end_index
-                and points[prior_index + 1][0] <= target
-            ):
-                prior_index += 1
-            if end_timestamp > cutoff and prior_index >= 0:
-                move = (end_mid - points[prior_index][1]) / self.price_tick
-                squared_moves.append(move * move)
-        if not squared_moves:
+        squared_moves = _ZERO
+        elapsed_seconds = _ZERO
+        for (start_timestamp, start_mid), (end_timestamp, end_mid) in zip(
+            points, points[1:]
+        ):
+            if end_timestamp <= cutoff:
+                continue
+            elapsed = Decimal(str(end_timestamp)) - Decimal(str(start_timestamp))
+            if elapsed <= _ZERO:
+                continue
+            move = (end_mid - start_mid) / self.price_tick
+            squared_moves += move * move
+            elapsed_seconds += elapsed
+        if elapsed_seconds == _ZERO:
             return None
-        mean_square = sum(squared_moves, _ZERO) / Decimal(len(squared_moves))
-        result = mean_square.sqrt()
+        result = (squared_moves / elapsed_seconds).sqrt()
         return result if result.is_finite() else None
 
     def _prune(self, received: float) -> None:

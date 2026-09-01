@@ -43,7 +43,9 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
                     "attribution_state": "authenticated",
                     "active_unwind": False,
                     "source": "websocket_order_update",
-                    "markouts": {"5": "-1.5"},
+                    "markout_5s_bps": "8",
+                    "raw_mid_markout_5s_bps": "8",
+                    "external_mid_markout_5s_bps": "-1.5",
                     "quote_context": {
                         "base_price": "100",
                         "shadow_price": "99",
@@ -57,7 +59,9 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
                     "attribution_state": "authenticated",
                     "active_unwind": False,
                     "source": "reconciliation",
-                    "markouts": {"5": "0.5"},
+                    "markout_5s_bps": "9",
+                    "raw_mid_markout_5s_bps": "9",
+                    "external_mid_markout_5s_bps": "0.5",
                 },
             ],
             "fill_markout_coverage": {"retained_events": 2},
@@ -85,6 +89,7 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
             report["markouts"]["entry_by_side_horizon"]["buy"]["5"]["count"],
             1,
         )
+        self.assertEqual(report["coverage"]["external_reference_missing"], 0)
         self.assertEqual(
             report["markouts"]["exit_by_role_side_horizon"]
             ["passive_exit"]["sell"]["5"]["count"],
@@ -139,7 +144,11 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
                 {
                     "account_audit": {},
                     "fill_markouts": [
-                        {"order_id": "unknown", "side": "buy", "markouts": {"5": "9"}}
+                        {
+                            "order_id": "unknown",
+                            "side": "buy",
+                            "external_mid_markout_5s_bps": "9",
+                        }
                     ],
                 }
             ]
@@ -149,6 +158,33 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
         self.assertEqual(
             report["markouts"]["authenticated_by_role_side_horizon"], {}
         )
+
+    def test_raw_only_markout_is_diagnostic_not_strategy_evidence(self) -> None:
+        report = analyze(
+            [
+                {
+                    "account_audit": {},
+                    "fill_markouts": [
+                        {
+                            "order_id": "raw-only",
+                            "side": "buy",
+                            "fill_role": "entry",
+                            "attribution_state": "authenticated",
+                            "active_unwind": False,
+                            "markout_5s_bps": "12",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            report["markouts"]["authenticated_by_role_side_horizon"], {}
+        )
+        self.assertEqual(report["coverage"]["external_reference_missing"], 1)
+        row = report["shadow_counterfactual"]["fills"][0]
+        self.assertEqual(row["markouts"], {})
+        self.assertEqual(row["raw_markouts"], {"5": "12"})
 
     def test_legacy_e2ay_summary_stays_all_pending_and_indeterminate(self) -> None:
         text = """
@@ -195,7 +231,7 @@ Retained maker fill events: 16.
             "attribution_state": "authenticated",
             "fill_role": "entry",
             "active_unwind": False,
-            "markout_5s_bps": "1",
+            "external_mid_markout_5s_bps": "1",
             "quote_context": {"base_price": "101", "shadow_price": "102"},
         }
         downgraded = {
@@ -208,7 +244,7 @@ Retained maker fill events: 16.
             "attribution_state": "authenticated",
             "fill_role": "entry",
             "active_unwind": False,
-            "markout_5s_bps": "-3",
+            "external_mid_markout_5s_bps": "-3",
         }
         early = {
             "uptime_seconds": 10,
@@ -227,7 +263,7 @@ Retained maker fill events: 16.
                     "attribution_state": "authenticated",
                     "fill_role": "entry",
                     "active_unwind": False,
-                    "markout_5s_bps": "-2",
+                    "external_mid_markout_5s_bps": "-2",
                     "quote_context": {
                         "base_price": "100",
                         "shadow_price": "99",
@@ -331,7 +367,7 @@ Retained maker fill events: 16.
                 "fill_role": role,
                 "attribution_state": state,
                 "active_unwind": active,
-                "markouts": {"5": "-1"},
+                "external_mid_markout_5s_bps": "-1",
                 "quote_context": {
                     "base_price": "100",
                     "shadow_price": shadow,
@@ -362,6 +398,195 @@ Retained maker fill events: 16.
         for order_id in ("exit", "pending", "active"):
             self.assertEqual(rows[order_id]["classification"], "indeterminate")
             self.assertIsNone(rows[order_id]["shadow_farther"])
+
+    def test_counterfactual_is_indeterminate_after_later_block_or_reprice(
+        self,
+    ) -> None:
+        def event(order_id: str, side: str, created: str) -> dict:
+            return {
+                "order_id": order_id,
+                "side": side,
+                "price": "100",
+                "started_monotonic": "20",
+                "fill_role": "entry",
+                "attribution_state": "authenticated",
+                "active_unwind": False,
+                "external_mid_markout_5s_bps": "-1",
+                "quote_context": {
+                    "base_price": "100",
+                    "shadow_price": "99" if side == "buy" else "101",
+                    "extra_spread_ticks": "1",
+                    "created_monotonic": created,
+                },
+            }
+
+        report = analyze(
+            [
+                {
+                    "uptime_seconds": 20,
+                    "account_audit": {},
+                    "fill_markouts": [
+                        event("later-block", "buy", "1"),
+                        event("later-reprice", "sell", "2"),
+                        event("later-unavailable", "buy", "12"),
+                        event("later-price-reprice", "buy", "10.5"),
+                        event("later-inapplicable", "sell", "16"),
+                    ],
+                    "controller_decision_history": [
+                        {
+                            "decision_id": 2,
+                            "recorded_monotonic": "10",
+                            "bid": {"blocked": True, "extra_spread_ticks": "1"},
+                            "ask": {
+                                "blocked": False,
+                                "extra_spread_ticks": "2",
+                            },
+                        },
+                        {
+                            "decision_id": 3,
+                            "recorded_monotonic": "11",
+                            "ready": True,
+                            "entry_applicable": True,
+                            "bid": {
+                                "blocked": False,
+                                "extra_spread_ticks": "1",
+                                "shadow_price": "98",
+                            },
+                        },
+                        {
+                            "decision_id": 4,
+                            "recorded_monotonic": "15",
+                            "ready": False,
+                            "error": "feature_pipeline_failed",
+                        },
+                        {
+                            "decision_id": 5,
+                            "recorded_monotonic": "17",
+                            "ready": True,
+                            "entry_applicable": False,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        rows = {
+            row["order_id"]: row
+            for row in report["shadow_counterfactual"]["fills"]
+        }
+        self.assertEqual(rows["later-block"]["classification"], "indeterminate")
+        self.assertEqual(
+            rows["later-block"]["classification_reason"],
+            "later_shadow_block",
+        )
+        self.assertEqual(
+            rows["later-reprice"]["classification"], "indeterminate"
+        )
+        self.assertEqual(
+            rows["later-reprice"]["classification_reason"],
+            "later_shadow_reprice",
+        )
+        self.assertEqual(
+            rows["later-unavailable"]["classification"], "indeterminate"
+        )
+        self.assertEqual(
+            rows["later-unavailable"]["classification_reason"],
+            "later_shadow_unavailable",
+        )
+        self.assertEqual(
+            rows["later-price-reprice"]["classification_reason"],
+            "later_shadow_reprice",
+        )
+        self.assertEqual(
+            rows["later-inapplicable"]["classification_reason"],
+            "later_entry_inapplicable",
+        )
+
+    def test_episode_ledgers_merge_across_checkpoints_by_stable_identity(
+        self,
+    ) -> None:
+        def episode(sequence: int) -> dict:
+            return {
+                "session_id": "session-a",
+                "episode_sequence": sequence,
+                "opened_at": f"2026-09-01T00:0{sequence}:00Z",
+                "closed_at": f"2026-09-01T00:0{sequence}:30Z",
+                "entry_side": "buy",
+                "gross": str(sequence),
+                "net_ex_funding": str(sequence),
+                "close_type": "maker_flat",
+            }
+
+        early = {
+            "uptime_seconds": 10,
+            "account_audit": {
+                "completed_fills": 2,
+                "completed_episode_ledger": [episode(1), episode(2)],
+            },
+        }
+        later = {
+            "uptime_seconds": 20,
+            "account_audit": {
+                "completed_fills": 3,
+                "completed_episode_ledger": [episode(2), episode(3)],
+            },
+        }
+
+        forward = analyze([early, later])
+        reverse = analyze([later, early])
+
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward["episodes"]["count"], 3)
+        self.assertEqual(forward["episodes"]["gross"]["mean"], Decimal("2"))
+        self.assertEqual(forward["coverage"]["merged_unique_episodes"], 3)
+        self.assertEqual(forward["coverage"]["identified_episodes"], 3)
+        self.assertEqual(
+            forward["coverage"]["legacy_final_snapshot_episodes"], 0
+        )
+
+    def test_incomplete_controller_history_fails_counterfactual_closed(
+        self,
+    ) -> None:
+        report = analyze(
+            [
+                {
+                    "account_audit": {},
+                    "controller_decision_history_total": 2,
+                    "controller_decision_history": [
+                        {
+                            "decision_id": 2,
+                            "recorded_monotonic": "2",
+                            "ready": True,
+                            "entry_applicable": True,
+                        }
+                    ],
+                    "fill_markouts": [
+                        {
+                            "order_id": "history-gap",
+                            "side": "buy",
+                            "price": "99",
+                            "started_monotonic": "3",
+                            "fill_role": "entry",
+                            "attribution_state": "authenticated",
+                            "active_unwind": False,
+                            "external_mid_markout_5s_bps": "-1",
+                            "quote_context": {
+                                "base_price": "100",
+                                "shadow_price": "99",
+                                "created_monotonic": "1",
+                            },
+                        }
+                    ],
+                }
+            ]
+        )
+
+        row = report["shadow_counterfactual"]["fills"][0]
+        self.assertEqual(row["classification"], "indeterminate")
+        self.assertEqual(
+            row["classification_reason"], "controller_history_incomplete"
+        )
+        self.assertFalse(report["coverage"]["controller_history_complete"])
 
 
 if __name__ == "__main__":
