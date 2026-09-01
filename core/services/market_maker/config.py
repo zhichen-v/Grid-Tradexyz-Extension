@@ -67,6 +67,25 @@ class MarketMakerConfig:
     max_raw_spread_bps: Decimal = Decimal("100")
     trend_guard_window_seconds: int = 0
     trend_guard_threshold_ticks: int = 0
+    quote_controller_mode: str = "fixed"
+    quote_controller_type: str = "toxicity_v1"
+    toxicity_book_depth_levels: int = 5
+    toxicity_feature_window_seconds: int = 60
+    toxicity_feature_reset_gap_seconds: int = 10
+    toxicity_warmup_seconds: int = 60
+    toxicity_min_samples: int = 20
+    toxicity_min_signal_ticks: Decimal = Decimal("0")
+    toxicity_widen_start_ticks: Decimal = Decimal("0")
+    toxicity_max_extra_spread_ticks: int = 0
+    toxicity_block_threshold_ticks: Decimal = Decimal("0")
+    toxicity_resume_threshold_ticks: Decimal = Decimal("0")
+    toxicity_block_confirmations: int = 2
+    toxicity_resume_confirmations: int = 2
+    toxicity_min_block_seconds: int = 5
+    toxicity_use_markout_feedback: bool = False
+    toxicity_markout_horizon_seconds: int = 5
+    toxicity_markout_min_samples: int = 8
+    toxicity_markout_half_life_seconds: int = 900
     maker_fee_rate: Decimal = Decimal("0")
     taker_fee_rate: Decimal = Decimal("0")
     min_profit_buffer_bps: Decimal = Decimal("0.5")
@@ -116,6 +135,10 @@ class MarketMakerConfig:
             "maker_fee_rate",
             "taker_fee_rate",
             "min_profit_buffer_bps",
+            "toxicity_min_signal_ticks",
+            "toxicity_widen_start_ticks",
+            "toxicity_block_threshold_ticks",
+            "toxicity_resume_threshold_ticks",
             "max_session_drawdown",
             "max_session_loss_for_maker_exit",
             "active_unwind_loss_trigger",
@@ -158,6 +181,71 @@ class MarketMakerConfig:
         ):
             raise ValueError(
                 "trend guard window and threshold must both be zero or positive"
+            )
+        if self.quote_controller_mode not in {"fixed", "shadow", "active"}:
+            raise ValueError(
+                "quote_controller_mode must be 'fixed', 'shadow', or 'active'"
+            )
+        if self.quote_controller_type != "toxicity_v1":
+            raise ValueError("quote_controller_type must be 'toxicity_v1'")
+        for name in (
+            "toxicity_book_depth_levels",
+            "toxicity_feature_window_seconds",
+            "toxicity_feature_reset_gap_seconds",
+            "toxicity_warmup_seconds",
+            "toxicity_min_samples",
+            "toxicity_block_confirmations",
+            "toxicity_resume_confirmations",
+            "toxicity_min_block_seconds",
+            "toxicity_markout_horizon_seconds",
+            "toxicity_markout_min_samples",
+            "toxicity_markout_half_life_seconds",
+        ):
+            self._validate_int(name, minimum=1)
+        if self.toxicity_block_confirmations > 3:
+            raise ValueError(
+                "toxicity_block_confirmations cannot exceed the three directional signals"
+            )
+        if self.toxicity_feature_window_seconds < 60:
+            raise ValueError(
+                "toxicity_feature_window_seconds must cover the 60-second horizon"
+            )
+        if self.toxicity_min_samples > 4096:
+            raise ValueError("toxicity_min_samples cannot exceed 4096")
+        if self.toxicity_markout_horizon_seconds not in {5, 15}:
+            raise ValueError(
+                "toxicity_markout_horizon_seconds must be 5 or 15"
+            )
+        self._validate_int("toxicity_max_extra_spread_ticks", minimum=0)
+        for name in (
+            "toxicity_min_signal_ticks",
+            "toxicity_widen_start_ticks",
+            "toxicity_block_threshold_ticks",
+            "toxicity_resume_threshold_ticks",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if self.toxicity_block_threshold_ticks > 0 and not (
+            self.toxicity_resume_threshold_ticks
+            < self.toxicity_widen_start_ticks
+            < self.toxicity_block_threshold_ticks
+        ):
+            raise ValueError(
+                "toxicity thresholds must satisfy 0 <= resume < widen_start < block"
+            )
+        if self.quote_controller_mode == "active" and not (
+            self.toxicity_max_extra_spread_ticks > 0
+            or self.toxicity_block_threshold_ticks > 0
+        ):
+            raise ValueError(
+                "active quote controller requires widening or blocking"
+            )
+        if (
+            self.quote_controller_mode == "active"
+            and self.toxicity_use_markout_feedback
+        ):
+            raise ValueError(
+                "active quote controller cannot use markout feedback in v1"
             )
         if self.max_raw_spread_bps <= 0:
             raise ValueError("max_raw_spread_bps must be positive")
@@ -343,6 +431,7 @@ class MarketMakerConfig:
             "require_flat_start",
             "ping_pong_enabled",
             "active_unwind_enabled",
+            "toxicity_use_markout_feedback",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")

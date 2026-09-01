@@ -48,7 +48,7 @@ market_maker:
             config.soft_exit_surplus_reserve_bps, Decimal("0.03")
         )
 
-    def test_example_yaml_loads_with_active_unwind_default_off(self) -> None:
+    def test_example_yaml_loads_with_all_rollout_defaults_safe(self) -> None:
         path = (
             Path(__file__).resolve().parents[1]
             / "config"
@@ -60,6 +60,63 @@ market_maker:
 
         self.assertTrue(config.dry_run)
         self.assertFalse(config.active_unwind_enabled)
+        self.assertEqual(config.quote_controller_mode, "fixed")
+        self.assertEqual(config.quote_controller_type, "toxicity_v1")
+
+    def test_quote_controller_defaults_and_valid_active_policy(self) -> None:
+        fixed = MarketMakerConfig()
+        self.assertEqual(fixed.quote_controller_mode, "fixed")
+        self.assertEqual(fixed.toxicity_widen_start_ticks, Decimal("0"))
+        self.assertFalse(fixed.toxicity_use_markout_feedback)
+
+        active = MarketMakerConfig(
+            quote_controller_mode="active",
+            toxicity_min_signal_ticks="0.5",
+            toxicity_widen_start_ticks="1",
+            toxicity_max_extra_spread_ticks=3,
+            toxicity_block_threshold_ticks="4",
+            toxicity_resume_threshold_ticks="0.5",
+        )
+        self.assertEqual(active.toxicity_widen_start_ticks, Decimal("1"))
+        self.assertEqual(active.toxicity_block_threshold_ticks, Decimal("4"))
+
+    def test_quote_controller_rejects_unsafe_or_unknown_configuration(self) -> None:
+        invalid_cases = (
+            ({"quote_controller_mode": "adaptive"}, "quote_controller_mode"),
+            ({"quote_controller_type": "unknown"}, "quote_controller_type"),
+            ({"toxicity_feature_window_seconds": 59}, "60-second"),
+            ({"toxicity_book_depth_levels": 0}, "book_depth"),
+            ({"toxicity_min_samples": 4097}, "cannot exceed 4096"),
+            ({"toxicity_markout_horizon_seconds": 1}, "must be 5 or 15"),
+            ({"toxicity_min_signal_ticks": "-0.1"}, "cannot be negative"),
+            ({"toxicity_max_extra_spread_ticks": -1}, "max_extra"),
+            (
+                {"toxicity_block_confirmations": 4},
+                "three directional signals",
+            ),
+            (
+                {
+                    "quote_controller_mode": "active",
+                    "toxicity_max_extra_spread_ticks": 1,
+                    "toxicity_use_markout_feedback": True,
+                },
+                "cannot use markout feedback",
+            ),
+            (
+                {
+                    "toxicity_block_threshold_ticks": "3",
+                    "toxicity_widen_start_ticks": "1",
+                    "toxicity_resume_threshold_ticks": "1",
+                },
+                "resume < widen_start < block",
+            ),
+            ({"quote_controller_mode": "active"}, "widening or blocking"),
+            ({"toxicity_use_markout_feedback": "false"}, "boolean"),
+        )
+        for values, message in invalid_cases:
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, message):
+                    MarketMakerConfig(**values)  # type: ignore[arg-type]
 
     def test_requires_market_maker_block(self) -> None:
         with self.assertRaisesRegex(ValueError, "market_maker"):

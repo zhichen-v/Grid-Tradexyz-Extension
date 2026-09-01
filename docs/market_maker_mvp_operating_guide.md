@@ -209,3 +209,34 @@ Long-run 每 30 分鐘保存：completed fills／round trips、maker turnover、
 最新live判定為：**P0 LIVE PREVENTION PROVEN / SHORT-LIVE PROMOTION NO-GO / 4H NOT STARTED / FORMAL 30-FILL ECONOMICS INCOMPLETE**。Entry reserve在第8個flat episode後正確阻擋第9輪，不能把「修復後繼續」解讀成可重置session loss或放寬cap。02:52兩次fresh authenticated postflight均為BTC position／orders=`0/0`、used collateral`0`、equity`299.069583`；兩份ignored overlay亦已恢復`dry_run:true`且同SHA `E60F3093E6FC2CC89875C2D79B27AC8E39C830F2FDBCC5CA1FA789573278C16D`。目前不得啟動4h；後續必須先針對雙側負markout與fee-cover不足形成新候選，完成offline regression／fresh T3，再取得新一輪明確live授權與fresh preflight。
 
 VPS 同步與測試仍不在本階段。歷史事故與舊 fingerprint 僅見 [驗證歷史](market_maker_mvp_validation_history.md)，不能代替 fresh preflight。
+
+## 9. Toxicity-aware entry controller rollout（code-only）
+
+本checkpoint新增bounded external-book feature store、authenticated fill-role attribution、`fixed/shadow/active` controller、entry-only arbiter、controller telemetry與本地offline analyzer。它沒有改Grid production code或shared adapter；OrderManager仍是唯一mutation authority，normal quote仍是`POST_ONLY`。Example YAML繼續保持`dry_run:true`、`active_unwind_enabled:false`、`quote_controller_mode:"fixed"`。
+
+Controller硬邊界：
+
+- 只處理flat inventory下的普通maker entry；non-flat或任何`reduce_only`直接bypass。
+- 只能向外widen或移除原本存在的side；不能縮spread、加size、改reference／reservation、改TIF或新增side。
+- Economic stop、entry reserve、RiskManager、inventory unwind與uncertain／reconciliation fail-closed均有優先權。
+- Active feature未ready、stale、invalid或feature pipeline exception時，flat entry關閉；non-flat exit仍可收斂。
+- Authenticated markout feedback只接受entry、非active unwind、WS／ordinary reconciliation及5／15秒資料；v1 active禁止使用feedback，shadow只供校準。
+
+本地分析只讀既有log／metrics，不連線交易所：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\analyze_market_maker_strategy.py <metrics-or-log> --json-output report.json --markdown-output report.md
+```
+
+Shadow輸出是counterfactual proxy，不是queue-fill backtest。舊E2ay只有16筆未帶authenticated role join的markout，所以必須維持`pending=16 / indeterminate=16`，不能回溯推斷entry／exit。
+
+Promotion順序固定：
+
+1. Gate A：`fixed` 30分鐘dry T3，真實create／cancel為0、hard counters全0，並證明既有quote parity。
+2. Gate B：`shadow` 30分鐘dry T3，final desired／would-place與fixed一致，feature readiness、decision history及CPU／RSS有界。
+3. Gate C：另取明確live授權後才做shadow live；實際仍送fixed quote，至少30 completed maker fills且authenticated natural flat，產出calibration report但不得稱收益證明。
+4. Gate D：依authenticated entry markout選較差一側，只開單側widening、不開blocking；base spread、size、mutation、unwind caps與另一側均不變，完整economic/hard-safety gate照舊。
+5. Gate E：只有單側active canary完整GO後才測雙側widening；side blocking仍是另一個單變因。
+6. Gate F：至少2–3次彼此獨立的fresh-flat short sessions通過後才做4小時；4小時GO後才考慮24小時／VPS。
+
+本checkpoint沒有執行Gate A–F、network、T3、live、flatten或account mutation，也不授權下一輪。E2ay維持「P0 prevention proof GO／short-live promotion NO-GO／4h未啟動／正式30-fill economics incomplete」。

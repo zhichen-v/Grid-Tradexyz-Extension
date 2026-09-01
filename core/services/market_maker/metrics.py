@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+import math
+from typing import Any, Iterable
 
 from .models import RuntimeState
 
@@ -11,6 +12,40 @@ _TEN_THOUSAND = Decimal("10000")
 _MARKOUT_HORIZONS = (1, 5, 15, 60)
 _MARKOUT_EVENT_LIMIT = 100
 _MARKOUT_PROGRESS_LIMIT = 500
+_ATTRIBUTION_LIMIT = 500
+_ATTRIBUTION_CONFLICT_LIMIT = _ATTRIBUTION_LIMIT + _MARKOUT_EVENT_LIMIT
+_CONTROLLER_HISTORY_LIMIT = 200
+_QUOTE_CONTEXT_LIMIT = 500
+_FILL_ROLES = ("entry", "risk_increasing", "passive_exit", "active_exit")
+_ENTRY_FEEDBACK_HORIZONS = (5, 15)
+_ENTRY_FEEDBACK_SOURCES = frozenset(
+    {"websocket_order_update", "reconciliation"}
+)
+
+
+def _markout_stats(values: list[Decimal]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "mean_bps": None,
+            "median_bps": None,
+            "min_bps": None,
+            "max_bps": None,
+        }
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    median = (
+        ordered[middle]
+        if len(ordered) % 2
+        else (ordered[middle - 1] + ordered[middle]) / Decimal("2")
+    )
+    return {
+        "count": len(ordered),
+        "mean_bps": sum(ordered, Decimal("0")) / len(ordered),
+        "median_bps": median,
+        "min_bps": ordered[0],
+        "max_bps": ordered[-1],
+    }
 
 
 def _default_counters() -> dict[str, int]:
@@ -94,11 +129,42 @@ class MarketMakerMetrics:
     counters: dict[str, int] = field(default_factory=_default_counters)
     account_audit: dict[str, Any] = field(default_factory=dict)
     inventory_unwind: dict[str, Any] = field(default_factory=dict)
+    quote_controller: dict[str, Any] = field(default_factory=dict)
+    controller_decision_history: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+    controller_error_count: int = 0
+    controller_ready_seconds: float = 0.0
+    controller_warming_seconds: float = 0.0
+    controller_bid_blocked_seconds: float = 0.0
+    controller_ask_blocked_seconds: float = 0.0
+    controller_both_blocked_seconds: float = 0.0
+    controller_bid_extra_ticks: int = 0
+    controller_ask_extra_ticks: int = 0
+    controller_base_bid: Decimal | None = None
+    controller_base_ask: Decimal | None = None
+    controller_shadow_bid: Decimal | None = None
+    controller_shadow_ask: Decimal | None = None
+    controller_applied_bid: Decimal | None = None
+    controller_applied_ask: Decimal | None = None
+    controller_feature_snapshot: dict[str, Any] = field(default_factory=dict)
     fill_markouts: list[dict[str, Any]] = field(default_factory=list)
     _maker_fill_progress: dict[str, tuple[Decimal, Decimal]] = field(
         default_factory=dict
     )
     _maker_fill_open_ids: set[str] = field(default_factory=set)
+    _authenticated_fill_attributions: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    _attribution_conflict_order_ids: dict[str, None] = field(
+        default_factory=dict
+    )
+    _controller_last_monotonic: float | None = None
+    _controller_history_key: tuple[Any, ...] | None = None
+    _controller_last_decision: dict[str, Any] | None = None
+    _quote_context_by_order: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
 
     def transition(self, state: RuntimeState, reason: str | None = None) -> None:
         if state is not self.runtime_state:
@@ -120,6 +186,164 @@ class MarketMakerMetrics:
         self.failed_cycles += 1
         self.consecutive_errors += 1
         return self.consecutive_errors
+
+    def record_controller_decision(
+        self,
+        decision: Any,
+        *,
+        now: float,
+        base_bid: Decimal | None,
+        base_ask: Decimal | None,
+        shadow_bid: Decimal | None,
+        shadow_ask: Decimal | None,
+        applied_bid: Decimal | None,
+        applied_ask: Decimal | None,
+        feature_snapshot: dict[str, Any] | None,
+        entry_applicable: bool = True,
+        error: str | None = None,
+    ) -> None:
+        """Record bounded controller telemetry without affecting quote behavior."""
+        if isinstance(now, bool) or not isinstance(now, (int, float)):
+            return
+        now_value = float(now)
+        if not math.isfinite(now_value):
+            return
+        self._accrue_controller_seconds(now_value)
+
+        bid = getattr(decision, "bid", None)
+        ask = getattr(decision, "ask", None)
+        bid_extra = getattr(bid, "extra_spread_ticks", 0)
+        ask_extra = getattr(ask, "extra_spread_ticks", 0)
+        bid_blocked = getattr(bid, "blocked", False)
+        ask_blocked = getattr(ask, "blocked", False)
+        current = {
+            "mode": getattr(decision, "mode", None),
+            "controller": getattr(decision, "controller", None),
+            "ready": getattr(decision, "ready", False) is True,
+            "reason": getattr(decision, "reason", None),
+            "decision_id": getattr(decision, "decision_id", None),
+            "bid": {
+                "extra_spread_ticks": bid_extra,
+                "blocked": bid_blocked,
+                "toxicity_score_ticks": getattr(
+                    bid, "toxicity_score_ticks", None
+                ),
+                "directional_confirmations": getattr(
+                    bid, "directional_confirmations", None
+                ),
+                "reason": getattr(bid, "reason", None),
+            },
+            "ask": {
+                "extra_spread_ticks": ask_extra,
+                "blocked": ask_blocked,
+                "toxicity_score_ticks": getattr(
+                    ask, "toxicity_score_ticks", None
+                ),
+                "directional_confirmations": getattr(
+                    ask, "directional_confirmations", None
+                ),
+                "reason": getattr(ask, "reason", None),
+            },
+            "feature_health": (
+                feature_snapshot.get("health")
+                if isinstance(feature_snapshot, dict)
+                else None
+            ),
+            "features": (
+                dict(feature_snapshot)
+                if isinstance(feature_snapshot, dict)
+                else {}
+            ),
+            "entry_applicable": entry_applicable is True,
+            "error": error,
+            "recorded_monotonic": now_value,
+        }
+        self.quote_controller = current
+        self.controller_bid_extra_ticks = (
+            bid_extra if type(bid_extra) is int and bid_extra >= 0 else 0
+        )
+        self.controller_ask_extra_ticks = (
+            ask_extra if type(ask_extra) is int and ask_extra >= 0 else 0
+        )
+        self.controller_base_bid = base_bid
+        self.controller_base_ask = base_ask
+        self.controller_shadow_bid = shadow_bid
+        self.controller_shadow_ask = shadow_ask
+        self.controller_applied_bid = applied_bid
+        self.controller_applied_ask = applied_ask
+        self.controller_feature_snapshot = (
+            dict(feature_snapshot) if isinstance(feature_snapshot, dict) else {}
+        )
+        if error is not None:
+            self.controller_error_count += 1
+
+        history_key = (
+            current["ready"],
+            bid_blocked,
+            ask_blocked,
+            self.controller_bid_extra_ticks,
+            self.controller_ask_extra_ticks,
+            error,
+        )
+        if history_key != self._controller_history_key or error is not None:
+            self.controller_decision_history.append(dict(current))
+            del self.controller_decision_history[:-_CONTROLLER_HISTORY_LIMIT]
+            self._controller_history_key = history_key
+        self._controller_last_decision = dict(current)
+
+    def record_controller_fill_snapshot(self, order_id: str, now: float) -> None:
+        context = self._quote_context_by_order.get(order_id)
+        if not order_id or self._controller_last_decision is None:
+            return
+        snapshot = dict(self._controller_last_decision)
+        snapshot.update(
+            event="maker_fill",
+            fill_order_id=order_id,
+            placement_quote_context=(dict(context) if context is not None else None),
+            recorded_monotonic=float(now),
+        )
+        self.controller_decision_history.append(snapshot)
+        del self.controller_decision_history[:-_CONTROLLER_HISTORY_LIMIT]
+
+    def record_quote_context(
+        self, order_id: str, context: dict[str, Any]
+    ) -> None:
+        if not order_id or not isinstance(context, dict):
+            return
+        self._quote_context_by_order.pop(order_id, None)
+        self._quote_context_by_order[order_id] = dict(context)
+        while len(self._quote_context_by_order) > _QUOTE_CONTEXT_LIMIT:
+            self._quote_context_by_order.pop(next(iter(self._quote_context_by_order)))
+        for event in self.fill_markouts:
+            if event.get("order_id") == order_id:
+                event["quote_context"] = dict(context)
+
+    def _accrue_controller_seconds(self, now: float) -> None:
+        previous = self._controller_last_monotonic
+        if previous is not None and now < previous:
+            return
+        self._controller_last_monotonic = now
+        if (
+            previous is None
+            or not self.quote_controller
+            or self.runtime_state is not RuntimeState.ACTIVE
+            or self.quote_controller.get("entry_applicable") is not True
+        ):
+            return
+        elapsed = now - previous
+        if self.quote_controller.get("ready") is True:
+            self.controller_ready_seconds += elapsed
+        else:
+            self.controller_warming_seconds += elapsed
+            return
+        bid_blocked = self.quote_controller.get("bid", {}).get("blocked") is True
+        ask_blocked = self.quote_controller.get("ask", {}).get("blocked") is True
+        if bid_blocked:
+            self.controller_bid_blocked_seconds += elapsed
+        if ask_blocked:
+            self.controller_ask_blocked_seconds += elapsed
+        if bid_blocked and ask_blocked:
+            self.controller_both_blocked_seconds += elapsed
 
     def record_maker_fill_markout(
         self,
@@ -172,6 +396,21 @@ class MarketMakerMetrics:
         fill_price = delta_notional / delta_filled
         if not fill_price.is_finite() or fill_price <= 0:
             return False
+        if (
+            order_id not in self._maker_fill_progress
+            and len(self._maker_fill_progress) >= _MARKOUT_PROGRESS_LIMIT
+        ):
+            evicted = next(
+                (
+                    candidate
+                    for candidate in self._maker_fill_progress
+                    if candidate not in self._maker_fill_open_ids
+                ),
+                None,
+            )
+            if evicted is None:
+                return False
+            self._maker_fill_progress.pop(evicted)
 
         self._maker_fill_progress.pop(order_id, None)
         self._maker_fill_progress[order_id] = (
@@ -192,13 +431,172 @@ class MarketMakerMetrics:
             "started_monotonic": now,
             "mae_bps": None,
             "mfe_bps": None,
+            "attribution_state": "pending",
+            "fill_role": None,
+            "episode_sequence": None,
+            "active_unwind": None,
+            "attribution_signature": None,
+            "attribution_conflict": False,
+            "quote_context": (
+                dict(self._quote_context_by_order[order_id])
+                if order_id in self._quote_context_by_order
+                else None
+            ),
         }
         for horizon in _MARKOUT_HORIZONS:
             event[f"markout_{horizon}s_bps"] = None
+        self._annotate_markout_event(event)
         self.fill_markouts.append(event)
         del self.fill_markouts[:-_MARKOUT_EVENT_LIMIT]
         self.update_fill_markouts(now=now, mid=mid)
         return True
+
+    def apply_authenticated_fill_attributions(
+        self, attributions: Iterable[dict[str, Any]]
+    ) -> None:
+        for attribution in attributions:
+            if not isinstance(attribution, dict):
+                continue
+            trade_id = str(attribution.get("trade_id", "") or "")
+            order_id = str(attribution.get("order_id", "") or "")
+            side = attribution.get("side")
+            role = attribution.get("role")
+            episode_sequence = attribution.get("episode_sequence")
+            prior_position = attribution.get("prior_position")
+            next_position = attribution.get("next_position")
+            exchange_timestamp = attribution.get("exchange_timestamp")
+            active_unwind = attribution.get("active_unwind")
+            position_flip = attribution.get("position_flip", False)
+            if (
+                not trade_id
+                or not order_id
+                or side not in {"buy", "sell"}
+                or role not in _FILL_ROLES
+                or type(episode_sequence) is not int
+                or episode_sequence <= 0
+                or not isinstance(prior_position, Decimal)
+                or not prior_position.is_finite()
+                or not isinstance(next_position, Decimal)
+                or not next_position.is_finite()
+                or type(exchange_timestamp) is not int
+                or exchange_timestamp < 0
+                or type(active_unwind) is not bool
+                or type(position_flip) is not bool
+            ):
+                continue
+            normalized = {
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "side": side,
+                "role": role,
+                "episode_sequence": episode_sequence,
+                "prior_position": prior_position,
+                "next_position": next_position,
+                "exchange_timestamp": exchange_timestamp,
+                "active_unwind": active_unwind,
+                "position_flip": position_flip,
+            }
+            existing = self._authenticated_fill_attributions.get(trade_id)
+            if existing is None:
+                self._authenticated_fill_attributions[trade_id] = normalized
+            elif existing != normalized:
+                self._remember_attribution_conflict(existing["order_id"])
+                self._remember_attribution_conflict(order_id)
+                continue
+        while len(self._authenticated_fill_attributions) > _ATTRIBUTION_LIMIT:
+            self._authenticated_fill_attributions.pop(
+                next(iter(self._authenticated_fill_attributions))
+            )
+        for event in self.fill_markouts:
+            self._annotate_markout_event(event)
+
+    def _annotate_markout_event(self, event: dict[str, Any]) -> None:
+        order_id = event["order_id"]
+        if order_id in self._attribution_conflict_order_ids:
+            self._set_pending_attribution(event, conflict=True)
+            return
+        matches = [
+            attribution
+            for attribution in self._authenticated_fill_attributions.values()
+            if attribution["order_id"] == order_id
+        ]
+        if not matches:
+            return
+        signatures = {
+            (
+                attribution["side"],
+                attribution["role"],
+                attribution["episode_sequence"],
+                attribution["active_unwind"],
+            )
+            for attribution in matches
+        }
+        if len(signatures) != 1 or any(
+            attribution["position_flip"] for attribution in matches
+        ):
+            self._remember_attribution_conflict(order_id)
+            self._set_pending_attribution(event, conflict=True)
+            return
+        side, role, episode_sequence, active_unwind = next(iter(signatures))
+        if side != event["side"]:
+            self._remember_attribution_conflict(order_id)
+            self._set_pending_attribution(event, conflict=True)
+            return
+        signature = {
+            "side": side,
+            "role": role,
+            "episode_sequence": episode_sequence,
+            "active_unwind": active_unwind,
+        }
+        prior_signature = event.get("attribution_signature")
+        if prior_signature is not None and prior_signature != signature:
+            self._remember_attribution_conflict(order_id)
+            self._set_pending_attribution(event, conflict=True)
+            return
+        event.update(
+            attribution_state="authenticated",
+            fill_role=role,
+            episode_sequence=episode_sequence,
+            active_unwind=active_unwind,
+            attribution_signature=signature,
+            attribution_conflict=False,
+        )
+
+    @staticmethod
+    def _set_pending_attribution(
+        event: dict[str, Any], *, conflict: bool
+    ) -> None:
+        event.update(
+            attribution_state="pending",
+            fill_role=None,
+            episode_sequence=None,
+            active_unwind=None,
+            attribution_conflict=conflict,
+        )
+
+    def _remember_attribution_conflict(self, order_id: str) -> None:
+        if not order_id:
+            return
+        self._attribution_conflict_order_ids.pop(order_id, None)
+        self._attribution_conflict_order_ids[order_id] = None
+        while (
+            len(self._attribution_conflict_order_ids)
+            > _ATTRIBUTION_CONFLICT_LIMIT
+        ):
+            pinned = {
+                event["order_id"] for event in self.fill_markouts
+            } | self._maker_fill_open_ids
+            evicted = next(
+                (
+                    candidate
+                    for candidate in self._attribution_conflict_order_ids
+                    if candidate not in pinned
+                ),
+                None,
+            )
+            if evicted is None:
+                break
+            self._attribution_conflict_order_ids.pop(evicted)
 
     def _trim_maker_fill_progress(self) -> None:
         while len(self._maker_fill_progress) > _MARKOUT_PROGRESS_LIMIT:
@@ -270,7 +668,105 @@ class MarketMakerMetrics:
             summary[side] = side_summary
         return summary
 
+    def _authenticated_markout_summary(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for side in ("buy", "sell"):
+            side_events = [
+                event for event in self.fill_markouts if event["side"] == side
+            ]
+            side_summary: dict[str, Any] = {
+                "pending_count": sum(
+                    event.get("attribution_state") != "authenticated"
+                    for event in side_events
+                )
+            }
+            for role in _FILL_ROLES:
+                role_events = [
+                    event
+                    for event in side_events
+                    if event.get("attribution_state") == "authenticated"
+                    and event.get("fill_role") == role
+                ]
+                side_summary[role] = {
+                    f"{horizon}s": _markout_stats(
+                        [
+                            value
+                            for event in role_events
+                            if (
+                                value := event[f"markout_{horizon}s_bps"]
+                            )
+                            is not None
+                        ]
+                    )
+                    for horizon in _MARKOUT_HORIZONS
+                }
+            summary[side] = side_summary
+        return summary
+
+    def authenticated_entry_markout_feedback(
+        self,
+        *,
+        now_monotonic: float | None = None,
+        half_life_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        use_decay = (
+            isinstance(now_monotonic, (int, float))
+            and not isinstance(now_monotonic, bool)
+            and math.isfinite(float(now_monotonic))
+            and type(half_life_seconds) is int
+            and half_life_seconds > 0
+        )
+        summary: dict[str, Any] = {}
+        for side in ("buy", "sell"):
+            events = [
+                event
+                for event in self.fill_markouts
+                if event["side"] == side
+                and event.get("attribution_state") == "authenticated"
+                and event.get("fill_role") == "entry"
+                and event.get("active_unwind") is False
+                and event.get("observation_source") in _ENTRY_FEEDBACK_SOURCES
+            ]
+            side_summary: dict[str, Any] = {}
+            for horizon in _ENTRY_FEEDBACK_HORIZONS:
+                observed = [
+                    event
+                    for event in events
+                    if event[f"markout_{horizon}s_bps"] is not None
+                ]
+                stats = _markout_stats(
+                    [event[f"markout_{horizon}s_bps"] for event in observed]
+                )
+                stats["ewma_bps"] = None
+                if use_decay and observed:
+                    half_life = Decimal(half_life_seconds)
+                    weighted_sum = Decimal("0")
+                    total_weight = Decimal("0")
+                    for event in observed:
+                        age = max(
+                            Decimal("0"),
+                            Decimal(
+                                str(
+                                    float(now_monotonic)
+                                    - event["started_monotonic"]
+                                )
+                            ),
+                        )
+                        weight = (
+                            -Decimal("2").ln() * age / half_life
+                        ).exp()
+                        weighted_sum += (
+                            event[f"markout_{horizon}s_bps"] * weight
+                        )
+                        total_weight += weight
+                    if total_weight > 0:
+                        stats["ewma_bps"] = weighted_sum / total_weight
+                side_summary[f"{horizon}s"] = stats
+            summary[side] = side_summary
+        return summary
+
     def snapshot(self, now: float) -> dict[str, Any]:
+        self._accrue_controller_seconds(now)
         return {
             "runtime_state": self.runtime_state.value,
             "pause_reason": self.pause_reason,
@@ -315,6 +811,37 @@ class MarketMakerMetrics:
             "counters": dict(self.counters),
             "account_audit": dict(self.account_audit),
             "inventory_unwind": dict(self.inventory_unwind),
+            "quote_controller": dict(self.quote_controller),
+            "controller_decision_history": [
+                dict(item) for item in self.controller_decision_history
+            ],
+            "controller_error_count": self.controller_error_count,
+            "controller_ready_seconds": self.controller_ready_seconds,
+            "controller_warming_seconds": self.controller_warming_seconds,
+            "controller_bid_blocked_seconds": (
+                self.controller_bid_blocked_seconds
+            ),
+            "controller_ask_blocked_seconds": (
+                self.controller_ask_blocked_seconds
+            ),
+            "controller_both_blocked_seconds": (
+                self.controller_both_blocked_seconds
+            ),
+            "controller_bid_extra_ticks": self.controller_bid_extra_ticks,
+            "controller_ask_extra_ticks": self.controller_ask_extra_ticks,
+            "controller_base_bid": self.controller_base_bid,
+            "controller_base_ask": self.controller_base_ask,
+            "controller_shadow_bid": self.controller_shadow_bid,
+            "controller_shadow_ask": self.controller_shadow_ask,
+            "controller_applied_bid": self.controller_applied_bid,
+            "controller_applied_ask": self.controller_applied_ask,
+            "controller_feature_snapshot": dict(
+                self.controller_feature_snapshot
+            ),
+            "quote_contexts": [
+                dict(context)
+                for context in self._quote_context_by_order.values()
+            ],
             "fill_markouts": [
                 {
                     **event,
@@ -333,6 +860,23 @@ class MarketMakerMetrics:
                 ),
                 "time_origin": "observation_monotonic",
                 "retained_events": len(self.fill_markouts),
+                "authenticated_events": sum(
+                    event.get("attribution_state") == "authenticated"
+                    for event in self.fill_markouts
+                ),
+                "pending_events": sum(
+                    event.get("attribution_state") != "authenticated"
+                    for event in self.fill_markouts
+                ),
+                "retained_authenticated_attributions": len(
+                    self._authenticated_fill_attributions
+                ),
             },
             "side_markout_summary": self._side_markout_summary(),
+            "authenticated_markout_summary": (
+                self._authenticated_markout_summary()
+            ),
+            "authenticated_entry_markout_feedback": (
+                self.authenticated_entry_markout_feedback()
+            ),
         }

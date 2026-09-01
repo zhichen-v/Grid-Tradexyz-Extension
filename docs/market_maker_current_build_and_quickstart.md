@@ -1,6 +1,6 @@
 # Market Maker 現行搭建與快速導入
 
-> 更新：2026-09-01 Asia/Taipei（entry-reserve short-live gate）。這是「現在可用什麼、參數是什麼、如何安全導入」的入口；不可取代 [操作指南](market_maker_mvp_operating_guide.md) 的安全規則。逐輪證據見 [驗證歷史](market_maker_mvp_validation_history.md)，架構細節見 [MVP Pipeline](CODEX_MARKET_MAKER_MVP_PIPELINE.md)。
+> 更新：2026-09-01 Asia/Taipei（toxicity-aware entry controller code-only checkpoint）。這是「現在可用什麼、參數是什麼、如何安全導入」的入口；不可取代 [操作指南](market_maker_mvp_operating_guide.md) 的安全規則。逐輪證據見 [驗證歷史](market_maker_mvp_validation_history.md)，架構細節見 [MVP Pipeline](CODEX_MARKET_MAKER_MVP_PIPELINE.md)。
 
 ## 1. 目前狀態
 
@@ -12,7 +12,7 @@
 | Account audit／shutdown | Live 內建 authenticated audit；停止先撤單，結束後必須雙 postflight |
 | Passive inventory unwind | Fee-aware exit、soft exit 與有界 maker-loss budget均已具備 |
 | Active inventory unwind | 預設關閉；IOC expiry mapping與full／partial／residual exact-terminal path已有歷史live proof。新entry reserve、獨立loss barrier與strict cap hierarchy已有offline、dry T3及short-live prevention proof；仍未通過4h／production rollout |
-| Economic stop／episode telemetry | Live達最小樣本失敗後鎖新episode、flat後`no_go`；保存bounded episode economics／execution history與WS＋ordinary reconciliation＋REST sync增量markout。最新live保留16筆maker fill，BUY／SELL各時域平均markout皆負；未達30 fills，dynamic quote controller仍停用 |
+| Economic stop／episode telemetry | Live達最小樣本失敗後鎖新episode、flat後`no_go`；保存bounded episode economics／execution history與authenticated role-separated markout。Toxicity-aware controller已有`fixed/shadow/active` code path，但example仍為`fixed`，尚未取得dry T3、live、economic或production promotion |
 | Final 4h validation | **Short-live promotion NO-GO／4h未啟動**：2026-09-01第8個flat episode後，剩餘session unwind budget`0.067657`不足新episode完整reserve`0.075`，entry reserve於新下單前正確block；runtime0，雙postflight flat／orders0 |
 
 最新short-live啟動前兩次authenticated preflight皆為BTC position／orders=`0/0`、used collateral=`0`、equity=`299.101926`。停止後02:52雙postflight皆reads PASS，position／orders=`0/0`、used collateral`0`、equity`299.069583`。該live只有16 completed maker fills，正式economic state仍是`collecting`；負bps與fee cover是不利訊號，但不得冒充達30-fill門檻後的正式economic NO-GO。
@@ -21,7 +21,7 @@
 
 資料與控制流：
 
-`trusted external BBO / position / economics` → `entry admission + risk + inventory episode` → `strategy quote` → `single coordinator` → `order manager` → `Lighter adapter` → `authenticated audit / economic stop / episode + markout metrics`
+`trusted external book / position / economics` → `entry admission + risk` → `base strategy quote` → `feature store + entry controller` → `entry-only quote arbiter` → `inventory episode` → `order manager` → `Lighter adapter` → `authenticated attribution / markout metrics`
 
 - `run_market_maker.py` 是獨立入口；核心位於 `core/services/market_maker/`，與 Grid runtime 分離。
 - Coordinator 是唯一 mutation authority；每側最多一張 managed order。
@@ -88,6 +88,37 @@
 
 Active IOC不是成交量工具。只有exact active order ID、反向side、amount不超過持倉、`reduce_only LIMIT + IOC`、兩階段barrier與全部loss/slippage cap同時成立，才是授權的taker事件。
 
+### 4.4 Toxicity-aware entry controller（尚未 promotion）
+
+Example 的安全預設是：
+
+```yaml
+quote_controller_mode: "fixed"
+quote_controller_type: "toxicity_v1"
+toxicity_max_extra_spread_ticks: 0
+toxicity_block_threshold_ticks: "0"
+toxicity_use_markout_feedback: false
+```
+
+`fixed`保持既有 final quote；`shadow`計算feature、score、widen／block候選但仍把原始base quote交給OrderManager；`active`只可能對flat inventory下的普通maker entry向外加寬或移除一側。既有ping-pong authenticated-flat barrier、non-flat、任何`reduce_only` exit、passive／active unwind、economic stop與entry reserve均優先且不受controller覆蓋。Active feature warming／stale／invalid時flat entry關閉，不會退回fixed猜測。
+
+下一個只供Gate B校準的shadow假設值如下；它不是live config，也沒有收益證明：
+
+```yaml
+quote_controller_mode: "shadow"
+toxicity_min_signal_ticks: "0.5"
+toxicity_widen_start_ticks: "1"
+toxicity_max_extra_spread_ticks: 3
+toxicity_block_threshold_ticks: "4"
+toxicity_resume_threshold_ticks: "0.5"
+toxicity_block_confirmations: 2
+toxicity_resume_confirmations: 2
+toxicity_min_block_seconds: 5
+toxicity_use_markout_feedback: false
+```
+
+先跑fixed parity T3，再跑shadow T3。未完成兩者前，不建立active live overlay。
+
 ## 5. 快速導入 checklist
 
 1. 準備Python 3.12、`uv`及repo `.venv`；依 [操作指南 §2](market_maker_mvp_operating_guide.md#2-安裝credentials-與隔離) 安裝並先跑完整測試。
@@ -137,7 +168,8 @@ IOC expiry修復後，首個active IOC完整成交；另一episode又以partial 
 ## 8. 已知限制
 
 - Active IOC exact-terminal path已有歷史live proof；新entry reserve亦已有short-live prevention proof，但目前只證明「付不起完整stop時不開新episode」，未證明4h穩定或production readiness。不得為完成run而放寬cap。
-- Markout／episode telemetry已取得16筆live maker fill；BUY／SELL的1／5／15／60秒平均值全負。Side-specific widening／pause controller仍停用，須先離線形成單變因候選並重新驗證。
+- E2ay的16筆歷史markout無法回溯取得新的authenticated entry／exit role join，因此分析仍是16筆pending／shadow indeterminate；不得用order奇偶或其他推測補標。新role attribution只適用於後續證據。
+- Side-specific widening／blocking已完成code-only與offline tests，但預設仍為`fixed`。尚未跑Gate A fixed T3或Gate B shadow T3，更沒有controller live、economic或production GO。
 - 最新場只運行23分14秒、16 completed fills；正式30-fill economics仍未完成，且short-live promotion已NO-GO，所以4h沒有啟動。
 - 最新02:52 authenticated truth為flat／orders0；系統仍不會在未授權時自動flatten，任何後續啟動前都需fresh reads。
 - 本地ignored候選不是portable deployment artifact；導入必須從committed example重建並重新做fresh preflight、測試與fingerprint。

@@ -19,10 +19,23 @@ from ...adapters.exchanges.models import (
 )
 from .account_monitor import AccountAuditError, MarketMakerAccountMonitor
 from .config import MarketMakerConfig, ceil_to_step, floor_to_step
+from .controllers import (
+    FixedEntryQuoteController,
+    QuoteControllerContext,
+    QuoteControllerDecision,
+    SideQuoteAdjustment,
+    ToxicityAwareEntryQuoteController,
+)
 from .inventory_unwind import InventoryEpisodeExecutor
+from .market_features import MarketFeatureStore
 from .metrics import MarketMakerMetrics
 from .models import MarketMetadata, MarketSnapshot, PositionSnapshot, RuntimeState
 from .order_manager import MarketMakerOrderManager
+from .quote_arbiter import (
+    QuoteArbiterContext,
+    apply_entry_controller,
+    controller_decision_error,
+)
 from .risk_manager import RiskManager
 from .strategy import MarketMakerStrategy, SoftExitEconomics
 
@@ -78,6 +91,8 @@ class MarketMakerCoordinator:
         metrics: MarketMakerMetrics | None = None,
         account_monitor: Any | None = None,
         inventory_executor: Any | None = None,
+        quote_controller: Any | None = None,
+        market_feature_store: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         status_callback: Callable[[dict[str, Any]], Any] | None = None,
@@ -102,6 +117,13 @@ class MarketMakerCoordinator:
         self.inventory_executor = inventory_executor or InventoryEpisodeExecutor(
             config
         )
+        self.quote_controller = quote_controller or (
+            FixedEntryQuoteController()
+            if config.quote_controller_mode == "fixed"
+            else ToxicityAwareEntryQuoteController.from_config(config)
+        )
+        self.market_feature_store = market_feature_store
+        self._controller_telemetry_decision_id = 0
         self._account_monitor_initialized = False
         self._processed_fill_generation = 0
         self._audited_fill_generation = 0
@@ -690,7 +712,7 @@ class MarketMakerCoordinator:
                 await self._fail_closed(risk.runtime_state, risk.reason)
                 return
 
-            desired = self.strategy.calculate_quotes(
+            base_desired = self.strategy.calculate_quotes(
                 self._market,
                 self._position,
                 self.metadata,
@@ -698,6 +720,14 @@ class MarketMakerCoordinator:
                 orders,
                 now_monotonic=now,
                 soft_exit_economics=self._trusted_soft_exit_economics(now),
+            )
+            desired, controller_cycle = self._apply_entry_quote_controller(
+                base=base_desired,
+                risk=risk,
+                orders=orders,
+                now=now,
+                economic_stop_pending=economic_stop_pending,
+                entry_admission_allowed=allow_new_episode,
             )
             self.metrics.reservation_price = desired.reservation_price
             self.metrics.target_bid = desired.bid.price if desired.bid else None
@@ -858,6 +888,7 @@ class MarketMakerCoordinator:
                 self.metrics.target_bid = desired.bid.price if desired.bid else None
                 self.metrics.target_ask = desired.ask.price if desired.ask else None
             actions = tuple(getattr(result, "actions", ()))
+            self._record_quote_contexts(actions, controller_cycle, now)
             self._record_reconcile_actions(actions)
             if active_lane:
                 for action in actions:
@@ -1658,7 +1689,7 @@ class MarketMakerCoordinator:
         ):
             return
         mid = (self._market.best_bid + self._market.best_ask) / Decimal("2")
-        self.metrics.record_maker_fill_markout(
+        recorded = self.metrics.record_maker_fill_markout(
             order_id=order_id,
             side=order.side.value,
             cumulative_filled=order.filled,
@@ -1675,6 +1706,8 @@ class MarketMakerCoordinator:
                 OrderStatus.EXPIRED,
             },
         )
+        if recorded:
+            self.metrics.record_controller_fill_snapshot(order_id, now)
 
     def _authenticated_flat_checkpoint(self) -> bool:
         return bool(
@@ -1814,6 +1847,287 @@ class MarketMakerCoordinator:
             self._market.best_ask - self.metadata.price_tick,
         )
 
+    def _ensure_market_feature_store(self) -> Any | None:
+        if self.config.quote_controller_mode == "fixed":
+            return None
+        if self.market_feature_store is not None:
+            return self.market_feature_store
+        if self.metadata is None:
+            return None
+        self.market_feature_store = MarketFeatureStore(
+            price_tick=self.metadata.price_tick,
+            depth_levels=self.config.toxicity_book_depth_levels,
+            feature_window_seconds=(
+                self.config.toxicity_feature_window_seconds
+            ),
+            reset_gap_seconds=self.config.toxicity_feature_reset_gap_seconds,
+            warmup_seconds=self.config.toxicity_warmup_seconds,
+            min_samples=self.config.toxicity_min_samples,
+            stale_after_seconds=self.config.stale_book_seconds,
+            clock=self._monotonic,
+        )
+        return self.market_feature_store
+
+    @staticmethod
+    def _feature_snapshot_mapping(features: Any | None) -> dict[str, Any]:
+        if features is None:
+            return {}
+        serializer = getattr(features, "to_dict", None)
+        if not callable(serializer):
+            return {}
+        values = serializer()
+        return dict(values) if isinstance(values, dict) else {}
+
+    def _controller_failure_decision(
+        self, features: Any | None, reason: str, decision_id: int
+    ) -> QuoteControllerDecision:
+        return QuoteControllerDecision(
+            mode=self.config.quote_controller_mode,
+            controller=self.config.quote_controller_type,
+            ready=False,
+            reason=reason,
+            decision_id=decision_id,
+            bid=SideQuoteAdjustment(reason=reason),
+            ask=SideQuoteAdjustment(reason=reason),
+            features=features,
+        )
+
+    def _apply_entry_quote_controller(
+        self,
+        *,
+        base: Any,
+        risk: Any,
+        orders: Iterable[Any],
+        now: float,
+        economic_stop_pending: bool,
+        entry_admission_allowed: bool,
+    ) -> tuple[Any, dict[str, Any]]:
+        assert self._market is not None
+        assert self._position is not None
+        assert self.metadata is not None
+
+        mode = self.config.quote_controller_mode
+        self._controller_telemetry_decision_id += 1
+        decision_id = self._controller_telemetry_decision_id
+        features = None
+        feature_snapshot: dict[str, Any] = {}
+        controller_error: str | None = None
+        if mode != "fixed":
+            try:
+                store = self._ensure_market_feature_store()
+                if store is None:
+                    controller_error = "feature_store_unavailable"
+                else:
+                    features = store.update(
+                        self._market,
+                        orders,
+                        now_monotonic=now,
+                    )
+                    feature_snapshot = self._feature_snapshot_mapping(features)
+                    if not feature_snapshot:
+                        controller_error = "feature_snapshot_unavailable"
+            except Exception as exc:
+                features = None
+                feature_snapshot = {}
+                controller_error = (
+                    f"feature_store_exception:{type(exc).__name__}"
+                )
+
+        entry_markout_feedback: dict[str, Any] = {}
+        if (
+            controller_error is None
+            and mode == "shadow"
+            and self.config.toxicity_use_markout_feedback
+        ):
+            try:
+                entry_markout_feedback = (
+                    self.metrics.authenticated_entry_markout_feedback(
+                        now_monotonic=now,
+                        half_life_seconds=(
+                            self.config.toxicity_markout_half_life_seconds
+                        ),
+                    )
+                )
+            except Exception as exc:
+                controller_error = (
+                    f"markout_feedback_exception:{type(exc).__name__}"
+                )
+
+        context = QuoteControllerContext(
+            now_monotonic=now,
+            features=features,
+            market=self._market,
+            metadata=self.metadata,
+            position=self._position,
+            risk=risk,
+            live_orders=tuple(orders),
+            base_quotes=base,
+            entry_markout_feedback=entry_markout_feedback,
+            economic_stop_pending=economic_stop_pending,
+            entry_admission_allowed=entry_admission_allowed,
+            inventory_unwind_active=(
+                self.config.active_unwind_enabled
+                and self._position.signed_size != 0
+            ),
+            active_unwind_pending=bool(
+                getattr(self.order_manager, "active_unwind_pending", False)
+            ),
+            active_unwind_ready=self._active_unwind_truth_token is not None,
+        )
+        if controller_error is not None:
+            decision = self._controller_failure_decision(
+                features, controller_error, decision_id
+            )
+        else:
+            try:
+                decision = self.quote_controller.evaluate(context)
+                if isinstance(decision, QuoteControllerDecision):
+                    decision = replace(decision, decision_id=decision_id)
+            except Exception as exc:
+                controller_error = f"controller_exception:{type(exc).__name__}"
+                decision = self._controller_failure_decision(
+                    features, "controller_exception", decision_id
+                )
+        validation_error = controller_decision_error(
+            decision, expected_mode=mode
+        )
+        if validation_error is not None:
+            controller_error = controller_error or validation_error
+            decision = self._controller_failure_decision(
+                features, validation_error, decision_id
+            )
+        if getattr(decision, "reason", None) in {
+            "features_invalid",
+            "invalid_time",
+        }:
+            controller_error = controller_error or str(decision.reason)
+
+        arbiter_context = QuoteArbiterContext(
+            ordinary_flat_entry=(
+                self._position.signed_size == 0
+                and risk.runtime_state is RuntimeState.ACTIVE
+                and risk.buy_reduce_only is False
+                and risk.sell_reduce_only is False
+            ),
+            economic_stop_pending=economic_stop_pending,
+            entry_admission_allowed=entry_admission_allowed,
+            risk_reduction_active=(
+                risk.runtime_state is not RuntimeState.ACTIVE
+                or getattr(risk, "soft_exit_latched", False) is True
+            ),
+            inventory_unwind_active=context.inventory_unwind_active,
+            active_unwind_pending=context.active_unwind_pending,
+            active_unwind_ready=context.active_unwind_ready,
+        )
+        entry_applicable = (
+            arbiter_context.ordinary_flat_entry
+            and not arbiter_context.economic_stop_pending
+            and arbiter_context.entry_admission_allowed
+            and not arbiter_context.risk_reduction_active
+            and not arbiter_context.inventory_unwind_active
+            and not arbiter_context.active_unwind_pending
+            and not arbiter_context.active_unwind_ready
+        )
+        if mode == "fixed":
+            shadow = base
+            applied = base
+        elif mode == "shadow":
+            shadow = apply_entry_controller(
+                base,
+                replace(decision, mode="active"),
+                self._position,
+                risk,
+                self.metadata,
+                context=arbiter_context,
+            )
+            applied = base
+        else:
+            applied = apply_entry_controller(
+                base,
+                decision,
+                self._position,
+                risk,
+                self.metadata,
+                context=arbiter_context,
+            )
+            shadow = applied
+
+        self.metrics.record_controller_decision(
+            decision,
+            now=now,
+            base_bid=base.bid.price if base.bid is not None else None,
+            base_ask=base.ask.price if base.ask is not None else None,
+            shadow_bid=shadow.bid.price if shadow.bid is not None else None,
+            shadow_ask=shadow.ask.price if shadow.ask is not None else None,
+            applied_bid=applied.bid.price if applied.bid is not None else None,
+            applied_ask=applied.ask.price if applied.ask is not None else None,
+            feature_snapshot=feature_snapshot,
+            entry_applicable=entry_applicable,
+            error=controller_error,
+        )
+        return applied, {
+            "base": base,
+            "shadow": shadow,
+            "applied": applied,
+            "decision": decision,
+            "features": feature_snapshot,
+        }
+
+    def _record_quote_contexts(
+        self,
+        actions: Iterable[Any],
+        controller_cycle: dict[str, Any],
+        now: float,
+    ) -> None:
+        base = controller_cycle["base"]
+        shadow = controller_cycle["shadow"]
+        applied = controller_cycle["applied"]
+        decision = controller_cycle["decision"]
+        for action in actions:
+            order_id = str(getattr(action, "order_id", "") or "").strip()
+            if (
+                getattr(action, "operation", None) != "place"
+                or getattr(action, "success", None) is not True
+                or getattr(action, "reduce_only", False) is not False
+                or not order_id
+                or getattr(action, "side", None)
+                not in {OrderSide.BUY, OrderSide.SELL}
+            ):
+                continue
+            side = action.side
+            side_name = "bid" if side is OrderSide.BUY else "ask"
+            adjustment = getattr(decision, side_name)
+            base_order = getattr(base, side_name)
+            shadow_order = getattr(shadow, side_name)
+            applied_order = getattr(applied, side_name)
+            self.metrics.record_quote_context(
+                order_id,
+                {
+                    "order_id": order_id,
+                    "side": side.value,
+                    "decision_id": getattr(decision, "decision_id", None),
+                    "controller_mode": self.config.quote_controller_mode,
+                    "base_price": (
+                        base_order.price if base_order is not None else None
+                    ),
+                    "shadow_price": (
+                        shadow_order.price if shadow_order is not None else None
+                    ),
+                    "applied_price": (
+                        applied_order.price if applied_order is not None else None
+                    ),
+                    "toxicity_score_ticks": getattr(
+                        adjustment, "toxicity_score_ticks", None
+                    ),
+                    "extra_spread_ticks": getattr(
+                        adjustment, "extra_spread_ticks", None
+                    ),
+                    "feature_snapshot": dict(controller_cycle["features"]),
+                    "reduce_only": False,
+                    "created_monotonic": now,
+                },
+            )
+
     def _update_account_audit_metrics(self) -> None:
         if self.account_monitor is None:
             return
@@ -1836,6 +2150,9 @@ class MarketMakerCoordinator:
             snapshot["maker_turnover_per_eligible_hour"] = None
             snapshot["maker_fills_per_eligible_hour"] = None
         snapshot.update(self._entry_admission_metrics)
+        self.metrics.apply_authenticated_fill_attributions(
+            snapshot.get("authenticated_fill_attributions", ())
+        )
         self.metrics.account_audit = snapshot
 
     def _trusted_soft_exit_economics(

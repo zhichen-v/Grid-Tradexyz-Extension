@@ -1,6 +1,6 @@
 # Market Maker 現況與優化方向
 
-> 更新：2026-09-01 entry-reserve short-live gate（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
+> 更新：2026-09-01 toxicity-aware entry controller code-only checkpoint（Asia/Taipei）。實際啟停與硬閘門以 [操作指南](market_maker_mvp_operating_guide.md) 及 fresh authenticated reads 為準。
 
 ## 現況
 
@@ -65,11 +65,22 @@ Active unwind目前為 **default OFF / explicit opt-in / execution path live-pro
 - 本場仍為 **hard-safety／economic NO-GO**：34 completed／16 round trips，completed turnover`485.272502`、exact fee`0.05823270024`、gross`-0.009290`、net`-0.06752270024`、`-1.391439 bps`、cover`-0.15953`、max DD`0.078506`。21:34:02同一受管order在cancel terminal confirmation清slot後才收到延遲partial-fill／nonterminal WS update，被active-slot-only matching誤判unknown；counter`2`是同一事件的兩次觀察，不是外部單。10秒內REST exact sync已解除pause，仍依累計hard gate停止。
 - 21:48依使用者授權，以既有單向helper完成唯一`POST_ONLY + reduce_only SELL 0.00020` recovery。Helper回報flat後正常退出；21:48:27與21:48:35兩次authenticated postflight皆position／orders=`0/0`、used collateral=`0`。Source與ignored live copy均維持`dry_run:true`。
 
+## Toxicity-aware entry controller checkpoint
+
+已完成的code-only範圍是：
+
+- Bounded external book view會保守扣除同side／同price的可識別own remaining，建立external BBO、depth、microprice與imbalance；時間序列計算1／5／15／60秒momentum及15／60秒RMS，遇時間倒退、大gap、stale或invalid資料會reset／fail closed。
+- Authenticated account ledger把fill分成`entry`、`risk_increasing`、`passive_exit`、`active_exit`；partial role綁定、跨audit sort watermark及sticky conflict proof避免eviction後錯誤升格。只有authenticated ordinary entry可供後續feedback。
+- `fixed`保持base quote；`shadow`只記候選；`active`只在ordinary flat entry套用向外widen／side block。Quote arbiter不改amount、reduce-only、TIF、reference、reservation或既有exit／unwind。
+- Controller decision history、placement quote context、fill snapshot、ready／warming／eligible blocked seconds與feature snapshot均有界。Offline analyzer分離entry／exit markout、episode maker／taker fee、controller feature／score、shadow proxy與coverage；proxy不是backtest。
+
+這只代表實作與offline regression候選。Example仍為`fixed + dry_run:true + active unwind OFF`；沒有新的T3、live、economic或production GO，也不回溯改判E2ay。E2ay既有16筆markout沒有新authenticated role join，仍全部pending／indeterminate。
+
 ## 下一步
 
 1. 保持source與兩份ignored active overlay為`dry_run:true`、active lane default off。最新02:52雙authenticated account evidence為BTC position／orders=`0/0`、used collateral`0`；這只證明該時點，不得假定狀態永久不變。
 2. 目前固定候選不得進入4h。Entry reserve已證明會正確拒絕付不起完整stop的新episode；不得為累積30 fills或完成4h而重置本場session economics、提高`0.10` session cap或降低`0.075` episode reserve。
-3. 先離線分析本場16筆雙側負markout與episode economics，一次只形成一個可驗證的新候選；在fee cover、completed net與flat-equity有合理改善依據前，不縮spread、不增加quote layer、不提高mutation。
-4. 任何新候選都須先跑受影響tests、完整Market Maker suite與fresh T3；其後另取明確live授權，並在啟動前再次用雙authenticated preflight證明flat／orders0。舊場次不得拼接成新session或4h證據。
+3. 先完成Gate A `fixed` parity T3，再用建議的單一shadow參數組跑Gate B；兩者都不授權live mutation。E2ay legacy evidence只作不利背景，不能假造role join。
+4. Gate C shadow live需另取明確授權、fresh雙preflight及至少30 completed maker fills／authenticated natural flat；其後才依較差side做Gate D單側widening canary。Blocking、雙側active與4h各自後移，不能同場混測。
 
 Active IOC是唯一、預設關閉且有界的taker例外，不是成交量工具。VPS仍不在本階段。

@@ -145,6 +145,7 @@ class ReconcileAction:
     amount: Decimal | None = None
     reduce_only: bool = False
     success: bool | None = None
+    order_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1287,6 +1288,11 @@ class MarketMakerOrderManager:
             )
             errors.append("create outcome uncertain: invalid confirmation")
             return effect
+        action = replace(
+            action,
+            order_id=str(order.id) if order.id is not None else None,
+        )
+        actions[action_index] = action
         if order.id is not None:
             self._known_order_ids.add(str(order.id))
         if fill_observed:

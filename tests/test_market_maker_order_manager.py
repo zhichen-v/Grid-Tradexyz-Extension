@@ -768,7 +768,11 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 all(action.success is True for action in result.actions)
             )
+            self.assertTrue(all(action.order_id for action in result.actions))
             self.assertFalse(result.position_refresh_required)
+        self.assertEqual(
+            [result.actions[0].order_id for result in results], ["1", "2"]
+        )
         for call in self.adapter.create_order.await_args_list:
             self.assertEqual(call.args[0], "BTC")
             self.assertEqual(call.args[2], OrderType.LIMIT)

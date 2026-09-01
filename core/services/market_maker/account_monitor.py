@@ -13,6 +13,9 @@ _TEN_THOUSAND = Decimal("10000")
 _READ_ATTEMPTS = 6
 _READ_RETRY_SECONDS = 1.0
 _COMPLETED_EPISODE_LEDGER_LIMIT = 100
+_AUTHENTICATED_FILL_LEDGER_LIMIT = 500
+_ORDER_ROLE_BINDING_LIMIT = 1000
+_SEEN_TRADE_ID_LIMIT = 4096
 
 
 class AccountAuditError(RuntimeError):
@@ -123,6 +126,24 @@ class _Fill:
         return self.amount if self.side is OrderSide.BUY else -self.amount
 
 
+def _trade_sort_key(trade: Any) -> tuple[int, int]:
+    trade_id = str(getattr(trade, "id", "") or "")
+    raw_data = getattr(trade, "raw_data", None)
+    if not isinstance(raw_data, dict):
+        raise AccountAuditError("account trade metadata is unavailable")
+    timestamp = raw_data.get("timestamp")
+    if type(timestamp) is not int or timestamp < 0:
+        raise AccountAuditError("account trade timestamp is invalid")
+    trade_sequence = raw_data.get("trade_sequence", trade_id)
+    try:
+        trade_sequence = int(str(trade_sequence))
+    except (TypeError, ValueError) as exc:
+        raise AccountAuditError("account trade sequence is invalid") from exc
+    if trade_sequence < 0:
+        raise AccountAuditError("account trade sequence is invalid")
+    return timestamp, trade_sequence
+
+
 def _fill_from_trade(
     trade: Any,
     expected_fee_rate: Decimal,
@@ -174,16 +195,6 @@ def _fill_from_trade(
         raise AccountAuditError("trade fee cannot be negative")
     if raw_data.get("trade_type") != "trade":
         raise AccountAuditError("non-standard account trade detected")
-    timestamp = raw_data.get("timestamp")
-    if type(timestamp) is not int or timestamp < 0:
-        raise AccountAuditError("account trade timestamp is invalid")
-    trade_sequence = raw_data.get("trade_sequence", trade_id)
-    try:
-        trade_sequence = int(str(trade_sequence))
-    except (TypeError, ValueError) as exc:
-        raise AccountAuditError("account trade sequence is invalid") from exc
-    if trade_sequence < 0:
-        raise AccountAuditError("account trade sequence is invalid")
     return _Fill(
         trade_id=trade_id,
         order_id=order_id,
@@ -192,7 +203,7 @@ def _fill_from_trade(
         turnover=turnover,
         fee=fee,
         gross=gross,
-        sort_key=(timestamp, trade_sequence),
+        sort_key=_trade_sort_key(trade),
         active_unwind=active_unwind,
     )
 
@@ -215,6 +226,15 @@ class SessionEconomics:
     completed_exact_fee: Decimal = _ZERO
     completed_gross: Decimal = _ZERO
     completed_episode_ledger: list[dict[str, Any]] = field(default_factory=list)
+    authenticated_fill_attributions: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+    _order_role_bindings: dict[
+        str, tuple[str, str, int, bool]
+    ] = field(default_factory=dict, repr=False)
+    _last_applied_fill_sort_key: tuple[int, int] | None = field(
+        default=None, repr=False
+    )
     episode_active_unwind_flat: int = 0
     active_unwind_turnover: Decimal = _ZERO
     active_unwind_exact_fee: Decimal = _ZERO
@@ -226,6 +246,7 @@ class SessionEconomics:
     _episode_gross: Decimal = _ZERO
     _episode_entry_side: str | None = None
     _episode_active_unwind_used: bool = False
+    _episode_sequence: int = 0
     _pending_economic_stop_reason: str | None = None
     current_equity: Decimal | None = None
     last_flat_equity_change: Decimal = _ZERO
@@ -234,11 +255,36 @@ class SessionEconomics:
     economic_reason: str | None = None
 
     def seed(self, trades: Iterable[Any]) -> None:
+        trade_ids: list[str] = []
+        sort_keys: list[tuple[int, int]] = []
         for trade in trades:
             trade_id = str(getattr(trade, "id", "") or "")
             if not trade_id:
                 raise AccountAuditError("baseline account trade is missing an id")
-            self.seen_trade_ids.add(trade_id)
+            trade_ids.append(trade_id)
+            try:
+                sort_keys.append(_trade_sort_key(trade))
+            except AccountAuditError:
+                # Legacy baseline records are identity-only. They remain replay
+                # protected by seen_trade_ids; ordering starts at the first
+                # authenticated runtime fill with a valid sort key.
+                continue
+        unique_trade_ids = set(trade_ids)
+        if len(unique_trade_ids) != len(trade_ids):
+            raise AccountAuditError("baseline account trades contain duplicate ids")
+        if (
+            len(self.seen_trade_ids | unique_trade_ids)
+            > _SEEN_TRADE_ID_LIMIT
+        ):
+            raise AccountAuditError("account trade identity registry exhausted")
+        self.seen_trade_ids.update(unique_trade_ids)
+        if sort_keys:
+            latest_sort_key = max(sort_keys)
+            if (
+                self._last_applied_fill_sort_key is None
+                or latest_sort_key > self._last_applied_fill_sort_key
+            ):
+                self._last_applied_fill_sort_key = latest_sort_key
 
     def apply(
         self,
@@ -269,6 +315,18 @@ class SessionEconomics:
         )
         if len(new_fills) >= 100:
             raise AccountAuditError("account trade audit window exhausted")
+        new_trade_ids = {fill.trade_id for fill in new_fills}
+        if len(new_trade_ids) != len(new_fills):
+            raise AccountAuditError("account trade response contains duplicate ids")
+        if len(self.seen_trade_ids) + len(new_trade_ids) > _SEEN_TRADE_ID_LIMIT:
+            raise AccountAuditError("account trade identity registry exhausted")
+        previous_sort_key = self._last_applied_fill_sort_key
+        for fill in new_fills:
+            if previous_sort_key is not None and fill.sort_key <= previous_sort_key:
+                raise AccountAuditError(
+                    "account trade arrived out of authenticated ledger order"
+                )
+            previous_sort_key = fill.sort_key
         attributable_order_ids = managed_order_ids | set(active_unwind_order_ids)
         if any(
             fill.order_id not in attributable_order_ids for fill in new_fills
@@ -282,11 +340,14 @@ class SessionEconomics:
                 "account trades and position are from inconsistent snapshots"
             )
 
+        projected_position = self.ledger_position
+        episode_sequence = self._episode_sequence
+        known_orders = dict(self._order_role_bindings)
+        classified_fills: list[tuple[_Fill, dict[str, Any]]] = []
         for fill in new_fills:
-            prior_position = self.ledger_position
+            prior_position = projected_position
             next_position = prior_position + fill.signed_amount
-            if prior_position == 0:
-                self._episode_entry_side = fill.side.value
+            position_flip = prior_position * next_position < 0
             if fill.active_unwind:
                 if prior_position == 0:
                     raise AccountAuditError(
@@ -296,7 +357,7 @@ class SessionEconomics:
                     raise AccountAuditError(
                         "active unwind direction does not reduce inventory"
                     )
-                if prior_position * next_position < 0:
+                if position_flip:
                     raise AccountAuditError(
                         "active unwind must not flip inventory"
                     )
@@ -304,8 +365,74 @@ class SessionEconomics:
                     raise AccountAuditError(
                         "active unwind must strictly reduce inventory"
                     )
+
+            known = known_orders.get(fill.order_id)
+            if known is not None:
+                known_side, role, fill_episode_sequence, known_active = known
+                if prior_position == 0 or (
+                    episode_sequence > 0
+                    and fill_episode_sequence != episode_sequence
+                ):
+                    raise AccountAuditError(
+                        "account order id was reused across inventory episodes"
+                    )
+                if known_side != fill.side.value or known_active != fill.active_unwind:
+                    raise AccountAuditError(
+                        "account order attribution changed across partial fills"
+                    )
+            else:
+                if len(known_orders) >= _ORDER_ROLE_BINDING_LIMIT:
+                    raise AccountAuditError(
+                        "account order attribution registry exhausted"
+                    )
+                if prior_position == 0:
+                    episode_sequence += 1
+                    role = "entry"
+                else:
+                    if episode_sequence == 0:
+                        episode_sequence = 1
+                    if position_flip or prior_position * fill.signed_amount > 0:
+                        role = "risk_increasing"
+                    else:
+                        role = (
+                            "active_exit"
+                            if fill.active_unwind
+                            else "passive_exit"
+                        )
+                fill_episode_sequence = episode_sequence
+                known_orders[fill.order_id] = (
+                    fill.side.value,
+                    role,
+                    fill_episode_sequence,
+                    fill.active_unwind,
+                )
+            attribution = {
+                "trade_id": fill.trade_id,
+                "order_id": fill.order_id,
+                "side": fill.side.value,
+                "role": role,
+                "episode_sequence": fill_episode_sequence,
+                "prior_position": prior_position,
+                "next_position": next_position,
+                "exchange_timestamp": fill.sort_key[0],
+                "active_unwind": fill.active_unwind,
+                "position_flip": position_flip,
+            }
+            classified_fills.append((fill, attribution))
+            projected_position = next_position
+
+        for fill, attribution in classified_fills:
+            prior_position = attribution["prior_position"]
+            next_position = attribution["next_position"]
+            if prior_position == 0:
+                self._episode_entry_side = fill.side.value
             self.seen_trade_ids.add(fill.trade_id)
             self.ledger_position = next_position
+            self._episode_sequence = attribution["episode_sequence"]
+            self.authenticated_fill_attributions.append(attribution)
+            del self.authenticated_fill_attributions[
+                :-_AUTHENTICATED_FILL_LEDGER_LIMIT
+            ]
             if fill.active_unwind:
                 self.unique_taker_fills += 1
                 self.active_unwind_turnover += fill.turnover
@@ -358,6 +485,10 @@ class SessionEconomics:
                 self._episode_gross = _ZERO
                 self._episode_entry_side = None
                 self._episode_active_unwind_used = False
+
+        self._order_role_bindings = known_orders
+        if new_fills:
+            self._last_applied_fill_sort_key = new_fills[-1].sort_key
 
         self.current_equity = current_equity
         if self.ledger_position == 0:
@@ -521,6 +652,10 @@ class SessionEconomics:
             "completed_gross": self.completed_gross,
             "completed_episode_ledger": [
                 dict(episode) for episode in self.completed_episode_ledger
+            ],
+            "authenticated_fill_attributions": [
+                dict(attribution)
+                for attribution in self.authenticated_fill_attributions
             ],
             "episode_flat_success": self.completed_round_trips,
             "episode_active_unwind_flat": self.episode_active_unwind_flat,

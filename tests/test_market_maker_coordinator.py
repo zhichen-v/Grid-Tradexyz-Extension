@@ -16,6 +16,10 @@ from core.adapters.exchanges.models import (
 )
 from core.services.market_maker.account_monitor import AccountAuditError
 from core.services.market_maker.config import MarketMakerConfig
+from core.services.market_maker.controllers import (
+    QuoteControllerDecision,
+    SideQuoteAdjustment,
+)
 from core.services.market_maker.coordinator import MarketMakerCoordinator
 from core.services.market_maker.models import (
     DesiredOrder,
@@ -202,6 +206,38 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             reason="normal",
         )
 
+    @staticmethod
+    def controller_features(
+        *,
+        health: str = "ready",
+        return_5s: str = "-3",
+        return_15s: str = "-9",
+        microprice_shift: str = "-3",
+        rms_15s: str = "0.1",
+    ) -> SimpleNamespace:
+        values = {
+            "health": health,
+            "reason": health,
+            "received_monotonic": 100.0,
+            "sample_count": 30,
+            "external_best_bid": Decimal("99.9"),
+            "external_best_ask": Decimal("100.1"),
+            "mid": Decimal("100"),
+            "spread_ticks": Decimal("2"),
+            "return_1s_ticks": Decimal("0"),
+            "return_5s_ticks": Decimal(return_5s),
+            "return_15s_ticks": Decimal(return_15s),
+            "return_60s_ticks": Decimal("0"),
+            "rms_1s_move_15s_ticks": Decimal(rms_15s),
+            "rms_1s_move_60s_ticks": Decimal(rms_15s),
+            "microprice": Decimal("100"),
+            "microprice_shift_ticks": Decimal(microprice_shift),
+            "depth_imbalance": Decimal("0"),
+        }
+        feature = SimpleNamespace(**values)
+        feature.to_dict = Mock(return_value=dict(values))
+        return feature
+
     def adapter(self):
         market = {
             "symbol": "BTC",
@@ -262,6 +298,8 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         metadata=None,
         account_monitor=None,
         inventory_executor=None,
+        quote_controller=None,
+        market_feature_store=None,
     ) -> MarketMakerCoordinator:
         adapter = adapter or self.adapter()
         order_manager = order_manager or self.order_manager()
@@ -272,6 +310,8 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             order_manager=order_manager,
             account_monitor=account_monitor,
             inventory_executor=inventory_executor,
+            quote_controller=quote_controller,
+            market_feature_store=market_feature_store,
             risk_manager=SimpleNamespace(evaluate=Mock(return_value=self.risk())),
             strategy=SimpleNamespace(
                 calculate_quotes=Mock(return_value=self.desired())
@@ -4234,6 +4274,365 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot["counters"]["would_place"], 1)
         self.assertEqual(snapshot["counters"]["would_cancel"], 1)
+
+    async def test_fixed_controller_passes_exact_base_quote_object(self) -> None:
+        coordinator = self.prepare_running()
+        base = coordinator.strategy.calculate_quotes.return_value
+        coordinator.metrics.authenticated_entry_markout_feedback = Mock(
+            side_effect=RuntimeError("unused feedback")
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        applied = coordinator.order_manager.reconcile.await_args.args[0]
+        self.assertIs(applied, base)
+        self.assertEqual(applied.reason, "normal")
+        self.assertEqual(coordinator.metrics.quote_controller["mode"], "fixed")
+        coordinator.metrics.authenticated_entry_markout_feedback.assert_not_called()
+
+    async def test_controller_telemetry_ids_are_monotonic_across_failure(
+        self,
+    ) -> None:
+        feature = self.controller_features()
+
+        def decision() -> QuoteControllerDecision:
+            return QuoteControllerDecision(
+                mode="shadow",
+                controller="injected",
+                ready=True,
+                reason="ready",
+                decision_id=1,
+                bid=SideQuoteAdjustment(),
+                ask=SideQuoteAdjustment(),
+                features=feature,
+            )
+
+        controller = SimpleNamespace(
+            evaluate=Mock(
+                side_effect=(
+                    decision(),
+                    RuntimeError("controller failure"),
+                    decision(),
+                )
+            )
+        )
+        coordinator = self.prepare_running(
+            config=self.config(quote_controller_mode="shadow"),
+            quote_controller=controller,
+            market_feature_store=SimpleNamespace(
+                update=Mock(return_value=feature)
+            ),
+        )
+
+        decision_ids = []
+        for _ in range(3):
+            await coordinator.run_one_cycle(force=True)
+            decision_ids.append(
+                coordinator.metrics.quote_controller["decision_id"]
+            )
+
+        self.assertEqual(decision_ids, [1, 2, 3])
+
+    async def test_shadow_markout_feedback_exception_is_contained(self) -> None:
+        feature = self.controller_features()
+        controller = SimpleNamespace(evaluate=Mock())
+        coordinator = self.prepare_running(
+            config=self.config(
+                quote_controller_mode="shadow",
+                toxicity_use_markout_feedback=True,
+            ),
+            quote_controller=controller,
+            market_feature_store=SimpleNamespace(
+                update=Mock(return_value=feature)
+            ),
+        )
+        coordinator.metrics.authenticated_entry_markout_feedback = Mock(
+            side_effect=RuntimeError("feedback failure")
+        )
+        base = coordinator.strategy.calculate_quotes.return_value
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertIs(coordinator.order_manager.reconcile.await_args.args[0], base)
+        controller.evaluate.assert_not_called()
+        self.assertEqual(
+            coordinator.metrics.quote_controller["error"],
+            "markout_feedback_exception:RuntimeError",
+        )
+
+    async def test_shadow_controller_records_candidate_but_is_a_no_op(
+        self,
+    ) -> None:
+        feature = self.controller_features()
+        store = SimpleNamespace(update=Mock(return_value=feature))
+        config = self.config(
+            quote_controller_mode="shadow",
+            toxicity_widen_start_ticks="1",
+            toxicity_max_extra_spread_ticks=3,
+        )
+        coordinator = self.prepare_running(
+            config=config,
+            market_feature_store=store,
+        )
+        base = coordinator.strategy.calculate_quotes.return_value
+
+        await coordinator.run_one_cycle(force=True)
+
+        applied = coordinator.order_manager.reconcile.await_args.args[0]
+        self.assertIs(applied, base)
+        self.assertEqual(coordinator.order_manager.reconcile.await_count, 1)
+        self.assertEqual(coordinator.metrics.controller_base_bid, Decimal("99.9"))
+        self.assertEqual(
+            coordinator.metrics.controller_shadow_bid, Decimal("99.7")
+        )
+        self.assertEqual(
+            coordinator.metrics.controller_applied_bid, Decimal("99.9")
+        )
+
+    async def test_invalid_shadow_decision_is_base_no_op_and_records_error(
+        self,
+    ) -> None:
+        feature = self.controller_features()
+        broken = SimpleNamespace(
+            evaluate=Mock(return_value=SimpleNamespace(mode="shadow", reason="bad"))
+        )
+        coordinator = self.prepare_running(
+            config=self.config(quote_controller_mode="shadow"),
+            quote_controller=broken,
+            market_feature_store=SimpleNamespace(
+                update=Mock(return_value=feature)
+            ),
+        )
+        base = coordinator.strategy.calculate_quotes.return_value
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertIs(coordinator.order_manager.reconcile.await_args.args[0], base)
+        self.assertEqual(coordinator.metrics.controller_error_count, 1)
+        self.assertEqual(
+            coordinator.metrics.quote_controller["error"],
+            "invalid_controller_decision_type",
+        )
+
+    async def test_feature_store_exception_is_authoritative_active_no_entry(
+        self,
+    ) -> None:
+        feature = self.controller_features()
+        ready_controller = SimpleNamespace(
+            evaluate=Mock(
+                return_value=QuoteControllerDecision(
+                    mode="active",
+                    controller="injected",
+                    ready=True,
+                    reason="ready",
+                    decision_id=1,
+                    bid=SideQuoteAdjustment(),
+                    ask=SideQuoteAdjustment(),
+                    features=feature,
+                )
+            )
+        )
+        coordinator = self.prepare_running(
+            config=self.config(
+                quote_controller_mode="active",
+                toxicity_max_extra_spread_ticks=1,
+            ),
+            quote_controller=ready_controller,
+            market_feature_store=SimpleNamespace(
+                update=Mock(side_effect=RuntimeError("feature failure"))
+            ),
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        applied = coordinator.order_manager.reconcile.await_args.args[0]
+        self.assertIsNone(applied.bid)
+        self.assertIsNone(applied.ask)
+        ready_controller.evaluate.assert_not_called()
+        self.assertEqual(coordinator.metrics.controller_error_count, 1)
+
+    async def test_active_controller_widens_only_flat_entry(self) -> None:
+        feature = self.controller_features()
+        store = SimpleNamespace(update=Mock(return_value=feature))
+        config = self.config(
+            quote_controller_mode="active",
+            toxicity_widen_start_ticks="1",
+            toxicity_max_extra_spread_ticks=3,
+        )
+        coordinator = self.prepare_running(
+            config=config,
+            market_feature_store=store,
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        applied = coordinator.order_manager.reconcile.await_args.args[0]
+        self.assertEqual(applied.bid.price, Decimal("99.7"))
+        self.assertEqual(applied.ask.price, Decimal("100.1"))
+        self.assertEqual(applied.bid.amount, Decimal("0.2"))
+        self.assertFalse(applied.bid.reduce_only)
+
+    async def test_active_warming_blocks_flat_entry_not_nonflat_exit(
+        self,
+    ) -> None:
+        feature = self.controller_features(health="warming")
+        store = SimpleNamespace(update=Mock(return_value=feature))
+        config = self.config(
+            quote_controller_mode="active",
+            toxicity_widen_start_ticks="1",
+            toxicity_max_extra_spread_ticks=3,
+        )
+        flat = self.prepare_running(
+            config=config,
+            market_feature_store=store,
+        )
+
+        await flat.run_one_cycle(force=True)
+
+        flat_applied = flat.order_manager.reconcile.await_args.args[0]
+        self.assertIsNone(flat_applied.bid)
+        self.assertIsNone(flat_applied.ask)
+
+        exit_manager = self.order_manager()
+        nonflat = self.prepare_running(
+            config=config,
+            order_manager=exit_manager,
+            market_feature_store=store,
+        )
+        nonflat._position = self.position(signed_size=Decimal("0.2"))
+        exit_quotes = replace(
+            self.desired(),
+            bid=None,
+            ask=replace(self.desired().ask, reduce_only=True),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+            reason="reduce inventory",
+        )
+        nonflat.strategy.calculate_quotes.return_value = exit_quotes
+
+        await nonflat.run_one_cycle(force=True)
+
+        exit_applied = exit_manager.reconcile.await_args.args[0]
+        self.assertIs(exit_applied, exit_quotes)
+        self.assertTrue(exit_applied.ask.reduce_only)
+
+    async def test_controller_exception_fails_closed_flat_and_preserves_exit(
+        self,
+    ) -> None:
+        feature = self.controller_features()
+        store = SimpleNamespace(update=Mock(return_value=feature))
+        broken = SimpleNamespace(
+            evaluate=Mock(side_effect=RuntimeError("controller failure"))
+        )
+        config = self.config(
+            quote_controller_mode="active",
+            toxicity_widen_start_ticks="1",
+            toxicity_max_extra_spread_ticks=3,
+        )
+        flat = self.prepare_running(
+            config=config,
+            quote_controller=broken,
+            market_feature_store=store,
+        )
+
+        await flat.run_one_cycle(force=True)
+
+        flat_applied = flat.order_manager.reconcile.await_args.args[0]
+        self.assertIsNone(flat_applied.bid)
+        self.assertIsNone(flat_applied.ask)
+        self.assertEqual(flat.metrics.controller_error_count, 1)
+
+        exit_manager = self.order_manager()
+        nonflat = self.prepare_running(
+            config=config,
+            order_manager=exit_manager,
+            quote_controller=broken,
+            market_feature_store=store,
+        )
+        nonflat._position = self.position(signed_size=Decimal("-0.2"))
+        exit_quotes = replace(
+            self.desired(),
+            ask=None,
+            bid=replace(self.desired().bid, reduce_only=True),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+            reason="reduce inventory",
+        )
+        nonflat.strategy.calculate_quotes.return_value = exit_quotes
+
+        await nonflat.run_one_cycle(force=True)
+
+        self.assertIs(exit_manager.reconcile.await_args.args[0], exit_quotes)
+
+    async def test_successful_maker_create_records_order_quote_context(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        manager.reconcile.return_value = SimpleNamespace(
+            actions=(
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "place",
+                    "normal",
+                    Decimal("99.9"),
+                    Decimal("0.2"),
+                    False,
+                    True,
+                    "maker-1",
+                ),
+            ),
+            errors=(),
+            runtime_state=RuntimeState.ACTIVE,
+        )
+        coordinator = self.prepare_running(order_manager=manager)
+
+        await coordinator.run_one_cycle(force=True)
+
+        contexts = coordinator.metrics.snapshot(self.now)["quote_contexts"]
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0]["order_id"], "maker-1")
+        self.assertEqual(contexts[0]["controller_mode"], "fixed")
+        self.assertEqual(contexts[0]["base_price"], Decimal("99.9"))
+        self.assertEqual(contexts[0]["applied_price"], Decimal("99.9"))
+
+    def test_account_snapshot_backfills_authenticated_markout_role(self) -> None:
+        attribution = {
+            "trade_id": "trade-1",
+            "order_id": "maker-1",
+            "side": "buy",
+            "role": "entry",
+            "episode_sequence": 1,
+            "prior_position": Decimal("0"),
+            "next_position": Decimal("0.2"),
+            "exchange_timestamp": 1,
+            "active_unwind": False,
+            "position_flip": False,
+        }
+        monitor = SimpleNamespace(
+            snapshot=Mock(
+                return_value={
+                    "maker_turnover": Decimal("20"),
+                    "unique_maker_fills": 1,
+                    "authenticated_fill_attributions": [attribution],
+                }
+            )
+        )
+        coordinator = self.coordinator(account_monitor=monitor)
+        coordinator.metrics.record_maker_fill_markout(
+            order_id="maker-1",
+            side="buy",
+            cumulative_filled=Decimal("0.2"),
+            cumulative_cost=Decimal("20"),
+            average_price=Decimal("100"),
+            now=self.now,
+            mid=Decimal("100"),
+            source="websocket_order_update",
+            terminal=True,
+        )
+
+        coordinator._update_account_audit_metrics()
+
+        event = coordinator.metrics.fill_markouts[-1]
+        self.assertEqual(event["attribution_state"], "authenticated")
+        self.assertEqual(event["fill_role"], "entry")
 
 
 if __name__ == "__main__":
