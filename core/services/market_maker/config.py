@@ -290,11 +290,11 @@ class MarketMakerConfig:
             if not (
                 Decimal("0")
                 < self.max_episode_loss_for_unwind
-                <= self.max_session_loss_for_unwind
+                < self.max_session_loss_for_unwind
             ):
                 raise ValueError(
-                    "active unwind episode loss must be positive and no greater "
-                    "than session loss"
+                    "active unwind episode loss must be positive and below "
+                    "session loss"
                 )
             if (
                 self.max_session_drawdown <= 0

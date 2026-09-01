@@ -162,6 +162,25 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
             snapshot["active_unwind_exact_fee"], Decimal("0.00796")
         )
         self.assertEqual(snapshot["ledger_position"], Decimal("0"))
+        self.assertEqual(snapshot["episode_flat_success"], 1)
+        self.assertEqual(snapshot["episode_active_unwind_flat"], 1)
+        self.assertEqual(
+            snapshot["completed_episode_ledger"],
+            [
+                {
+                    "maker_fills": 1,
+                    "entry_side": "buy",
+                    "turnover": Decimal("39.9"),
+                    "gross": Decimal("-0.1"),
+                    "exact_fee": Decimal("0.01036"),
+                    "maker_fee": Decimal("0.0024"),
+                    "taker_fee": Decimal("0.00796"),
+                    "net_ex_funding": Decimal("-0.11036"),
+                    "active_unwind_used": True,
+                    "close_type": "active_unwind_flat",
+                }
+            ],
+        )
 
     async def test_snapshot_exposes_same_generation_position_and_unrealized(self):
         adapter = self.adapter()
@@ -300,6 +319,59 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(economics.unique_taker_fills, 1)
                 self.assertEqual(economics.seen_trade_ids, {"1"})
 
+    def test_partial_active_then_maker_flat_reports_final_close_lane(self):
+        economics = SessionEconomics(
+            self.active_unwind_config(), baseline_equity=Decimal("300")
+        )
+        economics.apply(
+            [
+                trade(
+                    "1", "maker-open", OrderSide.BUY, "0.2", "20", "0",
+                    timestamp=1,
+                ),
+                trade(
+                    "2",
+                    "active-partial",
+                    OrderSide.SELL,
+                    "0.1",
+                    "10",
+                    "0",
+                    role="taker",
+                    fee_rate="0.0004",
+                    timestamp=2,
+                ),
+                trade(
+                    "3", "maker-close", OrderSide.SELL, "0.1", "10.1", "0.1",
+                    timestamp=3,
+                ),
+            ],
+            current_position=Decimal("0"),
+            current_equity=Decimal("300.092388"),
+            managed_order_ids={"maker-open", "maker-close"},
+            active_unwind_order_ids={"active-partial"},
+        )
+
+        snapshot = economics.snapshot()
+        self.assertEqual(snapshot["episode_flat_success"], 1)
+        self.assertEqual(snapshot["episode_active_unwind_flat"], 0)
+        self.assertEqual(
+            snapshot["completed_episode_ledger"],
+            [
+                {
+                    "maker_fills": 2,
+                    "entry_side": "buy",
+                    "turnover": Decimal("40.1"),
+                    "gross": Decimal("0.1"),
+                    "exact_fee": Decimal("0.007612"),
+                    "maker_fee": Decimal("0.003612"),
+                    "taker_fee": Decimal("0.004"),
+                    "net_ex_funding": Decimal("0.092388"),
+                    "active_unwind_used": True,
+                    "close_type": "maker_flat",
+                }
+            ],
+        )
+
     async def test_unattributed_or_wrong_fee_taker_remains_fatal(self):
         for active_ids, fee_rate, message in (
             (set(), "0.0004", "non-maker"),
@@ -373,6 +445,25 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
             account_net / Decimal("200.04") * Decimal("10000"),
         )
         self.assertEqual(snapshot["unattributed_flat_cashflow"], Decimal("0"))
+        self.assertEqual(snapshot["episode_flat_success"], 1)
+        self.assertEqual(snapshot["episode_active_unwind_flat"], 0)
+        self.assertEqual(
+            snapshot["completed_episode_ledger"],
+            [
+                {
+                    "maker_fills": 2,
+                    "entry_side": "buy",
+                    "turnover": Decimal("200.04"),
+                    "gross": Decimal("0.04"),
+                    "exact_fee": Decimal("0.0240048"),
+                    "maker_fee": Decimal("0.0240048"),
+                    "taker_fee": Decimal("0"),
+                    "net_ex_funding": Decimal("0.0159952"),
+                    "active_unwind_used": False,
+                    "close_type": "maker_flat",
+                }
+            ],
+        )
         self.assertEqual(
             snapshot["maker_turnover_per_wall_hour"], Decimal("800.16")
         )
@@ -383,6 +474,7 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
             soft_exit_after_seconds=120,
             soft_exit_net_turnover_bps=Decimal("-0.5"),
             max_session_loss_for_maker_exit=Decimal("0.10"),
+            dry_run=True,
         )
         adapter = self.adapter()
         monitor = self.monitor(adapter, config)
@@ -444,6 +536,185 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(recovered["completed_net_ex_funding"], Decimal("0.032"))
         self.assertEqual(recovered["session_loss_for_maker_exit"], Decimal("0"))
+
+    async def test_live_economic_failure_does_not_enter_bounded_recovery(self):
+        config = self.config(
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.10"),
+            dry_run=False,
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        adapter.get_account_trades.return_value = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade("2", "sell", OrderSide.SELL, "0.2", "100", "0", timestamp=2),
+        ]
+
+        with self.assertRaisesRegex(
+            AccountAuditError, "completed gross does not cover exact fees"
+        ):
+            await monitor.audit({"buy", "sell"})
+
+        self.assertEqual(monitor.economics.economic_state, "no_go")
+        self.assertEqual(monitor.state, "hard_stop")
+
+    async def test_live_economic_stop_waits_for_authenticated_flat(self):
+        config = self.config(
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.10"),
+            dry_run=False,
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        first_page = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade("2", "sell", OrderSide.SELL, "0.2", "100", "0", timestamp=2),
+            trade(
+                "3", "current-buy", OrderSide.BUY, "0.1", "50", "0", timestamp=3
+            ),
+        ]
+        adapter.get_account_trades.return_value = first_page
+        adapter.get_positions.return_value = [
+            position("0.1", PositionSide.LONG)
+        ]
+
+        await monitor.audit({"buy", "sell", "current-buy", "current-sell"})
+
+        pending = monitor.snapshot(self.now)
+        self.assertEqual(
+            pending["economic_state"], "economic_stop_pending_flat"
+        )
+        self.assertIn("waiting for authenticated flat", pending["economic_reason"])
+        self.assertEqual(monitor.state, "healthy")
+
+        reopened_page = [
+            *first_page,
+            trade(
+                "4",
+                "current-sell",
+                OrderSide.SELL,
+                "0.1",
+                "50",
+                "-0.2",
+                timestamp=4,
+            ),
+            trade(
+                "5",
+                "reopen-buy",
+                OrderSide.BUY,
+                "0.1",
+                "50",
+                "0",
+                timestamp=5,
+            ),
+        ]
+        adapter.get_account_trades.return_value = reopened_page
+        await monitor.audit(
+            {"buy", "sell", "current-buy", "current-sell", "reopen-buy"}
+        )
+
+        still_pending = monitor.snapshot(self.now)
+        self.assertEqual(
+            still_pending["economic_state"], "economic_stop_pending_flat"
+        )
+        self.assertIn(
+            "completed gross does not cover exact fees",
+            still_pending["economic_reason"],
+        )
+        self.assertNotIn("session loss exceeded", still_pending["economic_reason"])
+
+        adapter.get_account_trades.return_value = [
+            *reopened_page,
+            trade(
+                "6",
+                "reopen-sell",
+                OrderSide.SELL,
+                "0.1",
+                "50",
+                "1",
+                timestamp=6,
+            ),
+        ]
+        adapter.get_positions.return_value = []
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("300.97"))
+        ]
+
+        with self.assertRaisesRegex(
+            AccountAuditError, "completed gross does not cover exact fees"
+        ):
+            await monitor.audit(
+                {
+                    "buy",
+                    "sell",
+                    "current-buy",
+                    "current-sell",
+                    "reopen-buy",
+                    "reopen-sell",
+                }
+            )
+
+        stopped = monitor.snapshot(self.now)
+        self.assertEqual(stopped["economic_state"], "no_go")
+        self.assertEqual(stopped["audited_position"], Decimal("0"))
+        self.assertEqual(stopped["episode_flat_success"], 3)
+        self.assertEqual(monitor.state, "hard_stop")
+
+    async def test_live_session_loss_stop_waits_for_authenticated_flat(self):
+        config = self.config(
+            soft_exit_after_seconds=120,
+            soft_exit_net_turnover_bps=Decimal("-0.5"),
+            max_session_loss_for_maker_exit=Decimal("0.01"),
+            dry_run=False,
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        open_page = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade("2", "sell", OrderSide.SELL, "0.2", "100", "0", timestamp=2),
+            trade(
+                "3", "current-buy", OrderSide.BUY, "0.1", "50", "0", timestamp=3
+            ),
+        ]
+        managed_ids = {"buy", "sell", "current-buy", "current-sell"}
+        adapter.get_account_trades.return_value = open_page
+        adapter.get_positions.return_value = [
+            position("0.1", PositionSide.LONG)
+        ]
+
+        await monitor.audit(managed_ids)
+
+        pending = monitor.snapshot(self.now)
+        self.assertEqual(
+            pending["economic_state"], "economic_stop_pending_flat"
+        )
+        self.assertIn("session loss exceeded", pending["economic_reason"])
+        self.assertEqual(monitor.state, "healthy")
+
+        adapter.get_account_trades.return_value = [
+            *open_page,
+            trade(
+                "4",
+                "current-sell",
+                OrderSide.SELL,
+                "0.1",
+                "50",
+                "0",
+                timestamp=4,
+            ),
+        ]
+        adapter.get_positions.return_value = []
+
+        with self.assertRaisesRegex(AccountAuditError, "session loss exceeded"):
+            await monitor.audit(managed_ids)
+
+        self.assertEqual(monitor.economics.economic_state, "no_go")
+        self.assertEqual(monitor.state, "hard_stop")
 
     async def test_bounded_session_loss_exact_limit_is_allowed_but_excess_stops(
         self,
@@ -549,6 +820,31 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             monitor.economics.session_loss_for_maker_exit, Decimal("0.11")
         )
+
+    async def test_drawdown_stop_publishes_authenticated_flat_snapshot(self):
+        config = self.config(
+            economic_min_fills=10,
+            max_session_drawdown=Decimal("0.10"),
+        )
+        adapter = self.adapter()
+        monitor = self.monitor(adapter, config)
+        await monitor.initialize()
+        adapter.get_balances.return_value = [
+            SimpleNamespace(currency="USDG", total=Decimal("299.89"))
+        ]
+        adapter.get_account_trades.return_value = [
+            trade("1", "buy", OrderSide.BUY, "0.2", "100", "0", timestamp=1),
+            trade("2", "sell", OrderSide.SELL, "0.2", "100", "0", timestamp=2),
+        ]
+
+        with self.assertRaisesRegex(AccountAuditError, "max_session_drawdown"):
+            await monitor.audit({"buy", "sell"})
+
+        stopped = monitor.snapshot(self.now)
+        self.assertEqual(stopped["state"], "hard_stop")
+        self.assertTrue(stopped["last_audit_authenticated"])
+        self.assertEqual(stopped["audited_position"], Decimal("0"))
+        self.assertEqual(stopped["ledger_position"], Decimal("0"))
 
     async def test_flat_equity_loss_remains_reserved_during_next_episode(self):
         config = self.config(
@@ -898,6 +1194,50 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(monitor.economics.flat_equity_turnover_bps)
         self.assertEqual(monitor.economics.completed_fills, 8)
+
+    def test_completed_episode_ledger_is_bounded_without_losing_counters(self):
+        economics = SessionEconomics(
+            self.config(
+                maker_fee_rate=Decimal("0"),
+                min_completed_net_turnover_bps=Decimal("0"),
+            ),
+            baseline_equity=Decimal("300"),
+        )
+        for episode in range(101):
+            buy_id = f"buy-{episode}"
+            sell_id = f"sell-{episode}"
+            economics.apply(
+                [
+                    trade(
+                        str(episode * 2 + 1),
+                        buy_id,
+                        OrderSide.BUY,
+                        "0.1",
+                        "1",
+                        "0",
+                        fee_rate="0",
+                        timestamp=episode * 2 + 1,
+                    ),
+                    trade(
+                        str(episode * 2 + 2),
+                        sell_id,
+                        OrderSide.SELL,
+                        "0.1",
+                        "1",
+                        "0",
+                        fee_rate="0",
+                        timestamp=episode * 2 + 2,
+                    ),
+                ],
+                current_position=Decimal("0"),
+                current_equity=Decimal("300"),
+                managed_order_ids={buy_id, sell_id},
+            )
+
+        snapshot = economics.snapshot()
+        self.assertEqual(len(snapshot["completed_episode_ledger"]), 100)
+        self.assertEqual(snapshot["episode_flat_success"], 101)
+        self.assertEqual(snapshot["episode_active_unwind_flat"], 0)
 
     async def test_completed_fee_failure_is_not_hidden_by_open_tail(self):
         cases = (("0", "cover exact fees"), ("0.025", "threshold"))

@@ -570,6 +570,40 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.has_uncertain_state)
         self.assertEqual(manager.active_unwind_order_ids, frozenset())
 
+    async def test_active_unwind_ws_partial_is_registered_before_fill_report(
+        self,
+    ) -> None:
+        manager = self.make_manager(self.active_unwind_config())
+        manager._slots[OrderSide.BUY] = ManagedOrder(
+            side=OrderSide.BUY,
+            state=OrderSlotState.LIVE,
+            order_id="active-ws",
+            client_id="active-client",
+            price=Decimal("101"),
+            amount=Decimal("0.2"),
+            remaining=Decimal("0.2"),
+            reduce_only=True,
+            created_monotonic=self.clock(),
+            updated_monotonic=self.clock(),
+        )
+        manager._active_unwind_side = OrderSide.BUY
+        partial = exchange_order(
+            "active-ws",
+            OrderSide.BUY,
+            status=OrderStatus.OPEN,
+            price="101",
+            amount="0.2",
+            remaining="0.1",
+            client_id="active-client",
+            params={"time_in_force": "IOC", "reduce_only": True},
+        )
+
+        fill_observed = await manager.handle_order_update(partial)
+
+        self.assertTrue(fill_observed)
+        self.assertEqual(manager.active_unwind_order_ids, {"active-ws"})
+        self.assertTrue(manager.active_unwind_pending)
+
     async def test_active_unwind_terminal_history_hang_times_out_fail_closed(
         self,
     ) -> None:
@@ -1249,6 +1283,9 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.position_refresh_required)
         self.assertTrue(result.fill_observed)
+        self.assertEqual(
+            tuple(order.id for order in result.observed_fill_orders), ("1",)
+        )
         self.assertEqual(self.adapter.create_order.await_count, 1)
         self.assertIsNone(self.manager.slots[OrderSide.BUY])
 
@@ -1903,6 +1940,10 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.position_refresh_required)
         self.assertTrue(result.fill_observed)
+        self.assertEqual(
+            tuple(order.id for order in result.observed_fill_orders),
+            ("fast-fill",),
+        )
         self.assertEqual(result.errors, ())
         self.assertTrue(result.actions[0].success)
         self.assertIn("fast-fill", self.manager.known_order_ids)
@@ -2565,6 +2606,10 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.position_refresh_required)
         self.assertTrue(result.fill_observed)
+        self.assertEqual(
+            tuple(order.id for order in result.observed_fill_orders),
+            ("late-order",),
+        )
         self.adapter.cancel_order.assert_not_awaited()
         self.assertEqual(
             self.manager.slots[OrderSide.BUY].state,
@@ -3103,20 +3148,23 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             self.desired(bid_price="99.9", ask_price=None), self.risk()
         )
         self.adapter.get_open_orders.return_value = []
-        self.adapter.get_order_history.return_value = [
-            exchange_order(
-                "1",
-                OrderSide.BUY,
-                status=OrderStatus.FILLED,
-                price="99.9",
-                remaining="0",
-            )
-        ]
+        terminal = exchange_order(
+            "1",
+            OrderSide.BUY,
+            status=OrderStatus.FILLED,
+            price="99.9",
+            remaining="0",
+        )
+        self.adapter.get_order_history.return_value = [terminal]
 
         position_refresh_required = await self.manager.sync_open_orders()
 
         self.assertTrue(position_refresh_required)
         self.assertIsNone(self.manager.slots[OrderSide.BUY])
+        self.assertEqual(
+            self.manager.last_sync_result.observed_fill_orders,
+            (terminal,),
+        )
 
     async def test_history_terminal_records_exchange_id_from_client_match(self) -> None:
         await self.manager.reconcile(
@@ -3172,7 +3220,14 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             self.manager.slots[OrderSide.BUY].state,
             OrderSlotState.PARTIALLY_FILLED,
         )
+        self.assertEqual(
+            self.manager.last_sync_result.observed_fill_orders,
+            tuple(self.adapter.get_open_orders.return_value),
+        )
         self.assertFalse(await self.manager.sync_open_orders())
+        self.assertEqual(
+            self.manager.last_sync_result.observed_fill_orders, ()
+        )
 
     async def test_unknown_rest_order_pauses(self) -> None:
         self.adapter.get_open_orders.return_value = [

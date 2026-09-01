@@ -832,6 +832,39 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             coordinator.metrics.counters["reconciliation_failure"], 1
         )
 
+    async def test_active_unwind_budget_block_counts_episode_cap(self) -> None:
+        manager = self.order_manager()
+        unwind = SimpleNamespace(
+            blocked=True,
+            budget_blocked=True,
+            active_order=None,
+            passive_order=None,
+            suppress_passive=True,
+            reason="marketable active unwind exceeds episode loss cap",
+            snapshot=Mock(
+                return_value={
+                    "state": "blocked",
+                    "budget_blocked": True,
+                }
+            ),
+        )
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(),
+            order_manager=manager,
+            inventory_executor=SimpleNamespace(evaluate=Mock(return_value=unwind)),
+        )
+        coordinator._position = self.position(signed_size=Decimal("-0.2"))
+
+        with self.assertRaisesRegex(RuntimeError, "inventory unwind hard stop"):
+            await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(
+            coordinator.metrics.counters["episode_cap_blocked"], 1
+        )
+        self.assertEqual(
+            coordinator.metrics.counters["active_unwind_blocks"], 1
+        )
+
     async def test_active_unwind_rearms_and_bypasses_debounce_after_truth_drift(
         self,
     ) -> None:
@@ -1260,6 +1293,344 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 "allow_new_episode"
             ]
         )
+
+    async def test_entry_admission_reserves_full_lot_active_exit(self) -> None:
+        snapshot = self.active_account_snapshot("0")
+        snapshot["remaining_session_loss_for_unwind"] = Decimal("0.29")
+        monitor = SimpleNamespace(snapshot=Mock(return_value=snapshot))
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(),
+            account_monitor=monitor,
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator.metrics.account_audit["ledger_position"] = Decimal("0")
+
+        await coordinator.run_one_cycle(force=True)
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertFalse(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["reserved_worst_case_exit_cost"],
+            Decimal("0.30"),
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["entry_admission"], "blocked"
+        )
+        self.assertEqual(
+            coordinator.metrics.counters["episode_cap_blocked"], 1
+        )
+
+        snapshot["remaining_session_loss_for_unwind"] = Decimal("0.30")
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertTrue(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["entry_admission"], "allowed"
+        )
+
+        snapshot["current_drawdown"] = Decimal("0.20")
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertFalse(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["entry_admission_reason"],
+            "remaining drawdown cannot fund a full-lot stop",
+        )
+
+    async def test_entry_admission_fails_closed_without_fresh_economics(
+        self,
+    ) -> None:
+        coordinator = self.prepare_running(config=self.active_unwind_config())
+        coordinator._account_monitor_initialized = True
+        coordinator.metrics.account_audit["ledger_position"] = Decimal("0")
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertFalse(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["entry_admission_reason"],
+            "entry admission requires fresh authenticated economics",
+        )
+        self.assertEqual(
+            coordinator.metrics.counters["episode_cap_blocked"], 0
+        )
+
+        snapshot = self.active_account_snapshot("0")
+        snapshot["remaining_session_loss_for_unwind"] = Decimal("0.29")
+        coordinator.account_monitor = SimpleNamespace(
+            snapshot=Mock(return_value=snapshot)
+        )
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(
+            coordinator.metrics.counters["episode_cap_blocked"], 1
+        )
+
+    async def test_entry_admission_does_not_block_zero_mutation_dry_run(
+        self,
+    ) -> None:
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(dry_run=True)
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertTrue(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["entry_admission_reason"],
+            "dry run has no exchange mutations",
+        )
+        self.assertEqual(
+            coordinator.metrics.counters["episode_cap_blocked"], 0
+        )
+
+    async def test_economic_stop_pending_forces_inventory_exit(self) -> None:
+        coordinator = self.prepare_running()
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator.metrics.account_audit["economic_state"] = (
+            "economic_stop_pending_flat"
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertTrue(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "force_inventory_exit"
+            ]
+        )
+        self.assertFalse(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+
+    def test_maker_turnover_rate_excludes_active_unwind_turnover(self) -> None:
+        monitor = SimpleNamespace(
+            snapshot=Mock(
+                return_value={
+                    "maker_turnover": Decimal("10"),
+                    "turnover": Decimal("25"),
+                    "unique_maker_fills": 2,
+                }
+            )
+        )
+        coordinator = self.coordinator(account_monitor=monitor)
+        coordinator._eligible_quote_seconds = 3600
+
+        coordinator._update_account_audit_metrics()
+
+        self.assertEqual(
+            coordinator.metrics.account_audit[
+                "maker_turnover_per_eligible_hour"
+            ],
+            Decimal("10"),
+        )
+
+    def test_side_markouts_capture_horizons_and_excursions(self) -> None:
+        metrics = self.coordinator().metrics
+        for order_id, side in (("buy-1", "buy"), ("sell-1", "sell")):
+            metrics.record_maker_fill_markout(
+                order_id=order_id,
+                side=side,
+                cumulative_filled=Decimal("0.1"),
+                cumulative_cost=Decimal("10"),
+                average_price=None,
+                now=0.0,
+                mid=Decimal("100"),
+                source="websocket_order_update",
+                terminal=True,
+            )
+
+        for now, mid in (
+            (1.0, Decimal("99")),
+            (5.0, Decimal("101")),
+            (15.0, Decimal("98")),
+            (60.0, Decimal("102")),
+        ):
+            metrics.update_fill_markouts(now=now, mid=mid)
+
+        snapshot = metrics.snapshot(60.0)
+        buy, sell = snapshot["fill_markouts"]
+        self.assertEqual(buy["markout_1s_bps"], Decimal("-100"))
+        self.assertEqual(buy["markout_60s_bps"], Decimal("200"))
+        self.assertEqual(buy["mae_bps"], Decimal("-200"))
+        self.assertEqual(buy["mfe_bps"], Decimal("200"))
+        self.assertEqual(sell["markout_60s_bps"], Decimal("-200"))
+        self.assertEqual(
+            snapshot["side_markout_summary"]["buy"]["60s"],
+            {"count": 1, "mean_bps": Decimal("200")},
+        )
+        self.assertEqual(
+            snapshot["side_markout_summary"]["sell"]["60s"],
+            {"count": 1, "mean_bps": Decimal("-200")},
+        )
+
+    def test_markouts_use_incremental_partial_fill_price(self) -> None:
+        metrics = self.coordinator().metrics
+
+        first = metrics.record_maker_fill_markout(
+            order_id="buy-partial",
+            side="buy",
+            cumulative_filled=Decimal("0.1"),
+            cumulative_cost=Decimal("10"),
+            average_price=None,
+            now=0.0,
+            mid=Decimal("100"),
+            source="websocket_order_update",
+            terminal=False,
+        )
+        second = metrics.record_maker_fill_markout(
+            order_id="buy-partial",
+            side="buy",
+            cumulative_filled=Decimal("0.2"),
+            cumulative_cost=Decimal("20.2"),
+            average_price=None,
+            now=1.0,
+            mid=Decimal("100"),
+            source="reconciliation",
+            terminal=True,
+        )
+        duplicate = metrics.record_maker_fill_markout(
+            order_id="buy-partial",
+            side="buy",
+            cumulative_filled=Decimal("0.2"),
+            cumulative_cost=Decimal("20.2"),
+            average_price=None,
+            now=2.0,
+            mid=Decimal("100"),
+            source="reconciliation",
+            terminal=True,
+        )
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertFalse(duplicate)
+        first_event, second_event = metrics.fill_markouts
+        self.assertEqual(first_event["fill_amount"], Decimal("0.1"))
+        self.assertEqual(first_event["fill_price"], Decimal("100"))
+        self.assertEqual(second_event["fill_amount"], Decimal("0.1"))
+        self.assertEqual(second_event["fill_price"], Decimal("102"))
+        self.assertEqual(
+            second_event["observation_source"], "reconciliation"
+        )
+
+    def test_live_partial_progress_survives_terminal_history_churn(self) -> None:
+        metrics = self.coordinator().metrics
+        metrics.record_maker_fill_markout(
+            order_id="live-partial",
+            side="buy",
+            cumulative_filled=Decimal("0.1"),
+            cumulative_cost=Decimal("10"),
+            average_price=None,
+            now=0.0,
+            mid=Decimal("100"),
+            source="websocket_order_update",
+            terminal=False,
+        )
+        for index in range(501):
+            metrics.record_maker_fill_markout(
+                order_id=f"terminal-{index}",
+                side="buy",
+                cumulative_filled=Decimal("0.1"),
+                cumulative_cost=Decimal("10"),
+                average_price=None,
+                now=float(index + 1),
+                mid=Decimal("100"),
+                source="reconciliation",
+                terminal=True,
+            )
+
+        recorded = metrics.record_maker_fill_markout(
+            order_id="live-partial",
+            side="buy",
+            cumulative_filled=Decimal("0.2"),
+            cumulative_cost=Decimal("20.2"),
+            average_price=None,
+            now=503.0,
+            mid=Decimal("100"),
+            source="reconciliation",
+            terminal=True,
+        )
+
+        self.assertTrue(recorded)
+        self.assertLessEqual(len(metrics._maker_fill_progress), 500)
+        self.assertEqual(metrics.fill_markouts[-1]["fill_amount"], Decimal("0.1"))
+        self.assertEqual(metrics.fill_markouts[-1]["fill_price"], Decimal("102"))
+
+    def test_terminal_without_new_fill_releases_progress_pin(self) -> None:
+        metrics = self.coordinator().metrics
+        for index in range(501):
+            order_id = f"partial-cancel-{index}"
+            metrics.record_maker_fill_markout(
+                order_id=order_id,
+                side="buy",
+                cumulative_filled=Decimal("0.1"),
+                cumulative_cost=Decimal("10"),
+                average_price=None,
+                now=float(index),
+                mid=Decimal("100"),
+                source="websocket_order_update",
+                terminal=False,
+            )
+            duplicate_terminal = metrics.record_maker_fill_markout(
+                order_id=order_id,
+                side="buy",
+                cumulative_filled=Decimal("0.1"),
+                cumulative_cost=Decimal("10"),
+                average_price=None,
+                now=float(index) + 0.5,
+                mid=Decimal("100"),
+                source="reconciliation",
+                terminal=True,
+            )
+            self.assertFalse(duplicate_terminal)
+
+        self.assertLessEqual(len(metrics._maker_fill_progress), 500)
+        self.assertEqual(metrics._maker_fill_open_ids, set())
+
+    async def test_reconciliation_fill_is_forwarded_to_markouts(self) -> None:
+        observed = replace(
+            self.order("reconciled-fill", filled="0.2", status=OrderStatus.FILLED),
+            cost=Decimal("20"),
+            average=Decimal("100"),
+        )
+        manager = self.order_manager()
+        manager.reconcile.return_value = ReconcileResult(
+            actions=(),
+            runtime_state=RuntimeState.ACTIVE,
+            position_refresh_required=True,
+            fill_observed=True,
+            observed_fill_orders=(observed,),
+        )
+        coordinator = self.prepare_running(order_manager=manager)
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertEqual(len(coordinator.metrics.fill_markouts), 1)
+        event = coordinator.metrics.fill_markouts[0]
+        self.assertEqual(event["order_id"], "reconciled-fill")
+        self.assertEqual(event["fill_price"], Decimal("100"))
+        self.assertEqual(event["observation_source"], "reconciliation")
 
     async def test_soft_exit_waits_for_audit_after_processed_fill_updates(
         self,
@@ -3046,6 +3417,145 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(coordinator.running)
         self.assertEqual(coordinator.state, RuntimeState.ACTIVE)
 
+    async def test_pending_economic_stop_is_published_before_waiting_cycle(
+        self,
+    ) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        snapshot = self.active_account_snapshot("0.2")
+        snapshot["economic_state"] = "collecting"
+
+        async def audit(_managed_order_ids):
+            snapshot["economic_state"] = "economic_stop_pending_flat"
+            snapshot["economic_reason"] = "fee gate failed; waiting for flat"
+            entered.set()
+            await release.wait()
+
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=audit),
+            snapshot=Mock(side_effect=lambda _now: dict(snapshot)),
+        )
+        coordinator = self.prepare_running(account_monitor=monitor)
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator.metrics.account_audit = {
+            "state": "healthy",
+            "economic_state": "collecting",
+        }
+
+        audit_task = asyncio.create_task(coordinator.audit_account_once())
+        await entered.wait()
+        cycle_task = asyncio.create_task(coordinator.run_one_cycle(force=True))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(audit_task, cycle_task)
+
+        evaluation = coordinator.risk_manager.evaluate.call_args.kwargs
+        self.assertFalse(evaluation["allow_new_episode"])
+        self.assertTrue(evaluation["force_inventory_exit"])
+
+    async def test_failed_audit_blocks_waiting_cycle_before_risk(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        snapshot = self.active_account_snapshot("0")
+        snapshot["economic_state"] = "collecting"
+
+        async def audit(_managed_order_ids):
+            snapshot["state"] = "hard_stop"
+            snapshot["economic_state"] = "no_go"
+            snapshot["economic_reason"] = "authenticated economic no-go"
+            entered.set()
+            await release.wait()
+            raise AccountAuditError("authenticated economic no-go")
+
+        monitor = SimpleNamespace(
+            audit=AsyncMock(side_effect=audit),
+            snapshot=Mock(side_effect=lambda _now: dict(snapshot)),
+        )
+        manager = self.order_manager()
+        execution_snapshot = {
+            "episode_id": None,
+            "state": "flat",
+            "reason": "authenticated flat checkpoint",
+            "trigger": None,
+            "suppress_passive": False,
+            "blocked": False,
+            "active_attempts": 0,
+            "episode_active_attempts": 0,
+            "last_active_trigger": None,
+            "order_lane": None,
+            "order_side": None,
+            "order_price": None,
+            "order_amount": None,
+            "completed_episode_execution_history": [
+                {
+                    "episode_id": 1,
+                    "active_attempts": 1,
+                    "last_active_trigger": "loss",
+                }
+            ],
+        }
+        executor = SimpleNamespace(
+            record_authenticated_flat=Mock(),
+            execution_snapshot=Mock(return_value=execution_snapshot),
+        )
+        coordinator = self.prepare_running(
+            account_monitor=monitor,
+            order_manager=manager,
+            inventory_executor=executor,
+        )
+        coordinator.metrics.account_audit = {
+            "state": "healthy",
+            "economic_state": "collecting",
+        }
+        coordinator.metrics.inventory_unwind = {
+            "state": "active_ready",
+            "trigger": "loss",
+            "order_lane": "active_ioc",
+            "blocked": True,
+        }
+        coordinator._position = None
+
+        audit_task = asyncio.create_task(coordinator.audit_account_once())
+        await entered.wait()
+        cycle_task = asyncio.create_task(coordinator.run_one_cycle(force=True))
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(
+            audit_task, cycle_task, return_exceptions=True
+        )
+        monitor.audit.side_effect = None
+
+        self.assertIsInstance(results[0], AccountAuditError)
+        self.assertFalse(coordinator.running)
+        coordinator.risk_manager.evaluate.assert_not_called()
+        manager.reconcile.assert_not_awaited()
+        executor.record_authenticated_flat.assert_called_once_with()
+        self.assertEqual(
+            coordinator.metrics.inventory_unwind[
+                "completed_episode_execution_history"
+            ],
+            execution_snapshot["completed_episode_execution_history"],
+        )
+        self.assertIsNone(coordinator.metrics.inventory_unwind["trigger"])
+        self.assertIsNone(coordinator.metrics.inventory_unwind["order_lane"])
+        self.assertFalse(coordinator.metrics.inventory_unwind["blocked"])
+
+    async def test_published_economic_no_go_fails_closed_before_risk(self) -> None:
+        manager = self.order_manager()
+        coordinator = self.prepare_running(order_manager=manager)
+        coordinator.metrics.account_audit = {
+            "state": "hard_stop",
+            "economic_state": "no_go",
+            "economic_reason": "authenticated economic no-go",
+        }
+
+        await coordinator.run_one_cycle(force=True)
+
+        coordinator.risk_manager.evaluate.assert_not_called()
+        manager.reconcile.assert_not_awaited()
+        manager.cancel_managed_orders.assert_awaited_once()
+        self.assertEqual(coordinator.state, RuntimeState.PAUSED_ERROR)
+
     async def test_account_audit_timeout_marks_hard_stop(self) -> None:
         monitor = SimpleNamespace(
             audit=AsyncMock(),
@@ -3175,6 +3685,18 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ]
         manager = self.order_manager()
         manager.sync_open_orders.return_value = True
+        observed = replace(
+            self.order("rest-fill", filled="0.2", status=OrderStatus.FILLED),
+            cost=Decimal("20"),
+            average=Decimal("100"),
+        )
+        manager.last_sync_result = ReconcileResult(
+            actions=(),
+            runtime_state=RuntimeState.SYNCING,
+            position_refresh_required=True,
+            fill_observed=True,
+            observed_fill_orders=(observed,),
+        )
         coordinator = self.prepare_running(
             adapter=adapter, order_manager=manager
         )
@@ -3184,6 +3706,17 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         adapter.get_positions.assert_awaited_once_with(["BTC"])
         self.assertEqual(
             coordinator.position_snapshot.signed_size, Decimal("0.2")
+        )
+        self.assertEqual(len(coordinator.metrics.fill_markouts), 1)
+        self.assertEqual(
+            coordinator.metrics.fill_markouts[0]["observation_source"],
+            "rest_open_order_sync",
+        )
+        self.assertIn(
+            "rest_open_order_sync",
+            coordinator.metrics.snapshot(self.now)["fill_markout_coverage"][
+                "sources"
+            ],
         )
 
     async def test_rest_sync_refreshes_fill_before_unknown_order_pause(self) -> None:

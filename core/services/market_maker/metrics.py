@@ -7,6 +7,12 @@ from typing import Any
 from .models import RuntimeState
 
 
+_TEN_THOUSAND = Decimal("10000")
+_MARKOUT_HORIZONS = (1, 5, 15, 60)
+_MARKOUT_EVENT_LIMIT = 100
+_MARKOUT_PROGRESS_LIMIT = 500
+
+
 def _default_counters() -> dict[str, int]:
     return {
         name: 0
@@ -36,6 +42,7 @@ def _default_counters() -> dict[str, int]:
             "active_unwind_ambiguous",
             "active_unwind_blocks",
             "would_active_unwind",
+            "episode_cap_blocked",
         )
     }
 
@@ -87,6 +94,11 @@ class MarketMakerMetrics:
     counters: dict[str, int] = field(default_factory=_default_counters)
     account_audit: dict[str, Any] = field(default_factory=dict)
     inventory_unwind: dict[str, Any] = field(default_factory=dict)
+    fill_markouts: list[dict[str, Any]] = field(default_factory=list)
+    _maker_fill_progress: dict[str, tuple[Decimal, Decimal]] = field(
+        default_factory=dict
+    )
+    _maker_fill_open_ids: set[str] = field(default_factory=set)
 
     def transition(self, state: RuntimeState, reason: str | None = None) -> None:
         if state is not self.runtime_state:
@@ -108,6 +120,155 @@ class MarketMakerMetrics:
         self.failed_cycles += 1
         self.consecutive_errors += 1
         return self.consecutive_errors
+
+    def record_maker_fill_markout(
+        self,
+        *,
+        order_id: str,
+        side: str,
+        cumulative_filled: Decimal,
+        cumulative_cost: Decimal,
+        average_price: Decimal | None,
+        now: float,
+        mid: Decimal,
+        source: str,
+        terminal: bool,
+    ) -> bool:
+        if side not in {"buy", "sell"} or not order_id:
+            return False
+        if (
+            not isinstance(cumulative_filled, Decimal)
+            or not cumulative_filled.is_finite()
+            or cumulative_filled <= 0
+        ):
+            return False
+        if (
+            isinstance(cumulative_cost, Decimal)
+            and cumulative_cost.is_finite()
+            and cumulative_cost > 0
+        ):
+            cumulative_notional = cumulative_cost
+        elif (
+            isinstance(average_price, Decimal)
+            and average_price.is_finite()
+            and average_price > 0
+        ):
+            cumulative_notional = cumulative_filled * average_price
+        else:
+            return False
+
+        prior_filled, prior_notional = self._maker_fill_progress.get(
+            order_id, (Decimal("0"), Decimal("0"))
+        )
+        delta_filled = cumulative_filled - prior_filled
+        delta_notional = cumulative_notional - prior_notional
+        if delta_filled <= 0 or delta_notional <= 0:
+            if terminal and order_id in self._maker_fill_progress:
+                progress = self._maker_fill_progress.pop(order_id)
+                self._maker_fill_progress[order_id] = progress
+                self._maker_fill_open_ids.discard(order_id)
+                self._trim_maker_fill_progress()
+            return False
+        fill_price = delta_notional / delta_filled
+        if not fill_price.is_finite() or fill_price <= 0:
+            return False
+
+        self._maker_fill_progress.pop(order_id, None)
+        self._maker_fill_progress[order_id] = (
+            cumulative_filled,
+            cumulative_notional,
+        )
+        if terminal:
+            self._maker_fill_open_ids.discard(order_id)
+        else:
+            self._maker_fill_open_ids.add(order_id)
+        self._trim_maker_fill_progress()
+        event: dict[str, Any] = {
+            "order_id": order_id,
+            "side": side,
+            "fill_amount": delta_filled,
+            "fill_price": fill_price,
+            "observation_source": source,
+            "started_monotonic": now,
+            "mae_bps": None,
+            "mfe_bps": None,
+        }
+        for horizon in _MARKOUT_HORIZONS:
+            event[f"markout_{horizon}s_bps"] = None
+        self.fill_markouts.append(event)
+        del self.fill_markouts[:-_MARKOUT_EVENT_LIMIT]
+        self.update_fill_markouts(now=now, mid=mid)
+        return True
+
+    def _trim_maker_fill_progress(self) -> None:
+        while len(self._maker_fill_progress) > _MARKOUT_PROGRESS_LIMIT:
+            evicted = next(
+                (
+                    candidate
+                    for candidate in self._maker_fill_progress
+                    if candidate not in self._maker_fill_open_ids
+                ),
+                None,
+            )
+            if evicted is None:
+                break
+            self._maker_fill_progress.pop(evicted)
+
+    def sync_open_maker_order_ids(self, order_ids: set[str]) -> None:
+        self._maker_fill_open_ids.intersection_update(order_ids)
+        self._trim_maker_fill_progress()
+
+    def update_fill_markouts(self, *, now: float, mid: Decimal) -> None:
+        if not isinstance(mid, Decimal) or not mid.is_finite() or mid <= 0:
+            return
+        for event in self.fill_markouts:
+            if event["markout_60s_bps"] is not None:
+                continue
+            age = max(0.0, now - event["started_monotonic"])
+            fill_price = event["fill_price"]
+            markout = (
+                (mid - fill_price) / fill_price * _TEN_THOUSAND
+                if event["side"] == "buy"
+                else (fill_price - mid) / fill_price * _TEN_THOUSAND
+            )
+            event["mae_bps"] = (
+                markout
+                if event["mae_bps"] is None
+                else min(event["mae_bps"], markout)
+            )
+            event["mfe_bps"] = (
+                markout
+                if event["mfe_bps"] is None
+                else max(event["mfe_bps"], markout)
+            )
+            for horizon in _MARKOUT_HORIZONS:
+                key = f"markout_{horizon}s_bps"
+                if event[key] is None and age >= horizon:
+                    event[key] = markout
+
+    def _side_markout_summary(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for side in ("buy", "sell"):
+            side_summary: dict[str, Any] = {}
+            side_events = [
+                event for event in self.fill_markouts if event["side"] == side
+            ]
+            for horizon in _MARKOUT_HORIZONS:
+                values = [
+                    event[f"markout_{horizon}s_bps"]
+                    for event in side_events
+                    if event[f"markout_{horizon}s_bps"] is not None
+                ]
+                side_summary[f"{horizon}s"] = {
+                    "count": len(values),
+                    "mean_bps": (
+                        sum(values, Decimal("0")) / len(values)
+                        if values
+                        else None
+                    ),
+                }
+            summary[side] = side_summary
+        return summary
 
     def snapshot(self, now: float) -> dict[str, Any]:
         return {
@@ -154,4 +315,24 @@ class MarketMakerMetrics:
             "counters": dict(self.counters),
             "account_audit": dict(self.account_audit),
             "inventory_unwind": dict(self.inventory_unwind),
+            "fill_markouts": [
+                {
+                    **event,
+                    "age_seconds": max(
+                        0.0, now - event["started_monotonic"]
+                    ),
+                }
+                for event in self.fill_markouts
+            ],
+            "fill_markout_coverage": {
+                "unit": "observed_order_fill_delta",
+                "sources": (
+                    "websocket_order_update",
+                    "reconciliation",
+                    "rest_open_order_sync",
+                ),
+                "time_origin": "observation_monotonic",
+                "retained_events": len(self.fill_markouts),
+            },
+            "side_markout_summary": self._side_markout_summary(),
         }

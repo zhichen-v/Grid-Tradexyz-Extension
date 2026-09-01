@@ -210,6 +210,7 @@ market_maker:
             ({**values, "ping_pong_enabled": False}, "ping_pong_enabled"),
             ({**values, "active_unwind_after_seconds": 120}, "after soft exit"),
             ({**values, "active_unwind_loss_trigger": "0.30"}, "below episode"),
+            ({**values, "max_episode_loss_for_unwind": "0.40"}, "below session"),
             ({**values, "max_episode_loss_for_unwind": "0.41"}, "episode loss"),
             ({**values, "max_session_loss_for_unwind": "0.50"}, "drawdown"),
             ({**values, "active_unwind_max_slippage_ticks": 0}, "slippage"),

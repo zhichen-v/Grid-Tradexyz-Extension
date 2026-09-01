@@ -69,8 +69,8 @@ market_maker:
   active_unwind_max_slippage_ticks: 0
   active_unwind_max_attempts: 1
   active_unwind_confirmation_timeout_seconds: 5
-  # Episode 與 maker+taker session 的絕對 loss cap；啟用時皆須為正，
-  # session cap 必須低於 max_session_drawdown，且 maker exit budget 亦須為正。
+  # Episode 與 maker+taker session 的絕對 loss cap；啟用時必須滿足
+  # 0 < episode < session < drawdown，且 maker exit budget 亦須為正。
   max_episode_loss_for_unwind: "0"
   max_session_loss_for_unwind: "0"
   require_flat_start: false

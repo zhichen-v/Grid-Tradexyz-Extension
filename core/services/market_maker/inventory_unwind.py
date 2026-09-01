@@ -12,6 +12,7 @@ from .models import DesiredOrder, MarketMetadata, MarketSnapshot, PositionSnapsh
 
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
+_COMPLETED_EPISODE_HISTORY_LIMIT = 100
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,9 @@ class InventoryUnwindDecision:
     projected_session_loss: Decimal | None = None
     remaining_drawdown: Decimal | None = None
     active_attempts: int = 0
+    last_active_trigger: str | None = None
+    budget_blocked: bool = False
+    completed_episode_execution_history: tuple[dict[str, Any], ...] = ()
 
     def snapshot(self) -> dict[str, Any]:
         order = self.active_order or self.passive_order
@@ -55,6 +59,13 @@ class InventoryUnwindDecision:
             "projected_session_loss": self.projected_session_loss,
             "remaining_drawdown": self.remaining_drawdown,
             "active_attempts": self.active_attempts,
+            "episode_active_attempts": self.active_attempts,
+            "last_active_trigger": self.last_active_trigger,
+            "budget_blocked": self.budget_blocked,
+            "completed_episode_execution_history": [
+                dict(episode)
+                for episode in self.completed_episode_execution_history
+            ],
             "order_lane": lane,
             "order_side": order.side.value if order is not None else None,
             "order_price": order.price if order is not None else None,
@@ -79,6 +90,9 @@ class InventoryEpisodeExecutor:
         self._episode_sign = 0
         self._opened_monotonic: float | None = None
         self._active_attempts = 0
+        self._active_ready_trigger: str | None = None
+        self._last_active_trigger: str | None = None
+        self._completed_episode_execution_history: list[dict[str, Any]] = []
 
     def reset_session(self) -> None:
         self._next_episode_id = 1
@@ -86,10 +100,42 @@ class InventoryEpisodeExecutor:
         self._episode_sign = 0
         self._opened_monotonic = None
         self._active_attempts = 0
+        self._active_ready_trigger = None
+        self._last_active_trigger = None
+        self._completed_episode_execution_history.clear()
 
     def record_active_attempt(self) -> None:
         if self._episode_id is not None:
             self._active_attempts += 1
+            if self._active_ready_trigger in {"loss", "time"}:
+                self._last_active_trigger = self._active_ready_trigger
+            self._active_ready_trigger = None
+
+    def record_authenticated_flat(self) -> bool:
+        if self._episode_id is None:
+            return False
+        self._completed_episode_execution_history.append(
+            {
+                "episode_id": self._episode_id,
+                "active_attempts": self._active_attempts,
+                "last_active_trigger": self._last_active_trigger,
+            }
+        )
+        del self._completed_episode_execution_history[
+            :-_COMPLETED_EPISODE_HISTORY_LIMIT
+        ]
+        self._episode_id = None
+        self._episode_sign = 0
+        self._opened_monotonic = None
+        self._active_attempts = 0
+        self._active_ready_trigger = None
+        self._last_active_trigger = None
+        return True
+
+    def execution_snapshot(self) -> dict[str, Any]:
+        return self._decision(
+            "flat", "authenticated flat checkpoint", 0.0
+        ).snapshot()
 
     def evaluate(
         self,
@@ -121,10 +167,7 @@ class InventoryEpisodeExecutor:
                     "authenticated flat checkpoint pending",
                     age,
                 )
-            self._episode_id = None
-            self._episode_sign = 0
-            self._opened_monotonic = None
-            self._active_attempts = 0
+            self.record_authenticated_flat()
             return self._decision("flat", "authenticated flat checkpoint", 0.0)
 
         if self._episode_id is None:
@@ -133,6 +176,8 @@ class InventoryEpisodeExecutor:
             self._episode_sign = sign
             self._opened_monotonic = now_monotonic
             self._active_attempts = 0
+            self._active_ready_trigger = None
+            self._last_active_trigger = None
         elif sign != self._episode_sign:
             return self._decision(
                 "blocked",
@@ -145,10 +190,6 @@ class InventoryEpisodeExecutor:
         if not self.config.active_unwind_enabled:
             return self._decision(
                 "disabled", "active unwind is disabled", age
-            )
-        if not soft_exit_latched:
-            return self._decision(
-                "profit_exit", "strict fee-aware profit exit", age
             )
 
         economics = self._trusted_economics(account_snapshot, signed)
@@ -214,6 +255,10 @@ class InventoryEpisodeExecutor:
         )
         time_triggered = age >= self.config.active_unwind_after_seconds
         trigger = "loss" if loss_triggered else "time" if time_triggered else None
+        if trigger is None and not soft_exit_latched:
+            return self._decision(
+                "profit_exit", "strict fee-aware profit exit", age
+            )
 
         active_price = self._active_limit(
             sign,
@@ -236,6 +281,7 @@ class InventoryEpisodeExecutor:
                 age,
                 trigger=trigger,
                 blocked=True,
+                budget_blocked=True,
                 suppress_passive=True,
                 remaining_drawdown=remaining_drawdown,
             )
@@ -291,6 +337,7 @@ class InventoryEpisodeExecutor:
                     age,
                     trigger=trigger,
                     blocked=True,
+                    budget_blocked=True,
                     suppress_passive=True,
                     projected_episode_loss=projected_episode_loss,
                     projected_session_loss=projected_session_loss,
@@ -304,6 +351,7 @@ class InventoryEpisodeExecutor:
                 reduce_only=True,
                 reason=f"inventory unwind {trigger} barrier",
             )
+            self._active_ready_trigger = trigger
             return self._decision(
                 "active_ready",
                 order.reason,
@@ -390,6 +438,11 @@ class InventoryEpisodeExecutor:
             reason=reason,
             age_seconds=age,
             active_attempts=self._active_attempts,
+            last_active_trigger=self._last_active_trigger,
+            completed_episode_execution_history=tuple(
+                dict(episode)
+                for episode in self._completed_episode_execution_history
+            ),
             **values,
         )
 

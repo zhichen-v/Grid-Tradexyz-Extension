@@ -106,18 +106,25 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
         stranded: bool = True,
         authenticated_flat: bool = False,
         pending: bool = False,
+        soft_exit_latched: bool | None = None,
+        entry: str = "100",
         coordinator_unrealized_pnl: str = "0",
     ):
         return executor.evaluate(
             position=self.position(
                 position,
+                entry=entry,
                 unrealized_pnl=coordinator_unrealized_pnl,
             ),
             market=market or self.market(),
             metadata=self.metadata,
             account_snapshot=account or self.account(position),
             now_monotonic=now,
-            soft_exit_latched=position != "0",
+            soft_exit_latched=(
+                position != "0"
+                if soft_exit_latched is None
+                else soft_exit_latched
+            ),
             stranded_soft_exit=stranded,
             authenticated_flat=authenticated_flat,
             active_unwind_pending=pending,
@@ -150,11 +157,12 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
 
     def test_loss_and_time_barriers_create_bounded_long_short_ioc_intents(self) -> None:
         short = InventoryEpisodeExecutor(self.config)
-        self.evaluate(short, now=0)
+        self.evaluate(short, now=0, soft_exit_latched=False)
         loss_hit = self.evaluate(
             short,
             now=5,
             market=self.market("100.7", "100.8"),
+            soft_exit_latched=False,
         )
         self.assertEqual(loss_hit.trigger, "loss")
         self.assertEqual(loss_hit.active_order.side, OrderSide.BUY)
@@ -168,6 +176,7 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
             position="0.2",
             market=self.market("99.9", "100.1"),
             account=self.account("0.2"),
+            soft_exit_latched=False,
         )
         timed = self.evaluate(
             long,
@@ -175,11 +184,82 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
             position="0.2",
             market=self.market("99.9", "100.1"),
             account=self.account("0.2"),
+            soft_exit_latched=False,
         )
         self.assertEqual(timed.trigger, "time")
         self.assertEqual(timed.active_order.side, OrderSide.SELL)
         self.assertEqual(timed.active_order.price, Decimal("99.7"))
         self.assertTrue(timed.active_order.reduce_only)
+
+    def test_profit_exit_remains_when_no_loss_or_time_barrier_fires(self) -> None:
+        decision = self.evaluate(
+            InventoryEpisodeExecutor(self.config),
+            now=0,
+            soft_exit_latched=False,
+        )
+
+        self.assertEqual(decision.state, "profit_exit")
+        self.assertEqual(decision.reason, "strict fee-aware profit exit")
+        self.assertIsNone(decision.trigger)
+        self.assertIsNone(decision.active_order)
+
+    def test_pre_latch_untrusted_economics_waits_until_time_barrier(self) -> None:
+        cases = (
+            ("missing", {"state": "healthy"}, 30),
+            ("stale", self.account("-0.2", age_seconds=21.0), 31),
+        )
+        for name, account, barrier_now in cases:
+            with self.subTest(name=name):
+                executor = InventoryEpisodeExecutor(self.config)
+                waiting = self.evaluate(
+                    executor,
+                    now=0,
+                    account=account,
+                    stranded=False,
+                    soft_exit_latched=False,
+                )
+                blocked = self.evaluate(
+                    executor,
+                    now=barrier_now,
+                    account=account,
+                    stranded=False,
+                    soft_exit_latched=False,
+                )
+
+                self.assertEqual(waiting.state, "passive_wait")
+                self.assertFalse(waiting.blocked)
+                self.assertFalse(waiting.suppress_passive)
+                self.assertIn("unavailable", waiting.reason)
+                self.assertEqual(blocked.state, "blocked")
+                self.assertTrue(blocked.blocked)
+                self.assertIn("fresh authenticated economics", blocked.reason)
+
+    def test_pre_latch_unprovable_loss_exit_fails_closed(self) -> None:
+        cases = (
+            ("invalid entry", {"entry": "0"}, "entry price"),
+            (
+                "unusable slippage",
+                {
+                    "position": "0.2",
+                    "market": self.market("0.1", "0.2"),
+                    "account": self.account("0.2"),
+                },
+                "slippage price",
+            ),
+        )
+        for name, overrides, reason in cases:
+            with self.subTest(name=name):
+                decision = self.evaluate(
+                    InventoryEpisodeExecutor(self.config),
+                    now=0,
+                    stranded=False,
+                    soft_exit_latched=False,
+                    **overrides,
+                )
+
+                self.assertEqual(decision.state, "blocked")
+                self.assertTrue(decision.blocked)
+                self.assertIn(reason, decision.reason)
 
     def test_caps_attempts_and_authenticated_flat_are_fail_closed(self) -> None:
         executor = InventoryEpisodeExecutor(self.config)
@@ -190,6 +270,7 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
             market=self.market("101.5", "101.6"),
         )
         self.assertTrue(blocked.blocked)
+        self.assertTrue(blocked.budget_blocked)
         self.assertIn("episode loss", blocked.reason)
 
         executor = InventoryEpisodeExecutor(self.config)
@@ -200,6 +281,7 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
         executor.record_active_attempt()
         exhausted = self.evaluate(executor, now=31)
         self.assertTrue(exhausted.blocked)
+        self.assertFalse(exhausted.budget_blocked)
         self.assertIn("attempt", exhausted.reason)
 
         pending_flat = self.evaluate(
@@ -210,6 +292,9 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
         )
         self.assertEqual(pending_flat.state, "flat_pending_audit")
         self.assertIsNotNone(pending_flat.episode_id)
+        self.assertEqual(
+            pending_flat.snapshot()["completed_episode_execution_history"], []
+        )
         confirmed_flat = self.evaluate(
             executor,
             now=33,
@@ -219,6 +304,124 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
         )
         self.assertEqual(confirmed_flat.state, "flat")
         self.assertIsNone(confirmed_flat.episode_id)
+        self.assertEqual(
+            confirmed_flat.snapshot()["completed_episode_execution_history"],
+            [
+                {
+                    "episode_id": 1,
+                    "active_attempts": 2,
+                    "last_active_trigger": "time",
+                }
+            ],
+        )
+
+    def test_completed_episode_history_records_loss_trigger(self) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+        self.evaluate(executor, now=0, soft_exit_latched=False)
+        ready = self.evaluate(
+            executor,
+            now=5,
+            market=self.market("100.7", "100.8"),
+            soft_exit_latched=False,
+        )
+        self.assertEqual(ready.trigger, "loss")
+
+        executor.record_active_attempt()
+        completed = self.evaluate(
+            executor,
+            now=6,
+            position="0",
+            account=self.account("0"),
+            authenticated_flat=True,
+        )
+
+        self.assertEqual(
+            completed.snapshot()["completed_episode_execution_history"],
+            [
+                {
+                    "episode_id": 1,
+                    "active_attempts": 1,
+                    "last_active_trigger": "loss",
+                }
+            ],
+        )
+
+    def test_audit_can_finalize_execution_history_before_runtime_stop(self) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+        self.evaluate(executor, now=0, soft_exit_latched=False)
+        ready = self.evaluate(
+            executor,
+            now=5,
+            market=self.market("100.7", "100.8"),
+            soft_exit_latched=False,
+        )
+        self.assertEqual(ready.trigger, "loss")
+        executor.record_active_attempt()
+
+        self.assertTrue(executor.record_authenticated_flat())
+        self.assertFalse(executor.record_authenticated_flat())
+        published = executor.execution_snapshot()
+        self.assertEqual(published["state"], "flat")
+        self.assertIsNone(published["trigger"])
+        self.assertIsNone(published["order_lane"])
+        self.assertFalse(published["blocked"])
+        completed = self.evaluate(
+            executor,
+            now=6,
+            position="0",
+            account=self.account("0"),
+            authenticated_flat=True,
+        )
+        self.assertEqual(
+            completed.snapshot()["completed_episode_execution_history"],
+            [
+                {
+                    "episode_id": 1,
+                    "active_attempts": 1,
+                    "last_active_trigger": "loss",
+                }
+            ],
+        )
+
+    def test_completed_episode_history_is_bounded_and_resets_with_session(
+        self,
+    ) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+        history = []
+        for episode in range(101):
+            self.evaluate(
+                executor,
+                now=float(episode * 2),
+                soft_exit_latched=False,
+            )
+            completed = self.evaluate(
+                executor,
+                now=float(episode * 2 + 1),
+                position="0",
+                account=self.account("0"),
+                authenticated_flat=True,
+            )
+            history = completed.snapshot()[
+                "completed_episode_execution_history"
+            ]
+
+        self.assertEqual(len(history), 100)
+        self.assertEqual(history[0]["episode_id"], 2)
+        self.assertEqual(history[-1]["episode_id"], 101)
+        self.assertEqual(history[-1]["active_attempts"], 0)
+        self.assertIsNone(history[-1]["last_active_trigger"])
+
+        executor.reset_session()
+        reset = self.evaluate(
+            executor,
+            now=203,
+            position="0",
+            account=self.account("0"),
+            authenticated_flat=True,
+        )
+        self.assertEqual(
+            reset.snapshot()["completed_episode_execution_history"], []
+        )
 
     def test_stale_economics_and_pre_trigger_caps_do_not_mutate(self) -> None:
         executor = InventoryEpisodeExecutor(self.config)

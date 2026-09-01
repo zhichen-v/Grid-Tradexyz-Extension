@@ -73,6 +73,7 @@ class RiskManager:
         *,
         now_monotonic: float | None = None,
         allow_new_episode: bool = True,
+        force_inventory_exit: bool = False,
     ) -> RiskDecision:
         if position is None:
             return self._paused(
@@ -203,7 +204,8 @@ class RiskManager:
             self.config.ping_pong_enabled and position.signed_size != _ZERO
         )
         normal_reduction = (
-            ping_pong_reduction
+            force_inventory_exit
+            or ping_pong_reduction
             or residual_position
             or absolute_ratio >= self.config.hard_position_ratio
         )
@@ -214,7 +216,12 @@ class RiskManager:
             and position.signed_size != _ZERO
         ):
             self._soft_exit_latched = True
-        if (
+        if force_inventory_exit and position.signed_size == _ZERO:
+            state = RuntimeState.SYNCING
+            reason = "economic stop flat pending authenticated audit"
+            requested_buy = None
+            requested_sell = None
+        elif (
             self.config.ping_pong_enabled
             and position.signed_size == _ZERO
             and not allow_new_episode
@@ -226,7 +233,9 @@ class RiskManager:
         elif normal_reduction or self._soft_exit_latched:
             state = RuntimeState.RISK_REDUCTION
             reason = (
-                "soft exit latched until flat"
+                "economic stop pending authenticated flat"
+                if force_inventory_exit
+                else "soft exit latched until flat"
                 if self._soft_exit_latched
                 else (
                     "ping-pong inventory exit"
@@ -271,10 +280,11 @@ class RiskManager:
                 elif position.signed_size < 0:
                     requested_sell *= multiplier
 
-        if self.config.quote_mode == "bid_only":
-            requested_sell = None
-        elif self.config.quote_mode == "ask_only":
-            requested_buy = None
+        if not force_inventory_exit:
+            if self.config.quote_mode == "bid_only":
+                requested_sell = None
+            elif self.config.quote_mode == "ask_only":
+                requested_buy = None
 
         buy_amount = self._candidate_amount(
             requested_buy,

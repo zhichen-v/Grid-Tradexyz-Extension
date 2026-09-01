@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -154,16 +154,19 @@ class ReconcileResult:
     errors: tuple[str, ...] = ()
     position_refresh_required: bool = False
     fill_observed: bool = False
+    observed_fill_orders: tuple[OrderData, ...] = ()
 
 
 @dataclass
 class _OrderEffect:
     position_refresh_required: bool = False
     fill_observed: bool = False
+    observed_fill_orders: list[OrderData] = field(default_factory=list)
 
     def include(self, other: "_OrderEffect") -> None:
         self.position_refresh_required |= other.position_refresh_required
         self.fill_observed |= other.fill_observed
+        self.observed_fill_orders.extend(other.observed_fill_orders)
 
 
 class MarketMakerOrderManager:
@@ -211,6 +214,7 @@ class MarketMakerOrderManager:
         self.pause_reason: str | None = None
         self._shutting_down = False
         self.last_result = ReconcileResult((), RuntimeState.SYNCING)
+        self.last_sync_result = ReconcileResult((), RuntimeState.SYNCING)
 
     @property
     def slots(self) -> dict[OrderSide, ManagedOrder | None]:
@@ -231,7 +235,7 @@ class MarketMakerOrderManager:
 
     @property
     def active_unwind_order_ids(self) -> frozenset[str]:
-        """Order ids authorized as taker only after exact terminal proof."""
+        """Confirmed order ids attributable to the isolated taker lane."""
         return frozenset(self._active_unwind_order_ids)
 
     @property
@@ -408,9 +412,10 @@ class MarketMakerOrderManager:
                 return self._result(actions, ("order manager is stopping",))
 
             resolved = await self._resolve_uncertain_locked()
-            effect.fill_observed = any(
-                _has_visible_fill(order) for order in resolved
+            effect.observed_fill_orders.extend(
+                order for order in resolved if _has_visible_fill(order)
             )
+            effect.fill_observed = bool(effect.observed_fill_orders)
             effect.position_refresh_required = effect.fill_observed
             blocking = self._blocking_reason()
             if blocking:
@@ -604,9 +609,10 @@ class MarketMakerOrderManager:
                 return self._result(actions, (self.pause_reason or "disabled",))
 
             resolved = await self._resolve_uncertain_locked()
-            effect.fill_observed = any(
-                _has_visible_fill(order) for order in resolved
+            effect.observed_fill_orders.extend(
+                order for order in resolved if _has_visible_fill(order)
             )
+            effect.fill_observed = bool(effect.observed_fill_orders)
             effect.position_refresh_required = bool(resolved)
             blocking = self._blocking_reason()
             if blocking:
@@ -842,6 +848,7 @@ class MarketMakerOrderManager:
                 )
                 return self._result(actions, errors, effect)
 
+            self._active_unwind_order_ids.add(str(order.id))
             slot = self._slots[desired.side]
             if slot is None:
                 self._mark_submission_uncertain(
@@ -913,7 +920,9 @@ class MarketMakerOrderManager:
                 success=terminal.status is not OrderStatus.REJECTED,
             )
             effect.position_refresh_required = True
-            effect.fill_observed = fill_observed
+            effect.fill_observed |= fill_observed
+            if fill_observed:
+                effect.observed_fill_orders.append(terminal)
             return self._result(actions, errors, effect)
 
     async def handle_order_update(self, order: OrderData) -> bool:
@@ -943,6 +952,8 @@ class MarketMakerOrderManager:
                     side, "invalid active unwind order update proof"
                 )
                 return False
+            if self._active_unwind_side is side and order.id not in (None, ""):
+                self._active_unwind_order_ids.add(str(order.id))
             fill_observed = _has_visible_fill(
                 order, previous_remaining=slot.remaining
             )
@@ -957,12 +968,15 @@ class MarketMakerOrderManager:
     async def sync_open_orders(self) -> bool:
         async with self._lock:
             self._invalidate_active_unwind_preparation()
+            effect = _OrderEffect()
             resolved = await self._resolve_uncertain_locked()
-            position_refresh_required = any(
-                order.symbol == self.config.symbol
-                and _has_visible_fill(order)
+            effect.observed_fill_orders.extend(
+                order
                 for order in resolved
+                if order.symbol == self.config.symbol and _has_visible_fill(order)
             )
+            effect.fill_observed = bool(effect.observed_fill_orders)
+            effect.position_refresh_required = effect.fill_observed
             open_orders = self._active_symbol_orders(
                 await self.adapter.get_open_orders(self.config.symbol)
             )
@@ -991,17 +1005,23 @@ class MarketMakerOrderManager:
                             "invalid active unwind open-order proof",
                         )
                         continue
-                    position_refresh_required = (
-                        _has_visible_fill(
-                            matches[0], previous_remaining=slot.remaining
-                        )
-                        or position_refresh_required
+                    matched = matches[0]
+                    if (
+                        self._active_unwind_side is side
+                        and matched.id not in (None, "")
+                    ):
+                        self._active_unwind_order_ids.add(str(matched.id))
+                    fill_observed = _has_visible_fill(
+                        matched, previous_remaining=slot.remaining
                     )
-                    self._apply_order_update(side, matches[0])
+                    effect.position_refresh_required |= fill_observed
+                    effect.fill_observed |= fill_observed
+                    if fill_observed:
+                        effect.observed_fill_orders.append(matched)
+                    self._apply_order_update(side, matched)
                     continue
-                position_refresh_required = (
+                effect.include(
                     await self._resolve_missing_slot_locked(side, slot)
-                    or position_refresh_required
                 )
 
             unknown = [
@@ -1020,7 +1040,15 @@ class MarketMakerOrderManager:
                 self.pause_reason = None
                 self.runtime_state = RuntimeState.SYNCING
             self._clear_resolved_uncertainty_pause()
-            return position_refresh_required
+            self.last_sync_result = ReconcileResult(
+                (),
+                self.runtime_state,
+                (),
+                effect.position_refresh_required,
+                effect.fill_observed,
+                tuple(effect.observed_fill_orders),
+            )
+            return effect.position_refresh_required
 
     async def cancel_managed_orders(self, reason: str) -> ReconcileResult:
         self._begin_safety_requests()
@@ -1057,9 +1085,10 @@ class MarketMakerOrderManager:
             open_orders: list[OrderData] = []
             effect = _OrderEffect()
             resolved = await self._resolve_uncertain_locked()
-            effect.fill_observed = any(
-                _has_visible_fill(order) for order in resolved
+            effect.observed_fill_orders.extend(
+                order for order in resolved if _has_visible_fill(order)
             )
+            effect.fill_observed = bool(effect.observed_fill_orders)
             effect.position_refresh_required = effect.fill_observed
             if self.config.cancel_on_shutdown:
                 effect.include(
@@ -1068,7 +1097,7 @@ class MarketMakerOrderManager:
                     )
                 )
             if not self.config.dry_run:
-                await self._sync_for_shutdown_locked()
+                effect.include(await self._sync_for_shutdown_locked())
                 open_orders = self._active_symbol_orders(
                     await self.adapter.get_open_orders(self.config.symbol)
                 )
@@ -1260,6 +1289,8 @@ class MarketMakerOrderManager:
             return effect
         if order.id is not None:
             self._known_order_ids.add(str(order.id))
+        if fill_observed:
+            effect.observed_fill_orders.append(order)
         if order.status in _TERMINAL_STATUSES:
             terminal_slot = self._slots[desired.side]
             if terminal_slot is not None:
@@ -1271,7 +1302,7 @@ class MarketMakerOrderManager:
                     success=True,
                 )
                 self._slots[desired.side] = None
-                return _OrderEffect(True, True)
+                return effect
             actions[action_index] = replace(
                 action,
                 reason=(
@@ -1423,7 +1454,10 @@ class MarketMakerOrderManager:
                 errors.append(
                     "exact cancellation terminal proof could not be confirmed"
                 )
-                return _OrderEffect(fill_observed, fill_observed)
+                return _OrderEffect(
+                    fill_observed,
+                    fill_observed,
+                )
             if callable(confirmer) and not cached_terminal_used:
                 confirmer(result)
             actions[action_index] = replace(
@@ -1432,10 +1466,18 @@ class MarketMakerOrderManager:
             )
             self._record_terminal_order(slot, result)
             self._slots[side] = None
-            return _OrderEffect(True, fill_observed)
+            return _OrderEffect(
+                True,
+                fill_observed,
+                [result] if fill_observed else [],
+            )
         self._mark_cancellation_uncertain(slot)
         errors.append("cancel outcome is not terminal")
-        return _OrderEffect(fill_observed, fill_observed)
+        return _OrderEffect(
+            fill_observed,
+            fill_observed,
+            [result] if fill_observed else [],
+        )
 
     async def _cancel_confirmable_locked(
         self,
@@ -1488,6 +1530,8 @@ class MarketMakerOrderManager:
                 if self._active_unwind_side is order.side:
                     if not self._valid_active_resolution(slot, order):
                         continue
+                    if order.id not in (None, ""):
+                        self._active_unwind_order_ids.add(str(order.id))
                     if order.status in _TERMINAL_STATUSES:
                         self._apply_order_update(order.side, order)
                     else:
@@ -1505,7 +1549,8 @@ class MarketMakerOrderManager:
 
     async def _resolve_missing_slot_locked(
         self, side: OrderSide, slot: ManagedOrder
-    ) -> bool:
+    ) -> _OrderEffect:
+        effect = _OrderEffect()
         history_getter = getattr(self.adapter, "get_order_history", None)
         history: Iterable[OrderData] = ()
         if callable(history_getter):
@@ -1529,7 +1574,11 @@ class MarketMakerOrderManager:
                 terminal, previous_remaining=slot.remaining
             )
             self._apply_order_update(side, terminal)
-            return visible_fill if self._slots[side] is None else False
+            if visible_fill and self._slots[side] is None:
+                effect.position_refresh_required = True
+                effect.fill_observed = True
+                effect.observed_fill_orders.append(terminal)
+            return effect
         if slot.state in {
             OrderSlotState.CANCELING,
             OrderSlotState.UNCERTAIN_CANCELLATION,
@@ -1539,9 +1588,10 @@ class MarketMakerOrderManager:
             slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
             slot.submission_uncertain = True
             self._pause(f"{side.value} order disappeared without terminal proof")
-        return False
+        return effect
 
-    async def _sync_for_shutdown_locked(self) -> None:
+    async def _sync_for_shutdown_locked(self) -> _OrderEffect:
+        effect = _OrderEffect()
         open_orders = self._active_symbol_orders(
             await self.adapter.get_open_orders(self.config.symbol)
         )
@@ -1553,7 +1603,8 @@ class MarketMakerOrderManager:
                 for order in open_orders
             ):
                 continue
-            await self._resolve_missing_slot_locked(side, slot)
+            effect.include(await self._resolve_missing_slot_locked(side, slot))
+        return effect
 
     def _apply_order_update(self, side: OrderSide, order: OrderData) -> None:
         if order.status is OrderStatus.UNKNOWN:
@@ -2145,6 +2196,7 @@ class MarketMakerOrderManager:
             tuple(errors),
             effect.position_refresh_required,
             effect.fill_observed,
+            tuple(effect.observed_fill_orders),
         )
         self.last_result = result
         return result

@@ -12,6 +12,7 @@ _ZERO = Decimal("0")
 _TEN_THOUSAND = Decimal("10000")
 _READ_ATTEMPTS = 6
 _READ_RETRY_SECONDS = 1.0
+_COMPLETED_EPISODE_LEDGER_LIMIT = 100
 
 
 class AccountAuditError(RuntimeError):
@@ -213,13 +214,19 @@ class SessionEconomics:
     completed_turnover: Decimal = _ZERO
     completed_exact_fee: Decimal = _ZERO
     completed_gross: Decimal = _ZERO
+    completed_episode_ledger: list[dict[str, Any]] = field(default_factory=list)
+    episode_active_unwind_flat: int = 0
     active_unwind_turnover: Decimal = _ZERO
     active_unwind_exact_fee: Decimal = _ZERO
     active_unwind_gross: Decimal = _ZERO
     _episode_fills: int = 0
     _episode_turnover: Decimal = _ZERO
     _episode_fee: Decimal = _ZERO
+    _episode_taker_fee: Decimal = _ZERO
     _episode_gross: Decimal = _ZERO
+    _episode_entry_side: str | None = None
+    _episode_active_unwind_used: bool = False
+    _pending_economic_stop_reason: str | None = None
     current_equity: Decimal | None = None
     last_flat_equity_change: Decimal = _ZERO
     last_flat_completed_fills: int = 0
@@ -278,6 +285,8 @@ class SessionEconomics:
         for fill in new_fills:
             prior_position = self.ledger_position
             next_position = prior_position + fill.signed_amount
+            if prior_position == 0:
+                self._episode_entry_side = fill.side.value
             if fill.active_unwind:
                 if prior_position == 0:
                     raise AccountAuditError(
@@ -302,6 +311,7 @@ class SessionEconomics:
                 self.active_unwind_turnover += fill.turnover
                 self.active_unwind_exact_fee += fill.fee
                 self.active_unwind_gross += fill.gross
+                self._episode_taker_fee += fill.fee
             else:
                 self.unique_maker_fills += 1
                 self.maker_turnover += fill.turnover
@@ -312,16 +322,42 @@ class SessionEconomics:
             self._episode_turnover += fill.turnover
             self._episode_fee += fill.fee
             self._episode_gross += fill.gross
+            self._episode_active_unwind_used |= fill.active_unwind
             if next_position == 0:
                 self.completed_round_trips += 1
                 self.completed_fills += self._episode_fills
                 self.completed_turnover += self._episode_turnover
                 self.completed_exact_fee += self._episode_fee
                 self.completed_gross += self._episode_gross
+                self.completed_episode_ledger.append(
+                    {
+                        "maker_fills": self._episode_fills,
+                        "entry_side": self._episode_entry_side,
+                        "turnover": self._episode_turnover,
+                        "gross": self._episode_gross,
+                        "exact_fee": self._episode_fee,
+                        "maker_fee": self._episode_fee - self._episode_taker_fee,
+                        "taker_fee": self._episode_taker_fee,
+                        "net_ex_funding": self._episode_gross - self._episode_fee,
+                        "active_unwind_used": self._episode_active_unwind_used,
+                        "close_type": (
+                            "active_unwind_flat"
+                            if fill.active_unwind
+                            else "maker_flat"
+                        ),
+                    }
+                )
+                del self.completed_episode_ledger[
+                    :-_COMPLETED_EPISODE_LEDGER_LIMIT
+                ]
+                self.episode_active_unwind_flat += int(fill.active_unwind)
                 self._episode_fills = 0
                 self._episode_turnover = _ZERO
                 self._episode_fee = _ZERO
+                self._episode_taker_fee = _ZERO
                 self._episode_gross = _ZERO
+                self._episode_entry_side = None
+                self._episode_active_unwind_used = False
 
         self.current_equity = current_equity
         if self.ledger_position == 0:
@@ -337,13 +373,31 @@ class SessionEconomics:
             if self.config.active_unwind_enabled
             else self.config.max_session_loss_for_maker_exit
         )
+        if self._pending_economic_stop_reason is not None:
+            if self.ledger_position != 0:
+                self.economic_state = "economic_stop_pending_flat"
+                self.economic_reason = (
+                    f"{self._pending_economic_stop_reason}; "
+                    "waiting for authenticated flat"
+                )
+                return
+            self.economic_state = "no_go"
+            self.economic_reason = self._pending_economic_stop_reason
+            raise AccountAuditError(self.economic_reason)
+
         session_loss = self.session_loss_for_maker_exit
         if loss_budget > 0 and session_loss > loss_budget:
+            failure_reason = "bounded maker-exit session loss exceeded"
+            if not self.config.dry_run and self.ledger_position != 0:
+                self._pending_economic_stop_reason = failure_reason
+                self.economic_state = "economic_stop_pending_flat"
+                self.economic_reason = (
+                    f"{failure_reason}; waiting for authenticated flat"
+                )
+                return
             self.economic_state = "no_go"
-            self.economic_reason = (
-                "bounded maker-exit session loss exceeded"
-            )
-            raise AccountAuditError(self.economic_reason)
+            self.economic_reason = failure_reason
+            raise AccountAuditError(failure_reason)
 
         if self.completed_fills < self.config.economic_min_fills:
             if self.ledger_position != 0:
@@ -381,6 +435,17 @@ class SessionEconomics:
                 "flat account-value change/turnover is below the configured threshold"
             )
         if failure_reason is not None:
+            if not self.config.dry_run:
+                if self.ledger_position != 0:
+                    self._pending_economic_stop_reason = failure_reason
+                    self.economic_state = "economic_stop_pending_flat"
+                    self.economic_reason = (
+                        f"{failure_reason}; waiting for authenticated flat"
+                    )
+                    return
+                self.economic_state = "no_go"
+                self.economic_reason = failure_reason
+                raise AccountAuditError(failure_reason)
             if loss_budget > 0:
                 self.economic_state = "bounded_economic_recovery"
                 self.economic_reason = (
@@ -454,6 +519,11 @@ class SessionEconomics:
             "completed_turnover": self.completed_turnover,
             "completed_exact_fee": self.completed_exact_fee,
             "completed_gross": self.completed_gross,
+            "completed_episode_ledger": [
+                dict(episode) for episode in self.completed_episode_ledger
+            ],
+            "episode_flat_success": self.completed_round_trips,
+            "episode_active_unwind_flat": self.episode_active_unwind_flat,
             "active_unwind_turnover": self.active_unwind_turnover,
             "active_unwind_exact_fee": self.active_unwind_exact_fee,
             "active_unwind_gross": self.active_unwind_gross,
@@ -527,6 +597,7 @@ class MarketMakerAccountMonitor:
         self.max_observed_drawdown = _ZERO
         self.audited_position: Decimal | None = None
         self.audited_unrealized_pnl: Decimal | None = None
+        self.last_audit_authenticated = False
         self.state = "starting"
         self.reason: str | None = None
 
@@ -560,6 +631,9 @@ class MarketMakerAccountMonitor:
     ) -> None:
         if self.economics is None:
             raise AccountAuditError("account monitor is not initialized")
+        snapshot: dict[str, Any] | None = None
+        economics_applied = False
+        self.last_audit_authenticated = False
         try:
             snapshot = await self._read_consistent(
                 managed_order_ids,
@@ -576,13 +650,32 @@ class MarketMakerAccountMonitor:
                     _has_zero_integrator_fee_signing_proof(self.adapter)
                 ),
             )
+            economics_applied = True
             self._update_drawdown(snapshot["equity"])
         except AccountAuditError as exc:
+            if (
+                snapshot is not None
+                and self.economics.ledger_position == snapshot["position"]
+                and (
+                    economics_applied
+                    or self.economics.economic_state == "no_go"
+                )
+            ):
+                self.audited_position = snapshot["position"]
+                self.audited_unrealized_pnl = snapshot["unrealized_pnl"]
+                self.last_audit_monotonic = self._monotonic()
+                self.last_audit_authenticated = True
+                if not economics_applied:
+                    try:
+                        self._update_drawdown(snapshot["equity"])
+                    except AccountAuditError:
+                        pass
             self.mark_hard_stop(str(exc))
             raise
         self.audited_position = snapshot["position"]
         self.audited_unrealized_pnl = snapshot["unrealized_pnl"]
         self.last_audit_monotonic = self._monotonic()
+        self.last_audit_authenticated = True
         self.state = "healthy"
         self.reason = None
 
@@ -730,6 +823,7 @@ class MarketMakerAccountMonitor:
             "max_observed_drawdown": self.max_observed_drawdown,
             "audited_position": self.audited_position,
             "audited_unrealized_pnl": self.audited_unrealized_pnl,
+            "last_audit_authenticated": self.last_audit_authenticated,
             "maker_turnover_per_wall_hour": (
                 turnover / hours
                 if hours is not None and isinstance(turnover, Decimal)

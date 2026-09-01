@@ -178,6 +178,60 @@ class RiskManagerTests(unittest.TestCase):
         self.assertIsNone(decision.sell_amount)
         self.assertEqual(decision.runtime_state, RuntimeState.RISK_REDUCTION)
 
+    def test_economic_stop_forces_exit_only_even_without_ping_pong(self) -> None:
+        long = self.manager.evaluate(
+            self.position("0.2"),
+            (),
+            self.metadata,
+            now_monotonic=100.0,
+            force_inventory_exit=True,
+        )
+        self.assertIsNone(long.buy_amount)
+        self.assertEqual(long.sell_amount, Decimal("0.2"))
+        self.assertTrue(long.sell_reduce_only)
+        self.assertEqual(long.reason, "economic stop pending authenticated flat")
+
+        flat = self.manager.evaluate(
+            self.position("0"),
+            (),
+            self.metadata,
+            now_monotonic=100.0,
+            force_inventory_exit=True,
+        )
+        self.assertIsNone(flat.buy_amount)
+        self.assertIsNone(flat.sell_amount)
+        self.assertEqual(flat.runtime_state, RuntimeState.SYNCING)
+        self.assertEqual(
+            flat.reason, "economic stop flat pending authenticated audit"
+        )
+
+    def test_economic_stop_exit_overrides_one_sided_quote_mode(self) -> None:
+        cases = (
+            ("bid_only", "0.2", None, Decimal("0.2")),
+            ("ask_only", "-0.2", Decimal("0.2"), None),
+        )
+        for quote_mode, position, expected_buy, expected_sell in cases:
+            with self.subTest(quote_mode=quote_mode, position=position):
+                manager = RiskManager(
+                    replace(self.config, quote_mode=quote_mode)
+                )
+                decision = manager.evaluate(
+                    self.position(position),
+                    (),
+                    self.metadata,
+                    now_monotonic=100.0,
+                    force_inventory_exit=True,
+                )
+
+                self.assertEqual(decision.buy_amount, expected_buy)
+                self.assertEqual(decision.sell_amount, expected_sell)
+                self.assertEqual(
+                    decision.buy_reduce_only, expected_buy is not None
+                )
+                self.assertEqual(
+                    decision.sell_reduce_only, expected_sell is not None
+                )
+
     def test_sub_order_position_uses_executable_reduce_only_exit(self) -> None:
         manager = RiskManager(
             replace(
