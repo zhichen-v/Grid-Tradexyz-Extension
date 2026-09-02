@@ -177,6 +177,7 @@ class MarketMakerMetrics:
     controller_applied_ask: Decimal | None = None
     controller_feature_snapshot: dict[str, Any] = field(default_factory=dict)
     fill_markouts: list[dict[str, Any]] = field(default_factory=list)
+    fill_markout_event_total: int = 0
     _maker_fill_progress: dict[str, tuple[Decimal, Decimal]] = field(
         default_factory=dict
     )
@@ -697,6 +698,7 @@ class MarketMakerMetrics:
             event[f"external_mid_{horizon}s"] = None
             event[f"external_mid_markout_{horizon}s_bps"] = None
         self._annotate_markout_event(event)
+        self.fill_markout_event_total += 1
         self.fill_markouts.append(event)
         del self.fill_markouts[:-_MARKOUT_EVENT_LIMIT]
         self.update_fill_markouts(
@@ -1162,6 +1164,7 @@ class MarketMakerMetrics:
             ],
             "fill_markout_coverage": {
                 "unit": "observed_order_fill_delta",
+                "observed_event_total": self.fill_markout_event_total,
                 "sources": (
                     "websocket_order_update",
                     "reconciliation",

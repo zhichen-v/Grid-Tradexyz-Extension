@@ -1779,6 +1779,12 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             second_event["observation_source"], "reconciliation"
         )
+        self.assertEqual(
+            metrics.snapshot(2.0)["fill_markout_coverage"][
+                "observed_event_total"
+            ],
+            2,
+        )
 
     def test_live_partial_progress_survives_terminal_history_churn(self) -> None:
         metrics = self.coordinator().metrics
@@ -1822,6 +1828,9 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(metrics._maker_fill_progress), 500)
         self.assertEqual(metrics.fill_markouts[-1]["fill_amount"], Decimal("0.1"))
         self.assertEqual(metrics.fill_markouts[-1]["fill_price"], Decimal("102"))
+        coverage = metrics.snapshot(503.0)["fill_markout_coverage"]
+        self.assertEqual(coverage["retained_events"], 100)
+        self.assertEqual(coverage["observed_event_total"], 503)
 
     def test_terminal_without_new_fill_releases_progress_pin(self) -> None:
         metrics = self.coordinator().metrics
