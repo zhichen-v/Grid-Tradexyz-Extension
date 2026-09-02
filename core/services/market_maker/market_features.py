@@ -134,7 +134,8 @@ def build_external_book_view(
     own_sizes: dict[tuple[OrderSide, Decimal], Decimal] = {}
     for order in live_orders:
         if (
-            order.state not in _IDENTIFIABLE_OWN_STATES
+            getattr(order, "simulated", False) is True
+            or order.state not in _IDENTIFIABLE_OWN_STATES
             or order.submission_uncertain
             or order.cancellation_uncertain
             or not _finite_decimal(order.price, positive=True)

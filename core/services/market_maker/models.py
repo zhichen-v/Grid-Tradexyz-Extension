@@ -159,3 +159,4 @@ class ManagedOrder:
     submission_uncertain: bool = False
     cancellation_uncertain: bool = False
     intent: OrderIntentMetadata | None = None
+    simulated: bool = False

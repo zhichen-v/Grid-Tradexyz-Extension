@@ -208,6 +208,8 @@ class MarketMakerOrderManager:
             OrderSide.SELL: None,
         }
         self._mutation_timestamps: deque[float] = deque()
+        self._dry_run_mutation_timestamps: deque[float] = deque()
+        self._dry_run_order_sequence = 0
         self._submission_ambiguity_latched = False
         self._resolved_ambiguous_cancellations = 0
         self._post_only_event_generation = 0
@@ -536,8 +538,14 @@ class MarketMakerOrderManager:
                         )
                     )
                     if controller_block and any(
-                        action.operation == "cancel"
-                        and action.success is True
+                        (
+                            action.operation == "cancel"
+                            and action.success is True
+                        )
+                        or (
+                            self.config.dry_run
+                            and action.operation == "would_cancel"
+                        )
                         for action in actions[action_start:]
                     ):
                         self._controller_blocked_sides.add(side)
@@ -614,7 +622,14 @@ class MarketMakerOrderManager:
                 ):
                     self._controller_protective_cancel_monotonic[side] = now
                 if protective and any(
-                    action.operation == "cancel" and action.success is True
+                    (
+                        action.operation == "cancel"
+                        and action.success is True
+                    )
+                    or (
+                        self.config.dry_run
+                        and action.operation == "would_cancel"
+                    )
                     for action in new_actions
                 ):
                     assert target.intent is not None
@@ -645,6 +660,12 @@ class MarketMakerOrderManager:
                 return self._result(actions, errors, effect)
             if self._post_only_create_blocked():
                 self.runtime_state = RuntimeState.SYNCING
+                return self._result(actions, errors, effect)
+            if self.config.dry_run and any(
+                action.operation == "would_cancel" for action in actions
+            ):
+                if self.pause_reason is None:
+                    self.runtime_state = desired.runtime_state
                 return self._result(actions, errors, effect)
 
             # Risk-reducing creates have priority over risk-increasing creates.
@@ -696,11 +717,12 @@ class MarketMakerOrderManager:
                     return self._result(actions, errors, effect)
 
                 if any(
-                    action.operation == "place"
+                    action.operation in {"place", "would_place"}
                     for action in actions[action_start:]
                 ):
-                    # Return after one live create attempt so order updates
-                    # queued while awaiting the adapter are applied first.
+                    # Keep live and dry-run create cadence aligned. Live order
+                    # updates queued during the adapter call are applied first;
+                    # dry-run consumes the same one-create-per-cycle boundary.
                     if self.pause_reason is None:
                         self.runtime_state = desired.runtime_state
                     return self._result(actions, errors, effect)
@@ -1100,6 +1122,29 @@ class MarketMakerOrderManager:
             open_orders = self._active_symbol_orders(
                 await self.adapter.get_open_orders(self.config.symbol)
             )
+            if self.config.dry_run:
+                if open_orders:
+                    self._pause(
+                        "unknown open orders: "
+                        + ", ".join(str(order.id) for order in open_orders)
+                    )
+                elif (
+                    self.pause_reason
+                    and self.pause_reason.startswith(
+                        ("unknown open order", "unknown open orders")
+                    )
+                ):
+                    self.pause_reason = None
+                    self.runtime_state = RuntimeState.SYNCING
+                self.last_sync_result = ReconcileResult(
+                    (),
+                    self.runtime_state,
+                    (),
+                    effect.position_refresh_required,
+                    effect.fill_observed,
+                    tuple(effect.observed_fill_orders),
+                )
+                return effect.position_refresh_required
             matched_ids: set[int] = set()
             for side, slot in tuple(self._slots.items()):
                 if slot is None:
@@ -1345,10 +1390,46 @@ class MarketMakerOrderManager:
             cause=action_cause,
             intent=desired.intent,
         )
-        if self.config.dry_run:
-            actions.append(action)
-            return _OrderEffect()
         now = self._monotonic()
+        if self.config.dry_run:
+            normal_budget_available = self._dry_run_mutation_budget_available()
+            emergency_budget_available = (
+                not normal_budget_available
+                and risk_reduction
+                and desired.reduce_only
+                and now >= self._risk_reducing_create_not_before
+            )
+            if not normal_budget_available and not emergency_budget_available:
+                actions.append(
+                    replace(
+                        action,
+                        operation="would_defer",
+                        reason="dry-run mutation budget exhausted",
+                    )
+                )
+                return _OrderEffect()
+            if emergency_budget_available:
+                self._risk_reducing_create_not_before = now + 60
+            self._dry_run_order_sequence += 1
+            order_id = f"dry-run-{self._dry_run_order_sequence}"
+            self._slots[desired.side] = ManagedOrder(
+                side=desired.side,
+                state=OrderSlotState.LIVE,
+                order_id=order_id,
+                client_id=None,
+                price=desired.price,
+                amount=desired.amount,
+                remaining=desired.amount,
+                reduce_only=desired.reduce_only,
+                created_monotonic=now,
+                updated_monotonic=now,
+                intent=desired.intent,
+                simulated=True,
+            )
+            self._record_dry_run_mutation()
+            actions.append(replace(action, order_id=order_id))
+            self._complete_controller_create(desired.side)
+            return _OrderEffect()
         normal_budget_available = self._create_budget_available()
         emergency_budget_available = (
             not normal_budget_available
@@ -1567,11 +1648,30 @@ class MarketMakerOrderManager:
             slot.price,
             slot.remaining,
             slot.reduce_only,
+            order_id=slot.order_id,
             cause=cause,
             intent=slot.intent,
         )
         if self.config.dry_run:
+            if not slot.simulated:
+                self._pause("dry-run cannot mutate a non-simulated order slot")
+                errors.append(
+                    self.pause_reason
+                    or "dry-run cannot mutate a non-simulated order slot"
+                )
+                return _OrderEffect()
+            if not safety and not self._dry_run_mutation_budget_available():
+                actions.append(
+                    replace(
+                        action,
+                        operation="would_defer",
+                        reason="dry-run mutation budget exhausted",
+                    )
+                )
+                return _OrderEffect()
             actions.append(action)
+            self._slots[side] = None
+            self._record_dry_run_mutation()
             return _OrderEffect()
         if slot.order_id is None:
             slot.state = OrderSlotState.UNCERTAIN_SUBMISSION
@@ -2456,6 +2556,25 @@ class MarketMakerOrderManager:
     def _mutation_budget_available(self) -> bool:
         self._purge_mutations()
         return len(self._mutation_timestamps) < self.config.max_mutations_per_minute
+
+    def _dry_run_mutation_budget_available(self) -> bool:
+        self._purge_dry_run_mutations()
+        return (
+            len(self._dry_run_mutation_timestamps)
+            < self.config.max_mutations_per_minute
+        )
+
+    def _record_dry_run_mutation(self) -> None:
+        self._purge_dry_run_mutations()
+        self._dry_run_mutation_timestamps.append(self._monotonic())
+
+    def _purge_dry_run_mutations(self) -> None:
+        cutoff = self._monotonic() - 60
+        while (
+            self._dry_run_mutation_timestamps
+            and self._dry_run_mutation_timestamps[0] <= cutoff
+        ):
+            self._dry_run_mutation_timestamps.popleft()
 
     def _create_budget_available(self) -> bool:
         return self._mutation_budget_available()

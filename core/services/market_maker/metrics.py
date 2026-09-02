@@ -90,8 +90,14 @@ def _default_counters() -> dict[str, int]:
             "controller_protective_cancel_success",
             "controller_protective_reprices",
             "controller_protective_reprice_deferred",
+            "controller_protective_would_cancel",
+            "controller_protective_would_reprice",
+            "controller_protective_would_defer",
             "controller_block_cancels",
+            "controller_block_would_cancel",
             "controller_resume_creates",
+            "controller_resume_would_create",
+            "would_mutation_limiter_deferred",
         )
     }
 
@@ -320,6 +326,7 @@ class MarketMakerMetrics:
             revisions[order_id] = {
                 "order_id": order_id,
                 "side": getattr(getattr(order, "side", None), "value", None),
+                "simulated": getattr(order, "simulated", False) is True,
                 "revision": intent.revision,
                 "controller_decision_id": intent.controller_decision_id,
                 "extra_spread_ticks": intent.controller_extra_spread_ticks,

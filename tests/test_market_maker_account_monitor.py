@@ -1321,6 +1321,84 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["episode_flat_success"], 101)
         self.assertEqual(snapshot["episode_active_unwind_flat"], 0)
 
+    def test_order_id_reuse_across_inventory_episodes_fails_closed(self):
+        economics = SessionEconomics(
+            self.config(
+                maker_fee_rate=Decimal("0"),
+                min_completed_net_turnover_bps=Decimal("0"),
+            ),
+            baseline_equity=Decimal("300"),
+        )
+        economics.apply(
+            [
+                trade(
+                    "1",
+                    "shared-order",
+                    OrderSide.BUY,
+                    "0.1",
+                    "1",
+                    "0",
+                    fee_rate="0",
+                    timestamp=1,
+                ),
+                trade(
+                    "2",
+                    "close-1",
+                    OrderSide.SELL,
+                    "0.1",
+                    "1",
+                    "0",
+                    fee_rate="0",
+                    timestamp=2,
+                ),
+            ],
+            current_position=Decimal("0"),
+            current_equity=Decimal("300"),
+            managed_order_ids={"shared-order", "close-1"},
+            order_intent_contexts={
+                "shared-order": OrderIntentMetadata(
+                    kind=OrderIntentKind.BASE_ENTRY,
+                    revision=1,
+                    inventory_episode_id=1,
+                    authenticated_episode_sequence=1,
+                )
+            },
+        )
+        before = economics.snapshot()
+
+        with self.assertRaisesRegex(
+            AccountAuditError,
+            "order id was reused across inventory episodes",
+        ):
+            economics.apply(
+                [
+                    trade(
+                        "3",
+                        "shared-order",
+                        OrderSide.BUY,
+                        "0.1",
+                        "1",
+                        "0",
+                        fee_rate="0",
+                        timestamp=3,
+                    )
+                ],
+                current_position=Decimal("0.1"),
+                current_equity=Decimal("300"),
+                managed_order_ids={"shared-order"},
+                order_intent_contexts={
+                    "shared-order": OrderIntentMetadata(
+                        kind=OrderIntentKind.BASE_ENTRY,
+                        revision=2,
+                        inventory_episode_id=2,
+                        authenticated_episode_sequence=2,
+                    )
+                },
+            )
+
+        self.assertEqual(economics.snapshot(), before)
+        self.assertEqual(economics.seen_trade_ids, {"1", "2"})
+
     def test_long_run_attribution_supports_four_thousand_distinct_orders(self):
         economics = SessionEconomics(
             self.config(

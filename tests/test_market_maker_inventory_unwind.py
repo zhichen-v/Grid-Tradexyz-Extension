@@ -1061,6 +1061,45 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
             InventoryExitStage.INVENTORY_HOLD,
         )
 
+    def test_drawdown_boundary_is_the_binding_constraint(self) -> None:
+        executor = InventoryEpisodeExecutor(
+            replace(self.config, active_unwind_enabled=False)
+        )
+        self.evaluate(executor, now=0, soft_exit_latched=False)
+
+        decision = self.evaluate(
+            executor,
+            now=25,
+            account=self.account(
+                "-0.2",
+                current_drawdown=Decimal("0.49"),
+                current_equity=Decimal("299.51"),
+                audited_unrealized_pnl=Decimal("-0.05"),
+            ),
+        )
+
+        self.assertEqual(decision.state, "unwind_blocked")
+        self.assertEqual(decision.exit_stage, InventoryExitStage.INVENTORY_HOLD)
+        self.assertEqual(
+            decision.binding_constraint,
+            ExitBindingConstraint.DRAWDOWN_CAP,
+        )
+        self.assertFalse(decision.reachable_now)
+        self.assertEqual(decision.remaining_drawdown, Decimal("0.01"))
+        self.assertEqual(decision.allowed_passive_loss, Decimal("0.01"))
+        self.assertEqual(decision.selected_exit_price, Decimal("100.2"))
+        self.assertEqual(
+            decision.selected_exit_price, decision.drawdown_boundary_price
+        )
+        self.assertEqual(
+            decision.passive_order.intent.binding_constraint,
+            ExitBindingConstraint.DRAWDOWN_CAP,
+        )
+        self.assertEqual(
+            decision.passive_order.intent.exit_stage,
+            InventoryExitStage.INVENTORY_HOLD,
+        )
+
     def test_active_ioc_has_typed_policy_attribution(self) -> None:
         executor = InventoryEpisodeExecutor(self.config)
         self.evaluate(executor, now=0, soft_exit_latched=False)

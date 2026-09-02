@@ -58,6 +58,7 @@ def own_order(
     state: OrderSlotState = OrderSlotState.LIVE,
     submission_uncertain: bool = False,
     cancellation_uncertain: bool = False,
+    simulated: bool = False,
 ) -> ManagedOrder:
     amount = Decimal(remaining)
     return ManagedOrder(
@@ -73,6 +74,7 @@ def own_order(
         updated_monotonic=0.0,
         submission_uncertain=submission_uncertain,
         cancellation_uncertain=cancellation_uncertain,
+        simulated=simulated,
     )
 
 
@@ -145,6 +147,19 @@ class ExternalBookViewTests(unittest.TestCase):
                 self.assertEqual(view.bids[0].size, expected_size)
                 self.assertEqual(view.external_best_bid, expected_best)
                 self.assertTrue(all(level.size > 0 for level in view.bids))
+
+    def test_simulated_order_does_not_subtract_real_book_depth(self) -> None:
+        source = market(0)
+
+        view = build_external_book_view(
+            source,
+            (own_order(OrderSide.BUY, "99", "1.25", simulated=True),),
+            5,
+        )
+
+        self.assertTrue(view.valid)
+        self.assertEqual(view.bids[0].size, source.bids[0].size)
+        self.assertEqual(view.external_best_bid, source.best_bid)
 
     def test_depth_is_sorted_aggregated_and_bounded(self) -> None:
         source = market(

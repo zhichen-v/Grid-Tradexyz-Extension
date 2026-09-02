@@ -1780,6 +1780,121 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             target.bid.intent.revision,
         )
 
+    async def test_dry_run_virtual_protective_cancel_then_reprice_without_mutation(
+        self,
+    ) -> None:
+        manager = self.protective_manager(dry_run=True)
+
+        initial = await manager.reconcile(self.controller_bid(), self.risk())
+        initial_slot = manager.slots[OrderSide.BUY]
+
+        self.assertEqual(
+            [action.operation for action in initial.actions], ["would_place"]
+        )
+        self.assertIsNotNone(initial_slot)
+        assert initial_slot is not None
+        self.assertTrue(initial_slot.simulated)
+        self.assertEqual(initial_slot.order_id, initial.actions[0].order_id)
+        self.assertEqual(initial_slot.intent.revision, 1)
+
+        unchanged = await manager.reconcile(self.controller_bid(), self.risk())
+        self.assertEqual(unchanged.actions, ())
+
+        target = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+        cancelled = await manager.reconcile(target, self.risk())
+
+        self.assertEqual(
+            [action.operation for action in cancelled.actions],
+            ["would_cancel"],
+        )
+        self.assertIs(
+            cancelled.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+        self.assertEqual(cancelled.actions[0].order_id, initial_slot.order_id)
+        self.assertIsNone(manager.slots[OrderSide.BUY])
+
+        recreated = await manager.reconcile(target, self.risk())
+        recreated_slot = manager.slots[OrderSide.BUY]
+
+        self.assertEqual(
+            [action.operation for action in recreated.actions], ["would_place"]
+        )
+        self.assertIs(
+            recreated.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+        self.assertIsNotNone(recreated_slot)
+        assert recreated_slot is not None
+        self.assertTrue(recreated_slot.simulated)
+        self.assertEqual(recreated_slot.intent.revision, 2)
+        self.assertNotEqual(recreated_slot.order_id, initial_slot.order_id)
+        self.adapter.create_order.assert_not_awaited()
+        self.adapter.cancel_order.assert_not_awaited()
+
+    async def test_dry_run_virtual_reprice_respects_mutation_budget(
+        self,
+    ) -> None:
+        manager = self.protective_manager(
+            dry_run=True,
+            max_mutations_per_minute=2,
+        )
+        await manager.reconcile(self.controller_bid(), self.risk())
+        target = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+        await manager.reconcile(target, self.risk())
+
+        deferred = await manager.reconcile(target, self.risk())
+
+        self.assertEqual(
+            [action.operation for action in deferred.actions], ["would_defer"]
+        )
+        self.assertIs(
+            deferred.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+        self.assertIsNone(manager.slots[OrderSide.BUY])
+
+        self.clock.value += 61
+        recreated = await manager.reconcile(target, self.risk())
+
+        self.assertEqual(
+            [action.operation for action in recreated.actions], ["would_place"]
+        )
+        self.assertTrue(manager.slots[OrderSide.BUY].simulated)
+        self.adapter.create_order.assert_not_awaited()
+        self.adapter.cancel_order.assert_not_awaited()
+
+    async def test_dry_run_sync_preserves_virtual_slot_and_rejects_real_orders(
+        self,
+    ) -> None:
+        manager = self.protective_manager(dry_run=True)
+        await manager.reconcile(self.controller_bid(), self.risk())
+        virtual_slot = manager.slots[OrderSide.BUY]
+
+        await manager.sync_open_orders()
+
+        self.assertEqual(manager.slots[OrderSide.BUY], virtual_slot)
+        self.assertIsNone(manager.pause_reason)
+
+        self.adapter.get_open_orders.return_value = [
+            exchange_order("unexpected", OrderSide.BUY, price="99.9")
+        ]
+        await manager.sync_open_orders()
+
+        self.assertEqual(manager.runtime_state, RuntimeState.PAUSED_ORDER_STATE)
+        self.assertIn("unknown open orders", manager.pause_reason)
+        self.assertEqual(manager.slots[OrderSide.BUY], virtual_slot)
+        self.adapter.create_order.assert_not_awaited()
+        self.adapter.cancel_order.assert_not_awaited()
+
     async def test_protective_reversal_defers_inward_recreate(self) -> None:
         manager = self.protective_manager()
         await manager.reconcile(self.controller_bid(), self.risk())
@@ -3504,14 +3619,57 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        result = await manager.reconcile(self.desired(), self.risk())
+        first = await manager.reconcile(self.desired(), self.risk())
+        second = await manager.reconcile(self.desired(), self.risk())
 
         self.adapter.create_order.assert_not_awaited()
         self.adapter.cancel_order.assert_not_awaited()
         self.assertEqual(
-            [action.operation for action in result.actions],
-            ["would_place", "would_place"],
+            [action.operation for action in first.actions], ["would_place"]
         )
+        self.assertEqual(
+            [action.operation for action in second.actions], ["would_place"]
+        )
+
+    async def test_dry_run_risk_reducing_create_uses_emergency_budget(self) -> None:
+        manager = self.make_manager(
+            MarketMakerConfig(
+                symbol="BTC",
+                order_size=Decimal("0.2"),
+                max_position=Decimal("1"),
+                min_profit_buffer_bps=Decimal("0"),
+                max_mutations_per_minute=1,
+                dry_run=True,
+            )
+        )
+        await manager.reconcile(
+            self.desired(bid_price="99.9", ask_price=None), self.risk()
+        )
+        reducing_quotes = self.desired(
+            bid_price="99.8",
+            ask_price=None,
+            bid_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        reducing_risk = self.risk(
+            sell_amount=None,
+            buy_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+
+        cancelled = await manager.reconcile(reducing_quotes, reducing_risk)
+        created = await manager.reconcile(reducing_quotes, reducing_risk)
+
+        self.assertEqual(
+            [action.operation for action in cancelled.actions],
+            ["would_cancel"],
+        )
+        self.assertEqual(
+            [action.operation for action in created.actions], ["would_place"]
+        )
+        self.assertTrue(manager.slots[OrderSide.BUY].reduce_only)
+        self.adapter.create_order.assert_not_awaited()
+        self.adapter.cancel_order.assert_not_awaited()
 
     async def test_budget_block_does_not_report_cancel_as_executed(self) -> None:
         manager = self.make_manager(

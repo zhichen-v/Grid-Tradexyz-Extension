@@ -4567,6 +4567,36 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     success=True,
                     cause=ReconcileActionCause.CONTROLLER_RESUME,
                 ),
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "would_cancel",
+                    "protective dry run",
+                    cause=ReconcileActionCause.CONTROLLER_PROTECTIVE,
+                ),
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "would_place",
+                    "protective dry run",
+                    cause=ReconcileActionCause.CONTROLLER_PROTECTIVE,
+                ),
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "would_defer",
+                    "protective dry-run budget",
+                    cause=ReconcileActionCause.CONTROLLER_PROTECTIVE,
+                ),
+                ReconcileAction(
+                    OrderSide.SELL,
+                    "would_cancel",
+                    "block dry run",
+                    cause=ReconcileActionCause.CONTROLLER_BLOCK,
+                ),
+                ReconcileAction(
+                    OrderSide.SELL,
+                    "would_place",
+                    "resume dry run",
+                    cause=ReconcileActionCause.CONTROLLER_RESUME,
+                ),
             )
         )
 
@@ -4577,6 +4607,12 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counters["controller_protective_reprice_deferred"], 1)
         self.assertEqual(counters["controller_block_cancels"], 1)
         self.assertEqual(counters["controller_resume_creates"], 1)
+        self.assertEqual(counters["controller_protective_would_cancel"], 1)
+        self.assertEqual(counters["controller_protective_would_reprice"], 1)
+        self.assertEqual(counters["controller_protective_would_defer"], 1)
+        self.assertEqual(counters["controller_block_would_cancel"], 1)
+        self.assertEqual(counters["controller_resume_would_create"], 1)
+        self.assertEqual(counters["would_mutation_limiter_deferred"], 1)
 
     async def test_definitive_not_sent_action_is_retryable_not_reconcile_failure(
         self,
@@ -5003,6 +5039,40 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(contexts), 1)
         self.assertEqual(contexts[0]["order_id"], "maker-1")
         self.assertEqual(contexts[0]["controller_mode"], "fixed")
+        self.assertEqual(contexts[0]["base_price"], Decimal("99.9"))
+        self.assertEqual(contexts[0]["applied_price"], Decimal("99.9"))
+        self.assertFalse(contexts[0]["simulated"])
+
+    async def test_dry_run_maker_create_records_simulated_quote_context(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        manager.reconcile.return_value = SimpleNamespace(
+            actions=(
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "would_place",
+                    "normal",
+                    Decimal("99.9"),
+                    Decimal("0.2"),
+                    False,
+                    order_id="dry-run-1",
+                ),
+            ),
+            errors=(),
+            runtime_state=RuntimeState.ACTIVE,
+        )
+        coordinator = self.prepare_running(
+            config=self.config(dry_run=True),
+            order_manager=manager,
+        )
+
+        await coordinator.run_one_cycle(force=True)
+
+        contexts = coordinator.metrics.snapshot(self.now)["quote_contexts"]
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0]["order_id"], "dry-run-1")
+        self.assertTrue(contexts[0]["simulated"])
         self.assertEqual(contexts[0]["base_price"], Decimal("99.9"))
         self.assertEqual(contexts[0]["applied_price"], Decimal("99.9"))
 

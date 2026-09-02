@@ -38,6 +38,13 @@ class WalletProfileError(RuntimeError):
     """A named Lighter credential profile is missing or invalid."""
 
 
+class _PeriodicStatusConsoleFilter(logging.Filter):
+    """Keep full status evidence in the file without flooding the terminal."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith("Market maker status:")
+
+
 def _validate_profile_name(name: str) -> str:
     if not isinstance(name, str) or _PROFILE_NAME.fullmatch(name) is None:
         raise ValueError(
@@ -174,7 +181,7 @@ def parse_cli(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _logger(debug: bool) -> BaseLogger:
     level = "DEBUG" if debug else "INFO"
-    return BaseLogger(
+    logger = BaseLogger(
         "market_maker",
         LogConfig(
             log_dir="logs",
@@ -183,14 +190,103 @@ def _logger(debug: bool) -> BaseLogger:
             file_level="DEBUG",
         ),
     )
+    for handler in logger.logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(
+            handler, logging.FileHandler
+        ):
+            handler.addFilter(_PeriodicStatusConsoleFilter())
+    return logger
 
 
 def _status_logger(
     logger: BaseLogger, settings: dict[str, Any]
 ) -> Callable[[dict[str, Any]], None]:
-    return lambda status: logger.info(
-        f"Market maker status: {_redact(str(status), settings)}"
+    caches: dict[str, dict[tuple[Any, ...], str]] = {}
+
+    def log_status(status: dict[str, Any]) -> None:
+        incremental = _incremental_status_snapshot(status, caches)
+        logger.info(
+            f"Market maker status: {_redact(str(incremental), settings)}"
+        )
+
+    return log_status
+
+
+def _incremental_status_snapshot(
+    status: dict[str, Any],
+    caches: dict[str, dict[tuple[Any, ...], str]],
+) -> dict[str, Any]:
+    """Keep each periodic record self-contained without repeating history."""
+    snapshot = dict(status)
+    fields = (
+        (
+            "controller_decision_history",
+            ("event_sequence_run_id", "event_sequence", "decision_id", "event"),
+            (),
+        ),
+        (
+            "quote_contexts",
+            (
+                "event_sequence_run_id",
+                "placement_event_sequence",
+                "order_id",
+            ),
+            (),
+        ),
+        (
+            "fill_markouts",
+            (
+                "event_sequence_run_id",
+                "fill_observation_event_sequence",
+                "order_id",
+                "started_monotonic",
+            ),
+            ("age_seconds",),
+        ),
     )
+    for field, key_fields, volatile_fields in fields:
+        records = status.get(field)
+        if not isinstance(records, list):
+            continue
+        snapshot[f"{field}_retained"] = len(records)
+        snapshot[field] = _changed_status_records(
+            records,
+            caches.setdefault(field, {}),
+            key_fields=key_fields,
+            volatile_fields=volatile_fields,
+        )
+    return snapshot
+
+
+def _changed_status_records(
+    records: list[Any],
+    cache: dict[tuple[Any, ...], str],
+    *,
+    key_fields: tuple[str, ...],
+    volatile_fields: tuple[str, ...],
+) -> list[Any]:
+    current: dict[tuple[Any, ...], str] = {}
+    changed: list[Any] = []
+    for index, record in enumerate(records):
+        if isinstance(record, dict):
+            identity = tuple(record.get(field) for field in key_fields)
+            if not any(value not in (None, "") for value in identity):
+                identity = ("index", index)
+            comparable = {
+                key: value
+                for key, value in record.items()
+                if key not in volatile_fields
+            }
+        else:
+            identity = ("index", index)
+            comparable = record
+        signature = repr(comparable)
+        current[identity] = signature
+        if cache.get(identity) != signature:
+            changed.append(record)
+    cache.clear()
+    cache.update(current)
+    return changed
 
 
 def _install_stop_signals(
@@ -271,6 +367,17 @@ async def run_market_maker(
                 loop = asyncio.get_running_loop()
                 for sig in installed:
                     loop.remove_signal_handler(sig)
+        if config.dry_run and logger is not None:
+            try:
+                await coordinator.emit_status_once(
+                    event="market_maker_final_dry_run"
+                )
+                logger.info("market_maker_final_dry_run emitted")
+            except Exception as exc:
+                logger.warning(
+                    "Final dry-run status could not be emitted: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         if coordinator.state is RuntimeState.PAUSED_ERROR:
             detail = coordinator.fatal_exception
             raise RuntimeError(

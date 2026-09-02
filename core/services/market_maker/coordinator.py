@@ -1705,13 +1705,16 @@ class MarketMakerCoordinator:
                 else None
             )
             self.metrics.reference_includes_own_quote = any(
-                (
-                    order.side is OrderSide.BUY
-                    and order.price == self._market.best_bid
-                )
-                or (
-                    order.side is OrderSide.SELL
-                    and order.price == self._market.best_ask
+                getattr(order, "simulated", False) is not True
+                and (
+                    (
+                        order.side is OrderSide.BUY
+                        and order.price == self._market.best_bid
+                    )
+                    or (
+                        order.side is OrderSide.SELL
+                        and order.price == self._market.best_ask
+                    )
                 )
                 for order in orders
             )
@@ -1738,6 +1741,18 @@ class MarketMakerCoordinator:
                         )
                 elif operation == "place" and success is True:
                     self.metrics.increment("controller_protective_reprices")
+                elif operation == "would_cancel":
+                    self.metrics.increment(
+                        "controller_protective_would_cancel"
+                    )
+                elif operation == "would_place":
+                    self.metrics.increment(
+                        "controller_protective_would_reprice"
+                    )
+                elif operation == "would_defer":
+                    self.metrics.increment(
+                        "controller_protective_would_defer"
+                    )
                 elif operation in {"deferred", "blocked"}:
                     self.metrics.increment(
                         "controller_protective_reprice_deferred"
@@ -1749,11 +1764,21 @@ class MarketMakerCoordinator:
             ):
                 self.metrics.increment("controller_block_cancels")
             elif (
+                cause is ReconcileActionCause.CONTROLLER_BLOCK
+                and operation == "would_cancel"
+            ):
+                self.metrics.increment("controller_block_would_cancel")
+            elif (
                 cause is ReconcileActionCause.CONTROLLER_RESUME
                 and operation == "place"
                 and success is True
             ):
                 self.metrics.increment("controller_resume_creates")
+            elif (
+                cause is ReconcileActionCause.CONTROLLER_RESUME
+                and operation == "would_place"
+            ):
+                self.metrics.increment("controller_resume_would_create")
             if operation == "place":
                 self.metrics.increment("create_attempts")
                 if getattr(action, "success", None) is True:
@@ -1770,6 +1795,8 @@ class MarketMakerCoordinator:
                 self.metrics.increment("would_place")
             elif operation == "would_cancel":
                 self.metrics.increment("would_cancel")
+            elif operation == "would_defer":
+                self.metrics.increment("would_mutation_limiter_deferred")
             elif operation == "blocked":
                 self.metrics.increment("mutation_limiter_blocks")
             elif operation == "active_unwind":
@@ -2292,9 +2319,16 @@ class MarketMakerCoordinator:
         decision = controller_cycle["decision"]
         for action in actions:
             order_id = str(getattr(action, "order_id", "") or "").strip()
+            operation = getattr(action, "operation", None)
+            confirmed_create = (
+                operation == "place"
+                and getattr(action, "success", None) is True
+            )
+            simulated_create = (
+                self.config.dry_run and operation == "would_place"
+            )
             if (
-                getattr(action, "operation", None) != "place"
-                or getattr(action, "success", None) is not True
+                not (confirmed_create or simulated_create)
                 or getattr(action, "reduce_only", False) is not False
                 or not order_id
                 or getattr(action, "side", None)
@@ -2331,6 +2365,7 @@ class MarketMakerCoordinator:
                     ),
                     "feature_snapshot": dict(controller_cycle["features"]),
                     "reduce_only": False,
+                    "simulated": simulated_create,
                     "created_monotonic": now,
                 },
             )

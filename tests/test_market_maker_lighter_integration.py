@@ -225,6 +225,123 @@ class FakeLighterAdapter:
 
 
 class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_entrypoint_logger_suppresses_only_periodic_console_status(self) -> None:
+        logger = entrypoint._logger(debug=False)
+        status = logging.LogRecord(
+            "market_maker",
+            logging.INFO,
+            __file__,
+            1,
+            "Market maker status: {'cycles': 1}",
+            (),
+            None,
+        )
+        lifecycle = logging.LogRecord(
+            "market_maker",
+            logging.INFO,
+            __file__,
+            1,
+            "Market maker stopped cleanly",
+            (),
+            None,
+        )
+        console_handlers = [
+            handler
+            for handler in logger.logger.handlers
+            if isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+        ]
+        file_handlers = [
+            handler
+            for handler in logger.logger.handlers
+            if isinstance(handler, logging.FileHandler)
+        ]
+
+        self.assertEqual(len(console_handlers), 1)
+        self.assertEqual(len(file_handlers), 1)
+        self.assertFalse(console_handlers[0].filter(status))
+        self.assertTrue(console_handlers[0].filter(lifecycle))
+        self.assertTrue(file_handlers[0].filter(status))
+
+    def test_periodic_status_logging_emits_only_new_or_changed_records(self) -> None:
+        caches = {}
+        first = {
+            "cycles": 1,
+            "controller_decision_history": [
+                {
+                    "event_sequence_run_id": "run-1",
+                    "event_sequence": 1,
+                    "decision_id": 1,
+                }
+            ],
+            "quote_contexts": [
+                {
+                    "event_sequence_run_id": "run-1",
+                    "placement_event_sequence": 2,
+                    "order_id": "dry-run-1",
+                }
+            ],
+            "fill_markouts": [
+                {
+                    "event_sequence_run_id": "run-1",
+                    "fill_observation_event_sequence": 3,
+                    "order_id": "order-1",
+                    "started_monotonic": 10.0,
+                    "age_seconds": 1.0,
+                    "external_mid_markout_5s_bps": None,
+                }
+            ],
+        }
+
+        initial = entrypoint._incremental_status_snapshot(first, caches)
+        repeated = entrypoint._incremental_status_snapshot(
+            {
+                **first,
+                "cycles": 2,
+                "fill_markouts": [
+                    {**first["fill_markouts"][0], "age_seconds": 2.0}
+                ],
+            },
+            caches,
+        )
+        updated = entrypoint._incremental_status_snapshot(
+            {
+                **first,
+                "cycles": 3,
+                "controller_decision_history": [
+                    *first["controller_decision_history"],
+                    {
+                        "event_sequence_run_id": "run-1",
+                        "event_sequence": 4,
+                        "decision_id": 2,
+                    },
+                ],
+                "fill_markouts": [
+                    {
+                        **first["fill_markouts"][0],
+                        "age_seconds": 5.0,
+                        "external_mid_markout_5s_bps": Decimal("-1"),
+                    }
+                ],
+            },
+            caches,
+        )
+
+        self.assertEqual(len(initial["controller_decision_history"]), 1)
+        self.assertEqual(len(initial["quote_contexts"]), 1)
+        self.assertEqual(len(initial["fill_markouts"]), 1)
+        self.assertEqual(repeated["cycles"], 2)
+        self.assertEqual(repeated["controller_decision_history"], [])
+        self.assertEqual(repeated["quote_contexts"], [])
+        self.assertEqual(repeated["fill_markouts"], [])
+        self.assertEqual(
+            updated["controller_decision_history"][0]["decision_id"], 2
+        )
+        self.assertEqual(len(updated["fill_markouts"]), 1)
+        self.assertEqual(updated["controller_decision_history_retained"], 2)
+        self.assertEqual(updated["quote_contexts_retained"], 1)
+        self.assertEqual(updated["fill_markouts_retained"], 1)
+
     def config(
         self, *, dry_run: bool, quote_mode: str = "both"
     ) -> MarketMakerConfig:
@@ -274,6 +391,43 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             stop_event=stop,
         )
         return adapter, coordinator, factory_in_loop
+
+    async def test_cli_runtime_emits_best_effort_final_dry_status(self) -> None:
+        adapter = FakeLighterAdapter()
+        stop = asyncio.Event()
+        stop.set()
+        logger = SimpleNamespace(info=Mock(), warning=Mock())
+
+        coordinator = await entrypoint.run_market_maker(
+            self.config(dry_run=True),
+            {
+                "network": "robinhood_testnet",
+                "testnet": True,
+                "api_key_private_key": "test-only",
+                "account_index": 1,
+                "api_key_index": 2,
+                "expected_l1_address": None,
+            },
+            adapter_factory=lambda _settings: adapter,
+            stop_event=stop,
+            logger=logger,
+        )
+
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
+        messages = [call.args[0] for call in logger.info.call_args_list]
+        self.assertTrue(
+            any(
+                "market_maker_final_dry_run" in message
+                for message in messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message == "market_maker_final_dry_run emitted"
+                for message in messages
+            )
+        )
+        logger.warning.assert_not_called()
 
     @staticmethod
     def active_metadata() -> MarketMetadata:
