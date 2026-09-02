@@ -115,6 +115,13 @@ def _trade_ids(trades: Iterable[Any]) -> set[str]:
     return set(ids)
 
 
+def _order_ids(orders: Iterable[Any]) -> set[str]:
+    ids = [str(getattr(order, "id", "") or "") for order in orders]
+    if any(not order_id for order_id in ids) or len(ids) != len(set(ids)):
+        raise _SnapshotMismatch("account open order page has invalid/duplicate ids")
+    return set(ids)
+
+
 def _has_zero_integrator_fee_signing_proof(adapter: Any) -> bool:
     value = getattr(adapter, "managed_order_integrator_fee_tick", None)
     return type(value) is int and value == 0
@@ -1340,6 +1347,7 @@ class MarketMakerAccountMonitor:
         self.max_observed_drawdown = _ZERO
         self.audited_position: Decimal | None = None
         self.audited_unrealized_pnl: Decimal | None = None
+        self.audited_open_order_count: int | None = None
         self.last_audit_authenticated = False
         self.state = "starting"
         self.reason: str | None = None
@@ -1362,6 +1370,7 @@ class MarketMakerAccountMonitor:
         self.economics.current_equity = snapshot["equity"]
         self.audited_position = snapshot["position"]
         self.audited_unrealized_pnl = snapshot["unrealized_pnl"]
+        self.audited_open_order_count = len(snapshot["open_order_ids"])
         self.started_monotonic = self._monotonic()
         self.last_audit_monotonic = self.started_monotonic
         self.state = "healthy"
@@ -1370,6 +1379,7 @@ class MarketMakerAccountMonitor:
         self,
         managed_order_ids: set[str],
         *,
+        confirm_open_orders: bool = False,
         active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
         terminal_order_ids: set[str] | frozenset[str] = frozenset(),
         order_intent_contexts: Mapping[str, OrderIntentMetadata] | None = None,
@@ -1380,10 +1390,12 @@ class MarketMakerAccountMonitor:
         snapshot: dict[str, Any] | None = None
         economics_applied = False
         self.last_audit_authenticated = False
+        self.audited_open_order_count = None
         try:
             snapshot = await self._read_consistent(
                 managed_order_ids,
                 baseline=False,
+                confirm_open_orders=confirm_open_orders,
                 active_unwind_order_ids=active_unwind_order_ids,
             )
             self.economics.apply(
@@ -1413,6 +1425,9 @@ class MarketMakerAccountMonitor:
             ):
                 self.audited_position = snapshot["position"]
                 self.audited_unrealized_pnl = snapshot["unrealized_pnl"]
+                self.audited_open_order_count = len(
+                    snapshot["open_order_ids"]
+                )
                 self.last_audit_monotonic = self._monotonic()
                 self.last_audit_authenticated = True
                 if not economics_applied:
@@ -1424,6 +1439,7 @@ class MarketMakerAccountMonitor:
             raise
         self.audited_position = snapshot["position"]
         self.audited_unrealized_pnl = snapshot["unrealized_pnl"]
+        self.audited_open_order_count = len(snapshot["open_order_ids"])
         self.last_audit_monotonic = self._monotonic()
         self.last_audit_authenticated = True
         self.state = "healthy"
@@ -1438,6 +1454,7 @@ class MarketMakerAccountMonitor:
         managed_order_ids: set[str],
         *,
         baseline: bool,
+        confirm_open_orders: bool = False,
         active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         last_error: BaseException | None = None
@@ -1469,6 +1486,18 @@ class MarketMakerAccountMonitor:
                         "account trades changed during the audit read"
                     )
                 trades = confirmed_trades
+                if confirm_open_orders:
+                    confirmed_orders = list(
+                        await self.adapter.get_open_orders()
+                    )
+                    self._validate_orders(
+                        confirmed_orders, managed_order_ids
+                    )
+                    if _order_ids(orders) != _order_ids(confirmed_orders):
+                        raise _SnapshotMismatch(
+                            "account open orders changed during the audit read"
+                        )
+                    orders = confirmed_orders
                 if not baseline and self.economics is not None:
                     fills = [
                         _fill_from_trade(
@@ -1545,7 +1574,10 @@ class MarketMakerAccountMonitor:
         self.max_observed_drawdown = max(
             self.max_observed_drawdown, self.current_drawdown
         )
-        if self.current_drawdown >= self.config.max_session_drawdown:
+        if (
+            self.config.max_session_drawdown > 0
+            and self.current_drawdown >= self.config.max_session_drawdown
+        ):
             self.mark_hard_stop("max_session_drawdown reached")
             raise AccountAuditError(self.reason)
 
@@ -1577,6 +1609,7 @@ class MarketMakerAccountMonitor:
             "max_observed_drawdown": self.max_observed_drawdown,
             "audited_position": self.audited_position,
             "audited_unrealized_pnl": self.audited_unrealized_pnl,
+            "audited_open_order_count": self.audited_open_order_count,
             "last_audit_authenticated": self.last_audit_authenticated,
             "maker_turnover_per_wall_hour": (
                 turnover / hours

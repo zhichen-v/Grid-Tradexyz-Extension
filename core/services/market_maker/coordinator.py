@@ -109,6 +109,7 @@ class MarketMakerCoordinator:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         status_callback: Callable[[dict[str, Any]], Any] | None = None,
+        authenticated_evidence: bool = False,
     ) -> None:
         self.adapter = adapter
         self.config = config
@@ -119,6 +120,7 @@ class MarketMakerCoordinator:
         self._monotonic = monotonic
         self._sleep = sleep
         self._status_callback = status_callback
+        self._authenticated_evidence_enabled = authenticated_evidence
 
         now = monotonic()
         self.metrics = metrics or MarketMakerMetrics(now)
@@ -141,6 +143,8 @@ class MarketMakerCoordinator:
         self._processed_fill_generation = 0
         self._audited_fill_generation = 0
         self._authenticated = False
+        self._authenticated_preflight: dict[str, Any] | None = None
+        self._authenticated_postflight: dict[str, Any] | None = None
         self._state = RuntimeState.STARTING
         self._market: MarketSnapshot | None = None
         self._position: PositionSnapshot | None = None
@@ -219,12 +223,15 @@ class MarketMakerCoordinator:
                 self._transition(RuntimeState.STOPPED)
                 self._stopped_event.set()
                 return
+            self._validate_authenticated_evidence_config()
             self._account_monitor_initialized = False
             self.inventory_executor.reset_session()
             self._active_unwind_truth_token = None
             self._processed_fill_generation = 0
             self._audited_fill_generation = -1
             self._authenticated = False
+            self._authenticated_preflight = None
+            self._authenticated_postflight = None
             self._stopping = False
             self._fatal_exception = None
             self._error_paused_until = None
@@ -242,10 +249,12 @@ class MarketMakerCoordinator:
                     raise RuntimeError("exchange authentication failed")
                 self._authenticated = True
                 if (
-                    not self.config.dry_run
-                    and self.config.account_audit_interval_seconds
-                    and self.account_monitor is None
-                ):
+                    (
+                        not self.config.dry_run
+                        and self.config.account_audit_interval_seconds
+                    )
+                    or self._authenticated_evidence_enabled
+                ) and self.account_monitor is None:
                     self.account_monitor = MarketMakerAccountMonitor(
                         self.adapter,
                         self.config,
@@ -318,6 +327,16 @@ class MarketMakerCoordinator:
                 await self._wait_for_subscription_health()
                 if await self._abort_start_if_requested():
                     return
+                if self._authenticated_evidence_enabled:
+                    await self.audit_account_once()
+                    self._authenticated_preflight = (
+                        await self._capture_authenticated_flat_boundary()
+                    )
+                    await self.emit_status_once(
+                        event="market_maker_authenticated_preflight"
+                    )
+                    if await self._abort_start_if_requested():
+                        return
                 target = (
                     self._market.best_bid + self._market.best_ask
                 ) / Decimal("2")
@@ -448,7 +467,10 @@ class MarketMakerCoordinator:
 
         initialization_error: BaseException | None = None
         if (
-            not self.config.dry_run
+            (
+                not self.config.dry_run
+                or self._authenticated_evidence_enabled
+            )
             and self._authenticated
             and self.config.account_audit_interval_seconds
             and self.account_monitor is not None
@@ -461,15 +483,42 @@ class MarketMakerCoordinator:
 
         audit_error: BaseException | None = None
         status_error: BaseException | None = None
+        evidence_error: BaseException | None = None
         if (
-            not self.config.dry_run
-            and self._authenticated
+            self._authenticated
+            and (
+                not self.config.dry_run
+                or self._authenticated_evidence_enabled
+            )
+            and (
+                not self._authenticated_evidence_enabled
+                or self._account_monitor_initialized
+            )
             and callable(getattr(self.account_monitor, "audit", None))
         ):
             try:
                 await self.audit_account_once()
             except BaseException as exc:
                 audit_error = exc
+        if (
+            self._authenticated_evidence_enabled
+            and self._authenticated
+            and self._account_monitor_initialized
+            and shutdown_error is None
+            and initialization_error is None
+            and audit_error is None
+        ):
+            try:
+                self._authenticated_postflight = (
+                    await self._capture_authenticated_flat_boundary()
+                )
+            except BaseException as exc:
+                evidence_error = exc
+        if (
+            not self.config.dry_run
+            and self._authenticated
+            and callable(getattr(self.account_monitor, "audit", None))
+        ):
             try:
                 await self.emit_status_once(
                     event="market_maker_final_account_audit"
@@ -479,6 +528,7 @@ class MarketMakerCoordinator:
         return self._combine_cleanup_errors(
             shutdown_error,
             initialization_error,
+            evidence_error,
             audit_error,
             status_error,
         )
@@ -1212,7 +1262,10 @@ class MarketMakerCoordinator:
 
     async def _initialize_account_monitor(self) -> None:
         if (
-            not self.config.account_audit_interval_seconds
+            (
+                not self.config.account_audit_interval_seconds
+                and not self._authenticated_evidence_enabled
+            )
             or self._account_monitor_initialized
         ):
             return
@@ -1271,6 +1324,13 @@ class MarketMakerCoordinator:
         snapshot = self.metrics.snapshot(now)
         if event is not None:
             snapshot["event"] = event
+        if self._authenticated_preflight is not None:
+            snapshot["preflight"] = dict(self._authenticated_preflight)
+        if self._authenticated_postflight is not None:
+            snapshot["postflight"] = dict(self._authenticated_postflight)
+            snapshot["authenticated_open_orders"] = (
+                self._authenticated_postflight["open_orders"]
+            )
         if self._status_callback is None:
             logger.info("%s %s", event or "market_maker_status", snapshot)
         else:
@@ -1278,6 +1338,46 @@ class MarketMakerCoordinator:
             if inspect.isawaitable(result):
                 await result
         return snapshot
+
+    async def _capture_authenticated_flat_boundary(self) -> dict[str, Any]:
+        if not self._authenticated:
+            raise RuntimeError("authenticated boundary state is unavailable")
+        monitor = self.account_monitor
+        if (
+            monitor is None
+            or monitor.last_audit_authenticated is not True
+            or monitor.audited_position != 0
+            or monitor.audited_open_order_count != 0
+        ):
+            raise RuntimeError(
+                "authenticated boundary lacks a flat, zero-order account audit"
+            )
+        position = self._position
+        if position is None or position.signed_size != 0:
+            raise RuntimeError(
+                "authenticated boundary websocket position is not flat"
+            )
+        return {
+            "authenticated": True,
+            "position": monitor.audited_position,
+            "open_orders": 0,
+        }
+
+    def _validate_authenticated_evidence_config(self) -> None:
+        if not self._authenticated_evidence_enabled or self.config.dry_run:
+            return
+        if not self.config.require_flat_start:
+            raise ValueError("live evidence requires require_flat_start=true")
+        if self.config.startup_open_order_policy != "abort":
+            raise ValueError(
+                "live evidence requires startup_open_order_policy=abort"
+            )
+        if not self.config.exclusive_symbol_control:
+            raise ValueError(
+                "live evidence requires exclusive_symbol_control=true"
+            )
+        if not self.config.cancel_on_shutdown:
+            raise ValueError("live evidence requires cancel_on_shutdown=true")
 
     async def audit_account_once(self) -> None:
         if self.account_monitor is None:
@@ -1377,6 +1477,8 @@ class MarketMakerCoordinator:
             else frozenset()
         )
         audit_options: dict[str, Any] = {}
+        if self._authenticated_evidence_enabled:
+            audit_options["confirm_open_orders"] = True
         if active_ids:
             audit_options["active_unwind_order_ids"] = active_ids
         if terminal_ids:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
@@ -17,6 +20,7 @@ _FORBIDDEN_SECRET_FIELDS = {
     "secret_key",
     "wallet_private_key",
 }
+_PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def parse_decimal(value: Any, field_name: str = "value") -> Decimal:
@@ -69,6 +73,7 @@ class MarketMakerConfig:
     trend_guard_threshold_ticks: int = 0
     quote_controller_mode: str = "fixed"
     quote_controller_type: str = "toxicity_v1"
+    toxicity_profile_id: str = "disabled"
     toxicity_apply_bid: bool = False
     toxicity_apply_ask: bool = False
     toxicity_book_depth_levels: int = 5
@@ -192,6 +197,14 @@ class MarketMakerConfig:
             )
         if self.quote_controller_type != "toxicity_v1":
             raise ValueError("quote_controller_type must be 'toxicity_v1'")
+        if (
+            not isinstance(self.toxicity_profile_id, str)
+            or _PROFILE_ID.fullmatch(self.toxicity_profile_id) is None
+        ):
+            raise ValueError(
+                "toxicity_profile_id must start with a letter or number and contain "
+                "only letters, numbers, dots, underscores, or hyphens"
+            )
         for name in (
             "toxicity_book_depth_levels",
             "toxicity_feature_window_seconds",
@@ -531,3 +544,53 @@ def load_market_maker_config(path: str | Path) -> MarketMakerConfig:
     if not isinstance(block, Mapping):
         raise ValueError("market_maker must be a mapping")
     return MarketMakerConfig.from_mapping(block)
+
+
+def _canonical_decimal(value: Decimal) -> dict[str, Any]:
+    if not value.is_finite():
+        raise ValueError("semantic config decimals must be finite")
+    sign, raw_digits, exponent = value.as_tuple()
+    digits = list(raw_digits)
+    if not digits or all(digit == 0 for digit in digits):
+        return {"sign": 0, "digits": "0", "exponent": 0}
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    return {
+        "sign": sign,
+        "digits": "".join(str(digit) for digit in digits),
+        "exponent": exponent,
+    }
+
+
+def _semantic_config_value(value: Any) -> list[Any]:
+    if type(value) is bool:
+        return ["bool", value]
+    if type(value) is int:
+        return ["int", value]
+    if type(value) is str:
+        return ["str", value]
+    if isinstance(value, Decimal):
+        return ["decimal", _canonical_decimal(value)]
+    raise TypeError(
+        f"unsupported semantic config value type: {type(value).__name__}"
+    )
+
+
+def semantic_config_sha256(config: MarketMakerConfig) -> str:
+    """Hash every effective config field with deterministic scalar encoding."""
+    document = {
+        "schema": "market_maker_config_v1",
+        "values": {
+            field.name: _semantic_config_value(getattr(config, field.name))
+            for field in fields(config)
+        },
+    }
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()

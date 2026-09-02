@@ -38,6 +38,7 @@ from core.services.market_maker.models import (
     RuntimeState,
 )
 from core.services.market_maker.order_manager import MarketMakerOrderManager
+from scripts.mm_calibration_campaign import analyze_campaign
 
 
 def _order(
@@ -363,6 +364,13 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def run_fake(self, *, dry_run: bool, quote_mode: str = "both"):
         adapter = FakeLighterAdapter()
         factory_in_loop = False
+        stop = asyncio.Event()
+
+        class StopAfterFirstCycleCoordinator(MarketMakerCoordinator):
+            async def run_one_cycle(self, *args, **kwargs):
+                result = await super().run_one_cycle(*args, **kwargs)
+                stop.set()
+                return result
 
         def factory(settings):
             nonlocal factory_in_loop
@@ -371,10 +379,7 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(settings["network"], "robinhood_testnet")
             return adapter
 
-        stop = asyncio.Event()
-        if dry_run:
-            stop.set()
-        else:
+        if not dry_run:
             adapter.stop_event = stop
             adapter.stop_after_creates = 2 if quote_mode == "both" else 1
         coordinator = await entrypoint.run_market_maker(
@@ -388,6 +393,11 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "expected_l1_address": None,
             },
             adapter_factory=factory,
+            coordinator_factory=(
+                StopAfterFirstCycleCoordinator
+                if dry_run
+                else MarketMakerCoordinator
+            ),
             stop_event=stop,
         )
         return adapter, coordinator, factory_in_loop
@@ -395,23 +405,31 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_runtime_emits_best_effort_final_dry_status(self) -> None:
         adapter = FakeLighterAdapter()
         stop = asyncio.Event()
-        stop.set()
         logger = SimpleNamespace(info=Mock(), warning=Mock())
 
-        coordinator = await entrypoint.run_market_maker(
-            self.config(dry_run=True),
-            {
-                "network": "robinhood_testnet",
-                "testnet": True,
-                "api_key_private_key": "test-only",
-                "account_index": 1,
-                "api_key_index": 2,
-                "expected_l1_address": None,
-            },
-            adapter_factory=lambda _settings: adapter,
-            stop_event=stop,
-            logger=logger,
-        )
+        async def stop_after_start() -> None:
+            await asyncio.sleep(0.05)
+            stop.set()
+
+        stop_task = asyncio.create_task(stop_after_start())
+
+        try:
+            coordinator = await entrypoint.run_market_maker(
+                self.config(dry_run=True),
+                {
+                    "network": "robinhood_testnet",
+                    "testnet": True,
+                    "api_key_private_key": "test-only",
+                    "account_index": 1,
+                    "api_key_index": 2,
+                    "expected_l1_address": None,
+                },
+                adapter_factory=lambda _settings: adapter,
+                stop_event=stop,
+                logger=logger,
+            )
+        finally:
+            await stop_task
 
         self.assertEqual(coordinator.state, RuntimeState.STOPPED)
         messages = [call.args[0] for call in logger.info.call_args_list]
@@ -428,6 +446,378 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         logger.warning.assert_not_called()
+
+    async def test_failed_dry_start_does_not_emit_clean_final_marker(self) -> None:
+        adapter = FakeLighterAdapter()
+        adapter.connect = AsyncMock(return_value=False)
+        statuses: list[dict[str, object]] = []
+
+        with self.assertRaisesRegex(RuntimeError, "exchange connection failed"):
+            await entrypoint.run_market_maker(
+                self.config(dry_run=True),
+                {"api_key_private_key": "test-only"},
+                adapter_factory=lambda _settings: adapter,
+                stop_event=asyncio.Event(),
+                status_callback=statuses.append,
+            )
+
+        self.assertFalse(
+            any(
+                status.get("event") == "market_maker_final_dry_run"
+                for status in statuses
+            )
+        )
+
+    async def test_pre_set_stop_skips_start_and_final_dry_marker(self) -> None:
+        adapter = FakeLighterAdapter()
+        stop = asyncio.Event()
+        stop.set()
+        statuses: list[dict[str, object]] = []
+
+        coordinator = await entrypoint.run_market_maker(
+            self.config(dry_run=True),
+            {"api_key_private_key": "test-only"},
+            adapter_factory=lambda _settings: adapter,
+            stop_event=stop,
+            status_callback=statuses.append,
+        )
+
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
+        self.assertNotIn("connect", [event[0] for event in adapter.events])
+        self.assertEqual(statuses, [])
+
+    async def test_pre_set_live_stop_cannot_reach_first_mutation(self) -> None:
+        adapter = FakeLighterAdapter()
+        stop = asyncio.Event()
+        stop.set()
+
+        coordinator = await entrypoint.run_market_maker(
+            self.config(dry_run=False),
+            {"api_key_private_key": "test-only"},
+            adapter_factory=lambda _settings: adapter,
+            stop_event=stop,
+            status_callback=lambda _status: None,
+            authenticated_evidence=True,
+        )
+
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
+        self.assertNotIn("connect", [event[0] for event in adapter.events])
+        self.assertEqual(adapter.create_calls, [])
+        self.assertEqual(adapter.cancel_calls, [])
+
+    async def test_live_stop_during_connect_cannot_reach_first_mutation(
+        self,
+    ) -> None:
+        adapter = FakeLighterAdapter()
+        stop = asyncio.Event()
+        connect_started = asyncio.Event()
+        release_connect = asyncio.Event()
+
+        async def slow_connect() -> bool:
+            adapter.events.append(("connect",))
+            connect_started.set()
+            await release_connect.wait()
+            return True
+
+        adapter.connect = slow_connect
+        task = asyncio.create_task(
+            entrypoint.run_market_maker(
+                self.config(dry_run=False),
+                {"api_key_private_key": "test-only"},
+                adapter_factory=lambda _settings: adapter,
+                stop_event=stop,
+                status_callback=lambda _status: None,
+                authenticated_evidence=True,
+            )
+        )
+        await asyncio.wait_for(connect_started.wait(), timeout=1.0)
+        stop.set()
+        await asyncio.sleep(0)
+        release_connect.set()
+
+        coordinator = await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
+        self.assertNotIn("authenticate", [event[0] for event in adapter.events])
+        self.assertEqual(adapter.create_calls, [])
+        self.assertEqual(adapter.cancel_calls, [])
+
+    async def test_cancelled_dry_run_emits_clean_final_marker_after_stop(
+        self,
+    ) -> None:
+        adapter = FakeLighterAdapter()
+        statuses: list[dict[str, object]] = []
+        preflight_seen = asyncio.Event()
+
+        def record_status(status: dict[str, object]) -> None:
+            statuses.append(status)
+            if status.get("event") == "market_maker_authenticated_preflight":
+                preflight_seen.set()
+
+        task = asyncio.create_task(
+            entrypoint.run_market_maker(
+                self.config(dry_run=True),
+                {"api_key_private_key": "test-only"},
+                adapter_factory=lambda _settings: adapter,
+                stop_event=asyncio.Event(),
+                status_callback=record_status,
+                authenticated_evidence=True,
+            )
+        )
+        await asyncio.wait_for(preflight_seen.wait(), timeout=1.0)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(statuses[-1]["event"], "market_maker_final_dry_run")
+        self.assertEqual(statuses[-1]["runtime_state"], "stopped")
+        self.assertEqual(statuses[-1]["postflight"]["open_orders"], 0)
+
+    async def test_evidence_only_dry_run_emits_authenticated_boundaries(self) -> None:
+        adapter = FakeLighterAdapter()
+        stop = asyncio.Event()
+        statuses: list[dict[str, object]] = []
+
+        async def stop_after_start() -> None:
+            await asyncio.sleep(0.05)
+            stop.set()
+
+        stop_task = asyncio.create_task(stop_after_start())
+
+        try:
+            coordinator = await entrypoint.run_market_maker(
+                self.config(dry_run=True),
+                {
+                    "network": "robinhood_testnet",
+                    "testnet": True,
+                    "api_key_private_key": "test-only",
+                    "account_index": 1,
+                    "api_key_index": 2,
+                    "expected_l1_address": None,
+                },
+                adapter_factory=lambda _settings: adapter,
+                stop_event=stop,
+                status_callback=statuses.append,
+                authenticated_evidence=True,
+            )
+        finally:
+            await stop_task
+
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
+        self.assertEqual(adapter.create_calls, [])
+        self.assertEqual(adapter.cancel_calls, [])
+        self.assertEqual(
+            statuses[0]["event"],
+            "market_maker_authenticated_preflight",
+        )
+        self.assertEqual(statuses[-1]["event"], "market_maker_final_dry_run")
+        self.assertEqual(
+            statuses[-1]["preflight"],
+            {"authenticated": True, "position": Decimal("0"), "open_orders": 0},
+        )
+        self.assertEqual(
+            statuses[-1]["postflight"],
+            {"authenticated": True, "position": Decimal("0"), "open_orders": 0},
+        )
+        self.assertEqual(statuses[-1]["authenticated_open_orders"], 0)
+        self.assertTrue(
+            statuses[-1]["account_audit"]["last_audit_authenticated"]
+        )
+        self.assertEqual(
+            statuses[-1]["account_audit"]["audited_open_order_count"],
+            0,
+        )
+
+    async def test_real_dry_runner_evidence_is_analyzer_accepted(self) -> None:
+        adapter = FakeLighterAdapter()
+        stop = asyncio.Event()
+        config = replace(
+            self.config(dry_run=True),
+            toxicity_profile_id="profile-v1",
+            maker_fee_rate=Decimal("0.000120"),
+            taker_fee_rate=Decimal("0.000350"),
+        )
+        commit_sha = "a" * 40
+        config_sha = entrypoint.semantic_config_sha256(config)
+        settings = {
+            "network": "robinhood_testnet",
+            "testnet": True,
+            "api_key_private_key": "test-only",
+            "account_index": 1,
+            "api_key_index": 2,
+            "expected_l1_address": None,
+        }
+        network, account_identity_sha = entrypoint._evidence_account_identity(
+            settings,
+            config.exchange,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "runner-evidence.json"
+            times = iter(
+                (
+                    datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc),
+                    datetime(2026, 9, 3, 1, 30, tzinfo=timezone.utc),
+                )
+            )
+            writer = entrypoint.CalibrationEvidenceWriter(
+                output_path=output,
+                campaign_id="campaign-v1",
+                candidate_id="candidate-v1",
+                config=config,
+                commit_sha=commit_sha,
+                config_sha256=config_sha,
+                network=network,
+                account_identity_sha256=account_identity_sha,
+                repo_root=root,
+                utcnow=lambda: next(times),
+            )
+            writer.protect_sensitive_value("test-only")
+
+            async def stop_after_clock_tick() -> None:
+                await asyncio.sleep(0.05)
+                stop.set()
+
+            stop_task = asyncio.create_task(stop_after_clock_tick())
+            try:
+                await entrypoint.run_market_maker(
+                    config,
+                    settings,
+                    adapter_factory=lambda _settings: adapter,
+                    stop_event=stop,
+                    status_callback=writer.record,
+                    authenticated_evidence=True,
+                )
+            finally:
+                await stop_task
+            with patch.object(
+                entrypoint,
+                "_verified_clean_commit",
+                return_value=commit_sha,
+            ):
+                writer.finalize()
+
+            report = analyze_campaign(
+                {
+                    "campaign_id": "campaign-v1",
+                    "candidate_id": "candidate-v1",
+                    "expected_commit_sha": commit_sha,
+                    "expected_config_sha256": config_sha,
+                    "network": network,
+                    "expected_account_identity_sha256": account_identity_sha,
+                    "symbol": config.symbol,
+                    "controller_profile_id": config.toxicity_profile_id,
+                    "maker_fee_rate": str(config.maker_fee_rate),
+                    "taker_fee_rate": str(config.taker_fee_rate),
+                    "max_cumulative_flat_loss_usdg": "1.00",
+                    "inputs": [output.name],
+                },
+                base_dir=root,
+            )
+
+        self.assertEqual(
+            report["runs"]["included_count"], 1, report["runs"]
+        )
+        self.assertEqual(report["runs"]["diagnostic_only"], [])
+
+    async def test_fake_live_evidence_audits_before_and_after_mutations(self) -> None:
+        adapter = FakeLighterAdapter()
+        stop = asyncio.Event()
+        adapter.stop_event = stop
+        adapter.stop_after_creates = 2
+        statuses: list[dict[str, object]] = []
+
+        def record_status(status: dict[str, object]) -> None:
+            statuses.append(status)
+            adapter.events.append(("status", status.get("event")))
+
+        coordinator = await entrypoint.run_market_maker(
+            self.config(dry_run=False),
+            {
+                "network": "robinhood_testnet",
+                "testnet": True,
+                "api_key_private_key": "test-only",
+                "account_index": 1,
+                "api_key_index": 2,
+                "expected_l1_address": None,
+            },
+            adapter_factory=lambda _settings: adapter,
+            stop_event=stop,
+            status_callback=record_status,
+            authenticated_evidence=True,
+        )
+
+        self.assertEqual(coordinator.state, RuntimeState.STOPPED)
+        self.assertEqual(len(adapter.create_calls), 2)
+        self.assertEqual(
+            statuses[0]["event"],
+            "market_maker_authenticated_preflight",
+        )
+        self.assertEqual(
+            statuses[-1]["event"],
+            "market_maker_final_account_audit",
+        )
+        self.assertTrue(statuses[-1]["account_audit"]["last_audit_authenticated"])
+        self.assertEqual(
+            statuses[-1]["account_audit"]["audited_open_order_count"],
+            0,
+        )
+        self.assertEqual(statuses[-1]["preflight"]["position"], Decimal("0"))
+        self.assertEqual(statuses[-1]["postflight"]["position"], Decimal("0"))
+        self.assertEqual(statuses[-1]["authenticated_open_orders"], 0)
+        self.assertEqual(adapter.active, {})
+        preflight_index = adapter.events.index(
+            ("status", "market_maker_authenticated_preflight")
+        )
+        first_mutation_index = min(
+            index
+            for index, event in enumerate(adapter.events)
+            if event[0] in {"create", "cancel"}
+        )
+        self.assertLess(preflight_index, first_mutation_index)
+        final_status_index = adapter.events.index(
+            ("status", "market_maker_final_account_audit")
+        )
+        final_audit_read_index = max(
+            index
+            for index, event in enumerate(adapter.events)
+            if event[0] == "account_trades"
+        )
+        self.assertLess(final_audit_read_index, final_status_index)
+
+    async def test_evidence_preflight_rejects_open_orders_without_mutation(self) -> None:
+        adapter = FakeLighterAdapter()
+        adapter.active["external"] = _order(
+            "external",
+            OrderSide.BUY,
+            Decimal("99"),
+            Decimal("0.001"),
+            OrderStatus.OPEN,
+        )
+        stop = asyncio.Event()
+
+        with self.assertRaisesRegex(RuntimeError, "open order"):
+            await entrypoint.run_market_maker(
+                self.config(dry_run=True),
+                {
+                    "network": "robinhood_testnet",
+                    "testnet": True,
+                    "api_key_private_key": "test-only",
+                    "account_index": 1,
+                    "api_key_index": 2,
+                    "expected_l1_address": None,
+                },
+                adapter_factory=lambda _settings: adapter,
+                stop_event=stop,
+                status_callback=lambda _status: None,
+                authenticated_evidence=True,
+            )
+
+        self.assertEqual(adapter.create_calls, [])
+        self.assertEqual(adapter.cancel_calls, [])
+        self.assertIn("external", adapter.active)
 
     @staticmethod
     def active_metadata() -> MarketMetadata:
@@ -1250,6 +1640,41 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CliAndWalletProfileTests(unittest.TestCase):
+    def test_cli_requires_complete_evidence_identity(self) -> None:
+        incomplete = (
+            ["mm.yaml", "--evidence-output", "logs/market_maker_evidence/run.json"],
+            ["mm.yaml", "--campaign-id", "campaign-v1"],
+            ["mm.yaml", "--candidate-id", "candidate-v1"],
+        )
+        for argv in incomplete:
+            with (
+                self.subTest(argv=argv),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                entrypoint.parse_cli(argv)
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_cli_rejects_unsafe_evidence_ids(self) -> None:
+        for campaign_id in ("../campaign", "campaign/name", ".campaign"):
+            with (
+                self.subTest(campaign_id=campaign_id),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                entrypoint.parse_cli(
+                    [
+                        "mm.yaml",
+                        "--evidence-output",
+                        "logs/market_maker_evidence/run.json",
+                        "--campaign-id",
+                        campaign_id,
+                        "--candidate-id",
+                        "candidate-v1",
+                    ]
+                )
+            self.assertEqual(raised.exception.code, 2)
+
     def test_cli_accepts_wallet_alias_and_single_shortcut(self) -> None:
         self.assertEqual(
             entrypoint.parse_cli(["mm.yaml", "--walletname", "desk"]).wallet_name,
@@ -1498,6 +1923,139 @@ class CliAndWalletProfileTests(unittest.TestCase):
         combined = stderr.getvalue() + "\n".join(logger.messages)
         self.assertIn("<redacted>", combined)
         self.assertNotIn(secret, combined)
+
+    def test_evidence_fingerprint_fails_before_settings_load(self) -> None:
+        settings_loader = Mock(side_effect=AssertionError("credentials were read"))
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                entrypoint,
+                "load_market_maker_config",
+                return_value=MarketMakerConfig(),
+            ),
+            patch.object(
+                entrypoint,
+                "_resolve_evidence_output",
+                return_value=Path("ignored-evidence.json"),
+            ),
+            patch.object(
+                entrypoint,
+                "_verified_clean_commit",
+                side_effect=entrypoint.EvidenceError(
+                    "calibration evidence requires a clean worktree"
+                ),
+            ),
+            patch.object(entrypoint, "load_lighter_settings", settings_loader),
+            redirect_stderr(stderr),
+        ):
+            code = entrypoint.main(
+                [
+                    "ignored.yaml",
+                    "--evidence-output",
+                    "logs/market_maker_evidence/run.json",
+                    "--campaign-id",
+                    "campaign-v1",
+                    "--candidate-id",
+                    "candidate-v1",
+                ],
+                logger_factory=lambda _debug: Mock(),
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("clean worktree", stderr.getvalue())
+        settings_loader.assert_not_called()
+
+    def test_evidence_hash_uses_effective_dry_run_override(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Writer:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+            def protect_sensitive_value(self, _value) -> None:
+                pass
+
+            def record(self, _status) -> None:
+                pass
+
+            def finalize(self) -> Path:
+                return Path("ignored-evidence.json")
+
+        async def runtime(config, _settings, **_kwargs):
+            captured["runtime_config"] = config
+
+        live_config = MarketMakerConfig(
+            dry_run=False,
+            account_audit_interval_seconds=60,
+            max_session_drawdown=Decimal("1"),
+            require_flat_start=True,
+        )
+        evidence_settings = {
+            "network": "robinhood_testnet",
+            "account_index": 7,
+            "api_key_index": 2,
+            "api_key_private_key": "secret",
+        }
+        with (
+            patch.object(
+                entrypoint,
+                "load_market_maker_config",
+                return_value=live_config,
+            ),
+            patch.object(
+                entrypoint,
+                "_resolve_evidence_output",
+                return_value=Path("ignored-evidence.json"),
+            ),
+            patch.object(
+                entrypoint,
+                "_verified_clean_commit",
+                return_value="a" * 40,
+            ),
+            patch.object(entrypoint, "CalibrationEvidenceWriter", Writer),
+            patch.object(
+                entrypoint,
+                "load_lighter_settings",
+                return_value=evidence_settings,
+            ),
+        ):
+            code = entrypoint.main(
+                [
+                    "ignored.yaml",
+                    "--dry-run",
+                    "--evidence-output",
+                    "logs/market_maker_evidence/run.json",
+                    "--campaign-id",
+                    "campaign-v1",
+                    "--candidate-id",
+                    "candidate-v1",
+                ],
+                runtime=runtime,
+                logger_factory=lambda _debug: Mock(),
+            )
+
+        effective = replace(live_config, dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(captured["runtime_config"].dry_run)
+        self.assertEqual(
+            captured["config_sha256"],
+            entrypoint.semantic_config_sha256(effective),
+        )
+        self.assertNotEqual(
+            captured["config_sha256"],
+            entrypoint.semantic_config_sha256(live_config),
+        )
+        expected_network, expected_account_identity = (
+            entrypoint._evidence_account_identity(
+                evidence_settings,
+                effective.exchange,
+            )
+        )
+        self.assertEqual(captured["network"], expected_network)
+        self.assertEqual(
+            captured["account_identity_sha256"],
+            expected_account_identity,
+        )
 
     def test_main_preserves_config_mode_and_uses_injected_run_seams(self) -> None:
         captured = {}

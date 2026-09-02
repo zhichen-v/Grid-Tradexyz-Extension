@@ -135,6 +135,36 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         values.update(overrides)
         return self.config(**values)
 
+    async def test_audit_snapshot_binds_open_order_count(self) -> None:
+        adapter = self.adapter()
+        monitor = self.monitor(adapter)
+        await monitor.initialize()
+        adapter.get_open_orders.return_value = [
+            SimpleNamespace(id="managed", symbol="BTC")
+        ]
+
+        await monitor.audit({"managed"})
+
+        snapshot = monitor.snapshot(self.now)
+        self.assertTrue(snapshot["last_audit_authenticated"])
+        self.assertEqual(snapshot["audited_open_order_count"], 1)
+
+    async def test_evidence_audit_detects_order_appearing_mid_read(self) -> None:
+        adapter = self.adapter()
+        monitor = self.monitor(adapter)
+        await monitor.initialize()
+        adapter.get_open_orders.side_effect = [
+            [],
+            [SimpleNamespace(id="external", symbol="BTC")],
+        ]
+
+        with self.assertRaisesRegex(AccountAuditError, "unmanaged open order"):
+            await monitor.audit(set(), confirm_open_orders=True)
+
+        snapshot = monitor.snapshot(self.now)
+        self.assertFalse(snapshot["last_audit_authenticated"])
+        self.assertIsNone(snapshot["audited_open_order_count"])
+
     async def test_authorized_active_unwind_taker_is_separately_attributed(self):
         config = self.active_unwind_config()
         adapter = self.adapter()

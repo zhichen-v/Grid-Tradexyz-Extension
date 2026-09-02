@@ -25,6 +25,8 @@ _REQUIRED_MANIFEST_FIELDS = (
     "candidate_id",
     "expected_commit_sha",
     "expected_config_sha256",
+    "network",
+    "expected_account_identity_sha256",
     "symbol",
     "controller_profile_id",
     "maker_fee_rate",
@@ -32,6 +34,14 @@ _REQUIRED_MANIFEST_FIELDS = (
     "max_cumulative_flat_loss_usdg",
     "inputs",
 )
+_EVIDENCE_SCHEMA = "market_maker_calibration_evidence_v1"
+_EVIDENCE_TERMINAL_EVENTS = frozenset(
+    {
+        "market_maker_final_account_audit",
+        "market_maker_final_dry_run",
+    }
+)
+_ALLOWED_NETWORKS = frozenset({"robinhood", "robinhood_testnet"})
 _SECRET_KEY_PARTS = (
     "apikey",
     "credential",
@@ -189,6 +199,8 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_id",
         "expected_commit_sha",
         "expected_config_sha256",
+        "network",
+        "expected_account_identity_sha256",
         "symbol",
         "controller_profile_id",
     ):
@@ -206,8 +218,26 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         raise CampaignValidationError(
             "expected_config_sha256 must be 64 hex characters"
         )
+    if result["network"].lower() not in _ALLOWED_NETWORKS:
+        raise CampaignValidationError(
+            "network must be robinhood or robinhood_testnet"
+        )
+    if (
+        re.fullmatch(
+            r"[0-9a-fA-F]{64}",
+            result["expected_account_identity_sha256"],
+        )
+        is None
+    ):
+        raise CampaignValidationError(
+            "expected_account_identity_sha256 must be 64 hex characters"
+        )
     result["expected_commit_sha"] = result["expected_commit_sha"].lower()
     result["expected_config_sha256"] = result["expected_config_sha256"].lower()
+    result["network"] = result["network"].lower()
+    result["expected_account_identity_sha256"] = result[
+        "expected_account_identity_sha256"
+    ].lower()
     for field in ("maker_fee_rate", "taker_fee_rate", "max_cumulative_flat_loss_usdg"):
         value = result[field]
         if not isinstance(value, str):
@@ -350,6 +380,8 @@ def _identity(final: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_id": final.get("candidate_id"),
         "commit_sha": final.get("commit_sha"),
         "config_sha256": final.get("semantic_config_sha256", final.get("config_sha256")),
+        "network": final.get("network"),
+        "account_identity_sha256": final.get("account_identity_sha256"),
         "controller_profile_id": final.get("controller_profile_id"),
         "symbol": final.get("symbol"),
         "maker_fee_rate": final.get("maker_fee_rate"),
@@ -362,6 +394,7 @@ def _identity(final: Mapping[str, Any]) -> dict[str, Any]:
 def _identity_reasons(
     records: Iterable[Mapping[str, Any]], manifest: Mapping[str, Any]
 ) -> list[str]:
+    record_list = list(records)
     reasons: list[str] = []
     utc_periods: set[tuple[str, str]] = set()
     expected = {
@@ -369,17 +402,33 @@ def _identity_reasons(
         "candidate_id": manifest["candidate_id"],
         "commit_sha": manifest["expected_commit_sha"],
         "config_sha256": manifest["expected_config_sha256"],
+        "network": manifest["network"],
+        "account_identity_sha256": manifest[
+            "expected_account_identity_sha256"
+        ],
         "controller_profile_id": manifest["controller_profile_id"],
         "symbol": manifest["symbol"],
     }
-    for index, record in enumerate(records):
+    for index, record in enumerate(record_list):
+        if record.get("evidence_schema") != _EVIDENCE_SCHEMA:
+            reasons.append(f"snapshot_{index}_missing_or_invalid_evidence_schema")
+        if "evidence_integrity_errors" in record:
+            reasons.append(f"snapshot_{index}_evidence_integrity_errors_present")
         identity = _identity(record)
         for field, wanted in expected.items():
             actual = identity.get(field)
             if not isinstance(actual, str) or not actual.strip():
                 reasons.append(f"snapshot_{index}_missing_{field}")
             elif (
-                actual.strip().lower() if field in {"commit_sha", "config_sha256"} else actual.strip()
+                actual.strip().lower()
+                if field
+                in {
+                    "commit_sha",
+                    "config_sha256",
+                    "network",
+                    "account_identity_sha256",
+                }
+                else actual.strip()
             ) != wanted:
                 reasons.append(f"snapshot_{index}_mismatched_{field}")
         for field in ("maker_fee_rate", "taker_fee_rate"):
@@ -415,6 +464,12 @@ def _identity_reasons(
                 reasons.append(f"snapshot_{index}_uptime_exceeds_utc_period")
     if len(utc_periods) > 1:
         reasons.append("snapshot_utc_period_identity_conflict")
+    physical_final = record_list[-1]
+    selected_final = _final_record(record_list)
+    if physical_final.get("event") not in _EVIDENCE_TERMINAL_EVENTS:
+        reasons.append("final_snapshot_not_terminal_event")
+    if selected_final is not physical_final:
+        reasons.append("terminal_status_is_not_final_by_campaign_order")
     return reasons
 
 
@@ -1594,10 +1649,18 @@ def _fill_samples(
 
 
 def _empty_bin() -> dict[str, Any]:
-    return {"entries": [], "episodes": {}}
+    return {
+        "entries": [],
+        "episodes": {},
+        "maker_fills": 0,
+        "maker_turnover": Decimal("0"),
+        "completed_net": Decimal("0"),
+    }
 
 
-def _summarize_bin(bucket: Mapping[str, Any]) -> dict[str, Any]:
+def _summarize_bin(
+    bucket: Mapping[str, Any], eligible_hours: Decimal | None
+) -> dict[str, Any]:
     entries = list(bucket["entries"])
     episodes = list(bucket["episodes"].values())
     markout_5 = [_optional_decimal(item["markouts"].get("5")) for item in entries]
@@ -1643,6 +1706,21 @@ def _summarize_bin(bucket: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "passive_loss_used_usdg": _summary(
             episode.get("passive_loss_used") for episode in complete_episodes
+        ),
+        "maker_fills_per_eligible_hour": (
+            Decimal(bucket["maker_fills"]) / eligible_hours
+            if eligible_hours is not None
+            else None
+        ),
+        "maker_turnover_usdg_per_eligible_hour": (
+            bucket["maker_turnover"] / eligible_hours
+            if eligible_hours is not None
+            else None
+        ),
+        "net_usdg_per_eligible_hour": (
+            bucket["completed_net"] / eligible_hours
+            if eligible_hours is not None
+            else None
         ),
     }
 
@@ -1957,6 +2035,10 @@ def _analyze_campaign(
         "candidate_id": validated["candidate_id"],
         "expected_commit_sha": validated["expected_commit_sha"],
         "expected_config_sha256": validated["expected_config_sha256"],
+        "network": validated["network"],
+        "expected_account_identity_sha256": validated[
+            "expected_account_identity_sha256"
+        ],
         "controller_profile_id": validated["controller_profile_id"],
         "symbol": validated["symbol"],
         "maker_fee_rate": str(validated["maker_fee_rate"]),
@@ -2006,6 +2088,32 @@ def _analyze_campaign(
         denominator["excluded_active_exits"] += item[
             "authenticated_active_exit_trade_count"
         ]
+        maker_fills_by_episode: Counter[int] = Counter()
+        maker_turnover_by_episode: dict[int, Decimal] = {}
+        if item["attribution_evidence_complete"]:
+            maker_fills_by_episode.update(
+                attribution["episode_sequence"]
+                for attribution in item["authenticated_trade_attributions"]
+                if attribution["active_unwind"] is False
+            )
+            for sample in item["samples"]:
+                if (
+                    sample.get("attribution_state") != "authenticated"
+                    or sample.get("active_unwind") is not False
+                ):
+                    continue
+                sequence = sample.get("episode_sequence")
+                fill_amount = _optional_decimal(sample.get("fill_amount"))
+                fill_price = _optional_decimal(sample.get("fill_price"))
+                if (
+                    type(sequence) is int
+                    and fill_amount is not None
+                    and fill_price is not None
+                ):
+                    maker_turnover_by_episode[sequence] = (
+                        maker_turnover_by_episode.get(sequence, Decimal("0"))
+                        + abs(fill_amount) * fill_price
+                    )
         episodes_by_sequence: dict[int, list[dict[str, Any]]] = {}
         for episode in item["episodes"].values():
             sequence = episode.get("episode_sequence")
@@ -2054,17 +2162,32 @@ def _analyze_campaign(
                 if len(candidates_for_episode) == 1
                 else None
             )
-            if (
-                episode is None
-                or str(episode.get("entry_side", "")).lower() != side
-                or not _complete_campaign_episode(episode)
-                or not _episode_attribution_conserved(
+            episode_valid = (
+                episode is not None
+                and str(episode.get("entry_side", "")).lower() == side
+                and _complete_campaign_episode(episode)
+                and _episode_attribution_conserved(
                     episode, item["authenticated_trade_attributions"]
                 )
-            ):
+            )
+            if not episode_valid:
                 episode_economics_complete = False
-            if episode is not None and (key := _episode_key(episode)) is not None:
-                bucket["episodes"][(item["run_id"], *key)] = episode
+                continue
+            key = _episode_key(episode)
+            episode_net = _optional_decimal(
+                episode.get("net_ex_funding", episode.get("net"))
+            )
+            if key is None or episode_net is None:
+                episode_economics_complete = False
+                continue
+            campaign_episode_key = (item["run_id"], *key)
+            if campaign_episode_key not in bucket["episodes"]:
+                bucket["episodes"][campaign_episode_key] = episode
+                bucket["maker_fills"] += maker_fills_by_episode.get(sequence, 0)
+                bucket["maker_turnover"] += maker_turnover_by_episode.get(
+                    sequence, Decimal("0")
+                )
+                bucket["completed_net"] += episode_net
 
     total_entries = sum(
         denominator[f"authenticated_{side}_entries"]
@@ -2074,15 +2197,42 @@ def _analyze_campaign(
     score_complete &= total_entries > 0
     episode_economics_complete &= total_entries > 0
 
-    summarized_bins = {
-        side: {label: _summarize_bin(bins[label]) for label, *_ in _SCORE_BINS}
-        for side, bins in by_side.items()
-    }
     eligible_seconds = sum((item["eligible_quote_seconds"] for item in included), Decimal("0"))
     eligible_hours = eligible_seconds / Decimal("3600") if eligible_seconds > 0 else None
     maker_fills = sum(item["maker_fills"] for item in included)
     maker_turnover = sum((item["maker_turnover"] for item in included), Decimal("0"))
     completed_net = sum((item["completed_net"] for item in included), Decimal("0"))
+    binned_maker_fills = sum(
+        bucket["maker_fills"] for bins in by_side.values() for bucket in bins.values()
+    )
+    binned_maker_turnover = sum(
+        (
+            bucket["maker_turnover"]
+            for bins in by_side.values()
+            for bucket in bins.values()
+        ),
+        Decimal("0"),
+    )
+    binned_completed_net = sum(
+        (
+            bucket["completed_net"]
+            for bins in by_side.values()
+            for bucket in bins.values()
+        ),
+        Decimal("0"),
+    )
+    score_bin_rate_conservation_complete = (
+        binned_maker_fills == maker_fills
+        and binned_maker_turnover == maker_turnover
+        and binned_completed_net == completed_net
+    )
+    summarized_bins = {
+        side: {
+            label: _summarize_bin(bins[label], eligible_hours)
+            for label, *_ in _SCORE_BINS
+        }
+        for side, bins in by_side.items()
+    }
     risk_completed_net = sum(
         (item["completed_net"] for item in risk_items), Decimal("0")
     )
@@ -2140,6 +2290,8 @@ def _analyze_campaign(
         incomplete_reasons.append("meaningful_score_bins_not_proven")
     if not episode_economics_complete:
         incomplete_reasons.append("completed_episode_economics_incomplete")
+    if not score_bin_rate_conservation_complete:
+        incomplete_reasons.append("score_bin_rate_conservation_incomplete")
     if denominator["pending_or_indeterminate"]:
         incomplete_reasons.append("pending_or_indeterminate_evidence_present")
     if not attribution_evidence_complete:
@@ -2174,18 +2326,28 @@ def _analyze_campaign(
             "network_access": False,
             "exchange_mutation": False,
             "entry_sample_unit": "observed_order_fill_delta",
+            "score_bin_rate_scope": {
+                "denominator": "campaign eligible quote hours",
+                "maker_fills": "unique authenticated maker trades in episodes attributed to entries in the bin",
+                "maker_turnover": "all authenticated maker fill-delta notional in episodes attributed to entries in the bin",
+                "net": "deduplicated completed episodes attributable to entries in the bin",
+            },
             "required_top_level_per_snapshot": [
+                "evidence_schema=market_maker_calibration_evidence_v1",
                 "event_sequence_run_id",
                 "campaign_id",
                 "candidate_id",
                 "commit_sha",
                 "semantic_config_sha256 (or config_sha256)",
+                "network",
+                "account_identity_sha256",
                 "controller_profile_id",
                 "symbol",
                 "maker_fee_rate",
                 "taker_fee_rate",
                 "started_at_utc",
                 "ended_at_utc",
+                "event (selected final snapshot must be a recognized terminal event)",
             ],
             "required_final_authenticated_evidence": [
                 "preflight.authenticated=true, position=0, open_orders=0",
@@ -2209,6 +2371,10 @@ def _analyze_campaign(
             "campaign_evidence_sha256": campaign_evidence_sha256,
             "expected_commit_sha": validated["expected_commit_sha"],
             "expected_config_sha256": validated["expected_config_sha256"],
+            "network": validated["network"],
+            "expected_account_identity_sha256": validated[
+                "expected_account_identity_sha256"
+            ],
             "controller_profile_id": validated["controller_profile_id"],
             "symbol": validated["symbol"],
             "maker_fee_rate": validated["maker_fee_rate"],
@@ -2250,6 +2416,9 @@ def _analyze_campaign(
             ),
             "completed_episode_economics_complete": (
                 episode_economics_complete
+            ),
+            "score_bin_rate_conservation_complete": (
+                score_bin_rate_conservation_complete
             ),
             "meaningful_score_bins": meaningful_bins,
             "minimum_entries_per_meaningful_bin": (

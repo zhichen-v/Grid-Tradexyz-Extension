@@ -1,6 +1,7 @@
 import tempfile
 import unittest
-from decimal import Decimal
+from dataclasses import replace
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 from core.services.market_maker.config import (
@@ -10,6 +11,7 @@ from core.services.market_maker.config import (
     is_step_aligned,
     load_market_maker_config,
     parse_decimal,
+    semantic_config_sha256,
 )
 from core.services.market_maker.models import MarketMetadata
 
@@ -70,6 +72,7 @@ market_maker:
         self.assertFalse(config.active_unwind_enabled)
         self.assertEqual(config.quote_controller_mode, "fixed")
         self.assertEqual(config.quote_controller_type, "toxicity_v1")
+        self.assertEqual(config.toxicity_profile_id, "disabled")
         self.assertFalse(config.toxicity_apply_bid)
         self.assertFalse(config.toxicity_apply_ask)
         self.assertEqual(config.toxicity_outward_reprice_threshold_ticks, 1)
@@ -78,6 +81,7 @@ market_maker:
     def test_quote_controller_defaults_and_valid_active_policy(self) -> None:
         fixed = MarketMakerConfig()
         self.assertEqual(fixed.quote_controller_mode, "fixed")
+        self.assertEqual(fixed.toxicity_profile_id, "disabled")
         self.assertEqual(fixed.toxicity_widen_start_ticks, Decimal("0"))
         self.assertFalse(fixed.toxicity_use_markout_feedback)
         self.assertFalse(fixed.toxicity_apply_bid)
@@ -112,6 +116,9 @@ market_maker:
         invalid_cases = (
             ({"quote_controller_mode": "adaptive"}, "quote_controller_mode"),
             ({"quote_controller_type": "unknown"}, "quote_controller_type"),
+            ({"toxicity_profile_id": ""}, "toxicity_profile_id"),
+            ({"toxicity_profile_id": " candidate"}, "toxicity_profile_id"),
+            ({"toxicity_profile_id": "candidate profile"}, "toxicity_profile_id"),
             ({"toxicity_feature_window_seconds": 59}, "60-second"),
             ({"toxicity_book_depth_levels": 0}, "book_depth"),
             ({"toxicity_min_samples": 4097}, "cannot exceed 4096"),
@@ -446,6 +453,42 @@ market_maker:
         config.validate_order_size(metadata, Decimal("50000"))
         with self.assertRaisesRegex(ValueError, "min_quote_amount"):
             config.validate_order_size(metadata, Decimal("100"))
+
+    def test_semantic_config_hash_is_decimal_context_independent(self) -> None:
+        first = MarketMakerConfig(
+            max_raw_spread_bps=Decimal("500.000"),
+            toxicity_widen_start_ticks=Decimal("-0"),
+        )
+        equivalent = MarketMakerConfig(
+            max_raw_spread_bps=Decimal("5E+2"),
+            toxicity_widen_start_ticks=Decimal("0.000"),
+        )
+        with localcontext() as context:
+            context.prec = 2
+            low_precision = semantic_config_sha256(first)
+        with localcontext() as context:
+            context.prec = 50
+            high_precision = semantic_config_sha256(equivalent)
+
+        self.assertRegex(low_precision, r"^[0-9a-f]{64}$")
+        self.assertEqual(low_precision, high_precision)
+
+    def test_semantic_config_hash_changes_with_effective_fields(self) -> None:
+        base = MarketMakerConfig()
+        base_hash = semantic_config_sha256(base)
+        variants = (
+            replace(base, dry_run=False),
+            replace(base, toxicity_profile_id="candidate-v1"),
+            replace(base, maker_fee_rate=Decimal("0.00021")),
+            replace(base, symbol="ETH"),
+            replace(base, refresh_interval_ms=1001),
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(
+                    semantic_config_sha256(variant),
+                    base_hash,
+                )
 
 
 if __name__ == "__main__":

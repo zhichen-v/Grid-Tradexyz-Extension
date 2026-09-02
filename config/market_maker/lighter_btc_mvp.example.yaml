@@ -25,6 +25,7 @@ market_maker:
   # Entry-only toxicity controller。安全預設 fixed 完全保留既有報價行為。
   quote_controller_mode: "fixed"
   quote_controller_type: "toxicity_v1"
+  toxicity_profile_id: "disabled"
   toxicity_apply_bid: false
   toxicity_apply_ask: false
   toxicity_book_depth_levels: 5

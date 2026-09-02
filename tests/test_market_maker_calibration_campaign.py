@@ -4,10 +4,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+from run_market_maker import CalibrationEvidenceWriter
+from core.services.market_maker.config import (
+    MarketMakerConfig,
+    semantic_config_sha256,
+)
 from core.services.market_maker.metrics import MarketMakerMetrics
 from scripts.mm_calibration_campaign import (
     CampaignValidationError,
@@ -30,6 +36,8 @@ HARD_COUNTERS = {
     "unknown_orders": 0,
     "unresolved_cancellations": 0,
 }
+NETWORK = "robinhood"
+ACCOUNT_IDENTITY_SHA = "c" * 64
 
 
 def manifest(inputs: list[str], **overrides: object) -> dict[str, object]:
@@ -38,6 +46,8 @@ def manifest(inputs: list[str], **overrides: object) -> dict[str, object]:
         "candidate_id": "candidate-v1",
         "expected_commit_sha": "a" * 40,
         "expected_config_sha256": "b" * 64,
+        "network": NETWORK,
+        "expected_account_identity_sha256": ACCOUNT_IDENTITY_SHA,
         "symbol": "BTC",
         "controller_profile_id": "profile-v1",
         "maker_fee_rate": "0.000120",
@@ -85,6 +95,8 @@ def record(
     pending: int = 0,
     commit_sha: str = "a" * 40,
     config_sha256: str = "b" * 64,
+    network: str = NETWORK,
+    account_identity_sha256: str = ACCOUNT_IDENTITY_SHA,
     profile_id: str = "profile-v1",
     symbol: str = "BTC",
     maker_fee: str = "0.000120",
@@ -361,11 +373,15 @@ def record(
     current_drawdown = max(Decimal("0"), -flat_delta)
     max_drawdown = max(Decimal(drawdown), current_drawdown)
     final: dict[str, object] = {
+        "evidence_schema": "market_maker_calibration_evidence_v1",
+        "event": "market_maker_final_dry_run",
         "event_sequence_run_id": run_id,
         "campaign_id": "toxicity-cal-001",
         "candidate_id": "candidate-v1",
         "commit_sha": commit_sha,
         "semantic_config_sha256": config_sha256,
+        "network": network,
+        "account_identity_sha256": account_identity_sha256,
         "controller_profile_id": profile_id,
         "symbol": symbol,
         "maker_fee_rate": maker_fee,
@@ -424,8 +440,13 @@ def record(
             ),
             "maker_turnover": str(
                 sum(
-                    attribution["active_unwind"] is False
-                    for attribution in attributions
+                    (
+                        Decimal(str(event["fill_amount"]))
+                        * Decimal(str(event["fill_price"]))
+                        for event in events
+                        if event["active_unwind"] is False
+                    ),
+                    Decimal("0"),
                 )
             ),
             "completed_net_ex_funding": str(completed_net_total),
@@ -467,6 +488,53 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
             write_json(path, value)
         return name
 
+    def test_runner_writer_output_is_analyzer_accepted(self) -> None:
+        evidence_path = self.root / "runner-evidence.json"
+        times = iter(
+            (
+                datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc),
+                datetime(2026, 9, 3, 2, 0, tzinfo=timezone.utc),
+            )
+        )
+        effective_config = MarketMakerConfig(
+            toxicity_profile_id="profile-v1",
+            maker_fee_rate=Decimal("0.000120"),
+            taker_fee_rate=Decimal("0.000350"),
+        )
+        config_sha = semantic_config_sha256(effective_config)
+        writer = CalibrationEvidenceWriter(
+            output_path=evidence_path,
+            campaign_id="toxicity-cal-001",
+            candidate_id="candidate-v1",
+            config=effective_config,
+            commit_sha="a" * 40,
+            config_sha256=config_sha,
+            network=NETWORK,
+            account_identity_sha256=ACCOUNT_IDENTITY_SHA,
+            repo_root=self.root,
+            utcnow=lambda: next(times),
+        )
+        snapshot = record("writer-run", buy_entries=1)
+        snapshot["event"] = "market_maker_final_dry_run"
+        writer.record(snapshot)
+
+        with patch(
+            "run_market_maker._verified_clean_commit",
+            return_value="a" * 40,
+        ):
+            writer.finalize()
+
+        report = analyze_campaign(
+            manifest(
+                [evidence_path.name],
+                expected_config_sha256=config_sha,
+            ),
+            base_dir=self.root,
+        )
+
+        self.assertEqual(report["runs"]["included_run_ids"], ["writer-run"])
+        self.assertEqual(report["runs"]["diagnostic_only"], [])
+
     def test_same_fingerprint_multi_run_aggregates_and_can_complete(self) -> None:
         first = self._input("run1.json", record("run-1", buy_entries=30))
         second = self._input("run2.json", record("run-2", sell_entries=30))
@@ -479,11 +547,55 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
         self.assertEqual(report["campaign"]["status"], "calibration_complete")
         self.assertTrue(report["campaign"]["recommendation_allowed"])
         self.assertFalse(report["analysis_contract"]["live_profile_generated_or_applied"])
+        for field in (
+            "maker_fills_per_eligible_hour",
+            "maker_turnover_usdg_per_eligible_hour",
+            "net_usdg_per_eligible_hour",
+        ):
+            self.assertEqual(
+                sum(
+                    (
+                        bucket[field]
+                        for side in report["score_bins"].values()
+                        for bucket in side.values()
+                    ),
+                    Decimal("0"),
+                ),
+                report["rates"][field],
+            )
+        self.assertTrue(
+            report["calibration_coverage"]["score_bin_rate_conservation_complete"]
+        )
+
+        mismatch = record("fill-delta-turnover-mismatch", buy_entries=1)
+        mismatch["account_audit"]["maker_turnover"] = "201"  # type: ignore[index]
+        mismatch_path = self._input("fill-delta-turnover-mismatch.json", mismatch)
+        mismatch_report = analyze_campaign(
+            manifest([mismatch_path]), base_dir=self.root
+        )
+
+        self.assertFalse(
+            mismatch_report["calibration_coverage"][
+                "score_bin_rate_conservation_complete"
+            ]
+        )
+        self.assertIn(
+            "score_bin_rate_conservation_incomplete",
+            mismatch_report["campaign"]["incomplete_reasons"],
+        )
 
     def test_mixed_fingerprint_profile_symbol_and_fee_are_diagnostic_only(self) -> None:
         good = self._input("good.json", record("good", buy_entries=1))
         bad_commit = self._input("commit.json", record("c", commit_sha="c" * 40))
         bad_config = self._input("config.json", record("g", config_sha256="d" * 64))
+        bad_network = self._input(
+            "network.json",
+            record("n", network="robinhood_testnet"),
+        )
+        bad_account = self._input(
+            "account.json",
+            record("a", account_identity_sha256="d" * 64),
+        )
         bad_profile = self._input("profile.json", record("p", profile_id="profile-v2"))
         bad_symbol = self._input("symbol.json", record("s", symbol="ETH"))
         bad_fee = self._input("fee.json", record("f", maker_fee="0.0002"))
@@ -497,6 +609,8 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
                     good,
                     bad_commit,
                     bad_config,
+                    bad_network,
+                    bad_account,
                     bad_profile,
                     bad_symbol,
                     bad_fee,
@@ -510,15 +624,43 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
         reasons = {reason for item in report["runs"]["diagnostic_only"] for reason in item["reasons"]}
         self.assertTrue(any("mismatched_commit_sha" in reason for reason in reasons))
         self.assertTrue(any("mismatched_config_sha256" in reason for reason in reasons))
+        self.assertTrue(any("mismatched_network" in reason for reason in reasons))
+        self.assertTrue(
+            any("mismatched_account_identity_sha256" in reason for reason in reasons)
+        )
         self.assertTrue(any("mismatched_controller_profile_id" in reason for reason in reasons))
         self.assertTrue(any("mismatched_symbol" in reason for reason in reasons))
         self.assertTrue(any("mismatched_maker_fee_rate" in reason for reason in reasons))
         self.assertTrue(any("mismatched_campaign_id" in reason for reason in reasons))
 
+    def test_intermediate_snapshot_account_provenance_drift_is_diagnostic(self) -> None:
+        early = record(
+            "identity-drift",
+            network="robinhood_testnet",
+            account_identity_sha256="d" * 64,
+        )
+        early["uptime_seconds"] = "10"
+        early["eligible_quote_seconds"] = "10"
+        final = record("identity-drift")
+        path = self._input("identity-drift.jsonl", [early, final])
+
+        report = analyze_campaign(manifest([path]), base_dir=self.root)
+
+        self.assertEqual(report["runs"]["included_count"], 0)
+        reasons = report["runs"]["diagnostic_only"][0]["reasons"]
+        self.assertIn("snapshot_0_mismatched_network", reasons)
+        self.assertIn("snapshot_0_mismatched_account_identity_sha256", reasons)
+
     def test_hex_fingerprints_are_case_normalized(self) -> None:
         path = self._input(
             "uppercase.json",
-            record("uppercase", commit_sha="A" * 40, config_sha256="B" * 64),
+            record(
+                "uppercase",
+                commit_sha="A" * 40,
+                config_sha256="B" * 64,
+                network="ROBINHOOD",
+                account_identity_sha256="C" * 64,
+            ),
         )
 
         report = analyze_campaign(
@@ -526,12 +668,19 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
                 [path],
                 expected_commit_sha="A" * 40,
                 expected_config_sha256="B" * 64,
+                network="ROBINHOOD",
+                expected_account_identity_sha256="C" * 64,
             ),
             base_dir=self.root,
         )
 
         self.assertEqual(report["runs"]["included_run_ids"], ["uppercase"])
         self.assertEqual(report["campaign"]["expected_commit_sha"], "a" * 40)
+        self.assertEqual(report["campaign"]["network"], "robinhood")
+        self.assertEqual(
+            report["campaign"]["expected_account_identity_sha256"],
+            "c" * 64,
+        )
 
     def test_duplicate_run_id_is_never_in_denominator(self) -> None:
         one = self._input("one.json", record("duplicate", buy_entries=2))
@@ -557,6 +706,90 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
         reasons = {reason for item in report["runs"]["diagnostic_only"] for reason in item["reasons"]}
         self.assertIn("old_or_missing_runtime_run_id", reasons)
         self.assertIn("snapshot_0_missing_commit_sha", reasons)
+
+        cases = (
+            (
+                "missing-schema",
+                "missing_schema",
+                "snapshot_0_missing_or_invalid_evidence_schema",
+            ),
+            (
+                "wrong-schema",
+                "wrong_schema",
+                "snapshot_0_missing_or_invalid_evidence_schema",
+            ),
+            ("nonterminal", "nonterminal", "final_snapshot_not_terminal_event"),
+            (
+                "empty-integrity-marker",
+                "empty_integrity_marker",
+                "snapshot_0_evidence_integrity_errors_present",
+            ),
+            (
+                "malformed-integrity-marker",
+                "malformed_integrity_marker",
+                "snapshot_0_evidence_integrity_errors_present",
+            ),
+        )
+        for suffix, mutation, expected_reason in cases:
+            with self.subTest(mutation=mutation):
+                first = self._input(
+                    f"authority-{suffix}-buy.json",
+                    record(f"authority-{suffix}-buy", buy_entries=30),
+                )
+                invalid = record(f"authority-{suffix}-sell", sell_entries=30)
+                if mutation == "missing_schema":
+                    invalid.pop("evidence_schema")
+                elif mutation == "wrong_schema":
+                    invalid["evidence_schema"] = "legacy_evidence_v0"
+                elif mutation == "nonterminal":
+                    invalid["event"] = "market_maker_status"
+                elif mutation == "empty_integrity_marker":
+                    invalid["evidence_integrity_errors"] = []
+                else:
+                    invalid["evidence_integrity_errors"] = "invalid-marker"
+                second = self._input(
+                    f"authority-{suffix}-sell.json",
+                    invalid,
+                )
+
+                report = analyze_campaign(
+                    manifest([first, second]), base_dir=self.root
+                )
+
+                invalid_run = next(
+                    item
+                    for item in report["runs"]["diagnostic_only"]
+                    if item["run_id"] == f"authority-{suffix}-sell"
+                )
+                self.assertIn(expected_reason, invalid_run["reasons"])
+                self.assertNotIn(
+                    f"authority-{suffix}-sell",
+                    report["runs"]["included_run_ids"],
+                )
+                self.assertEqual(
+                    report["campaign"]["status"], "calibration_incomplete"
+                )
+                self.assertFalse(report["campaign"]["recommendation_allowed"])
+
+    def test_stale_nonterminal_tail_is_diagnostic_only(self) -> None:
+        terminal = record("stale-tail", buy_entries=1)
+        terminal["uptime_seconds"] = "3600"
+        terminal["eligible_quote_seconds"] = "3600"
+        stale_tail = record("stale-tail", buy_entries=1)
+        stale_tail["uptime_seconds"] = "10"
+        stale_tail["eligible_quote_seconds"] = "10"
+        stale_tail["event"] = "market_maker_status"
+        path = self._input("stale-tail.json", [terminal, stale_tail])
+
+        report = analyze_campaign(manifest([path]), base_dir=self.root)
+
+        self.assertEqual(report["runs"]["included_count"], 0)
+        reasons = report["runs"]["diagnostic_only"][0]["reasons"]
+        self.assertIn("final_snapshot_not_terminal_event", reasons)
+        self.assertIn(
+            "terminal_status_is_not_final_by_campaign_order",
+            reasons,
+        )
 
     def test_passive_active_and_pending_are_separate_from_entry_denominator(self) -> None:
         passive = self._input(
@@ -748,7 +981,42 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
         self.assertEqual(
             bins["0"]["external_markout_5s_bps"]["negative_probability"], Decimal("1")
         )
+        self.assertEqual(bins["0"]["maker_fills_per_eligible_hour"], Decimal("2"))
+        self.assertEqual(
+            bins["0"]["maker_turnover_usdg_per_eligible_hour"], Decimal("200")
+        )
+        self.assertEqual(bins["0"]["net_usdg_per_eligible_hour"], Decimal("0"))
+        self.assertEqual(
+            bins["[3,+inf)"]["net_usdg_per_eligible_hour"], Decimal("0.20")
+        )
+        self.assertEqual(
+            bins["[2,3)"]["maker_fills_per_eligible_hour"], Decimal("0")
+        )
+        self.assertEqual(
+            bins["[2,3)"]["maker_turnover_usdg_per_eligible_hour"], Decimal("0")
+        )
+        self.assertEqual(bins["[2,3)"]["net_usdg_per_eligible_hour"], Decimal("0"))
         self.assertEqual(bins["[3,+inf)"]["entry_count"], 1)
+
+    def test_campaign_digest_binds_network_and_account_identity(self) -> None:
+        path = self._input("identity.json", record("identity", buy_entries=1))
+
+        baseline = analyze_campaign(manifest([path]), base_dir=self.root)
+        other_network = analyze_campaign(
+            manifest([path], network="robinhood_testnet"),
+            base_dir=self.root,
+        )
+        other_account = analyze_campaign(
+            manifest([path], expected_account_identity_sha256="d" * 64),
+            base_dir=self.root,
+        )
+
+        digests = {
+            baseline["campaign"]["campaign_evidence_sha256"],
+            other_network["campaign"]["campaign_evidence_sha256"],
+            other_account["campaign"]["campaign_evidence_sha256"],
+        }
+        self.assertEqual(len(digests), 3)
 
     def test_checkpoint_episodes_deduplicate_by_session_and_sequence(self) -> None:
         checkpoint_episode = episode("session-checkpoint", gross="1", net_ex_funding="0.98")
@@ -866,6 +1134,22 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
         self.assertEqual(
             report["analysis_contract"]["entry_sample_unit"],
             "observed_order_fill_delta",
+        )
+        score_bin = report["score_bins"]["buy"]["0"]
+        self.assertEqual(score_bin["maker_fills_per_eligible_hour"], Decimal("3"))
+        self.assertEqual(
+            score_bin["maker_turnover_usdg_per_eligible_hour"], Decimal("200")
+        )
+        self.assertEqual(
+            score_bin["maker_fills_per_eligible_hour"],
+            report["rates"]["maker_fills_per_eligible_hour"],
+        )
+        self.assertEqual(
+            score_bin["maker_turnover_usdg_per_eligible_hour"],
+            report["rates"]["maker_turnover_usdg_per_eligible_hour"],
+        )
+        self.assertTrue(
+            report["calibration_coverage"]["score_bin_rate_conservation_complete"]
         )
 
     def test_missing_or_conflicting_typed_intent_never_enters_denominator(self) -> None:
@@ -1274,6 +1558,15 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
         with self.assertRaises(CampaignValidationError):
             analyze_campaign(
                 manifest(["unused"], expected_config_sha256="c" * 63)
+            )
+        with self.assertRaises(CampaignValidationError):
+            analyze_campaign(manifest(["unused"], network="unknown"))
+        with self.assertRaises(CampaignValidationError):
+            analyze_campaign(
+                manifest(
+                    ["unused"],
+                    expected_account_identity_sha256="c" * 63,
+                )
             )
         with self.assertRaises(CampaignValidationError):
             analyze_campaign(manifest([r"\\server\share\metrics.json"]))
@@ -1835,10 +2128,14 @@ class MarketMakerCalibrationCampaignTests(unittest.TestCase):
         snapshot = metrics.snapshot(3600.0)
         snapshot.update(
             {
+                "evidence_schema": "market_maker_calibration_evidence_v1",
+                "event": "market_maker_final_dry_run",
                 "campaign_id": "toxicity-cal-001",
                 "candidate_id": "candidate-v1",
                 "commit_sha": "a" * 40,
                 "semantic_config_sha256": "b" * 64,
+                "network": NETWORK,
+                "account_identity_sha256": ACCOUNT_IDENTITY_SHA,
                 "controller_profile_id": "profile-v1",
                 "symbol": "BTC",
                 "maker_fee_rate": "0.000120",
