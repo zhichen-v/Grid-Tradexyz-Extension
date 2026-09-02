@@ -27,6 +27,13 @@ _FEATURE_FIELDS = (
     "microprice_shift_ticks",
     "depth_imbalance",
 )
+_VIRTUAL_SHADOW_ACTIONS = (
+    "would_place",
+    "would_reprice",
+    "would_block",
+    "would_cancel",
+    "would_resume",
+)
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -171,6 +178,13 @@ def _stable_text(value: Any) -> str:
     )
 
 
+def _event_sequence_run_id(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    run_id = value.get("event_sequence_run_id")
+    return run_id if isinstance(run_id, str) and run_id.strip() else None
+
+
 def _record_rank(record: dict[str, Any]) -> tuple[Any, ...]:
     audit = record.get("account_audit")
     if not isinstance(audit, dict):
@@ -197,6 +211,8 @@ def _record_rank(record: dict[str, Any]) -> tuple[Any, ...]:
 
 def _event_key(event: dict[str, Any]) -> tuple[str, ...]:
     return (
+        _stable_text(_event_sequence_run_id(event)),
+        _stable_text(event.get("fill_observation_event_sequence")),
         _stable_text(event.get("trade_id")),
         _stable_text(event.get("order_id")),
         _stable_text(event.get("side")),
@@ -300,6 +316,7 @@ def _merge_history(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             key = tuple(
                 _stable_text(item.get(name))
                 for name in (
+                    "event_sequence",
                     "decision_id",
                     "recorded_monotonic",
                     "event",
@@ -307,7 +324,7 @@ def _merge_history(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                     "mode",
                     "controller",
                 )
-            )
+            ) + (_stable_text(_event_sequence_run_id(item)),)
             current = merged.get(key)
             item_quality = (len(_stable_text(item)), _stable_text(item))
             current_quality = (
@@ -341,7 +358,7 @@ def _quote_contexts(
                 "side",
                 "created_monotonic",
             )
-        )
+        ) + (_stable_text(_event_sequence_run_id(context)),)
         current = contexts.get(key)
         context_quality = (len(_stable_text(context)), _stable_text(context))
         current_quality = (
@@ -643,16 +660,53 @@ def _later_shadow_change(
     side = {"buy": "bid", "sell": "ask"}.get(
         str(event.get("side", "")).lower()
     )
-    if created is None or filled is None or side is None or filled < created:
+    if side is None:
+        return None
+
+    placement_sequence = _decimal(context.get("placement_event_sequence"))
+    fill_sequence = _decimal(event.get("fill_observation_event_sequence"))
+    placement_run_id = _event_sequence_run_id(context)
+    fill_run_id = _event_sequence_run_id(event)
+    decision_history = [
+        decision
+        for decision in history
+        if decision.get("event") != "maker_fill"
+    ]
+    sequence_fields_present = (
+        "placement_event_sequence" in context
+        or "fill_observation_event_sequence" in event
+        or any("event_sequence" in decision for decision in decision_history)
+    )
+    if sequence_fields_present:
+        if (
+            placement_sequence is None
+            or fill_sequence is None
+            or placement_run_id is None
+            or fill_run_id != placement_run_id
+        ):
+            return "event_sequence_incomplete"
+        if placement_sequence <= 0 or fill_sequence <= placement_sequence:
+            return "event_sequence_invalid"
+    elif created is None or filled is None or filled < created:
         return None
 
     placement_extra = _decimal(context.get("extra_spread_ticks"))
     placement_shadow = _decimal(context.get("shadow_price"))
     changes: list[tuple[Decimal, str]] = []
-    for decision in history:
-        recorded = _decimal(decision.get("recorded_monotonic"))
-        if recorded is None or not (created < recorded <= filled):
-            continue
+    for decision in decision_history:
+        if sequence_fields_present:
+            recorded = _decimal(decision.get("event_sequence"))
+            decision_run_id = _event_sequence_run_id(decision)
+            if recorded is None or decision_run_id is None:
+                return "event_sequence_incomplete"
+            if decision_run_id != placement_run_id:
+                continue
+            if not (placement_sequence < recorded < fill_sequence):
+                continue
+        else:
+            recorded = _decimal(decision.get("recorded_monotonic"))
+            if recorded is None or not (created < recorded <= filled):
+                continue
         if decision.get("ready") is False or decision.get("error") is not None:
             changes.append((recorded, "later_shadow_unavailable"))
             continue
@@ -680,25 +734,187 @@ def _later_shadow_change(
     return min(changes)[1] if changes else None
 
 
+def _virtual_shadow_lifecycle(
+    event: dict[str, Any],
+    context: dict[str, Any],
+    history: list[dict[str, Any]],
+    *,
+    history_complete: bool,
+) -> dict[str, Any] | None:
+    """Fold same-run shadow decisions without simulating queue priority."""
+
+    decision_history = [
+        decision
+        for decision in history
+        if decision.get("event") != "maker_fill"
+    ]
+    sequence_fields_present = (
+        "placement_event_sequence" in context
+        or "fill_observation_event_sequence" in event
+        or _event_sequence_run_id(context) is not None
+        or _event_sequence_run_id(event) is not None
+        or any("event_sequence" in decision for decision in decision_history)
+    )
+    if not sequence_fields_present:
+        return None
+
+    counts: Counter[str] = Counter()
+
+    def result(
+        *,
+        complete: bool,
+        reason: str | None,
+        live: bool | None = None,
+        price: Decimal | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "complete": complete,
+            "reason": reason,
+            "virtual_live_at_fill": live,
+            "virtual_price_at_fill": price if live is True else None,
+            "action_counts": {
+                action: counts.get(action, 0)
+                for action in _VIRTUAL_SHADOW_ACTIONS
+            },
+        }
+
+    if not history_complete:
+        return result(complete=False, reason="controller_history_incomplete")
+
+    placement_sequence = _decimal(context.get("placement_event_sequence"))
+    fill_sequence = _decimal(event.get("fill_observation_event_sequence"))
+    placement_run_id = _event_sequence_run_id(context)
+    fill_run_id = _event_sequence_run_id(event)
+    if (
+        placement_sequence is None
+        or fill_sequence is None
+        or placement_run_id is None
+        or fill_run_id != placement_run_id
+    ):
+        return result(complete=False, reason="event_sequence_incomplete")
+    if placement_sequence <= 0 or fill_sequence <= placement_sequence:
+        return result(complete=False, reason="event_sequence_invalid")
+    if "shadow_price" not in context:
+        return result(complete=False, reason="event_sequence_incomplete")
+
+    initial_shadow = context.get("shadow_price")
+    virtual_price = _decimal(initial_shadow)
+    if initial_shadow is not None and virtual_price is None:
+        return result(complete=False, reason="event_sequence_incomplete")
+    virtual_live = virtual_price is not None
+    if virtual_live:
+        counts["would_place"] += 1
+    else:
+        counts["would_block"] += 1
+
+    decisions: list[tuple[Decimal, dict[str, Any]]] = []
+    for decision in decision_history:
+        decision_run_id = _event_sequence_run_id(decision)
+        if decision_run_id is None:
+            return result(complete=False, reason="event_sequence_incomplete")
+        if decision_run_id != placement_run_id:
+            continue
+        recorded = _decimal(decision.get("event_sequence"))
+        if recorded is None or recorded <= 0:
+            return result(complete=False, reason="event_sequence_incomplete")
+        if placement_sequence < recorded < fill_sequence:
+            decisions.append((recorded, decision))
+    decisions.sort(key=lambda item: item[0])
+    if any(
+        earlier[0] >= later[0]
+        for earlier, later in zip(decisions, decisions[1:])
+    ):
+        return result(complete=False, reason="event_sequence_invalid")
+
+    side = {"buy": "bid", "sell": "ask"}.get(
+        str(event.get("side", "")).lower()
+    )
+    if side is None:
+        return result(complete=False, reason="insufficient_evidence")
+
+    for _, decision in decisions:
+        available = (
+            decision.get("ready") is True
+            and decision.get("error") is None
+            and decision.get("entry_applicable") is True
+        )
+        if not available:
+            if virtual_live:
+                counts["would_cancel"] += 1
+            virtual_live = False
+            virtual_price = None
+            continue
+
+        side_decision = decision.get(side)
+        if not isinstance(side_decision, dict):
+            return result(complete=False, reason="event_sequence_incomplete")
+        if side_decision.get("blocked") is True:
+            if virtual_live:
+                counts["would_block"] += 1
+                counts["would_cancel"] += 1
+            virtual_live = False
+            virtual_price = None
+            continue
+        if side_decision.get("blocked") is not False:
+            return result(complete=False, reason="event_sequence_incomplete")
+        if "shadow_price" not in side_decision:
+            return result(complete=False, reason="event_sequence_incomplete")
+        next_price = _decimal(side_decision.get("shadow_price"))
+        if next_price is None:
+            return result(complete=False, reason="event_sequence_incomplete")
+        if virtual_live:
+            if next_price != virtual_price:
+                counts["would_reprice"] += 1
+                virtual_price = next_price
+        else:
+            counts["would_place"] += 1
+            counts["would_resume"] += 1
+            virtual_live = True
+            virtual_price = next_price
+
+    return result(
+        complete=True,
+        reason=None,
+        live=virtual_live,
+        price=virtual_price,
+    )
+
+
 def _counterfactual(
     events: list[dict[str, Any]],
     pending: int,
     history: list[dict[str, Any]],
     *,
     history_complete: bool,
+    history_complete_by_run: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
+    excluded: Counter[str] = Counter()
+    lifecycle_actions: Counter[str] = Counter()
+    lifecycle_fill_states: Counter[str] = Counter()
     represented_pending = 0
     for event in events:
         context = event.get("quote_context")
-        label = "indeterminate"
         role = _event_role(event)
         authenticated_entry = (
             role == "entry" and event.get("active_unwind") is False
         )
+        exclusion_reason = None
         if role is None:
             represented_pending += 1
+            exclusion_reason = "pending_or_unauthenticated"
+        elif role == "passive_exit":
+            exclusion_reason = "passive_exit"
+        elif role == "active_exit" or event.get("active_unwind") is True:
+            exclusion_reason = "active_exit"
+        elif role == "entry" and not authenticated_entry:
+            exclusion_reason = "pending_or_unauthenticated"
+        elif role != "entry":
+            exclusion_reason = role
+        if exclusion_reason is not None:
+            excluded[exclusion_reason] += 1
+        label = "indeterminate" if authenticated_entry else "excluded"
         side = str(event.get("side", "")).lower()
         fill_price = _decimal(event.get("fill_price", event.get("price")))
         base = (
@@ -711,39 +927,133 @@ def _counterfactual(
             if isinstance(context, dict)
             else None
         )
-        later_change = (
-            _later_shadow_change(event, context, history)
+        run_id = _event_sequence_run_id(event)
+        event_history_complete = (
+            history_complete_by_run.get(run_id, False)
+            if run_id is not None and history_complete_by_run is not None
+            else history_complete
+        )
+        lifecycle = (
+            _virtual_shadow_lifecycle(
+                event,
+                context,
+                history,
+                history_complete=event_history_complete,
+            )
             if authenticated_entry and isinstance(context, dict)
             else None
         )
+        later_change = (
+            _later_shadow_change(event, context, history)
+            if authenticated_entry
+            and isinstance(context, dict)
+            and lifecycle is None
+            else None
+        )
         farther: bool | None = None
-        if authenticated_entry and side in {"buy", "sell"}:
-            if (
-                fill_price is not None
-                and base is not None
-                and shadow is None
-                and isinstance(context, dict)
-                and "shadow_price" in context
-            ):
-                farther = True
+        if (
+            authenticated_entry
+            and side in {"buy", "sell"}
+            and base is not None
+            and isinstance(context, dict)
+            and "shadow_price" in context
+        ):
+            farther = (
+                True
+                if shadow is None
+                else (side == "buy" and shadow < base)
+                or (side == "sell" and shadow > base)
+            )
+
+        classification_reason = None
+        if exclusion_reason is not None:
+            classification_reason = f"excluded_{exclusion_reason}"
+        elif lifecycle is not None:
+            if lifecycle["complete"] is not True:
+                label = "indeterminate"
+                classification_reason = lifecycle["reason"]
+            elif lifecycle["virtual_live_at_fill"] is False:
                 label = "likely_filtered"
-            elif fill_price is not None and base is not None and shadow is not None:
-                farther = (side == "buy" and shadow < base) or (
-                    side == "sell" and shadow > base
+                classification_reason = "virtual_not_live_at_fill"
+            else:
+                virtual_price = lifecycle["virtual_price_at_fill"]
+                reachable = (
+                    fill_price is not None
+                    and virtual_price is not None
+                    and (
+                        (side == "buy" and fill_price <= virtual_price)
+                        or (side == "sell" and fill_price >= virtual_price)
+                    )
                 )
-                still_reachable = (side == "buy" and fill_price <= shadow) or (
-                    side == "sell" and fill_price >= shadow
-                )
-                if still_reachable:
+                if reachable:
                     label = "still_reachable"
-                elif farther:
+                    classification_reason = "virtual_live_reachable_at_fill"
+                elif fill_price is not None and virtual_price is not None:
                     label = "likely_filtered"
-        if later_change is not None:
-            label = "indeterminate"
-        elif authenticated_entry and not history_complete:
-            label = "indeterminate"
-            later_change = "controller_history_incomplete"
-        counts[label] += 1
+                    classification_reason = "virtual_live_price_not_reached"
+                else:
+                    label = "indeterminate"
+                    classification_reason = "insufficient_evidence"
+        else:
+            if authenticated_entry and side in {"buy", "sell"}:
+                if (
+                    fill_price is not None
+                    and base is not None
+                    and shadow is None
+                    and isinstance(context, dict)
+                    and "shadow_price" in context
+                ):
+                    label = "likely_filtered"
+                elif (
+                    fill_price is not None
+                    and base is not None
+                    and shadow is not None
+                ):
+                    still_reachable = (
+                        side == "buy" and fill_price <= shadow
+                    ) or (side == "sell" and fill_price >= shadow)
+                    if still_reachable:
+                        label = "still_reachable"
+                    elif farther:
+                        label = "likely_filtered"
+            if later_change is not None:
+                label = "indeterminate"
+                classification_reason = later_change
+            elif authenticated_entry and not event_history_complete:
+                label = "indeterminate"
+                classification_reason = "controller_history_incomplete"
+            elif label != "indeterminate":
+                classification_reason = "placement_shadow_proxy"
+            else:
+                classification_reason = "insufficient_evidence"
+
+        action_counts = {
+            action: 0 for action in _VIRTUAL_SHADOW_ACTIONS
+        }
+        virtual_lifecycle_complete: bool | None = None
+        virtual_lifecycle_reason = None
+        virtual_live_at_fill = None
+        virtual_price_at_fill = None
+        if authenticated_entry:
+            if lifecycle is None:
+                virtual_lifecycle_complete = False
+                virtual_lifecycle_reason = "legacy_timestamp_proxy"
+                lifecycle_fill_states["unknown"] += 1
+            else:
+                virtual_lifecycle_complete = lifecycle["complete"]
+                virtual_lifecycle_reason = lifecycle["reason"]
+                action_counts = dict(lifecycle["action_counts"])
+                virtual_live_at_fill = lifecycle["virtual_live_at_fill"]
+                virtual_price_at_fill = lifecycle["virtual_price_at_fill"]
+                if lifecycle["complete"] is True:
+                    lifecycle_actions.update(action_counts)
+                    lifecycle_fill_states[
+                        "live" if virtual_live_at_fill else "not_live"
+                    ] += 1
+                else:
+                    lifecycle_fill_states["unknown"] += 1
+        if authenticated_entry:
+            counts[label] += 1
         rows.append(
             {
                 "order_id": event.get("order_id"),
@@ -756,23 +1066,55 @@ def _counterfactual(
                 "base_price": base,
                 "shadow_price": shadow,
                 "shadow_farther": farther,
+                "virtual_lifecycle_complete": virtual_lifecycle_complete,
+                "virtual_lifecycle_reason": virtual_lifecycle_reason,
+                "virtual_live_at_fill": virtual_live_at_fill,
+                "virtual_price_at_fill": virtual_price_at_fill,
+                "virtual_lifecycle_action_counts": action_counts,
                 "classification": label,
-                "classification_reason": later_change
-                or (
-                    "placement_shadow_proxy"
-                    if label != "indeterminate"
-                    else "insufficient_or_ineligible_evidence"
-                ),
+                "classification_reason": classification_reason,
                 "markouts": _event_markouts(event),
                 "raw_markouts": _event_raw_markouts(event),
             }
         )
     missing_pending = max(0, pending - represented_pending)
     if missing_pending:
-        counts["indeterminate"] += missing_pending
+        excluded["pending_or_unauthenticated"] += missing_pending
+    classification_counts = {
+        label: counts.get(label, 0)
+        for label in ("likely_filtered", "still_reachable", "indeterminate")
+    }
+    authenticated_entry_count = sum(classification_counts.values())
     return {
-        "method": "counterfactual_proxy_with_lifecycle_guard_not_backtest",
-        "classification_counts": dict(counts),
+        "method": "counterfactual_proxy_with_virtual_lifecycle_not_backtest",
+        "denominator_unit": "observed_authenticated_entry_fill_delta",
+        "authenticated_entry_count": authenticated_entry_count,
+        "classifiable_entry_count": (
+            classification_counts["likely_filtered"]
+            + classification_counts["still_reachable"]
+        ),
+        "indeterminate_entry_count": classification_counts["indeterminate"],
+        "excluded_fill_counts": {
+            label: excluded.get(label, 0)
+            for label in (
+                "passive_exit",
+                "active_exit",
+                "risk_increasing",
+                "pending_or_unauthenticated",
+            )
+        },
+        "classification_counts": classification_counts,
+        "virtual_lifecycle_action_counts": {
+            action: lifecycle_actions.get(action, 0)
+            for action in _VIRTUAL_SHADOW_ACTIONS
+        },
+        "virtual_live_at_fill_count": lifecycle_fill_states.get("live", 0),
+        "virtual_not_live_at_fill_count": lifecycle_fill_states.get(
+            "not_live", 0
+        ),
+        "virtual_unknown_at_fill_count": lifecycle_fill_states.get(
+            "unknown", 0
+        ),
         "fills": rows,
     }
 
@@ -796,22 +1138,56 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
         default=0,
     )
     markouts = _markout_analysis(events, legacy_pending)
-    reported_controller_history_total = max(
+    legacy_reported_controller_history_total = max(
         (
             int(record.get("controller_decision_history_total", 0) or 0)
             for record in records
+            if _event_sequence_run_id(record) is None
         ),
         default=0,
     )
+    reported_controller_history_by_run: dict[str, int] = {}
+    for record in records:
+        run_id = _event_sequence_run_id(record)
+        if run_id is None:
+            continue
+        reported_controller_history_by_run[run_id] = max(
+            reported_controller_history_by_run.get(run_id, 0),
+            int(record.get("controller_decision_history_total", 0) or 0),
+        )
+    merged_controller_history_by_run = Counter(
+        run_id
+        for item in history
+        if (run_id := _event_sequence_run_id(item)) is not None
+    )
+    controller_history_complete_by_run = {
+        run_id: (
+            reported_total == 0
+            or merged_controller_history_by_run.get(run_id, 0)
+            >= reported_total
+        )
+        for run_id, reported_total in reported_controller_history_by_run.items()
+    }
+    reported_controller_history_total = (
+        legacy_reported_controller_history_total
+        + sum(reported_controller_history_by_run.values())
+    )
     controller_history_complete = (
-        reported_controller_history_total == 0
-        or len(history) >= reported_controller_history_total
+        (
+            legacy_reported_controller_history_total == 0
+            or sum(
+                _event_sequence_run_id(item) is None for item in history
+            )
+            >= legacy_reported_controller_history_total
+        )
+        and all(controller_history_complete_by_run.values())
     )
     counterfactual = _counterfactual(
         events,
         markouts["pending_attribution_count"],
         history,
         history_complete=controller_history_complete,
+        history_complete_by_run=controller_history_complete_by_run,
     )
     episodes, episode_coverage = _merge_episodes(records, final)
     session_keys = (
@@ -927,6 +1303,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     volume = report["volume_retention_proxy"]
     coverage = report["coverage"]
     counts = counterfactual["classification_counts"]
+    excluded = counterfactual["excluded_fill_counts"]
+    lifecycle_actions = counterfactual["virtual_lifecycle_action_counts"]
     lines = [
         "# Market Maker strategy analysis",
         "",
@@ -983,15 +1361,36 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Shadow counterfactual proxy",
         "",
+        f"- Authenticated entries / classifiable / indeterminate: "
+        f"{counterfactual.get('authenticated_entry_count')} / "
+        f"{counterfactual.get('classifiable_entry_count')} / "
+        f"{counterfactual.get('indeterminate_entry_count')}",
+        f"- Excluded passive / active / risk-increasing / pending: "
+        f"{excluded.get('passive_exit', 0)} / {excluded.get('active_exit', 0)} / "
+        f"{excluded.get('risk_increasing', 0)} / "
+        f"{excluded.get('pending_or_unauthenticated', 0)}",
         f"- Likely filtered / still reachable / indeterminate: "
         f"{counts.get('likely_filtered', 0)} / {counts.get('still_reachable', 0)} / "
         f"{counts.get('indeterminate', 0)}",
+        f"- Virtual actions place / reprice / block / cancel / resume: "
+        f"{lifecycle_actions.get('would_place', 0)} / "
+        f"{lifecycle_actions.get('would_reprice', 0)} / "
+        f"{lifecycle_actions.get('would_block', 0)} / "
+        f"{lifecycle_actions.get('would_cancel', 0)} / "
+        f"{lifecycle_actions.get('would_resume', 0)}",
+        f"- Virtual live / not-live / unknown at fill: "
+        f"{counterfactual.get('virtual_live_at_fill_count', 0)} / "
+        f"{counterfactual.get('virtual_not_live_at_fill_count', 0)} / "
+        f"{counterfactual.get('virtual_unknown_at_fill_count', 0)}",
     ]
     for row in counterfactual.get("fills", []):
         lines.append(
             f"- {row.get('order_id')} {row.get('side')}: "
             f"fill={row.get('actual_fill_price')}, base={row.get('base_price')}, "
             f"shadow={row.get('shadow_price')}, farther={row.get('shadow_farther')}, "
+            f"virtual_live={row.get('virtual_live_at_fill')}, "
+            f"virtual_price={row.get('virtual_price_at_fill')}, "
+            f"virtual_actions={row.get('virtual_lifecycle_action_counts')}, "
             f"classification={row.get('classification')}, "
             f"reason={row.get('classification_reason')}, "
             f"external_markouts={row.get('markouts')}"

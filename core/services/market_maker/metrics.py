@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 import math
 from typing import Any, Iterable
+from uuid import uuid4
 
 from .models import RuntimeState
 
@@ -167,6 +168,12 @@ class MarketMakerMetrics:
     _quote_context_by_order: dict[str, dict[str, Any]] = field(
         default_factory=dict
     )
+    _event_sequence: int = 0
+    _event_sequence_run_id: str = field(
+        default_factory=lambda: uuid4().hex,
+        init=False,
+        repr=False,
+    )
 
     def transition(self, state: RuntimeState, reason: str | None = None) -> None:
         if state is not self.runtime_state:
@@ -176,6 +183,10 @@ class MarketMakerMetrics:
 
     def increment(self, name: str, amount: int = 1) -> None:
         self.counters[name] = self.counters.get(name, 0) + amount
+
+    def _next_event_sequence(self) -> int:
+        self._event_sequence += 1
+        return self._event_sequence
 
     def record_success(self, now: float) -> None:
         self.cycles += 1
@@ -210,6 +221,7 @@ class MarketMakerMetrics:
         now_value = float(now)
         if not math.isfinite(now_value):
             return
+        event_sequence = self._next_event_sequence()
         self._accrue_controller_seconds(now_value)
 
         bid = getattr(decision, "bid", None)
@@ -265,6 +277,8 @@ class MarketMakerMetrics:
             "entry_applicable": entry_applicable is True,
             "error": error,
             "recorded_monotonic": now_value,
+            "event_sequence": event_sequence,
+            "event_sequence_run_id": self._event_sequence_run_id,
         }
         self.quote_controller = current
         self.controller_bid_extra_ticks = (
@@ -308,11 +322,26 @@ class MarketMakerMetrics:
         if not order_id or self._controller_last_decision is None:
             return
         snapshot = dict(self._controller_last_decision)
+        last_controller_decision_event_sequence = snapshot.get("event_sequence")
+        fill_observation_event_sequence = None
+        if (
+            self.fill_markouts
+            and self.fill_markouts[-1].get("order_id") == order_id
+        ):
+            fill_observation_event_sequence = self.fill_markouts[-1].get(
+                "fill_observation_event_sequence"
+            )
         snapshot.update(
             event="maker_fill",
             fill_order_id=order_id,
             placement_quote_context=(dict(context) if context is not None else None),
             recorded_monotonic=float(now),
+            event_sequence=self._next_event_sequence(),
+            event_sequence_run_id=self._event_sequence_run_id,
+            last_controller_decision_event_sequence=(
+                last_controller_decision_event_sequence
+            ),
+            fill_observation_event_sequence=fill_observation_event_sequence,
         )
         self.controller_decision_history_total += 1
         self.controller_decision_history.append(snapshot)
@@ -323,13 +352,20 @@ class MarketMakerMetrics:
     ) -> None:
         if not order_id or not isinstance(context, dict):
             return
+        recorded_context = dict(context)
+        recorded_context["placement_event_sequence"] = (
+            self._next_event_sequence()
+        )
+        recorded_context["event_sequence_run_id"] = (
+            self._event_sequence_run_id
+        )
         self._quote_context_by_order.pop(order_id, None)
-        self._quote_context_by_order[order_id] = dict(context)
+        self._quote_context_by_order[order_id] = recorded_context
         while len(self._quote_context_by_order) > _QUOTE_CONTEXT_LIMIT:
             self._quote_context_by_order.pop(next(iter(self._quote_context_by_order)))
         for event in self.fill_markouts:
             if event.get("order_id") == order_id:
-                event["quote_context"] = dict(context)
+                event["quote_context"] = dict(recorded_context)
 
     def _accrue_controller_seconds(self, now: float) -> None:
         previous = self._controller_last_monotonic
@@ -443,6 +479,8 @@ class MarketMakerMetrics:
             "fill_price": fill_price,
             "observation_source": source,
             "started_monotonic": now,
+            "fill_observation_event_sequence": self._next_event_sequence(),
+            "event_sequence_run_id": self._event_sequence_run_id,
             "raw_mid_at_start": (
                 mid
                 if isinstance(mid, Decimal) and mid.is_finite() and mid > 0
@@ -840,6 +878,7 @@ class MarketMakerMetrics:
         self._accrue_controller_seconds(now)
         return {
             "runtime_state": self.runtime_state.value,
+            "event_sequence_run_id": self._event_sequence_run_id,
             "pause_reason": self.pause_reason,
             "state_transition_count": self.state_transition_count,
             "uptime_seconds": max(0.0, now - self.started_monotonic),

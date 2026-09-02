@@ -115,8 +115,18 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
             for row in report["shadow_counterfactual"]["fills"]
             if row["order_id"] == "exit-1"
         )
-        self.assertEqual(exit_row["classification"], "indeterminate")
+        self.assertEqual(exit_row["classification"], "excluded")
+        self.assertEqual(
+            exit_row["classification_reason"], "excluded_passive_exit"
+        )
         self.assertIsNone(exit_row["shadow_farther"])
+        counterfactual = report["shadow_counterfactual"]
+        self.assertEqual(counterfactual["authenticated_entry_count"], 1)
+        self.assertEqual(counterfactual["classifiable_entry_count"], 1)
+        self.assertEqual(counterfactual["indeterminate_entry_count"], 0)
+        self.assertEqual(
+            counterfactual["excluded_fill_counts"]["passive_exit"], 1
+        )
         self.assertEqual(report["session"]["completed_maker_fee"], Decimal("0.007"))
         self.assertEqual(report["session"]["completed_taker_fee"], Decimal("0.003"))
         self.assertEqual(
@@ -136,6 +146,10 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
         ):
             self.assertIn(heading, markdown)
         self.assertIn("fill=100, base=100, shadow=99", markdown)
+        self.assertIn(
+            "Authenticated entries / classifiable / indeterminate: 1 / 1 / 0",
+            markdown,
+        )
         json.loads(render_json(report))
 
     def test_unknown_attribution_is_pending_not_in_mean(self) -> None:
@@ -186,7 +200,7 @@ class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
         self.assertEqual(row["markouts"], {})
         self.assertEqual(row["raw_markouts"], {"5": "12"})
 
-    def test_legacy_e2ay_summary_stays_all_pending_and_indeterminate(self) -> None:
+    def test_legacy_e2ay_summary_stays_excluded_pending(self) -> None:
         text = """
 Completed maker fills / round trips / authenticated-flat episodes: 16 / 8 / 8.
 Completed turnover: 252.524840 USDG.
@@ -206,7 +220,17 @@ Retained maker fill events: 16.
         self.assertEqual(report["coverage"]["pending_attribution"], 16)
         self.assertEqual(
             report["shadow_counterfactual"]["classification_counts"],
-            {"indeterminate": 16},
+            {
+                "likely_filtered": 0,
+                "still_reachable": 0,
+                "indeterminate": 0,
+            },
+        )
+        self.assertEqual(
+            report["shadow_counterfactual"]["excluded_fill_counts"][
+                "pending_or_unauthenticated"
+            ],
+            16,
         )
         self.assertFalse(report["controller"]["available"])
 
@@ -383,7 +407,8 @@ Retained maker fill events: 16.
                         event("blocked", shadow=None),
                         event("exit", role="passive_exit"),
                         event("pending", state="pending"),
-                        event("active", active=True),
+                        event("active", role="active_exit", active=True),
+                        event("increase", role="risk_increasing"),
                     ],
                 }
             ]
@@ -395,9 +420,42 @@ Retained maker fill events: 16.
         }
         self.assertEqual(rows["entry"]["classification"], "likely_filtered")
         self.assertEqual(rows["blocked"]["classification"], "likely_filtered")
-        for order_id in ("exit", "pending", "active"):
-            self.assertEqual(rows[order_id]["classification"], "indeterminate")
+        for order_id in ("exit", "pending", "active", "increase"):
+            self.assertEqual(rows[order_id]["classification"], "excluded")
             self.assertIsNone(rows[order_id]["shadow_farther"])
+            self.assertIsNone(rows[order_id]["virtual_lifecycle_complete"])
+            self.assertEqual(
+                rows[order_id]["virtual_lifecycle_action_counts"],
+                {
+                    "would_place": 0,
+                    "would_reprice": 0,
+                    "would_block": 0,
+                    "would_cancel": 0,
+                    "would_resume": 0,
+                },
+            )
+        counterfactual = report["shadow_counterfactual"]
+        self.assertEqual(
+            counterfactual["classification_counts"],
+            {
+                "likely_filtered": 2,
+                "still_reachable": 0,
+                "indeterminate": 0,
+            },
+        )
+        self.assertEqual(counterfactual["authenticated_entry_count"], 2)
+        self.assertEqual(counterfactual["classifiable_entry_count"], 2)
+        self.assertEqual(counterfactual["indeterminate_entry_count"], 0)
+        self.assertEqual(
+            counterfactual["excluded_fill_counts"],
+            {
+                "passive_exit": 1,
+                "active_exit": 1,
+                "risk_increasing": 1,
+                "pending_or_unauthenticated": 1,
+            },
+        )
+        self.assertEqual(counterfactual["virtual_unknown_at_fill_count"], 2)
 
     def test_counterfactual_is_indeterminate_after_later_block_or_reprice(
         self,
@@ -500,6 +558,497 @@ Retained maker fill events: 16.
         self.assertEqual(
             rows["later-inapplicable"]["classification_reason"],
             "later_entry_inapplicable",
+        )
+
+    def test_counterfactual_event_sequence_orders_same_timestamp_events(
+        self,
+    ) -> None:
+        run_id = "run-a"
+
+        def event(order_id: str, placed: int, filled: int) -> dict:
+            return {
+                "order_id": order_id,
+                "side": "buy",
+                "price": "100",
+                "started_monotonic": "10",
+                "fill_observation_event_sequence": filled,
+                "event_sequence_run_id": run_id,
+                "fill_role": "entry",
+                "attribution_state": "authenticated",
+                "active_unwind": False,
+                "quote_context": {
+                    "base_price": "100",
+                    "shadow_price": "99",
+                    "extra_spread_ticks": 1,
+                    "created_monotonic": "10",
+                    "placement_event_sequence": placed,
+                    "event_sequence_run_id": run_id,
+                },
+            }
+
+        report = analyze(
+            [
+                {
+                    "event_sequence_run_id": run_id,
+                    "account_audit": {},
+                    "controller_decision_history_total": 3,
+                    "fill_markouts": [
+                        event("pre-fill-change", 10, 30),
+                        event("post-fill-change", 40, 50),
+                    ],
+                    "controller_decision_history": [
+                        {
+                            "decision_id": 1,
+                            "recorded_monotonic": "10",
+                            "event_sequence": 20,
+                            "event_sequence_run_id": run_id,
+                            "ready": True,
+                            "entry_applicable": True,
+                            "bid": {"blocked": True},
+                        },
+                        {
+                            "decision_id": 2,
+                            "recorded_monotonic": "10",
+                            "event_sequence": 45,
+                            "event_sequence_run_id": run_id,
+                            "event": "maker_fill",
+                            "bid": {"blocked": True},
+                        },
+                        {
+                            "decision_id": 3,
+                            "recorded_monotonic": "10",
+                            "event_sequence": 60,
+                            "event_sequence_run_id": run_id,
+                            "ready": True,
+                            "entry_applicable": False,
+                        },
+                    ],
+                }
+            ]
+        )
+
+        rows = {
+            row["order_id"]: row
+            for row in report["shadow_counterfactual"]["fills"]
+        }
+        self.assertEqual(
+            rows["pre-fill-change"]["classification_reason"],
+            "virtual_not_live_at_fill",
+        )
+        self.assertFalse(rows["pre-fill-change"]["virtual_live_at_fill"])
+        self.assertEqual(
+            rows["pre-fill-change"]["virtual_lifecycle_action_counts"],
+            {
+                "would_place": 1,
+                "would_reprice": 0,
+                "would_block": 1,
+                "would_cancel": 1,
+                "would_resume": 0,
+            },
+        )
+        self.assertEqual(
+            rows["post-fill-change"]["classification"],
+            "likely_filtered",
+        )
+        self.assertEqual(
+            rows["post-fill-change"]["classification_reason"],
+            "virtual_live_price_not_reached",
+        )
+        self.assertTrue(rows["post-fill-change"]["virtual_live_at_fill"])
+        self.assertEqual(
+            rows["post-fill-change"]["virtual_price_at_fill"], Decimal("99")
+        )
+
+    def test_virtual_shadow_lifecycle_folds_reprice_block_and_resume(
+        self,
+    ) -> None:
+        run_id = "virtual-run"
+
+        def event(
+            order_id: str,
+            *,
+            fill_price: str,
+            placed: int,
+            filled: int,
+        ) -> dict:
+            return {
+                "order_id": order_id,
+                "side": "buy",
+                "fill_price": fill_price,
+                "fill_observation_event_sequence": filled,
+                "event_sequence_run_id": run_id,
+                "fill_role": "entry",
+                "attribution_state": "authenticated",
+                "active_unwind": False,
+                "quote_context": {
+                    "base_price": "100",
+                    "shadow_price": "99",
+                    "placement_event_sequence": placed,
+                    "event_sequence_run_id": run_id,
+                },
+            }
+
+        report = analyze(
+            [
+                {
+                    "event_sequence_run_id": run_id,
+                    "account_audit": {},
+                    "controller_decision_history_total": 5,
+                    "fill_markouts": [
+                        event(
+                            "reprice-reachable",
+                            fill_price="98",
+                            placed=10,
+                            filled=30,
+                        ),
+                        event(
+                            "reprice-filtered",
+                            fill_price="100",
+                            placed=40,
+                            filled=60,
+                        ),
+                        event(
+                            "block-resume",
+                            fill_price="98",
+                            placed=70,
+                            filled=100,
+                        ),
+                        event(
+                            "blocked-at-fill",
+                            fill_price="100",
+                            placed=110,
+                            filled=130,
+                        ),
+                    ],
+                    "controller_decision_history": [
+                        {
+                            "event_sequence": 20,
+                            "event_sequence_run_id": run_id,
+                            "ready": True,
+                            "entry_applicable": True,
+                            "error": None,
+                            "bid": {
+                                "blocked": False,
+                                "shadow_price": "98",
+                            },
+                        },
+                        {
+                            "event_sequence": 50,
+                            "event_sequence_run_id": run_id,
+                            "ready": True,
+                            "entry_applicable": True,
+                            "error": None,
+                            "bid": {
+                                "blocked": False,
+                                "shadow_price": "98",
+                            },
+                        },
+                        {
+                            "event_sequence": 80,
+                            "event_sequence_run_id": run_id,
+                            "ready": True,
+                            "entry_applicable": True,
+                            "error": None,
+                            "bid": {"blocked": True},
+                        },
+                        {
+                            "event_sequence": 90,
+                            "event_sequence_run_id": run_id,
+                            "ready": True,
+                            "entry_applicable": True,
+                            "error": None,
+                            "bid": {
+                                "blocked": False,
+                                "shadow_price": "98",
+                            },
+                        },
+                        {
+                            "event_sequence": 120,
+                            "event_sequence_run_id": run_id,
+                            "ready": True,
+                            "entry_applicable": True,
+                            "error": None,
+                            "bid": {"blocked": True},
+                        },
+                    ],
+                }
+            ]
+        )
+
+        rows = {
+            row["order_id"]: row
+            for row in report["shadow_counterfactual"]["fills"]
+        }
+        self.assertEqual(
+            rows["reprice-reachable"]["classification"], "still_reachable"
+        )
+        self.assertEqual(
+            rows["reprice-filtered"]["classification"], "likely_filtered"
+        )
+        self.assertEqual(
+            rows["reprice-filtered"]["classification_reason"],
+            "virtual_live_price_not_reached",
+        )
+        self.assertEqual(
+            rows["reprice-reachable"]["virtual_lifecycle_action_counts"][
+                "would_reprice"
+            ],
+            1,
+        )
+        resumed = rows["block-resume"]
+        self.assertEqual(resumed["classification"], "still_reachable")
+        self.assertTrue(resumed["virtual_live_at_fill"])
+        self.assertEqual(resumed["virtual_price_at_fill"], Decimal("98"))
+        self.assertEqual(
+            resumed["virtual_lifecycle_action_counts"],
+            {
+                "would_place": 2,
+                "would_reprice": 0,
+                "would_block": 1,
+                "would_cancel": 1,
+                "would_resume": 1,
+            },
+        )
+        blocked = rows["blocked-at-fill"]
+        self.assertEqual(blocked["classification"], "likely_filtered")
+        self.assertFalse(blocked["virtual_live_at_fill"])
+        self.assertIsNone(blocked["virtual_price_at_fill"])
+        counterfactual = report["shadow_counterfactual"]
+        self.assertEqual(
+            counterfactual["virtual_lifecycle_action_counts"],
+            {
+                "would_place": 5,
+                "would_reprice": 2,
+                "would_block": 2,
+                "would_cancel": 2,
+                "would_resume": 1,
+            },
+        )
+        self.assertEqual(counterfactual["virtual_live_at_fill_count"], 3)
+        self.assertEqual(counterfactual["virtual_not_live_at_fill_count"], 1)
+        self.assertEqual(counterfactual["virtual_unknown_at_fill_count"], 0)
+
+    def test_event_sequence_does_not_cross_runtime_identity(self) -> None:
+        def event(order_id: str, run_id: str) -> dict:
+            return {
+                "order_id": order_id,
+                "side": "buy",
+                "price": "100",
+                "fill_observation_event_sequence": 30,
+                "event_sequence_run_id": run_id,
+                "fill_role": "entry",
+                "attribution_state": "authenticated",
+                "active_unwind": False,
+                "quote_context": {
+                    "base_price": "100",
+                    "shadow_price": "99",
+                    "placement_event_sequence": 10,
+                    "event_sequence_run_id": run_id,
+                },
+            }
+
+        report = analyze(
+            [
+                {
+                    "event_sequence_run_id": "run-a",
+                    "account_audit": {},
+                    "fill_markouts": [event("run-a-order", "run-a")],
+                },
+                {
+                    "event_sequence_run_id": "run-b",
+                    "account_audit": {},
+                    "controller_decision_history_total": 1,
+                    "controller_decision_history": [
+                        {
+                            "event_sequence": 20,
+                            "event_sequence_run_id": "run-b",
+                            "ready": True,
+                            "entry_applicable": True,
+                            "bid": {"blocked": True},
+                        }
+                    ],
+                },
+            ]
+        )
+
+        row = report["shadow_counterfactual"]["fills"][0]
+        self.assertEqual(row["classification"], "likely_filtered")
+        self.assertEqual(
+            row["classification_reason"], "virtual_live_price_not_reached"
+        )
+
+        without_run_proof = analyze(
+            [
+                {
+                    "event_sequence_run_id": "run-a",
+                    "account_audit": {},
+                    "fill_markouts": [event("unproven", "run-a")],
+                    "controller_decision_history": [
+                        {
+                            "event_sequence": 20,
+                            "ready": True,
+                            "entry_applicable": True,
+                            "bid": {"blocked": True},
+                        }
+                    ],
+                }
+            ]
+        )["shadow_counterfactual"]["fills"][0]
+        self.assertEqual(without_run_proof["classification"], "indeterminate")
+        self.assertEqual(
+            without_run_proof["classification_reason"],
+            "event_sequence_incomplete",
+        )
+        self.assertFalse(without_run_proof["virtual_lifecycle_complete"])
+
+    def test_event_sequence_history_coverage_is_per_runtime(self) -> None:
+        report = analyze(
+            [
+                {
+                    "event_sequence_run_id": "run-a",
+                    "account_audit": {},
+                    "controller_decision_history_total": 2,
+                    "controller_decision_history": [
+                        {
+                            "event_sequence": 5,
+                            "event_sequence_run_id": "run-a",
+                            "ready": True,
+                            "entry_applicable": True,
+                        }
+                    ],
+                    "fill_markouts": [
+                        {
+                            "order_id": "run-a-history-gap",
+                            "side": "buy",
+                            "price": "100",
+                            "fill_observation_event_sequence": 30,
+                            "event_sequence_run_id": "run-a",
+                            "fill_role": "entry",
+                            "attribution_state": "authenticated",
+                            "active_unwind": False,
+                            "quote_context": {
+                                "base_price": "100",
+                                "shadow_price": "99",
+                                "placement_event_sequence": 10,
+                                "event_sequence_run_id": "run-a",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "event_sequence_run_id": "run-b",
+                    "account_audit": {},
+                    "controller_decision_history_total": 1,
+                    "controller_decision_history": [
+                        {
+                            "event_sequence": 20,
+                            "event_sequence_run_id": "run-b",
+                            "ready": True,
+                            "entry_applicable": True,
+                        }
+                    ],
+                },
+            ]
+        )
+
+        row = report["shadow_counterfactual"]["fills"][0]
+        self.assertEqual(row["classification"], "indeterminate")
+        self.assertEqual(
+            row["classification_reason"], "controller_history_incomplete"
+        )
+        self.assertFalse(row["virtual_lifecycle_complete"])
+        self.assertIsNone(row["virtual_live_at_fill"])
+        self.assertIsNone(row["virtual_price_at_fill"])
+        self.assertFalse(report["coverage"]["controller_history_complete"])
+
+    def test_counterfactual_mixed_event_sequence_fails_closed(self) -> None:
+        base_event = {
+            "order_id": "mixed",
+            "side": "buy",
+            "price": "100",
+            "started_monotonic": "3",
+            "fill_role": "entry",
+            "attribution_state": "authenticated",
+            "active_unwind": False,
+            "quote_context": {
+                "base_price": "100",
+                "shadow_price": "99",
+                "created_monotonic": "1",
+            },
+        }
+        cases = (
+            (
+                {
+                    **base_event,
+                    "fill_observation_event_sequence": 3,
+                    "quote_context": {
+                        **base_event["quote_context"],
+                        "placement_event_sequence": 1,
+                    },
+                },
+                {"recorded_monotonic": "2", "entry_applicable": False},
+            ),
+            (
+                {
+                    **base_event,
+                    "quote_context": {
+                        **base_event["quote_context"],
+                        "placement_event_sequence": 1,
+                    },
+                },
+                {
+                    "recorded_monotonic": "2",
+                    "event_sequence": 2,
+                    "entry_applicable": False,
+                },
+            ),
+        )
+        for event_row, decision in cases:
+            with self.subTest(event=event_row, decision=decision):
+                report = analyze(
+                    [
+                        {
+                            "account_audit": {},
+                            "controller_decision_history": [decision],
+                            "fill_markouts": [event_row],
+                        }
+                    ]
+                )
+                row = report["shadow_counterfactual"]["fills"][0]
+                self.assertEqual(row["classification"], "indeterminate")
+                self.assertEqual(
+                    row["classification_reason"],
+                    "event_sequence_incomplete",
+                )
+
+    def test_event_sequence_keeps_equal_fill_deltas_distinct(self) -> None:
+        event = {
+            "order_id": "partial",
+            "side": "buy",
+            "fill_amount": "0.1",
+            "fill_price": "100",
+            "started_monotonic": "10",
+            "observation_source": "websocket_order_update",
+            "fill_role": "entry",
+            "attribution_state": "authenticated",
+            "active_unwind": False,
+            "quote_context": {"base_price": "100", "shadow_price": "99"},
+        }
+        report = analyze(
+            [
+                {
+                    "account_audit": {},
+                    "fill_markouts": [
+                        {**event, "fill_observation_event_sequence": 1},
+                        {**event, "fill_observation_event_sequence": 2},
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(report["coverage"]["merged_unique_events"], 2)
+        self.assertEqual(
+            report["shadow_counterfactual"]["authenticated_entry_count"], 2
         )
 
     def test_episode_ledgers_merge_across_checkpoints_by_stable_identity(

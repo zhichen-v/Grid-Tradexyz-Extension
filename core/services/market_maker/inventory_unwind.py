@@ -187,14 +187,12 @@ class InventoryEpisodeExecutor:
             )
 
         age = self._age(now_monotonic)
-        if not self.config.active_unwind_enabled:
-            return self._decision(
-                "disabled", "active unwind is disabled", age
-            )
-
         economics = self._trusted_economics(account_snapshot, signed)
         if economics is None:
-            if age >= self.config.active_unwind_after_seconds:
+            if (
+                self.config.active_unwind_enabled
+                and age >= self.config.active_unwind_after_seconds
+            ):
                 return self._decision(
                     "blocked",
                     "active unwind requires fresh authenticated economics",
@@ -205,7 +203,6 @@ class InventoryEpisodeExecutor:
                 "passive_wait",
                 "passive unwind budget is unavailable",
                 age,
-                suppress_passive=stranded_soft_exit,
             )
 
         entry = position.entry_price
@@ -214,6 +211,7 @@ class InventoryEpisodeExecutor:
                 "blocked", "inventory entry price is invalid", age, blocked=True
             )
         quantity = abs(signed)
+        reduce_only_amount = max(self.config.order_size, quantity)
         open_net = economics["open_net"]
         completed_base = min(
             economics["completed_net"], economics["last_flat_equity_change"]
@@ -223,85 +221,99 @@ class InventoryEpisodeExecutor:
             self.config.max_session_drawdown - economics["current_drawdown"],
         )
 
-        slippage_price = self._slippage_limit(sign, market, metadata)
-        if slippage_price is None:
-            return self._decision(
-                "blocked",
-                "active unwind slippage price is invalid",
-                age,
-                blocked=True,
-                suppress_passive=True,
-                remaining_drawdown=remaining_drawdown,
+        slippage_price = None
+        trigger_episode_loss = _ZERO
+        trigger_session_loss = _ZERO
+        trigger_drawdown = _ZERO
+        trigger = None
+        if self.config.active_unwind_enabled:
+            slippage_price = self._slippage_limit(sign, market, metadata)
+            if slippage_price is None:
+                return self._decision(
+                    "blocked",
+                    "active unwind slippage price is invalid",
+                    age,
+                    blocked=True,
+                    suppress_passive=True,
+                    remaining_drawdown=remaining_drawdown,
+                )
+            trigger_net = self._projected_episode_net(
+                sign,
+                quantity,
+                entry,
+                slippage_price,
+                self.config.taker_fee_rate,
+                open_net,
             )
-        trigger_net = self._projected_episode_net(
-            sign,
-            quantity,
-            entry,
-            slippage_price,
-            self.config.taker_fee_rate,
-            open_net,
-        )
-        trigger_episode_loss = max(_ZERO, -trigger_net)
-        trigger_session_loss = max(_ZERO, -(completed_base + trigger_net))
-        trigger_drawdown = self._projected_drawdown(
-            sign,
-            quantity,
-            entry,
-            slippage_price,
-            economics,
-        )
-        loss_triggered = (
-            trigger_episode_loss >= self.config.active_unwind_loss_trigger
-        )
-        time_triggered = age >= self.config.active_unwind_after_seconds
-        trigger = "loss" if loss_triggered else "time" if time_triggered else None
+            trigger_episode_loss = max(_ZERO, -trigger_net)
+            trigger_session_loss = max(
+                _ZERO, -(completed_base + trigger_net)
+            )
+            trigger_drawdown = self._projected_drawdown(
+                sign,
+                quantity,
+                entry,
+                slippage_price,
+                economics,
+            )
+            loss_triggered = (
+                trigger_episode_loss
+                >= self.config.active_unwind_loss_trigger
+            )
+            time_triggered = age >= self.config.active_unwind_after_seconds
+            trigger = (
+                "loss" if loss_triggered else "time" if time_triggered else None
+            )
         if trigger is None and not soft_exit_latched:
             return self._decision(
                 "profit_exit", "strict fee-aware profit exit", age
             )
 
-        active_price = self._active_limit(
-            sign,
-            quantity,
-            entry,
-            open_net,
-            completed_base,
-            economics,
-            market,
-            metadata,
-        )
-        if trigger is not None and active_price is None:
-            return self._decision(
-                "blocked",
-                self._active_marketability_block_reason(
-                    trigger_episode_loss,
-                    trigger_session_loss,
-                    trigger_drawdown,
-                ),
-                age,
-                trigger=trigger,
-                blocked=True,
-                budget_blocked=True,
-                suppress_passive=True,
-                remaining_drawdown=remaining_drawdown,
-            )
-        projected_price = active_price or slippage_price
-        projected_net = self._projected_episode_net(
-            sign, quantity, entry, projected_price,
-            self.config.taker_fee_rate, open_net,
-        )
-        projected_episode_loss = max(_ZERO, -projected_net)
-        projected_session_loss = max(
-            _ZERO, -(completed_base + projected_net)
-        )
-        projected_drawdown = self._projected_drawdown(
-            sign,
-            quantity,
-            entry,
-            projected_price,
-            economics,
-        )
         if trigger is not None:
+            active_price = self._active_limit(
+                sign,
+                quantity,
+                entry,
+                open_net,
+                completed_base,
+                economics,
+                market,
+                metadata,
+            )
+            if active_price is None:
+                return self._decision(
+                    "blocked",
+                    self._active_marketability_block_reason(
+                        trigger_episode_loss,
+                        trigger_session_loss,
+                        trigger_drawdown,
+                    ),
+                    age,
+                    trigger=trigger,
+                    blocked=True,
+                    budget_blocked=True,
+                    suppress_passive=True,
+                    remaining_drawdown=remaining_drawdown,
+                )
+            projected_net = self._projected_episode_net(
+                sign,
+                quantity,
+                entry,
+                active_price,
+                self.config.taker_fee_rate,
+                open_net,
+            )
+            projected_episode_loss = max(_ZERO, -projected_net)
+            projected_session_loss = max(
+                _ZERO, -(completed_base + projected_net)
+            )
+            projected_drawdown = self._projected_drawdown(
+                sign,
+                quantity,
+                entry,
+                active_price,
+                economics,
+            )
             if active_unwind_pending:
                 return self._decision(
                     "active_pending",
@@ -347,7 +359,7 @@ class InventoryEpisodeExecutor:
             order = DesiredOrder(
                 side=side,
                 price=active_price,
-                amount=quantity,
+                amount=reduce_only_amount,
                 reduce_only=True,
                 reason=f"inventory unwind {trigger} barrier",
             )
@@ -365,24 +377,64 @@ class InventoryEpisodeExecutor:
             )
 
         progress = self._passive_unlock_progress(age)
-        passive_cap = min(
-            self.config.max_episode_loss_for_unwind,
-            self.config.max_session_loss_for_maker_exit,
-        )
-        unlocked = passive_cap * progress
-        session_allowance = max(
-            _ZERO,
-            self.config.max_session_loss_for_maker_exit + completed_base,
-        )
-        allowed = min(unlocked, session_allowance, remaining_drawdown)
-        passive_price = self._passive_limit(
+        unlocked = self.config.max_episode_loss_for_unwind * progress
+        episode_boundary = self._passive_limit(
             sign,
             quantity,
             entry,
             open_net,
-            allowed,
+            unlocked,
             metadata,
         )
+        if self.config.max_session_loss_for_maker_exit > 0:
+            session_allowance = max(
+                _ZERO,
+                self.config.max_session_loss_for_maker_exit
+                + completed_base,
+            )
+            session_boundary = self._passive_limit(
+                sign,
+                quantity,
+                entry,
+                open_net,
+                session_allowance,
+                metadata,
+            )
+        else:
+            session_allowance = self._authenticated_surplus_allowance(
+                completed_base,
+                economics["completed_turnover"],
+            )
+            session_boundary = self._surplus_price_boundary(
+                sign,
+                quantity,
+                entry,
+                open_net,
+                completed_base,
+                economics["completed_turnover"],
+                economics["open_turnover"],
+                metadata,
+            )
+            if session_boundary is None:
+                return self._decision(
+                    "blocked",
+                    "passive surplus exit denominator must be positive",
+                    age,
+                    blocked=True,
+                    suppress_passive=True,
+                    unlocked_episode_loss=unlocked,
+                    allowed_passive_loss=session_allowance,
+                    remaining_drawdown=remaining_drawdown,
+                )
+        drawdown_boundary = self._drawdown_price_boundary(
+            sign,
+            quantity,
+            entry,
+            economics,
+            metadata,
+            self.config.maker_fee_rate,
+        )
+        allowed = min(unlocked, session_allowance, remaining_drawdown)
         normal_price = normal_passive_price
         if (
             not isinstance(normal_price, Decimal)
@@ -399,29 +451,46 @@ class InventoryEpisodeExecutor:
                 allowed_passive_loss=allowed,
                 remaining_drawdown=remaining_drawdown,
             )
-        reachable = (
-            normal_price >= passive_price if sign > 0 else normal_price <= passive_price
-        )
-        passive_order = None
-        suppress = stranded_soft_exit and not reachable
-        if stranded_soft_exit and reachable:
-            passive_order = DesiredOrder(
-                side=OrderSide.SELL if sign > 0 else OrderSide.BUY,
-                price=normal_price,
-                amount=quantity,
-                reduce_only=True,
-                reason="inventory unwind passive budget chase",
+        if sign > 0:
+            passive_boundary = max(
+                episode_boundary, session_boundary, drawdown_boundary
             )
+            reachable = normal_price >= passive_boundary
+            passive_price = max(normal_price, passive_boundary)
+        else:
+            passive_boundary = min(
+                episode_boundary, session_boundary, drawdown_boundary
+            )
+            reachable = normal_price <= passive_boundary
+            passive_price = min(normal_price, passive_boundary)
+        passive_order = DesiredOrder(
+            side=OrderSide.SELL if sign > 0 else OrderSide.BUY,
+            price=passive_price,
+            amount=reduce_only_amount,
+            reduce_only=True,
+            reason="inventory unwind passive budget chase",
+        )
+        projected_net = self._projected_episode_net(
+            sign,
+            quantity,
+            entry,
+            passive_price,
+            self.config.maker_fee_rate,
+            open_net,
+        )
+        projected_episode_loss = max(_ZERO, -projected_net)
+        projected_session_loss = max(
+            _ZERO, -(completed_base + projected_net)
+        )
         return self._decision(
-            "passive_chase" if passive_order else "passive_wait",
+            "passive_chase" if reachable else "unwind_blocked",
             (
                 passive_order.reason
-                if passive_order
-                else "passive quote is outside the unlocked loss budget"
+                if reachable
+                else "passive quote held at the authenticated economic boundary"
             ),
             age,
             passive_order=passive_order,
-            suppress_passive=suppress,
             unlocked_episode_loss=unlocked,
             allowed_passive_loss=allowed,
             projected_episode_loss=projected_episode_loss,
@@ -458,6 +527,8 @@ class InventoryEpisodeExecutor:
         start = self.config.soft_exit_after_seconds
         end = self.config.active_unwind_after_seconds
         if age <= start:
+            return _ZERO
+        if end <= start:
             return _ZERO
         return min(
             _ONE,
@@ -500,7 +571,12 @@ class InventoryEpisodeExecutor:
             metadata,
         )
         drawdown_boundary = self._drawdown_price_boundary(
-            sign, quantity, entry, economics, metadata
+            sign,
+            quantity,
+            entry,
+            economics,
+            metadata,
+            self.config.taker_fee_rate,
         )
         if sign > 0:
             price = max(
@@ -551,6 +627,75 @@ class InventoryEpisodeExecutor:
             self.config.maker_fee_rate,
             metadata,
         )
+
+    def _authenticated_surplus_allowance(
+        self,
+        completed_base: Decimal,
+        completed_turnover: Decimal,
+    ) -> Decimal:
+        minimum_rate = (
+            self.config.min_completed_net_turnover_bps
+            / Decimal("10000")
+        )
+        completed_target = minimum_rate * completed_turnover
+        reserve = min(
+            max(_ZERO, completed_base - completed_target),
+            self.config.soft_exit_surplus_reserve_bps
+            / Decimal("10000")
+            * completed_turnover,
+        )
+        return max(
+            _ZERO,
+            completed_base - completed_target - reserve,
+        )
+
+    def _surplus_price_boundary(
+        self,
+        sign: int,
+        quantity: Decimal,
+        entry: Decimal,
+        open_net: Decimal,
+        completed_base: Decimal,
+        completed_turnover: Decimal,
+        open_turnover: Decimal,
+        metadata: MarketMetadata,
+    ) -> Decimal | None:
+        minimum_rate = (
+            self.config.min_completed_net_turnover_bps
+            / Decimal("10000")
+        )
+        reserve = min(
+            max(
+                _ZERO,
+                completed_base - minimum_rate * completed_turnover,
+            ),
+            self.config.soft_exit_surplus_reserve_bps
+            / Decimal("10000")
+            * completed_turnover,
+        )
+        required_net = (
+            minimum_rate * (completed_turnover + open_turnover)
+            + reserve
+        )
+        fee = self.config.maker_fee_rate
+        if sign > 0:
+            denominator = quantity * (_ONE - fee - minimum_rate)
+            if denominator <= 0:
+                return None
+            raw = (
+                required_net
+                - completed_base
+                - open_net
+                + quantity * entry
+            ) / denominator
+            return ceil_to_step(raw, metadata.price_tick)
+        raw = (
+            completed_base
+            + open_net
+            + quantity * entry
+            - required_net
+        ) / (quantity * (_ONE + fee + minimum_rate))
+        return floor_to_step(raw, metadata.price_tick)
 
     @staticmethod
     def _loss_price_boundary(
@@ -616,6 +761,7 @@ class InventoryEpisodeExecutor:
         entry: Decimal,
         economics: dict[str, Decimal],
         metadata: MarketMetadata,
+        fee: Decimal,
     ) -> Decimal:
         required_equity = (
             economics["baseline_equity"] - self.config.max_session_drawdown
@@ -624,7 +770,6 @@ class InventoryEpisodeExecutor:
             economics["current_equity"]
             - economics["audited_unrealized_pnl"]
         )
-        fee = self.config.taker_fee_rate
         if sign > 0:
             raw = (
                 required_equity - equity_before_close + quantity * entry
@@ -686,6 +831,29 @@ class InventoryEpisodeExecutor:
             for value in values.values()
         ):
             return None
+        turnover_values = {
+            "completed_turnover": snapshot.get("completed_turnover"),
+            "open_turnover": snapshot.get("open_episode_turnover"),
+        }
+        trusted_turnover = all(
+            isinstance(value, Decimal)
+            and value.is_finite()
+            and value >= 0
+            for value in turnover_values.values()
+        )
+        if (
+            self.config.max_session_loss_for_maker_exit == 0
+            and not trusted_turnover
+        ):
+            return None
+        values.update(
+            turnover_values
+            if trusted_turnover
+            else {
+                "completed_turnover": _ZERO,
+                "open_turnover": _ZERO,
+            }
+        )
         if (
             values["ledger_position"] != signed
             or values["audited_position"] != signed

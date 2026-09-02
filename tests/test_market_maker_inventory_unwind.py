@@ -83,8 +83,10 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
             "state": "healthy",
             "age_seconds": 0.5,
             "ledger_position": Decimal(position),
+            "completed_turnover": Decimal("0"),
             "completed_net_ex_funding": Decimal("0"),
             "last_flat_equity_change": Decimal("0"),
+            "open_episode_turnover": Decimal("20"),
             "open_episode_net_ex_funding": Decimal("-0.0024"),
             "current_drawdown": Decimal("0.05"),
             "baseline_equity": Decimal("300"),
@@ -109,15 +111,18 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
         soft_exit_latched: bool | None = None,
         entry: str = "100",
         coordinator_unrealized_pnl: str = "0",
+        metadata: MarketMetadata | None = None,
+        normal_passive_price: Decimal | None = None,
     ):
+        selected_market = market or self.market()
         return executor.evaluate(
             position=self.position(
                 position,
                 entry=entry,
                 unrealized_pnl=coordinator_unrealized_pnl,
             ),
-            market=market or self.market(),
-            metadata=self.metadata,
+            market=selected_market,
+            metadata=metadata or self.metadata,
             account_snapshot=account or self.account(position),
             now_monotonic=now,
             soft_exit_latched=(
@@ -129,24 +134,107 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
             authenticated_flat=authenticated_flat,
             active_unwind_pending=pending,
             normal_passive_price=(
-                (market or self.market()).best_ask
+                normal_passive_price
+                if normal_passive_price is not None
+                else selected_market.best_ask
                 if Decimal(position) > 0
-                else (market or self.market()).best_bid
+                else selected_market.best_bid
                 if Decimal(position) < 0
                 else None
             ),
         )
 
+    def gate_c_config(self, **overrides) -> MarketMakerConfig:
+        values = {
+            "order_size": Decimal("0.00020"),
+            "max_position": Decimal("0.00040"),
+            "active_unwind_enabled": False,
+            "soft_exit_after_seconds": 120,
+            "active_unwind_after_seconds": 180,
+            "min_completed_net_turnover_bps": Decimal("0.02"),
+            "soft_exit_surplus_reserve_bps": Decimal("0.02"),
+            "max_episode_loss_for_unwind": Decimal("0.075"),
+            "max_session_loss_for_unwind": Decimal("0.10"),
+            "max_session_loss_for_maker_exit": Decimal("0"),
+        }
+        values.update(overrides)
+        return replace(self.config, **values)
+
+    def gate_c_account(self, **overrides) -> dict:
+        values = {
+            "completed_turnover": Decimal("123.670880"),
+            "completed_net_ex_funding": Decimal("0.00795949440"),
+            "last_flat_equity_change": Decimal("0.00795949440"),
+            "open_episode_turnover": Decimal("15.441480"),
+            "open_episode_net_ex_funding": Decimal("-0.001852977600"),
+            "current_drawdown": Decimal("0"),
+            "current_equity": Decimal("300"),
+            "audited_unrealized_pnl": Decimal("0"),
+        }
+        values.update(overrides)
+        return self.account("-0.00020", **values)
+
+    def gate_c_metadata(self) -> MarketMetadata:
+        return replace(
+            self.metadata,
+            size_decimals=5,
+            quantity_step=Decimal("0.00001"),
+            min_base_amount=Decimal("0.00001"),
+        )
+
+    def gate_c_decision(
+        self,
+        *,
+        config: MarketMakerConfig | None = None,
+        account: dict | None = None,
+        now: float = 180,
+        soft_exit_latched: bool = True,
+        stranded: bool = True,
+    ):
+        executor = InventoryEpisodeExecutor(config or self.gate_c_config())
+        market = self.market("77230.0", "77230.2")
+        snapshot = account or self.gate_c_account()
+        metadata = self.gate_c_metadata()
+        self.evaluate(
+            executor,
+            now=0,
+            position="-0.00020",
+            entry="77207.4",
+            market=market,
+            account=snapshot,
+            metadata=metadata,
+            stranded=False,
+            soft_exit_latched=False,
+        )
+        decision = self.evaluate(
+            executor,
+            now=now,
+            position="-0.00020",
+            entry="77207.4",
+            market=market,
+            account=snapshot,
+            metadata=metadata,
+            normal_passive_price=Decimal("77230.0"),
+            soft_exit_latched=soft_exit_latched,
+            stranded=stranded,
+        )
+        return decision, metadata
+
     def test_passive_budget_unlock_suppresses_then_chases_normal_band(self) -> None:
         executor = InventoryEpisodeExecutor(self.config)
         early = self.evaluate(executor, now=0)
-        self.assertTrue(early.suppress_passive)
-        self.assertIsNone(early.passive_order)
+        self.assertEqual(early.state, "unwind_blocked")
+        self.assertFalse(early.suppress_passive)
+        self.assertEqual(early.passive_order.price, Decimal("99.9"))
 
         still_blocked = self.evaluate(executor, now=15)
-        self.assertTrue(still_blocked.suppress_passive)
+        self.assertEqual(still_blocked.state, "unwind_blocked")
+        self.assertFalse(still_blocked.suppress_passive)
         self.assertEqual(
-            still_blocked.unlocked_episode_loss, Decimal("0.0375")
+            still_blocked.passive_order.price, Decimal("100.3")
+        )
+        self.assertEqual(
+            still_blocked.unlocked_episode_loss, Decimal("0.0750")
         )
 
         reachable = self.evaluate(executor, now=25)
@@ -154,6 +242,227 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
         self.assertEqual(reachable.passive_order.side, OrderSide.BUY)
         self.assertEqual(reachable.passive_order.price, Decimal("100.5"))
         self.assertTrue(reachable.passive_order.reduce_only)
+
+    def test_sub_min_residual_uses_executable_reduce_only_amount(self) -> None:
+        metadata = replace(
+            self.metadata,
+            size_decimals=5,
+            quantity_step=Decimal("0.00001"),
+            min_base_amount=Decimal("0.00020"),
+            min_quote_amount=Decimal("10"),
+        )
+        base_config = replace(
+            self.config,
+            order_size=Decimal("0.00020"),
+            max_position=Decimal("0.00040"),
+        )
+        market = self.market("77230.0", "77230.2")
+        account = self.account(
+            "-0.00010",
+            open_episode_turnover=Decimal("7.72074"),
+            open_episode_net_ex_funding=Decimal("-0.0009264888"),
+            audited_unrealized_pnl=Decimal("0"),
+        )
+
+        passive = InventoryEpisodeExecutor(
+            replace(base_config, active_unwind_enabled=False)
+        )
+        passive_decision = self.evaluate(
+            passive,
+            now=15,
+            position="-0.00010",
+            entry="77207.4",
+            market=market,
+            account=account,
+            metadata=metadata,
+            normal_passive_price=Decimal("77230.0"),
+            soft_exit_latched=True,
+        )
+        self.assertIsNotNone(passive_decision.passive_order)
+        self.assertEqual(
+            passive_decision.passive_order.amount, Decimal("0.00020")
+        )
+        self.assertTrue(passive_decision.passive_order.reduce_only)
+
+        active = InventoryEpisodeExecutor(base_config)
+        self.evaluate(
+            active,
+            now=0,
+            position="-0.00010",
+            entry="77207.4",
+            market=market,
+            account=account,
+            metadata=metadata,
+            soft_exit_latched=False,
+        )
+        active_decision = self.evaluate(
+            active,
+            now=30,
+            position="-0.00010",
+            entry="77207.4",
+            market=market,
+            account=account,
+            metadata=metadata,
+            soft_exit_latched=False,
+        )
+        self.assertIsNotNone(active_decision.active_order)
+        self.assertEqual(
+            active_decision.active_order.amount, Decimal("0.00020")
+        )
+        self.assertTrue(active_decision.active_order.reduce_only)
+
+    def test_active_off_gate_c_session_boundary_is_exact_to_one_tick(
+        self,
+    ) -> None:
+        decision, metadata = self.gate_c_decision()
+
+        self.assertEqual(decision.state, "unwind_blocked")
+        self.assertIsNone(decision.active_order)
+        self.assertIsNotNone(decision.passive_order)
+        self.assertEqual(decision.passive_order.side, OrderSide.BUY)
+        self.assertEqual(decision.passive_order.amount, Decimal("0.00020"))
+        self.assertTrue(decision.passive_order.reduce_only)
+        boundary = decision.passive_order.price
+        self.assertEqual(boundary, Decimal("77225.8"))
+
+        quantity = Decimal("0.00020")
+        entry = Decimal("77207.4")
+        maker_fee = Decimal("0.000120")
+        minimum_rate = Decimal("0.02") / Decimal("10000")
+        completed_turnover = Decimal("123.670880")
+        completed_net = Decimal("0.00795949440")
+        open_turnover = Decimal("15.441480")
+        open_net = Decimal("-0.001852977600")
+        reserve = (
+            Decimal("0.02") / Decimal("10000") * completed_turnover
+        )
+
+        def projected_net(price: Decimal) -> Decimal:
+            return (
+                completed_net
+                + open_net
+                + quantity * (entry - price)
+                - quantity * price * maker_fee
+            )
+
+        def required_floor(price: Decimal) -> Decimal:
+            final_turnover = (
+                completed_turnover + open_turnover + quantity * price
+            )
+            return minimum_rate * final_turnover + reserve
+
+        self.assertGreaterEqual(
+            projected_net(boundary), required_floor(boundary)
+        )
+        next_tick = boundary + metadata.price_tick
+        self.assertLess(
+            projected_net(next_tick), required_floor(next_tick)
+        )
+
+    def test_long_surplus_nonpositive_denominator_fails_closed(self) -> None:
+        account = self.account(
+            "0.2",
+            completed_turnover=Decimal("100"),
+            completed_net_ex_funding=Decimal("101"),
+            last_flat_equity_change=Decimal("101"),
+            open_episode_turnover=Decimal("20"),
+            open_episode_net_ex_funding=Decimal("0"),
+            current_drawdown=Decimal("0"),
+            current_equity=Decimal("300"),
+            audited_unrealized_pnl=Decimal("0"),
+        )
+        for name, minimum_bps in (
+            ("zero", "9998.8"),
+            ("negative", "9998.9"),
+        ):
+            with self.subTest(name=name):
+                executor = InventoryEpisodeExecutor(
+                    replace(
+                        self.config,
+                        active_unwind_enabled=False,
+                        max_session_loss_for_maker_exit=Decimal("0"),
+                        min_completed_net_turnover_bps=Decimal(minimum_bps),
+                    )
+                )
+                self.evaluate(
+                    executor,
+                    now=0,
+                    position="0.2",
+                    account=account,
+                    stranded=False,
+                    soft_exit_latched=False,
+                )
+
+                decision = self.evaluate(
+                    executor,
+                    now=15,
+                    position="0.2",
+                    account=account,
+                    soft_exit_latched=True,
+                )
+
+                self.assertEqual(decision.state, "blocked")
+                self.assertTrue(decision.blocked)
+                self.assertTrue(decision.suppress_passive)
+                self.assertIsNone(decision.passive_order)
+                self.assertIn("denominator", decision.reason)
+
+    def test_gate_c_episode_cap_is_exact_to_one_tick(self) -> None:
+        config = self.gate_c_config(
+            max_episode_loss_for_unwind=Decimal("0.005")
+        )
+        decision, metadata = self.gate_c_decision(config=config)
+
+        self.assertIsNotNone(decision.passive_order)
+        boundary = decision.passive_order.price
+        self.assertEqual(boundary, Decimal("77213.8"))
+
+        quantity = Decimal("0.00020")
+        entry = Decimal("77207.4")
+        maker_fee = Decimal("0.000120")
+        open_net = Decimal("-0.001852977600")
+
+        def projected_episode_net(price: Decimal) -> Decimal:
+            return (
+                open_net
+                + quantity * (entry - price)
+                - quantity * price * maker_fee
+            )
+
+        self.assertGreaterEqual(
+            projected_episode_net(boundary), Decimal("-0.005")
+        )
+        self.assertLess(
+            projected_episode_net(boundary + metadata.price_tick),
+            Decimal("-0.005"),
+        )
+
+    def test_untrusted_economics_never_relaxes_passive_boundary(self) -> None:
+        cases = {
+            "missing turnover": self.gate_c_account(),
+            "stale audit": self.gate_c_account(age_seconds=21.0),
+        }
+        cases["missing turnover"].pop("completed_turnover")
+
+        for name, account in cases.items():
+            with self.subTest(name=name):
+                decision, _ = self.gate_c_decision(account=account)
+
+                self.assertIsNone(decision.passive_order)
+                self.assertIsNone(decision.active_order)
+                self.assertFalse(decision.suppress_passive)
+                self.assertEqual(decision.state, "passive_wait")
+
+    def test_passive_budget_does_not_progress_before_soft_exit_latch(self) -> None:
+        before_latch, _ = self.gate_c_decision(
+            now=150,
+            stranded=False,
+            soft_exit_latched=False,
+        )
+
+        self.assertEqual(before_latch.unlocked_episode_loss, Decimal("0"))
+        self.assertIsNone(before_latch.passive_order)
+        self.assertIsNone(before_latch.active_order)
 
     def test_loss_and_time_barriers_create_bounded_long_short_ioc_intents(self) -> None:
         short = InventoryEpisodeExecutor(self.config)

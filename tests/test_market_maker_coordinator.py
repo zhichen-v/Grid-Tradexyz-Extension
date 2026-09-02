@@ -658,11 +658,9 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         order_manager.reconcile.assert_not_awaited()
         self.assertIs(coordinator._state, RuntimeState.PAUSED_ERROR)
 
-    async def test_stranded_soft_exit_cancels_before_reconcile(self) -> None:
-        reason = (
-            "soft exit is stranded outside the normal passive quote "
-            "band by the economic gate"
-        )
+    async def test_active_off_stranded_soft_exit_is_delegated_to_executor(
+        self,
+    ) -> None:
         cases = (
             (
                 Decimal("-0.2"),
@@ -722,30 +720,41 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         for position, risk, desired in cases:
             with self.subTest(position=position):
                 order_manager = self.order_manager()
-                order_manager.cancel_managed_orders.return_value = (
-                    SimpleNamespace(
-                        actions=(),
-                        errors=(),
-                        fill_observed=False,
-                        position_refresh_required=False,
-                    )
+                unwind = SimpleNamespace(
+                    blocked=False,
+                    budget_blocked=False,
+                    active_order=None,
+                    passive_order=None,
+                    suppress_passive=False,
+                    reason="passive unwind remains bounded",
+                    snapshot=Mock(
+                        return_value={"state": "passive_wait", "blocked": False}
+                    ),
                 )
-                coordinator = self.prepare_running(order_manager=order_manager)
+                executor = SimpleNamespace(evaluate=Mock(return_value=unwind))
+                coordinator = self.prepare_running(
+                    order_manager=order_manager,
+                    inventory_executor=executor,
+                )
                 coordinator._position = self.position(signed_size=position)
                 coordinator.risk_manager.evaluate.return_value = risk
                 coordinator.strategy.calculate_quotes.return_value = desired
 
-                with self.assertRaisesRegex(RuntimeError, "strategy hard stop"):
-                    await coordinator.run_one_cycle(force=True)
+                await coordinator.run_one_cycle(force=True)
 
-                order_manager.cancel_managed_orders.assert_awaited_once_with(
-                    reason
+                executor.evaluate.assert_called_once()
+                self.assertTrue(
+                    executor.evaluate.call_args.kwargs["stranded_soft_exit"]
                 )
-                order_manager.reconcile.assert_not_awaited()
-                self.assertIs(coordinator._state, RuntimeState.PAUSED_ERROR)
-                self.assertEqual(coordinator.metrics.quote_reason, reason)
+                order_manager.reconcile.assert_awaited_once_with(desired, risk)
+                order_manager.cancel_managed_orders.assert_not_awaited()
+                order_manager.execute_active_unwind.assert_not_awaited()
+                self.assertEqual(
+                    coordinator.metrics.inventory_unwind["state"],
+                    "passive_wait",
+                )
 
-    async def test_active_unwind_suppresses_stranded_quote_before_barrier(
+    async def test_active_unwind_holds_stranded_quote_at_boundary_before_barrier(
         self,
     ) -> None:
         manager = self.order_manager()
@@ -801,11 +810,12 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.run_one_cycle(force=True)
 
         reconciled = manager.reconcile.await_args.args[0]
-        self.assertIsNone(reconciled.bid)
+        self.assertEqual(reconciled.bid.price, Decimal("99.9"))
+        self.assertTrue(reconciled.bid.reduce_only)
         self.assertIsNone(reconciled.ask)
         manager.execute_active_unwind.assert_not_awaited()
         self.assertEqual(
-            coordinator.metrics.inventory_unwind["state"], "passive_wait"
+            coordinator.metrics.inventory_unwind["state"], "unwind_blocked"
         )
 
     async def test_active_unwind_error_is_terminal_hard_stop(self) -> None:
@@ -1267,6 +1277,8 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 order_manager = self.order_manager()
                 coordinator = self.prepare_running(order_manager=order_manager)
                 coordinator._position = self.position(signed_size=position)
+                evaluate = Mock(wraps=coordinator.inventory_executor.evaluate)
+                coordinator.inventory_executor.evaluate = evaluate
                 coordinator.risk_manager.evaluate.return_value = replace(
                     self.risk(),
                     buy_amount=Decimal("0.2") if is_buy else None,
@@ -1293,6 +1305,10 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                 await coordinator.run_one_cycle(force=True)
 
+                evaluate.assert_called_once()
+                self.assertFalse(
+                    evaluate.call_args.kwargs["stranded_soft_exit"]
+                )
                 order_manager.cancel_managed_orders.assert_not_awaited()
                 order_manager.reconcile.assert_awaited_once()
 
@@ -1393,6 +1409,35 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             coordinator.metrics.account_audit["entry_admission_reason"],
             "remaining drawdown cannot fund a full-lot stop",
         )
+
+    async def test_entry_admission_reserves_episode_cap_with_active_lane_off(
+        self,
+    ) -> None:
+        snapshot = self.active_account_snapshot("0")
+        snapshot["remaining_session_loss_for_unwind"] = Decimal("0.29")
+        monitor = SimpleNamespace(snapshot=Mock(return_value=snapshot))
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(active_unwind_enabled=False),
+            account_monitor=monitor,
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator.metrics.account_audit["ledger_position"] = Decimal("0")
+
+        await coordinator.run_one_cycle(force=True)
+
+        self.assertFalse(
+            coordinator.risk_manager.evaluate.call_args.kwargs[
+                "allow_new_episode"
+            ]
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["reserved_worst_case_exit_cost"],
+            Decimal("0.30"),
+        )
+        self.assertEqual(
+            coordinator.metrics.account_audit["entry_admission"], "blocked"
+        )
+        coordinator.order_manager.execute_active_unwind.assert_not_awaited()
 
     async def test_entry_admission_fails_closed_without_fresh_economics(
         self,
@@ -4625,6 +4670,8 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             market_feature_store=store,
         )
         nonflat._position = self.position(signed_size=Decimal("0.2"))
+        controller_evaluate = Mock(wraps=nonflat.quote_controller.evaluate)
+        nonflat.quote_controller.evaluate = controller_evaluate
         exit_quotes = replace(
             self.desired(),
             bid=None,
@@ -4639,6 +4686,9 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         exit_applied = exit_manager.reconcile.await_args.args[0]
         self.assertIs(exit_applied, exit_quotes)
         self.assertTrue(exit_applied.ask.reduce_only)
+        self.assertTrue(
+            controller_evaluate.call_args.args[0].inventory_unwind_active
+        )
 
     async def test_controller_exception_fails_closed_flat_and_preserves_exit(
         self,

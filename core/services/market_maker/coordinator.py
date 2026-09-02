@@ -789,100 +789,87 @@ class MarketMakerCoordinator:
                 )
             )
             active_lane = False
-            if self.config.active_unwind_enabled:
-                unwind = self.inventory_executor.evaluate(
-                    position=self._position,
-                    market=self._market,
-                    metadata=self.metadata,
-                    account_snapshot=self._trusted_inventory_unwind_snapshot(now),
-                    now_monotonic=now,
-                    soft_exit_latched=(
-                        getattr(risk, "soft_exit_latched", False) is True
-                    ),
-                    stranded_soft_exit=stranded_soft_exit,
-                    authenticated_flat=self._authenticated_flat_checkpoint(),
-                    active_unwind_pending=bool(
-                        getattr(
-                            self.order_manager, "active_unwind_pending", False
-                        )
-                    ),
-                    normal_passive_price=self._normal_passive_unwind_price(
-                        desired
-                    ),
+            unwind = self.inventory_executor.evaluate(
+                position=self._position,
+                market=self._market,
+                metadata=self.metadata,
+                account_snapshot=self._trusted_inventory_unwind_snapshot(now),
+                now_monotonic=now,
+                soft_exit_latched=(
+                    getattr(risk, "soft_exit_latched", False) is True
+                ),
+                stranded_soft_exit=stranded_soft_exit,
+                authenticated_flat=self._authenticated_flat_checkpoint(),
+                active_unwind_pending=bool(
+                    getattr(
+                        self.order_manager, "active_unwind_pending", False
+                    )
+                ),
+                normal_passive_price=self._normal_passive_unwind_price(desired),
+            )
+            self.metrics.inventory_unwind = unwind.snapshot()
+            if unwind.blocked:
+                if unwind.budget_blocked:
+                    self.metrics.increment("episode_cap_blocked")
+                self.metrics.increment("active_unwind_blocks")
+                self.metrics.quote_reason = unwind.reason
+                await self._fail_closed(RuntimeState.PAUSED_ERROR, unwind.reason)
+                raise RuntimeError(
+                    f"inventory unwind hard stop: {unwind.reason}"
                 )
-                self.metrics.inventory_unwind = unwind.snapshot()
-                if unwind.blocked:
-                    if unwind.budget_blocked:
-                        self.metrics.increment("episode_cap_blocked")
-                    self.metrics.increment("active_unwind_blocks")
-                    self.metrics.quote_reason = unwind.reason
-                    await self._fail_closed(RuntimeState.PAUSED_ERROR, unwind.reason)
-                    raise RuntimeError(
-                        f"inventory unwind hard stop: {unwind.reason}"
-                    )
-                if unwind.active_order is not None:
-                    active_lane = True
-                    prepared_generation = self._consume_active_unwind_truth(
-                        unwind.episode_id, now
-                    )
-                    manager_prepared_generation = getattr(
-                        self.order_manager,
-                        "active_unwind_prepared_generation",
-                        None,
-                    )
-                    if (
-                        prepared_generation is None
-                        and type(manager_prepared_generation) is int
-                    ):
-                        if not await self._refresh_active_unwind_truth():
-                            return
-                        if not self._arm_active_unwind_truth(unwind.episode_id):
-                            reason = (
-                                "active unwind fresh-truth token could not be re-armed"
-                            )
-                            await self._fail_closed(
-                                RuntimeState.PAUSED_ORDER_STATE, reason
-                            )
-                            return
-                        self._quote_event.set()
+            if unwind.active_order is not None:
+                active_lane = True
+                prepared_generation = self._consume_active_unwind_truth(
+                    unwind.episode_id, now
+                )
+                manager_prepared_generation = getattr(
+                    self.order_manager,
+                    "active_unwind_prepared_generation",
+                    None,
+                )
+                if (
+                    prepared_generation is None
+                    and type(manager_prepared_generation) is int
+                ):
+                    if not await self._refresh_active_unwind_truth():
                         return
-                    result = await self.order_manager.execute_active_unwind(
-                        unwind.active_order,
-                        prepared_generation=prepared_generation,
-                    )
-                else:
-                    if unwind.passive_order is not None:
-                        if unwind.passive_order.side is OrderSide.BUY:
-                            desired = replace(
-                                desired,
-                                bid=unwind.passive_order,
-                                ask=None,
-                                reason=unwind.reason,
-                            )
-                        else:
-                            desired = replace(
-                                desired,
-                                bid=None,
-                                ask=unwind.passive_order,
-                                reason=unwind.reason,
-                            )
-                    elif unwind.suppress_passive:
+                    if not self._arm_active_unwind_truth(unwind.episode_id):
+                        reason = (
+                            "active unwind fresh-truth token could not be re-armed"
+                        )
+                        await self._fail_closed(
+                            RuntimeState.PAUSED_ORDER_STATE, reason
+                        )
+                        return
+                    self._quote_event.set()
+                    return
+                result = await self.order_manager.execute_active_unwind(
+                    unwind.active_order,
+                    prepared_generation=prepared_generation,
+                )
+            else:
+                if unwind.passive_order is not None:
+                    if unwind.passive_order.side is OrderSide.BUY:
                         desired = replace(
                             desired,
-                            bid=None,
+                            bid=unwind.passive_order,
                             ask=None,
                             reason=unwind.reason,
                         )
-                    result = await self.order_manager.reconcile(desired, risk)
-            elif stranded_soft_exit:
-                reason = (
-                    "soft exit is stranded outside the normal passive quote "
-                    "band by the economic gate"
-                )
-                self.metrics.quote_reason = reason
-                await self._fail_closed(RuntimeState.PAUSED_ERROR, reason)
-                raise RuntimeError(f"strategy hard stop: {reason}")
-            else:
+                    else:
+                        desired = replace(
+                            desired,
+                            bid=None,
+                            ask=unwind.passive_order,
+                            reason=unwind.reason,
+                        )
+                elif unwind.suppress_passive:
+                    desired = replace(
+                        desired,
+                        bid=None,
+                        ask=None,
+                        reason=unwind.reason,
+                    )
                 result = await self.order_manager.reconcile(desired, risk)
             if active_lane and unwind.active_order is not None:
                 self.metrics.target_bid = (
@@ -1827,7 +1814,7 @@ class MarketMakerCoordinator:
 
     def _entry_admission_allows_new_episode(self, now: float) -> bool:
         if (
-            not self.config.active_unwind_enabled
+            self.config.max_episode_loss_for_unwind <= 0
             or self._position is None
             or self._position.signed_size != 0
         ):
@@ -2036,10 +2023,7 @@ class MarketMakerCoordinator:
             entry_markout_feedback=entry_markout_feedback,
             economic_stop_pending=economic_stop_pending,
             entry_admission_allowed=entry_admission_allowed,
-            inventory_unwind_active=(
-                self.config.active_unwind_enabled
-                and self._position.signed_size != 0
-            ),
+            inventory_unwind_active=self._position.signed_size != 0,
             active_unwind_pending=bool(
                 getattr(self.order_manager, "active_unwind_pending", False)
             ),

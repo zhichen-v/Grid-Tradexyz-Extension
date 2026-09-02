@@ -186,6 +186,77 @@ class MarketMakerControllerTelemetryTests(unittest.TestCase):
         self.assertEqual(len(metrics.controller_decision_history), 3)
         self.assertEqual(metrics.controller_decision_history_total, 3)
 
+    def test_event_sequence_orders_decision_placement_fill_and_snapshot(
+        self,
+    ) -> None:
+        metrics = MarketMakerMetrics(0.0)
+        self.record(metrics, self.decision(1), 10.0)
+        decision_sequence = metrics.quote_controller["event_sequence"]
+        run_id = metrics.quote_controller["event_sequence_run_id"]
+        metrics.record_quote_context(
+            "same-time-order",
+            {
+                "order_id": "same-time-order",
+                "base_price": Decimal("100"),
+                "shadow_price": Decimal("99.9"),
+                "created_monotonic": 10.0,
+            },
+        )
+        placement_sequence = metrics.snapshot(10.0)["quote_contexts"][0][
+            "placement_event_sequence"
+        ]
+        placement_context = metrics.snapshot(10.0)["quote_contexts"][0]
+        self.assertTrue(
+            metrics.record_maker_fill_markout(
+                order_id="same-time-order",
+                side="buy",
+                cumulative_filled=Decimal("0.2"),
+                cumulative_cost=Decimal("20"),
+                average_price=Decimal("100"),
+                now=10.0,
+                mid=Decimal("100"),
+                source="websocket_order_update",
+                terminal=True,
+            )
+        )
+        fill_sequence = metrics.fill_markouts[-1][
+            "fill_observation_event_sequence"
+        ]
+        fill_event = metrics.fill_markouts[-1]
+        metrics.record_controller_fill_snapshot("same-time-order", 10.0)
+        fill_snapshot = metrics.controller_decision_history[-1]
+        self.record(
+            metrics,
+            self.decision(2),
+            10.0,
+            entry_applicable=False,
+        )
+        post_fill_decision_sequence = metrics.quote_controller[
+            "event_sequence"
+        ]
+
+        self.assertLess(decision_sequence, placement_sequence)
+        self.assertLess(placement_sequence, fill_sequence)
+        self.assertLess(fill_sequence, fill_snapshot["event_sequence"])
+        self.assertLess(
+            fill_snapshot["event_sequence"], post_fill_decision_sequence
+        )
+        self.assertEqual(placement_context["event_sequence_run_id"], run_id)
+        self.assertEqual(fill_event["event_sequence_run_id"], run_id)
+        self.assertEqual(fill_snapshot["event_sequence_run_id"], run_id)
+        self.assertEqual(metrics.snapshot(10.0)["event_sequence_run_id"], run_id)
+        self.assertNotEqual(
+            MarketMakerMetrics(0.0).snapshot(0.0)["event_sequence_run_id"],
+            run_id,
+        )
+        self.assertEqual(
+            fill_snapshot["last_controller_decision_event_sequence"],
+            decision_sequence,
+        )
+        self.assertEqual(
+            fill_snapshot["fill_observation_event_sequence"], fill_sequence
+        )
+
     def test_seconds_exclude_inapplicable_and_stopped_intervals(self) -> None:
         metrics = MarketMakerMetrics(0.0)
         self.record(metrics, self.decision(1, bid_blocked=True), 0.0)
