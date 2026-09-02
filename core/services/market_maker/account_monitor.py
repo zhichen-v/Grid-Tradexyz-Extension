@@ -2,14 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 from uuid import uuid4
 
 from ...adapters.exchanges.models import OrderSide
 from .config import MarketMakerConfig
+from .models import (
+    EpisodePolicyObservation,
+    OrderIntentKind,
+    OrderIntentMetadata,
+)
 
 
 _ZERO = Decimal("0")
+_ONE = Decimal("1")
 _TEN_THOUSAND = Decimal("10000")
 _READ_ATTEMPTS = 6
 _READ_RETRY_SECONDS = 1.0
@@ -20,6 +26,7 @@ _AUTHENTICATED_FILL_LEDGER_LIMIT = 500
 _SESSION_ATTRIBUTION_LIMIT = 8192
 _ORDER_ROLE_BINDING_LIMIT = _SESSION_ATTRIBUTION_LIMIT
 _SEEN_TRADE_ID_LIMIT = _SESSION_ATTRIBUTION_LIMIT
+_SECONDS_TIMESTAMP_LIMIT = 10_000_000_000
 
 
 class AccountAuditError(RuntimeError):
@@ -148,6 +155,20 @@ def _trade_sort_key(trade: Any) -> tuple[int, int]:
     return timestamp, trade_sequence
 
 
+def _inventory_duration_seconds(opened_at: int, closed_at: int) -> Decimal:
+    opened_seconds = Decimal(opened_at) / (
+        Decimal("1000")
+        if opened_at >= _SECONDS_TIMESTAMP_LIMIT
+        else Decimal("1")
+    )
+    closed_seconds = Decimal(closed_at) / (
+        Decimal("1000")
+        if closed_at >= _SECONDS_TIMESTAMP_LIMIT
+        else Decimal("1")
+    )
+    return max(_ZERO, closed_seconds - opened_seconds)
+
+
 def _fill_from_trade(
     trade: Any,
     expected_fee_rate: Decimal,
@@ -237,6 +258,9 @@ class SessionEconomics:
     _order_role_bindings: dict[
         str, tuple[str, str, int, bool]
     ] = field(default_factory=dict, repr=False)
+    _order_intent_bindings: dict[str, OrderIntentMetadata] = field(
+        default_factory=dict, repr=False
+    )
     _seen_trade_id_order: dict[str, None] = field(
         default_factory=dict, repr=False
     )
@@ -255,10 +279,32 @@ class SessionEconomics:
     _episode_fee: Decimal = _ZERO
     _episode_taker_fee: Decimal = _ZERO
     _episode_gross: Decimal = _ZERO
+    _episode_entry_turnover: Decimal = _ZERO
+    _episode_entry_quantity: Decimal = _ZERO
+    _episode_entry_fee: Decimal = _ZERO
+    _episode_exit_turnover: Decimal = _ZERO
+    _episode_exit_quantity: Decimal = _ZERO
     _episode_entry_side: str | None = None
     _episode_opened_at: int | None = None
     _episode_active_unwind_used: bool = False
+    _episode_active_attempt_order_ids: set[str] = field(
+        default_factory=set, repr=False
+    )
+    _episode_vwap_complete: bool = True
+    _episode_close_policy_coverage: bool = True
+    _episode_final_exit_stage: str | None = None
+    _episode_final_binding_constraint: str | None = None
+    _episode_entered_inventory_hold: bool | None = None
+    _episode_max_unlocked_loss: Decimal = _ZERO
+    _episode_passive_exit_net: Decimal = _ZERO
+    _episode_passive_exit_quantity: Decimal = _ZERO
+    _episode_surplus_funded_passive_net: Decimal = _ZERO
+    _episode_surplus_funded_passive_quantity: Decimal = _ZERO
+    _episode_active_attempt_count: int = 0
+    _episode_policy_observation_seen: bool = False
+    _episode_inventory_episode_id: int | None = None
     _episode_sequence: int = 0
+    policy_context_missing_count: int = 0
     _pending_economic_stop_reason: str | None = None
     current_equity: Decimal | None = None
     last_flat_equity_change: Decimal = _ZERO
@@ -352,9 +398,108 @@ class SessionEconomics:
         active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
         open_order_ids: set[str] | frozenset[str] = frozenset(),
         terminal_order_ids: set[str] | frozenset[str] = frozenset(),
+        order_intent_contexts: Mapping[str, OrderIntentMetadata] | None = None,
+        episode_policy_observation: EpisodePolicyObservation | None = None,
         allow_unreported_zero_integrator_fee: bool = False,
     ) -> None:
         trades = tuple(trades)
+        if order_intent_contexts is None:
+            order_intent_contexts = {}
+        if episode_policy_observation is not None:
+            if not isinstance(
+                episode_policy_observation, EpisodePolicyObservation
+            ):
+                raise AccountAuditError(
+                    "account episode policy observation is invalid"
+                )
+            observation_sequence = (
+                episode_policy_observation.authenticated_episode_sequence
+            )
+            if type(observation_sequence) is not int or observation_sequence <= 0:
+                raise AccountAuditError(
+                    "account episode policy observation sequence is invalid"
+                )
+            if type(episode_policy_observation.entered_inventory_hold) is not bool:
+                raise AccountAuditError(
+                    "account episode policy hold observation is invalid"
+                )
+            if (
+                type(episode_policy_observation.active_attempts) is not int
+                or episode_policy_observation.active_attempts < 0
+            ):
+                raise AccountAuditError(
+                    "account episode policy active attempts are invalid"
+                )
+            observed_unlocked = (
+                episode_policy_observation.max_unlocked_episode_loss
+            )
+            if (
+                not isinstance(observed_unlocked, Decimal)
+                or not observed_unlocked.is_finite()
+                or observed_unlocked < 0
+            ):
+                raise AccountAuditError(
+                    "account episode policy unlocked loss is invalid"
+                )
+            if (
+                self.ledger_position != 0
+                and self._episode_sequence > 0
+                and observation_sequence != self._episode_sequence
+            ):
+                raise AccountAuditError(
+                    "account episode policy observation conflicts with open episode"
+                )
+        active_attempt_contexts: dict[int, set[str]] = {}
+        active_attempt_counts: dict[int, int] = {}
+        inventory_hold_contexts: set[int] = set()
+        max_unlocked_contexts: dict[int, Decimal] = {}
+        for order_id, intent_context in order_intent_contexts.items():
+            if not isinstance(intent_context, OrderIntentMetadata):
+                continue
+            context_sequence = intent_context.authenticated_episode_sequence
+            if type(context_sequence) is not int:
+                continue
+            if (
+                type(intent_context.active_attempts) is not int
+                or intent_context.active_attempts < 0
+            ):
+                raise AccountAuditError(
+                    "account order intent active_attempts is invalid"
+                )
+            if type(intent_context.entered_inventory_hold) is not bool:
+                raise AccountAuditError(
+                    "account order intent entered_inventory_hold is invalid"
+                )
+            context_attempts = intent_context.active_attempts + int(
+                intent_context.kind is OrderIntentKind.ACTIVE_EXIT
+            )
+            active_attempt_counts[context_sequence] = max(
+                active_attempt_counts.get(context_sequence, 0),
+                context_attempts,
+            )
+            unlocked = intent_context.unlocked_episode_loss
+            if unlocked is not None:
+                if (
+                    not isinstance(unlocked, Decimal)
+                    or not unlocked.is_finite()
+                    or unlocked < 0
+                ):
+                    raise AccountAuditError(
+                        "account order intent unlocked_episode_loss is invalid"
+                    )
+                max_unlocked_contexts[context_sequence] = max(
+                    max_unlocked_contexts.get(context_sequence, _ZERO),
+                    unlocked,
+                )
+            if intent_context.kind is OrderIntentKind.ACTIVE_EXIT:
+                active_attempt_contexts.setdefault(
+                    context_sequence, set()
+                ).add(order_id)
+            if intent_context.entered_inventory_hold or (
+                intent_context.exit_stage is not None
+                and intent_context.exit_stage.value == "inventory_hold"
+            ):
+                inventory_hold_contexts.add(context_sequence)
         page_trade_ids = {
             str(getattr(trade, "id", "") or "") for trade in trades
         }
@@ -414,16 +559,22 @@ class SessionEconomics:
         projected_position = self.ledger_position
         episode_sequence = self._episode_sequence
         known_orders = dict(self._order_role_bindings)
+        known_intents = dict(self._order_intent_bindings)
+        episode_inventory_id = self._episode_inventory_episode_id
         episode_order_ids = set(self._episode_order_ids)
         pinned_order_ids = (
             page_order_ids | set(open_order_ids) | episode_order_ids
         )
         role_binding_evictions = 0
-        classified_fills: list[tuple[_Fill, dict[str, Any]]] = []
+        classified_fills: list[
+            tuple[_Fill, dict[str, Any], OrderIntentMetadata | None, bool]
+        ] = []
         for fill in new_fills:
             prior_position = projected_position
             next_position = prior_position + fill.signed_amount
             position_flip = prior_position * next_position < 0
+            if prior_position == 0:
+                episode_inventory_id = None
             if fill.active_unwind:
                 if prior_position == 0:
                     raise AccountAuditError(
@@ -473,6 +624,7 @@ class SessionEconomics:
                             "account order attribution registry exhausted"
                         )
                     known_orders.pop(candidate)
+                    known_intents.pop(candidate, None)
                     role_binding_evictions += 1
                 if prior_position == 0:
                     episode_sequence += 1
@@ -495,6 +647,99 @@ class SessionEconomics:
                     fill_episode_sequence,
                     fill.active_unwind,
                 )
+
+            provided_intent = None
+            if fill.order_id in order_intent_contexts:
+                provided_intent = order_intent_contexts[fill.order_id]
+                if not isinstance(provided_intent, OrderIntentMetadata):
+                    raise AccountAuditError(
+                        "account order intent context is invalid"
+                    )
+            bound_intent = known_intents.get(fill.order_id)
+            if (
+                bound_intent is not None
+                and provided_intent is not None
+                and bound_intent != provided_intent
+            ):
+                raise AccountAuditError(
+                    "account order intent changed across partial fills"
+                )
+            intent = bound_intent or provided_intent
+            if intent is not None:
+                known_intents[fill.order_id] = intent
+                expected_intents = (
+                    {
+                        OrderIntentKind.BASE_ENTRY,
+                        OrderIntentKind.CONTROLLER_ENTRY,
+                    }
+                    if role in {"entry", "risk_increasing"}
+                    else {
+                        OrderIntentKind.ACTIVE_EXIT
+                        if role == "active_exit"
+                        else OrderIntentKind.PASSIVE_EXIT
+                    }
+                )
+                if intent.kind not in expected_intents:
+                    raise AccountAuditError(
+                        "account order intent conflicts with authenticated fill role"
+                    )
+                if fill.active_unwind != (
+                    intent.kind is OrderIntentKind.ACTIVE_EXIT
+                ):
+                    raise AccountAuditError(
+                        "account order intent conflicts with active unwind lane"
+                    )
+                authenticated_sequence = (
+                    intent.authenticated_episode_sequence
+                )
+                if authenticated_sequence is not None and (
+                    type(authenticated_sequence) is not int
+                    or authenticated_sequence != fill_episode_sequence
+                ):
+                    raise AccountAuditError(
+                        "account order intent conflicts with authenticated episode"
+                    )
+                inventory_episode_id = intent.inventory_episode_id
+                if inventory_episode_id is not None:
+                    if type(inventory_episode_id) is not int:
+                        raise AccountAuditError(
+                            "account order intent inventory episode is invalid"
+                        )
+                    if (
+                        episode_inventory_id is not None
+                        and inventory_episode_id != episode_inventory_id
+                    ):
+                        raise AccountAuditError(
+                            "account order intent changed inventory episode"
+                        )
+                    episode_inventory_id = inventory_episode_id
+
+                for field_name in (
+                    "available_completed_surplus",
+                    "surplus_reserve",
+                    "unlocked_episode_loss",
+                    "allowed_passive_loss",
+                ):
+                    policy_value = getattr(intent, field_name)
+                    if policy_value is not None and (
+                        not isinstance(policy_value, Decimal)
+                        or not policy_value.is_finite()
+                        or policy_value < 0
+                    ):
+                        raise AccountAuditError(
+                            f"account order intent {field_name} is invalid"
+                        )
+
+            context_complete = intent is not None
+            if intent is not None and role in {"passive_exit", "active_exit"}:
+                context_complete &= (
+                    intent.authenticated_episode_sequence
+                    == fill_episode_sequence
+                    and intent.inventory_episode_id is not None
+                    and intent.policy_decision_id is not None
+                    and intent.exit_stage is not None
+                    and intent.binding_constraint is not None
+                )
             if prior_position == 0:
                 episode_order_ids.clear()
             episode_order_ids.add(fill.order_id)
@@ -510,20 +755,152 @@ class SessionEconomics:
                 "exchange_timestamp": fill.sort_key[0],
                 "active_unwind": fill.active_unwind,
                 "position_flip": position_flip,
+                "intent_kind": (
+                    intent.kind.value if intent is not None else None
+                ),
+                "policy_decision_id": (
+                    intent.policy_decision_id if intent is not None else None
+                ),
+                "exit_stage": (
+                    intent.exit_stage.value
+                    if intent is not None and intent.exit_stage is not None
+                    else None
+                ),
+                "binding_constraint": (
+                    intent.binding_constraint.value
+                    if intent is not None
+                    and intent.binding_constraint is not None
+                    else None
+                ),
+                "controller_decision_id": (
+                    intent.controller_decision_id
+                    if intent is not None
+                    else None
+                ),
             }
-            classified_fills.append((fill, attribution))
+            classified_fills.append(
+                (fill, attribution, intent, context_complete)
+            )
             projected_position = next_position
             if next_position == 0:
                 episode_order_ids.clear()
+                episode_inventory_id = None
 
-        for fill, attribution in classified_fills:
+        def merge_policy_observation() -> None:
+            if episode_policy_observation is None:
+                return
+            self._episode_entered_inventory_hold = bool(
+                self._episode_entered_inventory_hold
+                or episode_policy_observation.entered_inventory_hold
+            )
+            self._episode_active_attempt_count = max(
+                self._episode_active_attempt_count,
+                episode_policy_observation.active_attempts,
+            )
+            self._episode_max_unlocked_loss = max(
+                self._episode_max_unlocked_loss,
+                episode_policy_observation.max_unlocked_episode_loss,
+            )
+            self._episode_policy_observation_seen = True
+
+        if (
+            episode_policy_observation is not None
+            and self._episode_sequence
+            == episode_policy_observation.authenticated_episode_sequence
+        ):
+            merge_policy_observation()
+
+        if self._episode_sequence in max_unlocked_contexts:
+            self._episode_max_unlocked_loss = max(
+                self._episode_max_unlocked_loss,
+                max_unlocked_contexts[self._episode_sequence],
+            )
+        for fill, attribution, intent, context_complete in classified_fills:
             prior_position = attribution["prior_position"]
             next_position = attribution["next_position"]
             if prior_position == 0:
                 self._episode_entry_side = fill.side.value
                 self._episode_opened_at = fill.sort_key[0]
+                self._episode_entry_turnover = _ZERO
+                self._episode_entry_quantity = _ZERO
+                self._episode_entry_fee = _ZERO
+                self._episode_exit_turnover = _ZERO
+                self._episode_exit_quantity = _ZERO
+                self._episode_active_attempt_order_ids.clear()
+                self._episode_vwap_complete = True
+                self._episode_close_policy_coverage = True
+                self._episode_final_exit_stage = None
+                self._episode_final_binding_constraint = None
+                self._episode_entered_inventory_hold = None
+                self._episode_max_unlocked_loss = _ZERO
+                self._episode_passive_exit_net = _ZERO
+                self._episode_passive_exit_quantity = _ZERO
+                self._episode_surplus_funded_passive_net = _ZERO
+                self._episode_surplus_funded_passive_quantity = _ZERO
+                self._episode_active_attempt_count = 0
+                self._episode_policy_observation_seen = False
             self.ledger_position = next_position
             self._episode_sequence = attribution["episode_sequence"]
+            if (
+                episode_policy_observation is not None
+                and self._episode_sequence
+                == episode_policy_observation.authenticated_episode_sequence
+            ):
+                merge_policy_observation()
+            self._episode_active_attempt_order_ids.update(
+                active_attempt_contexts.get(self._episode_sequence, ())
+            )
+            self._episode_active_attempt_count = max(
+                self._episode_active_attempt_count,
+                active_attempt_counts.get(self._episode_sequence, 0),
+            )
+            if self._episode_sequence in inventory_hold_contexts:
+                self._episode_entered_inventory_hold = True
+            if self._episode_sequence in max_unlocked_contexts:
+                self._episode_max_unlocked_loss = max(
+                    self._episode_max_unlocked_loss,
+                    max_unlocked_contexts[self._episode_sequence],
+                )
+            if intent is None:
+                self.policy_context_missing_count += 1
+            self._episode_close_policy_coverage &= context_complete
+            if attribution["position_flip"]:
+                self._episode_vwap_complete = False
+            if attribution["role"] in {"entry", "risk_increasing"}:
+                self._episode_entry_turnover += fill.turnover
+                self._episode_entry_quantity += fill.amount
+                self._episode_entry_fee += fill.fee
+            else:
+                self._episode_exit_turnover += fill.turnover
+                self._episode_exit_quantity += fill.amount
+                self._episode_final_exit_stage = attribution["exit_stage"]
+                self._episode_final_binding_constraint = attribution[
+                    "binding_constraint"
+                ]
+                if attribution["role"] == "passive_exit":
+                    passive_net = fill.gross - fill.fee
+                    self._episode_passive_exit_net += passive_net
+                    self._episode_passive_exit_quantity += fill.amount
+                    if (
+                        attribution["exit_stage"]
+                        == "surplus_funded_passive"
+                    ):
+                        self._episode_surplus_funded_passive_net += passive_net
+                        self._episode_surplus_funded_passive_quantity += (
+                            fill.amount
+                        )
+            if fill.active_unwind:
+                self._episode_active_attempt_order_ids.add(fill.order_id)
+            if attribution["exit_stage"] == "inventory_hold":
+                self._episode_entered_inventory_hold = True
+            if (
+                intent is not None
+                and intent.unlocked_episode_loss is not None
+            ):
+                self._episode_max_unlocked_loss = max(
+                    self._episode_max_unlocked_loss,
+                    intent.unlocked_episode_loss,
+                )
             self.authenticated_fill_attributions.append(attribution)
             del self.authenticated_fill_attributions[
                 :-_AUTHENTICATED_FILL_LEDGER_LIMIT
@@ -546,11 +923,68 @@ class SessionEconomics:
             self._episode_gross += fill.gross
             self._episode_active_unwind_used |= fill.active_unwind
             if next_position == 0:
+                vwap_complete = (
+                    self._episode_vwap_complete
+                    and self._episode_entry_quantity > 0
+                    and self._episode_entry_quantity
+                    == self._episode_exit_quantity
+                )
+                entry_vwap = (
+                    self._episode_entry_turnover
+                    / self._episode_entry_quantity
+                    if vwap_complete
+                    else None
+                )
+                exit_vwap = (
+                    self._episode_exit_turnover
+                    / self._episode_exit_quantity
+                    if vwap_complete
+                    else None
+                )
+                quantity = (
+                    self._episode_entry_quantity if vwap_complete else None
+                )
+                inventory_duration_seconds = (
+                    _inventory_duration_seconds(
+                        self._episode_opened_at, fill.sort_key[0]
+                    )
+                    if self._episode_opened_at is not None
+                    else None
+                )
                 self.completed_round_trips += 1
                 self.completed_fills += self._episode_fills
                 self.completed_turnover += self._episode_turnover
                 self.completed_exact_fee += self._episode_fee
                 self.completed_gross += self._episode_gross
+                entry_quantity = self._episode_entry_quantity
+                passive_entry_fee = (
+                    self._episode_entry_fee
+                    * min(
+                        _ONE,
+                        self._episode_passive_exit_quantity
+                        / entry_quantity,
+                    )
+                    if entry_quantity > 0
+                    else _ZERO
+                )
+                surplus_entry_fee = (
+                    self._episode_entry_fee
+                    * min(
+                        _ONE,
+                        self._episode_surplus_funded_passive_quantity
+                        / entry_quantity,
+                    )
+                    if entry_quantity > 0
+                    else _ZERO
+                )
+                passive_loss_used = max(
+                    _ZERO,
+                    -(self._episode_passive_exit_net - passive_entry_fee),
+                )
+                policy_coverage = (
+                    self._episode_close_policy_coverage
+                    and self._episode_policy_observation_seen
+                )
                 self.completed_episode_ledger.append(
                     {
                         "session_id": self.session_id,
@@ -571,6 +1005,45 @@ class SessionEconomics:
                             if fill.active_unwind
                             else "maker_flat"
                         ),
+                        "entry_vwap": entry_vwap,
+                        "exit_vwap": exit_vwap,
+                        "quantity": quantity,
+                        "inventory_duration_seconds": (
+                            inventory_duration_seconds
+                        ),
+                        "final_exit_stage": self._episode_final_exit_stage,
+                        "final_binding_constraint": (
+                            self._episode_final_binding_constraint
+                        ),
+                        "surplus_spent": (
+                            max(
+                                _ZERO,
+                                -(
+                                    self._episode_surplus_funded_passive_net
+                                    - surplus_entry_fee
+                                ),
+                            )
+                            if policy_coverage
+                            else None
+                        ),
+                        "passive_loss_used": (
+                            passive_loss_used if policy_coverage else None
+                        ),
+                        "max_unlocked_episode_loss": (
+                            self._episode_max_unlocked_loss
+                            if policy_coverage
+                            else None
+                        ),
+                        "entered_inventory_hold": (
+                            self._episode_entered_inventory_hold
+                        ),
+                        "active_attempts": max(
+                            self._episode_active_attempt_count,
+                            len(self._episode_active_attempt_order_ids),
+                        ),
+                        "close_policy_coverage": (
+                            policy_coverage
+                        ),
                     }
                 )
                 del self.completed_episode_ledger[
@@ -582,14 +1055,34 @@ class SessionEconomics:
                 self._episode_fee = _ZERO
                 self._episode_taker_fee = _ZERO
                 self._episode_gross = _ZERO
+                self._episode_entry_turnover = _ZERO
+                self._episode_entry_quantity = _ZERO
+                self._episode_entry_fee = _ZERO
+                self._episode_exit_turnover = _ZERO
+                self._episode_exit_quantity = _ZERO
                 self._episode_entry_side = None
                 self._episode_opened_at = None
                 self._episode_active_unwind_used = False
+                self._episode_active_attempt_order_ids.clear()
+                self._episode_vwap_complete = True
+                self._episode_close_policy_coverage = True
+                self._episode_final_exit_stage = None
+                self._episode_final_binding_constraint = None
+                self._episode_entered_inventory_hold = None
+                self._episode_max_unlocked_loss = _ZERO
+                self._episode_passive_exit_net = _ZERO
+                self._episode_passive_exit_quantity = _ZERO
+                self._episode_surplus_funded_passive_net = _ZERO
+                self._episode_surplus_funded_passive_quantity = _ZERO
+                self._episode_active_attempt_count = 0
+                self._episode_policy_observation_seen = False
 
         self.seen_trade_ids = projected_seen_ids
         self._seen_trade_id_order = projected_seen_order
         self.seen_trade_id_evictions += trade_id_evictions
         self._order_role_bindings = known_orders
+        self._order_intent_bindings = known_intents
+        self._episode_inventory_episode_id = episode_inventory_id
         self._episode_order_ids = episode_order_ids
         self.order_role_binding_evictions += role_binding_evictions
         if new_fills:
@@ -762,6 +1255,8 @@ class SessionEconomics:
                 dict(attribution)
                 for attribution in self.authenticated_fill_attributions
             ],
+            "policy_context_missing_count": self.policy_context_missing_count,
+            "episode_sequence": self._episode_sequence,
             "seen_trade_id_registry_size": len(self.seen_trade_ids),
             "seen_trade_id_evictions": self.seen_trade_id_evictions,
             "order_role_binding_registry_size": len(
@@ -877,6 +1372,8 @@ class MarketMakerAccountMonitor:
         *,
         active_unwind_order_ids: set[str] | frozenset[str] = frozenset(),
         terminal_order_ids: set[str] | frozenset[str] = frozenset(),
+        order_intent_contexts: Mapping[str, OrderIntentMetadata] | None = None,
+        episode_policy_observation: EpisodePolicyObservation | None = None,
     ) -> None:
         if self.economics is None:
             raise AccountAuditError("account monitor is not initialized")
@@ -897,6 +1394,8 @@ class MarketMakerAccountMonitor:
                 active_unwind_order_ids=active_unwind_order_ids,
                 open_order_ids=snapshot["open_order_ids"],
                 terminal_order_ids=terminal_order_ids,
+                order_intent_contexts=order_intent_contexts,
+                episode_policy_observation=episode_policy_observation,
                 allow_unreported_zero_integrator_fee=(
                     _has_zero_integrator_fee_signing_proof(self.adapter)
                 ),

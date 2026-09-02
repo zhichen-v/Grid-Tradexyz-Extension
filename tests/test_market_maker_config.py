@@ -34,6 +34,10 @@ market_maker:
   soft_exit_after_seconds: 120
   soft_exit_net_turnover_bps: "-5.0"
   soft_exit_surplus_reserve_bps: "0.03"
+  toxicity_apply_bid: true
+  toxicity_apply_ask: false
+  toxicity_outward_reprice_threshold_ticks: 2
+  toxicity_outward_reprice_min_interval_ms: 6000
 """
         )
 
@@ -47,6 +51,10 @@ market_maker:
         self.assertEqual(
             config.soft_exit_surplus_reserve_bps, Decimal("0.03")
         )
+        self.assertTrue(config.toxicity_apply_bid)
+        self.assertFalse(config.toxicity_apply_ask)
+        self.assertEqual(config.toxicity_outward_reprice_threshold_ticks, 2)
+        self.assertEqual(config.toxicity_outward_reprice_min_interval_ms, 6000)
 
     def test_example_yaml_loads_with_all_rollout_defaults_safe(self) -> None:
         path = (
@@ -62,15 +70,26 @@ market_maker:
         self.assertFalse(config.active_unwind_enabled)
         self.assertEqual(config.quote_controller_mode, "fixed")
         self.assertEqual(config.quote_controller_type, "toxicity_v1")
+        self.assertFalse(config.toxicity_apply_bid)
+        self.assertFalse(config.toxicity_apply_ask)
+        self.assertEqual(config.toxicity_outward_reprice_threshold_ticks, 1)
+        self.assertEqual(config.toxicity_outward_reprice_min_interval_ms, 5000)
 
     def test_quote_controller_defaults_and_valid_active_policy(self) -> None:
         fixed = MarketMakerConfig()
         self.assertEqual(fixed.quote_controller_mode, "fixed")
         self.assertEqual(fixed.toxicity_widen_start_ticks, Decimal("0"))
         self.assertFalse(fixed.toxicity_use_markout_feedback)
+        self.assertFalse(fixed.toxicity_apply_bid)
+        self.assertFalse(fixed.toxicity_apply_ask)
+
+        shadow = MarketMakerConfig(quote_controller_mode="shadow")
+        self.assertFalse(shadow.toxicity_apply_bid)
+        self.assertFalse(shadow.toxicity_apply_ask)
 
         active = MarketMakerConfig(
             quote_controller_mode="active",
+            toxicity_apply_bid=True,
             toxicity_min_signal_ticks="0.5",
             toxicity_widen_start_ticks="1",
             toxicity_max_extra_spread_ticks=3,
@@ -79,6 +98,15 @@ market_maker:
         )
         self.assertEqual(active.toxicity_widen_start_ticks, Decimal("1"))
         self.assertEqual(active.toxicity_block_threshold_ticks, Decimal("4"))
+
+        both_sides = MarketMakerConfig(
+            quote_controller_mode="active",
+            toxicity_apply_bid=True,
+            toxicity_apply_ask=True,
+            toxicity_max_extra_spread_ticks=1,
+        )
+        self.assertTrue(both_sides.toxicity_apply_bid)
+        self.assertTrue(both_sides.toxicity_apply_ask)
 
     def test_quote_controller_rejects_unsafe_or_unknown_configuration(self) -> None:
         invalid_cases = (
@@ -97,6 +125,7 @@ market_maker:
             (
                 {
                     "quote_controller_mode": "active",
+                    "toxicity_apply_bid": True,
                     "toxicity_max_extra_spread_ticks": 1,
                     "toxicity_use_markout_feedback": True,
                 },
@@ -110,7 +139,24 @@ market_maker:
                 },
                 "resume < widen_start < block",
             ),
-            ({"quote_controller_mode": "active"}, "widening or blocking"),
+            (
+                {
+                    "quote_controller_mode": "active",
+                    "toxicity_apply_bid": True,
+                },
+                "widening or blocking",
+            ),
+            (
+                {
+                    "quote_controller_mode": "active",
+                    "toxicity_max_extra_spread_ticks": 1,
+                },
+                "at least one enabled side",
+            ),
+            ({"toxicity_apply_bid": "false"}, "boolean"),
+            ({"toxicity_apply_ask": 1}, "boolean"),
+            ({"toxicity_outward_reprice_threshold_ticks": 0}, "integer >= 1"),
+            ({"toxicity_outward_reprice_min_interval_ms": 0}, "integer >= 1"),
             ({"toxicity_use_markout_feedback": "false"}, "boolean"),
         )
         for values, message in invalid_cases:

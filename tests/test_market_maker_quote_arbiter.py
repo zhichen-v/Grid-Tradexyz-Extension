@@ -13,6 +13,7 @@ from core.services.market_maker.models import (
     DesiredOrder,
     DesiredQuotes,
     MarketMetadata,
+    OrderIntentKind,
     PositionSnapshot,
     RuntimeState,
 )
@@ -123,8 +124,9 @@ class QuoteArbiterTests(unittest.TestCase):
 
     def test_active_widens_outward_without_changing_size_or_quote_metadata(self) -> None:
         base = self.base()
+        decision = self.decision()
 
-        applied = self.apply(base, self.decision())
+        applied = self.apply(base, decision)
 
         self.assertEqual(applied.bid.price, Decimal("99.7"))
         self.assertEqual(applied.ask.price, Decimal("100.4"))
@@ -136,6 +138,41 @@ class QuoteArbiterTests(unittest.TestCase):
         self.assertEqual(applied.reservation_price, base.reservation_price)
         self.assertEqual(applied.half_spread, base.half_spread)
         self.assertIn("controller=toxicity_v1", applied.reason)
+        self.assertEqual(
+            applied.bid.intent.kind, OrderIntentKind.CONTROLLER_ENTRY
+        )
+        self.assertEqual(applied.bid.intent.revision, decision.decision_id)
+        self.assertEqual(
+            applied.bid.intent.controller_decision_id,
+            decision.decision_id,
+        )
+        self.assertTrue(applied.bid.intent.controller_outward_only)
+        self.assertEqual(
+            applied.bid.intent.controller_extra_spread_ticks, 2
+        )
+        self.assertEqual(
+            applied.ask.intent.controller_extra_spread_ticks, 3
+        )
+
+    def test_active_applies_only_enabled_side_and_preserves_other_base(self) -> None:
+        base = self.base()
+        decision = replace(
+            self.decision(),
+            ask=SideQuoteAdjustment(blocked=True),
+        )
+
+        applied = self.apply(
+            base,
+            decision,
+            context=QuoteArbiterContext(apply_bid=True, apply_ask=False),
+        )
+
+        self.assertEqual(applied.bid.price, Decimal("99.7"))
+        self.assertEqual(
+            applied.bid.intent.kind, OrderIntentKind.CONTROLLER_ENTRY
+        )
+        self.assertIs(applied.ask, base.ask)
+        self.assertEqual(applied.controller_blocked_sides, frozenset())
 
     def test_active_blocks_a_side_and_never_adds_a_missing_side(self) -> None:
         base = self.base(ask=False)
@@ -148,6 +185,10 @@ class QuoteArbiterTests(unittest.TestCase):
 
         self.assertIsNone(applied.bid)
         self.assertIsNone(applied.ask)
+        self.assertEqual(
+            applied.controller_blocked_sides,
+            frozenset({OrderSide.BUY}),
+        )
 
     def test_nonflat_position_bypasses_even_invalid_active_decision(self) -> None:
         base = self.base(reduce_only=True)

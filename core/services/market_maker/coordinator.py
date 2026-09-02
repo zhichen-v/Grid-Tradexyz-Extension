@@ -5,6 +5,7 @@ import inspect
 import logging
 import math
 import time
+from collections.abc import Mapping
 from collections import deque
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
@@ -30,13 +31,19 @@ from .inventory_unwind import InventoryEpisodeExecutor
 from .market_features import MarketFeatureStore, build_external_book_view
 from .metrics import MarketMakerMetrics
 from .models import (
+    EpisodePolicyObservation,
     MarketMetadata,
     MarketSnapshot,
+    OrderIntentKind,
+    OrderIntentMetadata,
     OrderSlotState,
     PositionSnapshot,
     RuntimeState,
 )
-from .order_manager import MarketMakerOrderManager
+from .order_manager import (
+    MarketMakerOrderManager,
+    ReconcileActionCause,
+)
 from .quote_arbiter import (
     QuoteArbiterContext,
     apply_entry_controller,
@@ -807,7 +814,9 @@ class MarketMakerCoordinator:
                 ),
                 normal_passive_price=self._normal_passive_unwind_price(desired),
             )
-            self.metrics.inventory_unwind = unwind.snapshot()
+            self.metrics.record_inventory_unwind(
+                unwind.snapshot(), now=now
+            )
             if unwind.blocked:
                 if unwind.budget_blocked:
                     self.metrics.increment("episode_cap_blocked")
@@ -869,6 +878,68 @@ class MarketMakerCoordinator:
                         bid=None,
                         ask=None,
                         reason=unwind.reason,
+                    )
+                elif self._position.signed_size != 0:
+                    policy_decision_id = int(
+                        getattr(unwind, "policy_decision_id", 0) or 0
+                    )
+                    exit_intent = OrderIntentMetadata(
+                        kind=OrderIntentKind.PASSIVE_EXIT,
+                        revision=policy_decision_id,
+                        inventory_episode_id=getattr(
+                            unwind, "episode_id", None
+                        ),
+                        authenticated_episode_sequence=(
+                            getattr(
+                                unwind,
+                                "authenticated_episode_sequence",
+                                None,
+                            )
+                        ),
+                        exit_stage=getattr(unwind, "exit_stage", None),
+                        policy_decision_id=(
+                            policy_decision_id or None
+                        ),
+                        binding_constraint=getattr(
+                            unwind, "binding_constraint", None
+                        ),
+                        available_completed_surplus=(
+                            getattr(
+                                unwind,
+                                "available_completed_surplus",
+                                None,
+                            )
+                        ),
+                        surplus_reserve=getattr(
+                            unwind, "surplus_reserve", None
+                        ),
+                        unlocked_episode_loss=getattr(
+                            unwind, "unlocked_episode_loss", None
+                        ),
+                        allowed_passive_loss=getattr(
+                            unwind, "allowed_passive_loss", None
+                        ),
+                        entered_inventory_hold=bool(
+                            getattr(unwind, "entered_inventory_hold", False)
+                        ),
+                        active_attempts=int(
+                            getattr(unwind, "active_attempts", 0) or 0
+                        ),
+                    )
+                    desired = replace(
+                        desired,
+                        bid=(
+                            replace(desired.bid, intent=exit_intent)
+                            if desired.bid is not None
+                            and desired.bid.reduce_only
+                            else desired.bid
+                        ),
+                        ask=(
+                            replace(desired.ask, intent=exit_intent)
+                            if desired.ask is not None
+                            and desired.ask.reduce_only
+                            else desired.ask
+                        ),
                     )
                 result = await self.order_manager.reconcile(desired, risk)
             if active_lane and unwind.active_order is not None:
@@ -1287,7 +1358,10 @@ class MarketMakerCoordinator:
                     if callable(snapshotter):
                         execution = snapshotter()
                         if isinstance(execution, dict):
-                            self.metrics.inventory_unwind = dict(execution)
+                            self.metrics.record_inventory_unwind(
+                                execution,
+                                now=self._monotonic(),
+                            )
 
     async def _audit_account_current_state(self) -> None:
         managed_ids = self._managed_order_id_snapshot()
@@ -1307,6 +1381,44 @@ class MarketMakerCoordinator:
             audit_options["active_unwind_order_ids"] = active_ids
         if terminal_ids:
             audit_options["terminal_order_ids"] = terminal_ids
+        intent_contexts: dict[str, OrderIntentMetadata] = {}
+        for source_name in (
+            "terminal_order_intent_contexts",
+            "order_intent_contexts",
+        ):
+            source = getattr(self.order_manager, source_name, {})
+            if not isinstance(source, Mapping):
+                raise AccountAuditError(
+                    f"order manager {source_name} is unavailable"
+                )
+            for order_id, intent in source.items():
+                if not isinstance(order_id, str) or not order_id:
+                    raise AccountAuditError("order intent id is invalid")
+                if not isinstance(intent, OrderIntentMetadata):
+                    raise AccountAuditError("order intent metadata is invalid")
+                previous = intent_contexts.get(order_id)
+                if previous is not None and previous != intent:
+                    raise AccountAuditError(
+                        "live and terminal order intent metadata conflict"
+                    )
+                intent_contexts[order_id] = intent
+        if intent_contexts:
+            audit_options["order_intent_contexts"] = intent_contexts
+        policy_observer = getattr(
+            self.inventory_executor, "policy_observation", None
+        )
+        if callable(policy_observer):
+            policy_observation = policy_observer()
+            if policy_observation is not None:
+                if not isinstance(
+                    policy_observation, EpisodePolicyObservation
+                ):
+                    raise AccountAuditError(
+                        "inventory episode policy observation is invalid"
+                    )
+                audit_options["episode_policy_observation"] = (
+                    policy_observation
+                )
         await self.account_monitor.audit(managed_ids, **audit_options)
         self._audited_fill_generation = self._processed_fill_generation
 
@@ -1611,6 +1723,37 @@ class MarketMakerCoordinator:
     def _record_reconcile_actions(self, actions: Iterable[Any]) -> None:
         for action in actions:
             operation = getattr(action, "operation", "")
+            cause = getattr(
+                action, "cause", ReconcileActionCause.NORMAL
+            )
+            success = getattr(action, "success", None)
+            if cause is ReconcileActionCause.CONTROLLER_PROTECTIVE:
+                if operation == "cancel":
+                    self.metrics.increment(
+                        "controller_protective_cancel_attempts"
+                    )
+                    if success is True:
+                        self.metrics.increment(
+                            "controller_protective_cancel_success"
+                        )
+                elif operation == "place" and success is True:
+                    self.metrics.increment("controller_protective_reprices")
+                elif operation in {"deferred", "blocked"}:
+                    self.metrics.increment(
+                        "controller_protective_reprice_deferred"
+                    )
+            elif (
+                cause is ReconcileActionCause.CONTROLLER_BLOCK
+                and operation == "cancel"
+                and success is True
+            ):
+                self.metrics.increment("controller_block_cancels")
+            elif (
+                cause is ReconcileActionCause.CONTROLLER_RESUME
+                and operation == "place"
+                and success is True
+            ):
+                self.metrics.increment("controller_resume_creates")
             if operation == "place":
                 self.metrics.increment("create_attempts")
                 if getattr(action, "success", None) is True:
@@ -1645,6 +1788,9 @@ class MarketMakerCoordinator:
 
     def _update_live_metrics(self, orders: Iterable[Any]) -> None:
         live = tuple(orders)
+        self.metrics.sync_controller_live_orders(
+            live, now=self._monotonic()
+        )
         buys = tuple(order for order in live if order.side is OrderSide.BUY)
         sells = tuple(order for order in live if order.side is OrderSide.SELL)
         self.metrics.live_buy_remaining = sum(
@@ -2073,6 +2219,12 @@ class MarketMakerCoordinator:
             inventory_unwind_active=context.inventory_unwind_active,
             active_unwind_pending=context.active_unwind_pending,
             active_unwind_ready=context.active_unwind_ready,
+            apply_bid=(
+                True if mode == "shadow" else self.config.toxicity_apply_bid
+            ),
+            apply_ask=(
+                True if mode == "shadow" else self.config.toxicity_apply_ask
+            ),
         )
         entry_applicable = (
             arbiter_context.ordinary_flat_entry
@@ -2208,7 +2360,7 @@ class MarketMakerCoordinator:
         self.metrics.apply_authenticated_fill_attributions(
             snapshot.get("authenticated_fill_attributions", ())
         )
-        self.metrics.account_audit = snapshot
+        self.metrics.record_account_audit(snapshot)
 
     def _trusted_soft_exit_economics(
         self, now: float

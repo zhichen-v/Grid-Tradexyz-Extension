@@ -6,7 +6,7 @@ import math
 from typing import Any, Iterable
 from uuid import uuid4
 
-from .models import RuntimeState
+from .models import OrderIntentKind, OrderSlotState, RuntimeState
 
 
 _TEN_THOUSAND = Decimal("10000")
@@ -17,6 +17,7 @@ _ATTRIBUTION_LIMIT = 500
 _ATTRIBUTION_CONFLICT_LIMIT = _ATTRIBUTION_LIMIT + _MARKOUT_EVENT_LIMIT
 _CONTROLLER_HISTORY_LIMIT = 200
 _QUOTE_CONTEXT_LIMIT = 500
+_COMPLETED_EPISODE_METRIC_LIMIT = 500
 _FILL_ROLES = ("entry", "risk_increasing", "passive_exit", "active_exit")
 _ENTRY_FEEDBACK_HORIZONS = (5, 15)
 _ENTRY_FEEDBACK_SOURCES = frozenset(
@@ -80,6 +81,17 @@ def _default_counters() -> dict[str, int]:
             "would_active_unwind",
             "episode_cap_blocked",
             "markout_telemetry_errors",
+            "exit_stage_transition_count",
+            "strict_profit_exit_count",
+            "surplus_funded_exit_count",
+            "bounded_passive_loss_exit_count",
+            "active_exit_count",
+            "controller_protective_cancel_attempts",
+            "controller_protective_cancel_success",
+            "controller_protective_reprices",
+            "controller_protective_reprice_deferred",
+            "controller_block_cancels",
+            "controller_resume_creates",
         )
     }
 
@@ -142,6 +154,13 @@ class MarketMakerMetrics:
     controller_bid_blocked_seconds: float = 0.0
     controller_ask_blocked_seconds: float = 0.0
     controller_both_blocked_seconds: float = 0.0
+    inventory_hold_seconds: float = 0.0
+    controller_order_live_seconds_by_score: dict[str, float] = field(
+        default_factory=dict
+    )
+    controller_live_order_revisions: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
     controller_bid_extra_ticks: int = 0
     controller_ask_extra_ticks: int = 0
     controller_base_bid: Decimal | None = None
@@ -165,6 +184,13 @@ class MarketMakerMetrics:
     _controller_last_monotonic: float | None = None
     _controller_history_key: tuple[Any, ...] | None = None
     _controller_last_decision: dict[str, Any] | None = None
+    _controller_live_last_monotonic: float | None = None
+    _controller_live_scores: tuple[str, ...] = ()
+    _inventory_last_monotonic: float | None = None
+    _inventory_last_transition_sequence: int = 0
+    _counted_completed_episodes: dict[tuple[str, int], None] = field(
+        default_factory=dict
+    )
     _quote_context_by_order: dict[str, dict[str, Any]] = field(
         default_factory=dict
     )
@@ -183,6 +209,156 @@ class MarketMakerMetrics:
 
     def increment(self, name: str, amount: int = 1) -> None:
         self.counters[name] = self.counters.get(name, 0) + amount
+
+    def record_inventory_unwind(
+        self, snapshot: dict[str, Any], *, now: float
+    ) -> None:
+        self._accrue_inventory_hold(now)
+        self.inventory_unwind = dict(snapshot)
+        history = snapshot.get("stage_transition_history", ())
+        if not isinstance(history, (list, tuple)):
+            return
+        for transition in history:
+            if not isinstance(transition, dict):
+                continue
+            transition_sequence = transition.get("transition_sequence")
+            if (
+                type(transition_sequence) is not int
+                or transition_sequence <= 0
+            ):
+                continue
+            if transition_sequence <= self._inventory_last_transition_sequence:
+                continue
+            self.increment("exit_stage_transition_count")
+            self._inventory_last_transition_sequence = transition_sequence
+
+    def record_account_audit(self, snapshot: dict[str, Any]) -> None:
+        self.account_audit = dict(snapshot)
+        episodes = snapshot.get("completed_episode_ledger", ())
+        if not isinstance(episodes, (list, tuple)):
+            return
+        for episode in episodes:
+            if not isinstance(episode, dict):
+                continue
+            session_id = episode.get("session_id")
+            sequence = episode.get("episode_sequence")
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or type(sequence) is not int
+                or sequence <= 0
+            ):
+                continue
+            key = (session_id, sequence)
+            if key in self._counted_completed_episodes:
+                continue
+            self._counted_completed_episodes[key] = None
+            while (
+                len(self._counted_completed_episodes)
+                > _COMPLETED_EPISODE_METRIC_LIMIT
+            ):
+                self._counted_completed_episodes.pop(
+                    next(iter(self._counted_completed_episodes))
+                )
+            if episode.get("close_policy_coverage") is not True:
+                continue
+            counter = {
+                "strict_profit": "strict_profit_exit_count",
+                "surplus_funded_passive": "surplus_funded_exit_count",
+                "bounded_passive_loss": "bounded_passive_loss_exit_count",
+                "active_ioc": "active_exit_count",
+            }.get(episode.get("final_exit_stage"))
+            if counter is not None:
+                self.increment(counter)
+
+    def _accrue_inventory_hold(self, now: float) -> None:
+        if isinstance(now, bool) or not isinstance(now, (int, float)):
+            return
+        now_value = float(now)
+        if not math.isfinite(now_value):
+            return
+        previous = self._inventory_last_monotonic
+        if previous is None:
+            self._inventory_last_monotonic = now_value
+            return
+        if now_value < previous:
+            return
+        self._inventory_last_monotonic = now_value
+        if self.inventory_unwind.get("exit_stage") == "inventory_hold":
+            self.inventory_hold_seconds += now_value - previous
+
+    def sync_controller_live_orders(
+        self, orders: Iterable[Any], *, now: float
+    ) -> None:
+        self._accrue_controller_live_seconds(now)
+        revisions: dict[str, dict[str, Any]] = {}
+        scores: list[str] = []
+        for order in orders:
+            intent = getattr(order, "intent", None)
+            order_id = str(getattr(order, "order_id", "") or "")
+            if (
+                not order_id
+                or intent is None
+                or intent.kind is not OrderIntentKind.CONTROLLER_ENTRY
+                or getattr(order, "state", None)
+                not in {OrderSlotState.LIVE, OrderSlotState.PARTIALLY_FILLED}
+            ):
+                continue
+            context = self._quote_context_by_order.get(order_id, {})
+            score = context.get("toxicity_score_ticks")
+            score_key = None
+            if (
+                isinstance(score, Decimal)
+                and score.is_finite()
+                and score >= 0
+            ):
+                side_value = getattr(
+                    getattr(order, "side", None), "value", "unknown"
+                )
+                score_key = f"{side_value}:{self._controller_score_bin(score)}"
+                scores.append(score_key)
+            revisions[order_id] = {
+                "order_id": order_id,
+                "side": getattr(getattr(order, "side", None), "value", None),
+                "revision": intent.revision,
+                "controller_decision_id": intent.controller_decision_id,
+                "extra_spread_ticks": intent.controller_extra_spread_ticks,
+                "toxicity_score_ticks": score,
+            }
+        self.controller_live_order_revisions = revisions
+        self._controller_live_scores = tuple(scores)
+
+    @staticmethod
+    def _controller_score_bin(score: Decimal) -> str:
+        if score == 0:
+            return "0"
+        if score < 1:
+            return "(0,1)"
+        if score < 2:
+            return "[1,2)"
+        if score < 3:
+            return "[2,3)"
+        return "[3,+inf)"
+
+    def _accrue_controller_live_seconds(self, now: float) -> None:
+        if isinstance(now, bool) or not isinstance(now, (int, float)):
+            return
+        now_value = float(now)
+        if not math.isfinite(now_value):
+            return
+        previous = self._controller_live_last_monotonic
+        if previous is None:
+            self._controller_live_last_monotonic = now_value
+            return
+        if now_value < previous:
+            return
+        self._controller_live_last_monotonic = now_value
+        elapsed = now_value - previous
+        for score in self._controller_live_scores:
+            self.controller_order_live_seconds_by_score[score] = (
+                self.controller_order_live_seconds_by_score.get(score, 0.0)
+                + elapsed
+            )
 
     def _next_event_sequence(self) -> int:
         self._event_sequence += 1
@@ -876,6 +1052,8 @@ class MarketMakerMetrics:
 
     def snapshot(self, now: float) -> dict[str, Any]:
         self._accrue_controller_seconds(now)
+        self._accrue_inventory_hold(now)
+        self._accrue_controller_live_seconds(now)
         return {
             "runtime_state": self.runtime_state.value,
             "event_sequence_run_id": self._event_sequence_run_id,
@@ -939,6 +1117,17 @@ class MarketMakerMetrics:
             ),
             "controller_both_blocked_seconds": (
                 self.controller_both_blocked_seconds
+            ),
+            "inventory_hold_seconds": self.inventory_hold_seconds,
+            "controller_order_live_seconds_by_score": dict(
+                self.controller_order_live_seconds_by_score
+            ),
+            "controller_live_order_revisions": {
+                order_id: dict(revision)
+                for order_id, revision in self.controller_live_order_revisions.items()
+            },
+            "policy_context_missing_count": self.account_audit.get(
+                "policy_context_missing_count", 0
             ),
             "controller_bid_extra_ticks": self.controller_bid_extra_ticks,
             "controller_ask_extra_ticks": self.controller_ask_extra_ticks,

@@ -399,6 +399,7 @@ class MarketMakerLighterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "state": "healthy",
             "age_seconds": 0.5,
             "ledger_position": Decimal("-0.001"),
+            "episode_sequence": 1,
             "audited_position": Decimal("-0.001"),
             "audited_unrealized_pnl": Decimal("-0.0007"),
             "completed_net_ex_funding": Decimal("0"),

@@ -22,10 +22,13 @@ from core.services.market_maker.controllers import (
 )
 from core.services.market_maker.coordinator import MarketMakerCoordinator
 from core.services.market_maker.models import (
+    EpisodePolicyObservation,
     DesiredOrder,
     DesiredQuotes,
     MarketMetadata,
     MarketSnapshot,
+    OrderIntentKind,
+    OrderIntentMetadata,
     OrderSlotState,
     PositionSnapshot,
     RuntimeState,
@@ -33,6 +36,7 @@ from core.services.market_maker.models import (
 from core.services.market_maker.order_manager import (
     MarketMakerOrderManager,
     ReconcileAction,
+    ReconcileActionCause,
     ReconcileResult,
 )
 from core.services.market_maker.risk_manager import RiskDecision
@@ -353,6 +357,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "state": "healthy",
             "age_seconds": 0.5,
             "ledger_position": signed,
+            "episode_sequence": 1,
             "audited_position": signed,
             "audited_unrealized_pnl": Decimal("0"),
             "completed_turnover": Decimal("10"),
@@ -746,13 +751,76 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(
                     executor.evaluate.call_args.kwargs["stranded_soft_exit"]
                 )
-                order_manager.reconcile.assert_awaited_once_with(desired, risk)
+                applied, applied_risk = order_manager.reconcile.await_args.args
+                self.assertEqual(applied_risk, risk)
+                applied_exit = applied.bid or applied.ask
+                expected_exit = desired.bid or desired.ask
+                self.assertIsNotNone(applied_exit)
+                self.assertEqual(
+                    replace(applied_exit, intent=None),
+                    expected_exit,
+                )
+                self.assertIs(
+                    applied_exit.intent.kind,
+                    OrderIntentKind.PASSIVE_EXIT,
+                )
                 order_manager.cancel_managed_orders.assert_not_awaited()
                 order_manager.execute_active_unwind.assert_not_awaited()
                 self.assertEqual(
                     coordinator.metrics.inventory_unwind["state"],
                     "passive_wait",
                 )
+
+    async def test_unaudited_fill_generation_suppresses_exit_until_sequence_is_bound(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        snapshot = self.active_account_snapshot("0.2")
+        snapshot["episode_sequence"] = 1
+        monitor = SimpleNamespace(snapshot=Mock(return_value=snapshot))
+        coordinator = self.prepare_running(
+            config=self.active_unwind_config(active_unwind_enabled=False),
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        coordinator._account_monitor_initialized = True
+        coordinator._position = self.position(signed_size=Decimal("0.2"))
+        coordinator._processed_fill_generation = 1
+        coordinator._audited_fill_generation = 0
+        risk = replace(
+            self.risk(),
+            buy_amount=None,
+            sell_amount=Decimal("0.2"),
+            sell_reduce_only=True,
+            soft_exit_latched=True,
+            runtime_state=RuntimeState.RISK_REDUCTION,
+        )
+        exit_quotes = replace(
+            self.desired(),
+            bid=None,
+            ask=replace(self.desired().ask, reduce_only=True),
+            runtime_state=RuntimeState.RISK_REDUCTION,
+            reason="reduce inventory",
+        )
+        coordinator.risk_manager.evaluate.return_value = risk
+        coordinator.strategy.calculate_quotes.return_value = exit_quotes
+
+        await coordinator.run_one_cycle(force=True)
+
+        unaudited = manager.reconcile.await_args.args[0]
+        self.assertIsNone(unaudited.bid)
+        self.assertIsNone(unaudited.ask)
+        manager.reconcile.reset_mock()
+        coordinator._audited_fill_generation = 1
+
+        await coordinator.run_one_cycle(force=True)
+
+        audited = manager.reconcile.await_args.args[0]
+        self.assertIsNotNone(audited.ask)
+        self.assertEqual(
+            audited.ask.intent.authenticated_episode_sequence,
+            1,
+        )
 
     async def test_active_unwind_holds_stranded_quote_at_boundary_before_barrier(
         self,
@@ -1255,10 +1323,93 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             {"ioc-1"},
             active_unwind_order_ids=frozenset({"ioc-1"}),
             terminal_order_ids=frozenset({"ioc-1"}),
+            episode_policy_observation=EpisodePolicyObservation(
+                authenticated_episode_sequence=1,
+                entered_inventory_hold=True,
+                active_attempts=1,
+                max_unlocked_episode_loss=Decimal("0"),
+            ),
         )
         self.assertEqual(coordinator._processed_fill_generation, 1)
         self.assertEqual(coordinator._audited_fill_generation, 1)
         self.assertEqual(coordinator.metrics.counters["active_unwind_success"], 1)
+
+    async def test_account_audit_receives_merged_order_intent_contexts(
+        self,
+    ) -> None:
+        shared = OrderIntentMetadata(
+            kind=OrderIntentKind.CONTROLLER_ENTRY,
+            revision=2,
+        )
+        terminal = OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=3,
+        )
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"shared", "terminal"})
+        manager.terminal_order_ids = frozenset({"shared", "terminal"})
+        manager.order_intent_contexts = {"shared": shared}
+        manager.terminal_order_intent_contexts = {
+            "shared": shared,
+            "terminal": terminal,
+        }
+        monitor = SimpleNamespace(audit=AsyncMock())
+        coordinator = self.coordinator(
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+        observation = EpisodePolicyObservation(
+            authenticated_episode_sequence=1,
+            entered_inventory_hold=True,
+            active_attempts=1,
+            max_unlocked_episode_loss=Decimal("0.2"),
+        )
+        coordinator.inventory_executor = SimpleNamespace(
+            policy_observation=Mock(return_value=observation)
+        )
+
+        await coordinator._audit_account_current_state()
+
+        monitor.audit.assert_awaited_once_with(
+            {"shared", "terminal"},
+            terminal_order_ids=frozenset({"shared", "terminal"}),
+            order_intent_contexts={
+                "shared": shared,
+                "terminal": terminal,
+            },
+            episode_policy_observation=observation,
+        )
+
+    async def test_account_audit_rejects_conflicting_intent_contexts(
+        self,
+    ) -> None:
+        manager = self.order_manager()
+        manager.known_order_ids = frozenset({"order-1"})
+        manager.order_intent_contexts = {
+            "order-1": OrderIntentMetadata(
+                kind=OrderIntentKind.BASE_ENTRY,
+                revision=0,
+            )
+        }
+        manager.terminal_order_intent_contexts = {
+            "order-1": OrderIntentMetadata(
+                kind=OrderIntentKind.CONTROLLER_ENTRY,
+                revision=1,
+            )
+        }
+        monitor = SimpleNamespace(audit=AsyncMock())
+        coordinator = self.coordinator(
+            order_manager=manager,
+            account_monitor=monitor,
+        )
+
+        with self.assertRaisesRegex(
+            AccountAuditError,
+            "live and terminal order intent metadata conflict",
+        ):
+            await coordinator._audit_account_current_state()
+
+        monitor.audit.assert_not_awaited()
 
     async def test_stranded_soft_exit_guard_preserves_normal_band(self) -> None:
         cases = (
@@ -4377,6 +4528,56 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator.order_manager.reconcile.assert_awaited_once()
         coordinator.order_manager.cancel_managed_orders.assert_awaited_once()
 
+    async def test_controller_action_metrics_require_typed_causes(self) -> None:
+        coordinator = self.prepare_running()
+        coordinator._record_reconcile_actions(
+            (
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "cancel",
+                    "protective",
+                    success=True,
+                    cause=ReconcileActionCause.CONTROLLER_PROTECTIVE,
+                ),
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "place",
+                    "protective",
+                    success=True,
+                    cause=ReconcileActionCause.CONTROLLER_PROTECTIVE,
+                ),
+                ReconcileAction(
+                    OrderSide.BUY,
+                    "deferred",
+                    "protective",
+                    success=False,
+                    cause=ReconcileActionCause.CONTROLLER_PROTECTIVE,
+                ),
+                ReconcileAction(
+                    OrderSide.SELL,
+                    "cancel",
+                    "block",
+                    success=True,
+                    cause=ReconcileActionCause.CONTROLLER_BLOCK,
+                ),
+                ReconcileAction(
+                    OrderSide.SELL,
+                    "place",
+                    "resume",
+                    success=True,
+                    cause=ReconcileActionCause.CONTROLLER_RESUME,
+                ),
+            )
+        )
+
+        counters = coordinator.metrics.counters
+        self.assertEqual(counters["controller_protective_cancel_attempts"], 1)
+        self.assertEqual(counters["controller_protective_cancel_success"], 1)
+        self.assertEqual(counters["controller_protective_reprices"], 1)
+        self.assertEqual(counters["controller_protective_reprice_deferred"], 1)
+        self.assertEqual(counters["controller_block_cancels"], 1)
+        self.assertEqual(counters["controller_resume_creates"], 1)
+
     async def test_definitive_not_sent_action_is_retryable_not_reconcile_failure(
         self,
     ) -> None:
@@ -4605,6 +4806,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator = self.prepare_running(
             config=self.config(
                 quote_controller_mode="active",
+                toxicity_apply_bid=True,
                 toxicity_max_extra_spread_ticks=1,
             ),
             quote_controller=ready_controller,
@@ -4626,6 +4828,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         store = SimpleNamespace(update=Mock(return_value=feature))
         config = self.config(
             quote_controller_mode="active",
+            toxicity_apply_bid=True,
             toxicity_widen_start_ticks="1",
             toxicity_max_extra_spread_ticks=3,
         )
@@ -4649,6 +4852,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         store = SimpleNamespace(update=Mock(return_value=feature))
         config = self.config(
             quote_controller_mode="active",
+            toxicity_apply_bid=True,
             toxicity_widen_start_ticks="1",
             toxicity_max_extra_spread_ticks=3,
         )
@@ -4664,11 +4868,17 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(flat_applied.ask)
 
         exit_manager = self.order_manager()
+        exit_snapshot = self.active_account_snapshot("0.2")
+        exit_snapshot["episode_sequence"] = 1
         nonflat = self.prepare_running(
             config=config,
             order_manager=exit_manager,
+            account_monitor=SimpleNamespace(
+                snapshot=Mock(return_value=exit_snapshot)
+            ),
             market_feature_store=store,
         )
+        nonflat._account_monitor_initialized = True
         nonflat._position = self.position(signed_size=Decimal("0.2"))
         controller_evaluate = Mock(wraps=nonflat.quote_controller.evaluate)
         nonflat.quote_controller.evaluate = controller_evaluate
@@ -4684,8 +4894,18 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await nonflat.run_one_cycle(force=True)
 
         exit_applied = exit_manager.reconcile.await_args.args[0]
-        self.assertIs(exit_applied, exit_quotes)
+        self.assertEqual(
+            replace(
+                exit_applied,
+                ask=replace(exit_applied.ask, intent=None),
+            ),
+            exit_quotes,
+        )
         self.assertTrue(exit_applied.ask.reduce_only)
+        self.assertIs(
+            exit_applied.ask.intent.kind,
+            OrderIntentKind.PASSIVE_EXIT,
+        )
         self.assertTrue(
             controller_evaluate.call_args.args[0].inventory_unwind_active
         )
@@ -4700,6 +4920,7 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         config = self.config(
             quote_controller_mode="active",
+            toxicity_apply_bid=True,
             toxicity_widen_start_ticks="1",
             toxicity_max_extra_spread_ticks=3,
         )
@@ -4717,12 +4938,18 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flat.metrics.controller_error_count, 1)
 
         exit_manager = self.order_manager()
+        exit_snapshot = self.active_account_snapshot("-0.2")
+        exit_snapshot["episode_sequence"] = 1
         nonflat = self.prepare_running(
             config=config,
             order_manager=exit_manager,
+            account_monitor=SimpleNamespace(
+                snapshot=Mock(return_value=exit_snapshot)
+            ),
             quote_controller=broken,
             market_feature_store=store,
         )
+        nonflat._account_monitor_initialized = True
         nonflat._position = self.position(signed_size=Decimal("-0.2"))
         exit_quotes = replace(
             self.desired(),
@@ -4735,7 +4962,18 @@ class MarketMakerCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         await nonflat.run_one_cycle(force=True)
 
-        self.assertIs(exit_manager.reconcile.await_args.args[0], exit_quotes)
+        exit_applied = exit_manager.reconcile.await_args.args[0]
+        self.assertEqual(
+            replace(
+                exit_applied,
+                bid=replace(exit_applied.bid, intent=None),
+            ),
+            exit_quotes,
+        )
+        self.assertIs(
+            exit_applied.bid.intent.kind,
+            OrderIntentKind.PASSIVE_EXIT,
+        )
 
     async def test_successful_maker_create_records_order_quote_context(
         self,

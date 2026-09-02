@@ -6,7 +6,14 @@ from decimal import Decimal
 from ...adapters.exchanges.models import OrderSide
 from .config import is_step_aligned
 from .controllers.base import QuoteControllerDecision, SideQuoteAdjustment
-from .models import DesiredOrder, DesiredQuotes, MarketMetadata, PositionSnapshot
+from .models import (
+    DesiredOrder,
+    DesiredQuotes,
+    MarketMetadata,
+    OrderIntentKind,
+    OrderIntentMetadata,
+    PositionSnapshot,
+)
 from .risk_manager import RiskDecision
 
 
@@ -19,6 +26,8 @@ class QuoteArbiterContext:
     inventory_unwind_active: bool = False
     active_unwind_pending: bool = False
     active_unwind_ready: bool = False
+    apply_bid: bool = True
+    apply_ask: bool = True
 
 
 def _finite_decimal(value: object, *, positive: bool = False) -> bool:
@@ -48,6 +57,11 @@ def _fail_closed(base: DesiredQuotes, reason: str) -> DesiredQuotes:
         base,
         bid=None,
         ask=None,
+        controller_blocked_sides=frozenset(
+            order.side
+            for order in (base.bid, base.ask)
+            if order is not None and not order.reduce_only
+        ),
         reason=_reason(base.reason, f"controller_error={reason}"),
     )
 
@@ -156,7 +170,18 @@ def _apply_side(
         f"side={side_name};extra_ticks={adjustment.extra_spread_ticks};"
         f"blocked=false;reason={adjustment.reason}"
     )
-    return replace(order, price=price, reason=_reason(order.reason, code))
+    return replace(
+        order,
+        price=price,
+        reason=_reason(order.reason, code),
+        intent=OrderIntentMetadata(
+            kind=OrderIntentKind.CONTROLLER_ENTRY,
+            revision=decision.decision_id,
+            controller_decision_id=decision.decision_id,
+            controller_outward_only=True,
+            controller_extra_spread_ticks=adjustment.extra_spread_ticks,
+        ),
+    )
 
 
 def apply_entry_controller(
@@ -182,6 +207,10 @@ def apply_entry_controller(
         return _fail_closed(base, "invalid_flat_position")
     if not _valid_active_decision(decision):
         return _fail_closed(base, "invalid_active_decision")
+    if type(arbiter_context.apply_bid) is not bool or type(
+        arbiter_context.apply_ask
+    ) is not bool:
+        return _fail_closed(base, "invalid_active_side_gate")
     tick = getattr(metadata, "price_tick", None)
     if not _finite_decimal(tick, positive=True):
         return _fail_closed(base, "invalid_price_tick")
@@ -193,19 +222,27 @@ def apply_entry_controller(
         if base.bid.price >= base.ask.price:
             return _fail_closed(base, "crossed_base_quotes")
 
-    bid = _apply_side(
-        base.bid,
-        decision.bid,
-        tick,
-        is_bid=True,
-        decision=decision,
+    bid = (
+        _apply_side(
+            base.bid,
+            decision.bid,
+            tick,
+            is_bid=True,
+            decision=decision,
+        )
+        if arbiter_context.apply_bid
+        else base.bid
     )
-    ask = _apply_side(
-        base.ask,
-        decision.ask,
-        tick,
-        is_bid=False,
-        decision=decision,
+    ask = (
+        _apply_side(
+            base.ask,
+            decision.ask,
+            tick,
+            is_bid=False,
+            decision=decision,
+        )
+        if arbiter_context.apply_ask
+        else base.ask
     )
     if bid is not None and (
         not _finite_decimal(bid.price, positive=True)
@@ -222,9 +259,34 @@ def apply_entry_controller(
     if bid is not None and ask is not None and bid.price >= ask.price:
         return _fail_closed(base, "crossed_applied_quotes")
 
+    blocked_sides = frozenset(
+        side
+        for side, enabled, base_order, applied_order, adjustment in (
+            (
+                OrderSide.BUY,
+                arbiter_context.apply_bid,
+                base.bid,
+                bid,
+                decision.bid,
+            ),
+            (
+                OrderSide.SELL,
+                arbiter_context.apply_ask,
+                base.ask,
+                ask,
+                decision.ask,
+            ),
+        )
+        if enabled
+        and base_order is not None
+        and applied_order is None
+        and adjustment.blocked
+    )
+
     return replace(
         base,
         bid=bid,
         ask=ask,
+        controller_blocked_sides=blocked_sides,
         reason=_reason(base.reason, _controller_code(decision)),
     )

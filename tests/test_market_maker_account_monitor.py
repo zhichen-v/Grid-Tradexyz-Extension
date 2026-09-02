@@ -10,6 +10,13 @@ from core.services.market_maker.account_monitor import (
     SessionEconomics,
 )
 from core.services.market_maker.config import MarketMakerConfig
+from core.services.market_maker.models import (
+    EpisodePolicyObservation,
+    ExitBindingConstraint,
+    InventoryExitStage,
+    OrderIntentKind,
+    OrderIntentMetadata,
+)
 
 
 def trade(
@@ -151,6 +158,31 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         await monitor.audit(
             {"maker-open"},
             active_unwind_order_ids={"active-close"},
+            order_intent_contexts={
+                "maker-open": OrderIntentMetadata(
+                    kind=OrderIntentKind.BASE_ENTRY,
+                    revision=1,
+                    inventory_episode_id=1,
+                    authenticated_episode_sequence=1,
+                ),
+                "active-close": OrderIntentMetadata(
+                    kind=OrderIntentKind.ACTIVE_EXIT,
+                    revision=1,
+                    inventory_episode_id=1,
+                    authenticated_episode_sequence=1,
+                    exit_stage=InventoryExitStage.ACTIVE_IOC,
+                    policy_decision_id=2,
+                    binding_constraint=(
+                        ExitBindingConstraint.ACTIVE_SLIPPAGE
+                    ),
+                ),
+            },
+            episode_policy_observation=EpisodePolicyObservation(
+                authenticated_episode_sequence=1,
+                entered_inventory_hold=False,
+                active_attempts=1,
+                max_unlocked_episode_loss=Decimal("0"),
+            ),
         )
 
         snapshot = monitor.snapshot(self.now)
@@ -164,6 +196,7 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["ledger_position"], Decimal("0"))
         self.assertEqual(snapshot["episode_flat_success"], 1)
         self.assertEqual(snapshot["episode_active_unwind_flat"], 1)
+        self.assertEqual(snapshot["episode_sequence"], 1)
         self.assertEqual(
             snapshot["completed_episode_ledger"],
             [
@@ -182,9 +215,22 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
                     "net_ex_funding": Decimal("-0.11036"),
                     "active_unwind_used": True,
                     "close_type": "active_unwind_flat",
+                    "entry_vwap": Decimal("100"),
+                    "exit_vwap": Decimal("99.5"),
+                    "quantity": Decimal("0.2"),
+                    "inventory_duration_seconds": Decimal("1"),
+                    "final_exit_stage": "active_ioc",
+                    "final_binding_constraint": "active_slippage",
+                    "surplus_spent": Decimal("0"),
+                    "passive_loss_used": Decimal("0"),
+                    "max_unlocked_episode_loss": Decimal("0"),
+                    "entered_inventory_hold": False,
+                    "active_attempts": 1,
+                    "close_policy_coverage": True,
                 }
             ],
         )
+        self.assertEqual(snapshot["policy_context_missing_count"], 0)
 
     async def test_snapshot_exposes_same_generation_position_and_unrealized(self):
         adapter = self.adapter()
@@ -376,6 +422,18 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
                     "net_ex_funding": Decimal("0.092388"),
                     "active_unwind_used": True,
                     "close_type": "maker_flat",
+                    "entry_vwap": Decimal("100"),
+                    "exit_vwap": Decimal("100.5"),
+                    "quantity": Decimal("0.2"),
+                    "inventory_duration_seconds": Decimal("2"),
+                    "final_exit_stage": None,
+                    "final_binding_constraint": None,
+                    "surplus_spent": None,
+                    "passive_loss_used": None,
+                    "max_unlocked_episode_loss": None,
+                    "entered_inventory_hold": None,
+                    "active_attempts": 1,
+                    "close_policy_coverage": False,
                 }
             ],
         )
@@ -473,6 +531,18 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
                     "net_ex_funding": Decimal("0.0159952"),
                     "active_unwind_used": False,
                     "close_type": "maker_flat",
+                    "entry_vwap": Decimal("500"),
+                    "exit_vwap": Decimal("500.2"),
+                    "quantity": Decimal("0.2"),
+                    "inventory_duration_seconds": Decimal("1"),
+                    "final_exit_stage": None,
+                    "final_binding_constraint": None,
+                    "surplus_spent": None,
+                    "passive_loss_used": None,
+                    "max_unlocked_episode_loss": None,
+                    "entered_inventory_hold": None,
+                    "active_attempts": 0,
+                    "close_policy_coverage": False,
                 }
             ],
         )
@@ -1344,6 +1414,18 @@ class MarketMakerAccountMonitorTests(unittest.IsolatedAsyncioTestCase):
                 "net_ex_funding": Decimal("0"),
                 "active_unwind_used": False,
                 "close_type": "maker_flat",
+                "entry_vwap": Decimal("10"),
+                "exit_vwap": Decimal("10"),
+                "quantity": Decimal("0.1"),
+                "inventory_duration_seconds": Decimal("1"),
+                "final_exit_stage": None,
+                "final_binding_constraint": None,
+                "surplus_spent": None,
+                "passive_loss_used": None,
+                "max_unlocked_episode_loss": None,
+                "entered_inventory_hold": None,
+                "active_attempts": 0,
+                "close_policy_coverage": False,
             },
         )
 

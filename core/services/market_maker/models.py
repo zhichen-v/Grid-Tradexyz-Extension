@@ -34,6 +34,62 @@ class OrderSlotState(Enum):
     TERMINAL = "terminal"
 
 
+class OrderIntentKind(Enum):
+    BASE_ENTRY = "base_entry"
+    CONTROLLER_ENTRY = "controller_entry"
+    PASSIVE_EXIT = "passive_exit"
+    ACTIVE_EXIT = "active_exit"
+
+
+class InventoryExitStage(Enum):
+    STRICT_PROFIT = "strict_profit"
+    SURPLUS_FUNDED_PASSIVE = "surplus_funded_passive"
+    BOUNDED_PASSIVE_LOSS = "bounded_passive_loss"
+    INVENTORY_HOLD = "inventory_hold"
+    ACTIVE_IOC = "active_ioc"
+    FLAT_PENDING_AUDIT = "flat_pending_audit"
+    COMPLETED = "completed"
+
+
+class ExitBindingConstraint(Enum):
+    NORMAL_PASSIVE = "normal_passive"
+    EPISODE_CAP = "episode_cap"
+    SESSION_SURPLUS = "session_surplus"
+    SESSION_LOSS_CAP = "session_loss_cap"
+    DRAWDOWN_CAP = "drawdown_cap"
+    ACTIVE_SLIPPAGE = "active_slippage"
+    ATTEMPT_CAP = "attempt_cap"
+    DATA_UNTRUSTED = "data_untrusted"
+
+
+@dataclass(frozen=True)
+class OrderIntentMetadata:
+    kind: OrderIntentKind
+    revision: int
+    controller_decision_id: int | None = None
+    controller_outward_only: bool = False
+    controller_extra_spread_ticks: int | None = None
+    inventory_episode_id: int | None = None
+    authenticated_episode_sequence: int | None = None
+    exit_stage: InventoryExitStage | None = None
+    policy_decision_id: int | None = None
+    binding_constraint: ExitBindingConstraint | None = None
+    available_completed_surplus: Decimal | None = None
+    surplus_reserve: Decimal | None = None
+    unlocked_episode_loss: Decimal | None = None
+    allowed_passive_loss: Decimal | None = None
+    entered_inventory_hold: bool = False
+    active_attempts: int = 0
+
+
+@dataclass(frozen=True)
+class EpisodePolicyObservation:
+    authenticated_episode_sequence: int
+    entered_inventory_hold: bool
+    active_attempts: int
+    max_unlocked_episode_loss: Decimal
+
+
 @dataclass(frozen=True)
 class MarketMetadata:
     symbol: str
@@ -72,6 +128,7 @@ class DesiredOrder:
     amount: Decimal
     reduce_only: bool
     reason: str
+    intent: OrderIntentMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +141,7 @@ class DesiredQuotes:
     inventory_ratio: Decimal
     runtime_state: RuntimeState
     reason: str
+    controller_blocked_sides: frozenset[OrderSide] = frozenset()
 
 
 @dataclass
@@ -100,3 +158,4 @@ class ManagedOrder:
     updated_monotonic: float
     submission_uncertain: bool = False
     cancellation_uncertain: bool = False
+    intent: OrderIntentMetadata | None = None

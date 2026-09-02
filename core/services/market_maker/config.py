@@ -69,6 +69,8 @@ class MarketMakerConfig:
     trend_guard_threshold_ticks: int = 0
     quote_controller_mode: str = "fixed"
     quote_controller_type: str = "toxicity_v1"
+    toxicity_apply_bid: bool = False
+    toxicity_apply_ask: bool = False
     toxicity_book_depth_levels: int = 5
     toxicity_feature_window_seconds: int = 60
     toxicity_feature_reset_gap_seconds: int = 10
@@ -77,6 +79,8 @@ class MarketMakerConfig:
     toxicity_min_signal_ticks: Decimal = Decimal("0")
     toxicity_widen_start_ticks: Decimal = Decimal("0")
     toxicity_max_extra_spread_ticks: int = 0
+    toxicity_outward_reprice_threshold_ticks: int = 1
+    toxicity_outward_reprice_min_interval_ms: int = 5000
     toxicity_block_threshold_ticks: Decimal = Decimal("0")
     toxicity_resume_threshold_ticks: Decimal = Decimal("0")
     toxicity_block_confirmations: int = 2
@@ -200,6 +204,8 @@ class MarketMakerConfig:
             "toxicity_markout_horizon_seconds",
             "toxicity_markout_min_samples",
             "toxicity_markout_half_life_seconds",
+            "toxicity_outward_reprice_threshold_ticks",
+            "toxicity_outward_reprice_min_interval_ms",
         ):
             self._validate_int(name, minimum=1)
         if self.toxicity_block_confirmations > 3:
@@ -431,10 +437,18 @@ class MarketMakerConfig:
             "require_flat_start",
             "ping_pong_enabled",
             "active_unwind_enabled",
+            "toxicity_apply_bid",
+            "toxicity_apply_ask",
             "toxicity_use_markout_feedback",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
+        if self.quote_controller_mode == "active" and not (
+            self.toxicity_apply_bid or self.toxicity_apply_ask
+        ):
+            raise ValueError(
+                "active quote controller requires at least one enabled side"
+            )
         if self.ping_pong_enabled:
             if self.quote_mode != "both":
                 raise ValueError("ping_pong_enabled requires quote_mode 'both'")

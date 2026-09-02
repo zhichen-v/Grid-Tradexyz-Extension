@@ -22,15 +22,22 @@ from core.services.market_maker.config import MarketMakerConfig
 from core.services.market_maker.models import (
     DesiredOrder,
     DesiredQuotes,
+    ExitBindingConstraint,
+    InventoryExitStage,
     ManagedOrder,
     MarketMetadata,
     MarketSnapshot,
     OrderBookLevel,
+    OrderIntentKind,
+    OrderIntentMetadata,
     OrderSlotState,
     PositionSnapshot,
     RuntimeState,
 )
-from core.services.market_maker.order_manager import MarketMakerOrderManager
+from core.services.market_maker.order_manager import (
+    MarketMakerOrderManager,
+    ReconcileActionCause,
+)
 from core.services.market_maker.risk_manager import RiskDecision, RiskManager
 from core.services.market_maker.strategy import MarketMakerStrategy
 
@@ -574,10 +581,19 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         manager = self.make_manager(self.active_unwind_config())
+        intent = OrderIntentMetadata(
+            kind=OrderIntentKind.ACTIVE_EXIT,
+            revision=4,
+            inventory_episode_id=2,
+            authenticated_episode_sequence=3,
+            exit_stage=InventoryExitStage.ACTIVE_IOC,
+            policy_decision_id=4,
+            binding_constraint=ExitBindingConstraint.ACTIVE_SLIPPAGE,
+        )
         manager._slots[OrderSide.BUY] = ManagedOrder(
             side=OrderSide.BUY,
-            state=OrderSlotState.LIVE,
-            order_id="active-ws",
+            state=OrderSlotState.UNCERTAIN_SUBMISSION,
+            order_id=None,
             client_id="active-client",
             price=Decimal("101"),
             amount=Decimal("0.2"),
@@ -585,6 +601,8 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             reduce_only=True,
             created_monotonic=self.clock(),
             updated_monotonic=self.clock(),
+            submission_uncertain=True,
+            intent=intent,
         )
         manager._active_unwind_side = OrderSide.BUY
         partial = exchange_order(
@@ -602,6 +620,13 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(fill_observed)
         self.assertEqual(manager.active_unwind_order_ids, {"active-ws"})
+        self.assertEqual(manager.known_order_ids, {"active-ws"})
+        self.assertEqual(
+            manager.order_intent_contexts["active-ws"], intent
+        )
+        self.assertEqual(
+            manager.slots[OrderSide.BUY].intent, intent
+        )
         self.assertTrue(manager.active_unwind_pending)
 
     async def test_active_unwind_terminal_history_hang_times_out_fail_closed(
@@ -694,7 +719,10 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
         ask_amount: str = "0.2",
         bid_reduce_only: bool = False,
         ask_reduce_only: bool = False,
+        bid_intent: OrderIntentMetadata | None = None,
+        ask_intent: OrderIntentMetadata | None = None,
         state: RuntimeState = RuntimeState.ACTIVE,
+        controller_blocked_sides: frozenset[OrderSide] = frozenset(),
     ) -> DesiredQuotes:
         bid = (
             DesiredOrder(
@@ -703,6 +731,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
                 Decimal(bid_amount),
                 bid_reduce_only,
                 "test",
+                bid_intent,
             )
             if bid_price is not None
             else None
@@ -714,6 +743,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
                 Decimal(ask_amount),
                 ask_reduce_only,
                 "test",
+                ask_intent,
             )
             if ask_price is not None
             else None
@@ -727,7 +757,73 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             inventory_ratio=Decimal("0"),
             runtime_state=state,
             reason="test",
+            controller_blocked_sides=controller_blocked_sides,
         )
+
+    @staticmethod
+    def order_intent(revision: int) -> OrderIntentMetadata:
+        return OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=revision,
+            inventory_episode_id=7,
+            authenticated_episode_sequence=3,
+            exit_stage=InventoryExitStage.BOUNDED_PASSIVE_LOSS,
+            policy_decision_id=11,
+            binding_constraint=ExitBindingConstraint.EPISODE_CAP,
+            available_completed_surplus=Decimal("0.40"),
+            surplus_reserve=Decimal("0.10"),
+            unlocked_episode_loss=Decimal("0.20"),
+            allowed_passive_loss=Decimal("0.15"),
+            entered_inventory_hold=True,
+            active_attempts=2,
+        )
+
+    @staticmethod
+    def controller_intent(
+        revision: int,
+        extra_spread_ticks: int,
+        *,
+        outward_only: bool = True,
+    ) -> OrderIntentMetadata:
+        return OrderIntentMetadata(
+            kind=OrderIntentKind.CONTROLLER_ENTRY,
+            revision=revision,
+            controller_decision_id=revision,
+            controller_outward_only=outward_only,
+            controller_extra_spread_ticks=extra_spread_ticks,
+        )
+
+    def controller_bid(
+        self,
+        *,
+        price: str = "99.9",
+        revision: int = 1,
+        extra_spread_ticks: int = 0,
+        outward_only: bool = True,
+        reduce_only: bool = False,
+        state: RuntimeState = RuntimeState.ACTIVE,
+    ) -> DesiredQuotes:
+        return self.desired(
+            bid_price=price,
+            ask_price=None,
+            bid_reduce_only=reduce_only,
+            bid_intent=self.controller_intent(
+                revision,
+                extra_spread_ticks,
+                outward_only=outward_only,
+            ),
+            state=state,
+        )
+
+    def protective_manager(self, **overrides) -> MarketMakerOrderManager:
+        config = replace(
+            self.config,
+            reprice_threshold_ticks=125,
+            min_order_lifetime_ms=30_000,
+            toxicity_outward_reprice_threshold_ticks=1,
+            toxicity_outward_reprice_min_interval_ms=5_000,
+        )
+        return self.make_manager(replace(config, **overrides))
 
     @staticmethod
     def risk(
@@ -753,6 +849,192 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             reason="test",
             safe=safe,
         )
+
+    async def test_confirmed_create_exposes_order_intent_context(self) -> None:
+        intent = self.order_intent(1)
+
+        await self.manager.reconcile(
+            self.desired(
+                bid_price="99.9",
+                ask_price=None,
+                bid_intent=intent,
+            ),
+            self.risk(),
+        )
+
+        self.assertEqual(
+            dict(self.manager.order_intent_contexts),
+            {"1": intent},
+        )
+        self.assertEqual(dict(self.manager.terminal_order_intent_contexts), {})
+
+    async def test_partial_update_preserves_complete_order_intent(self) -> None:
+        intent = self.order_intent(1)
+        await self.manager.reconcile(
+            self.desired(
+                bid_price="99.9",
+                ask_price=None,
+                bid_intent=intent,
+            ),
+            self.risk(),
+        )
+
+        await self.manager.handle_order_update(
+            exchange_order(
+                "1",
+                OrderSide.BUY,
+                price="99.9",
+                remaining="0.1",
+            )
+        )
+
+        slot = self.manager.slots[OrderSide.BUY]
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.intent, intent)
+        self.assertEqual(self.manager.order_intent_contexts["1"], intent)
+
+    async def test_exact_terminal_moves_order_intent_context(self) -> None:
+        intent = self.order_intent(1)
+        await self.manager.reconcile(
+            self.desired(
+                bid_price="99.9",
+                ask_price=None,
+                bid_intent=intent,
+            ),
+            self.risk(),
+        )
+
+        await self.manager.handle_order_update(
+            exchange_order(
+                "1",
+                OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                price="99.9",
+                remaining="0",
+            )
+        )
+
+        self.assertNotIn("1", self.manager.order_intent_contexts)
+        self.assertEqual(
+            dict(self.manager.terminal_order_intent_contexts),
+            {"1": intent},
+        )
+
+    async def test_replacement_uses_target_order_intent_revision(self) -> None:
+        initial_intent = self.order_intent(1)
+        target_intent = self.order_intent(2)
+        await self.manager.reconcile(
+            self.desired(
+                bid_price="99.9",
+                ask_price=None,
+                bid_intent=initial_intent,
+            ),
+            self.risk(),
+        )
+        self.clock.value += 2
+        target = self.desired(
+            bid_price="99.8",
+            ask_price=None,
+            bid_intent=target_intent,
+        )
+
+        cancel_result = await self.manager.reconcile(target, self.risk())
+        self.assertTrue(cancel_result.position_refresh_required)
+        await self.manager.reconcile(target, self.risk())
+
+        slot = self.manager.slots[OrderSide.BUY]
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.order_id, "2")
+        self.assertEqual(slot.intent, target_intent)
+        self.assertEqual(
+            dict(self.manager.order_intent_contexts),
+            {"2": target_intent},
+        )
+        self.assertEqual(
+            dict(self.manager.terminal_order_intent_contexts),
+            {"1": initial_intent},
+        )
+
+    async def test_confirmed_order_id_intent_collision_fails_closed(self) -> None:
+        async def create_with_reused_id(
+            symbol,
+            side,
+            order_type,
+            amount,
+            price,
+            params,
+        ):
+            return exchange_order(
+                "shared",
+                side,
+                price=str(price),
+                amount=str(amount),
+                params=params,
+            )
+
+        self.adapter.create_order.side_effect = create_with_reused_id
+        original_intent = self.order_intent(1)
+        conflicting_intent = self.order_intent(2)
+        await self.manager.reconcile(
+            self.desired(
+                bid_price="99.9",
+                ask_price=None,
+                bid_intent=original_intent,
+            ),
+            self.risk(),
+        )
+        await self.manager.handle_order_update(
+            exchange_order(
+                "shared",
+                OrderSide.BUY,
+                status=OrderStatus.FILLED,
+                price="99.9",
+                remaining="0",
+            )
+        )
+
+        await self.manager.reconcile(
+            self.desired(
+                bid_price=None,
+                ask_price="100.1",
+                ask_intent=conflicting_intent,
+            ),
+            self.risk(buy_amount=None),
+        )
+
+        self.assertEqual(
+            self.manager.runtime_state,
+            RuntimeState.PAUSED_ORDER_STATE,
+        )
+        self.assertEqual(
+            self.manager.pause_reason,
+            "confirmed order id changed intent context",
+        )
+        self.adapter.cancel_order.assert_awaited_once_with("shared", "BTC")
+        self.assertIsNone(self.manager.slots[OrderSide.SELL])
+        self.assertNotIn("shared", self.manager.order_intent_contexts)
+        self.assertEqual(
+            self.manager.terminal_order_intent_contexts["shared"],
+            original_intent,
+        )
+
+    async def test_order_intent_context_mappings_are_read_only(self) -> None:
+        intent = self.order_intent(1)
+        await self.manager.reconcile(
+            self.desired(
+                bid_price="99.9",
+                ask_price=None,
+                bid_intent=intent,
+            ),
+            self.risk(),
+        )
+
+        for contexts in (
+            self.manager.order_intent_contexts,
+            self.manager.terminal_order_intent_contexts,
+        ):
+            with self.assertRaises(TypeError):
+                contexts["other"] = intent
 
     async def test_initial_bid_and_ask_are_post_only(self) -> None:
         results = (
@@ -1168,6 +1450,411 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.adapter.cancel_order.assert_not_awaited()
         self.assertEqual(self.adapter.create_order.await_count, 1)
+
+    async def test_one_tick_controller_protective_reprice_cancels_with_cause(
+        self,
+    ) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+
+        result = await manager.reconcile(
+            self.controller_bid(
+                price="99.8",
+                revision=2,
+                extra_spread_ticks=1,
+            ),
+            self.risk(),
+        )
+
+        self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
+        self.assertEqual(len(result.actions), 1)
+        self.assertEqual(result.actions[0].operation, "cancel")
+        self.assertIs(
+            result.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+
+    async def test_only_explicit_controller_block_marks_cancel_and_resume(
+        self,
+    ) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+
+        risk_cancel = await manager.reconcile(
+            self.desired(
+                bid_price=None,
+                ask_price=None,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+            self.risk(state=RuntimeState.RISK_REDUCTION),
+        )
+        normal_resume = await manager.reconcile(
+            self.controller_bid(revision=2), self.risk()
+        )
+
+        self.assertIs(
+            risk_cancel.actions[0].cause,
+            ReconcileActionCause.SAFETY,
+        )
+        self.assertIs(
+            normal_resume.actions[0].cause,
+            ReconcileActionCause.NORMAL,
+        )
+
+        controller_block = await manager.reconcile(
+            self.desired(
+                bid_price=None,
+                ask_price=None,
+                controller_blocked_sides=frozenset({OrderSide.BUY}),
+            ),
+            self.risk(),
+        )
+        controller_resume = await manager.reconcile(
+            self.controller_bid(revision=3), self.risk()
+        )
+
+        self.assertIs(
+            controller_block.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_BLOCK,
+        )
+        self.assertIs(
+            controller_resume.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_RESUME,
+        )
+
+    async def test_controller_outward_move_below_threshold_does_not_cancel(
+        self,
+    ) -> None:
+        manager = self.protective_manager(
+            toxicity_outward_reprice_threshold_ticks=2,
+        )
+        await manager.reconcile(self.controller_bid(), self.risk())
+
+        result = await manager.reconcile(
+            self.controller_bid(
+                price="99.8",
+                revision=2,
+                extra_spread_ticks=1,
+            ),
+            self.risk(),
+        )
+
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertEqual(result.actions, ())
+
+    async def test_same_controller_revision_does_not_fast_reprice(self) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+
+        result = await manager.reconcile(
+            self.controller_bid(
+                price="99.8",
+                revision=1,
+                extra_spread_ticks=1,
+            ),
+            self.risk(),
+        )
+
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertEqual(result.actions, ())
+
+    async def test_same_controller_extra_with_outward_base_move_is_not_fast(
+        self,
+    ) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(
+            self.controller_bid(extra_spread_ticks=1),
+            self.risk(),
+        )
+
+        result = await manager.reconcile(
+            self.controller_bid(
+                price="99.8",
+                revision=2,
+                extra_spread_ticks=1,
+            ),
+            self.risk(),
+        )
+
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertEqual(result.actions, ())
+
+    async def test_controller_inward_move_obeys_normal_lifetime_and_threshold(
+        self,
+    ) -> None:
+        manager = self.protective_manager(reprice_threshold_ticks=1)
+        await manager.reconcile(self.controller_bid(), self.risk())
+        inward = self.controller_bid(
+            price="100.0",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+
+        early = await manager.reconcile(inward, self.risk())
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertEqual(early.actions, ())
+
+        self.clock.value += 30
+        mature = await manager.reconcile(inward, self.risk())
+        self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
+        self.assertEqual(mature.actions[0].operation, "cancel")
+        self.assertIs(mature.actions[0].cause, ReconcileActionCause.NORMAL)
+
+    async def test_partial_controller_order_does_not_fast_reprice(self) -> None:
+        manager = self.protective_manager(reprice_threshold_ticks=1)
+        await manager.reconcile(self.controller_bid(), self.risk())
+        await manager.handle_order_update(
+            exchange_order(
+                "1",
+                OrderSide.BUY,
+                price="99.9",
+                remaining="0.1",
+            )
+        )
+
+        result = await manager.reconcile(
+            self.controller_bid(
+                price="99.8",
+                revision=2,
+                extra_spread_ticks=1,
+            ),
+            self.risk(),
+        )
+
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertEqual(result.actions, ())
+
+    async def test_reduce_only_controller_order_does_not_fast_reprice(
+        self,
+    ) -> None:
+        manager = self.protective_manager(reprice_threshold_ticks=1)
+        risk = self.risk(
+            sell_amount=None,
+            buy_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        await manager.reconcile(
+            self.controller_bid(
+                reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+            risk,
+        )
+
+        result = await manager.reconcile(
+            self.controller_bid(
+                price="99.8",
+                revision=2,
+                extra_spread_ticks=1,
+                reduce_only=True,
+                state=RuntimeState.RISK_REDUCTION,
+            ),
+            risk,
+        )
+
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertEqual(result.actions, ())
+
+    async def test_controller_protective_interval_defers_and_survives_rollback(
+        self,
+    ) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+        self.clock.value += 0.1
+        revision_two = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+        await manager.reconcile(revision_two, self.risk())
+        await manager.reconcile(revision_two, self.risk())
+
+        self.clock.value += 0.1
+        revision_three = self.controller_bid(
+            price="99.7",
+            revision=3,
+            extra_spread_ticks=2,
+        )
+        interval = await manager.reconcile(revision_three, self.risk())
+        self.assertEqual(self.adapter.cancel_order.await_count, 1)
+        self.assertEqual(interval.actions[0].operation, "deferred")
+        self.assertIs(
+            interval.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+
+        self.clock.value -= 10
+        rollback = await manager.reconcile(revision_three, self.risk())
+        self.assertEqual(self.adapter.cancel_order.await_count, 1)
+        self.assertEqual(rollback.actions[0].operation, "deferred")
+        self.assertIs(
+            rollback.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+
+    async def test_budget_block_does_not_advance_protective_interval(
+        self,
+    ) -> None:
+        manager = self.protective_manager(
+            max_mutations_per_minute=1,
+            toxicity_outward_reprice_min_interval_ms=120_000,
+        )
+        await manager.reconcile(self.controller_bid(), self.risk())
+        target = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+
+        blocked = await manager.reconcile(target, self.risk())
+        self.assertEqual(blocked.actions[0].operation, "blocked")
+        self.assertIs(
+            blocked.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+
+        self.clock.value += 61
+        cancelled = await manager.reconcile(target, self.risk())
+        self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
+        self.assertEqual(cancelled.actions[0].operation, "cancel")
+        self.assertIs(
+            cancelled.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+
+    async def test_protective_cancel_fill_does_not_mark_pending_reprice(
+        self,
+    ) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+        self.adapter.cancel_order.side_effect = None
+        self.adapter.cancel_order.return_value = exchange_order(
+            "1",
+            OrderSide.BUY,
+            status=OrderStatus.FILLED,
+            price="99.9",
+            remaining="0",
+        )
+        target = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+
+        cancelled = await manager.reconcile(target, self.risk())
+        self.assertTrue(cancelled.fill_observed)
+        self.assertFalse(cancelled.actions[0].success)
+
+        created = await manager.reconcile(target, self.risk())
+        self.assertEqual(created.actions[0].operation, "place")
+        self.assertIs(created.actions[0].cause, ReconcileActionCause.NORMAL)
+        self.assertEqual(created.actions[0].intent, target.bid.intent)
+
+    async def test_protective_cancel_then_create_keeps_cause_and_revision(
+        self,
+    ) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+        target = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+
+        cancelled = await manager.reconcile(target, self.risk())
+        self.assertTrue(cancelled.actions[0].success)
+        self.assertIs(
+            cancelled.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+
+        created = await manager.reconcile(target, self.risk())
+        self.assertEqual(created.actions[0].operation, "place")
+        self.assertIs(
+            created.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+        self.assertEqual(created.actions[0].intent, target.bid.intent)
+        self.assertEqual(
+            manager.slots[OrderSide.BUY].intent.revision,
+            target.bid.intent.revision,
+        )
+
+    async def test_protective_reversal_defers_inward_recreate(self) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+        protective = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+        await manager.reconcile(protective, self.risk())
+        inward = self.controller_bid(
+            price="99.9",
+            revision=3,
+            extra_spread_ticks=0,
+        )
+
+        deferred = await manager.reconcile(inward, self.risk())
+
+        self.assertEqual(deferred.actions[0].operation, "deferred")
+        self.assertIs(
+            deferred.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+
+        self.clock.value += 30
+        recreated = await manager.reconcile(inward, self.risk())
+        self.assertEqual(recreated.actions[0].operation, "place")
+        self.assertIs(recreated.actions[0].cause, ReconcileActionCause.NORMAL)
+
+    async def test_protective_create_budget_block_keeps_typed_cause(self) -> None:
+        manager = self.protective_manager(max_mutations_per_minute=2)
+        await manager.reconcile(self.controller_bid(), self.risk())
+        target = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+        await manager.reconcile(target, self.risk())
+
+        blocked = await manager.reconcile(target, self.risk())
+
+        self.assertEqual(blocked.actions[0].operation, "blocked")
+        self.assertIs(
+            blocked.actions[0].cause,
+            ReconcileActionCause.CONTROLLER_PROTECTIVE,
+        )
+        self.assertEqual(blocked.actions[0].intent, target.bid.intent)
+
+    async def test_reduce_only_exit_bypasses_pending_controller_target(self) -> None:
+        manager = self.protective_manager()
+        await manager.reconcile(self.controller_bid(), self.risk())
+        protective = self.controller_bid(
+            price="99.8",
+            revision=2,
+            extra_spread_ticks=1,
+        )
+        await manager.reconcile(protective, self.risk())
+        exit_order = self.desired(
+            bid_price="100.0",
+            ask_price=None,
+            bid_reduce_only=True,
+            bid_intent=self.order_intent(3),
+            state=RuntimeState.RISK_REDUCTION,
+        )
+        exit_risk = self.risk(
+            sell_amount=None,
+            buy_reduce_only=True,
+            state=RuntimeState.RISK_REDUCTION,
+        )
+
+        created = await manager.reconcile(exit_order, exit_risk)
+
+        self.assertEqual(created.actions[0].operation, "place")
+        self.assertIs(created.actions[0].cause, ReconcileActionCause.NORMAL)
+        self.assertTrue(created.actions[0].reduce_only)
 
     async def test_more_aggressive_reduce_only_reprice_bypasses_threshold_after_lifetime(
         self,

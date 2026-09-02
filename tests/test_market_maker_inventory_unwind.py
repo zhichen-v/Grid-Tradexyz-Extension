@@ -6,8 +6,11 @@ from core.adapters.exchanges.models import OrderBookLevel, OrderSide
 from core.services.market_maker.config import MarketMakerConfig
 from core.services.market_maker.inventory_unwind import InventoryEpisodeExecutor
 from core.services.market_maker.models import (
+    ExitBindingConstraint,
+    InventoryExitStage,
     MarketMetadata,
     MarketSnapshot,
+    OrderIntentKind,
     PositionSnapshot,
 )
 
@@ -93,6 +96,7 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
             "current_equity": Decimal("299.95"),
             "audited_position": Decimal(position),
             "audited_unrealized_pnl": Decimal("-0.05"),
+            "episode_sequence": 1,
         }
         snapshot.update(overrides)
         return snapshot
@@ -450,7 +454,7 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
 
                 self.assertIsNone(decision.passive_order)
                 self.assertIsNone(decision.active_order)
-                self.assertFalse(decision.suppress_passive)
+                self.assertTrue(decision.suppress_passive)
                 self.assertEqual(decision.state, "passive_wait")
 
     def test_passive_budget_does_not_progress_before_soft_exit_latch(self) -> None:
@@ -537,7 +541,7 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
 
                 self.assertEqual(waiting.state, "passive_wait")
                 self.assertFalse(waiting.blocked)
-                self.assertFalse(waiting.suppress_passive)
+                self.assertTrue(waiting.suppress_passive)
                 self.assertIn("unavailable", waiting.reason)
                 self.assertEqual(blocked.state, "blocked")
                 self.assertTrue(blocked.blocked)
@@ -914,6 +918,189 @@ class InventoryEpisodeExecutorTests(unittest.TestCase):
                 )
                 self.assertTrue(decision.blocked)
                 self.assertIn(reason, decision.reason)
+
+    def test_policy_ids_stages_and_passive_intent_are_deterministic(
+        self,
+    ) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+        strict = self.evaluate(
+            executor,
+            now=0,
+            stranded=False,
+            soft_exit_latched=False,
+        )
+        hold = self.evaluate(executor, now=1)
+        bounded = self.evaluate(executor, now=25)
+
+        self.assertEqual(
+            [
+                strict.policy_decision_id,
+                hold.policy_decision_id,
+                bounded.policy_decision_id,
+            ],
+            [1, 2, 3],
+        )
+        self.assertEqual(strict.authenticated_episode_sequence, 1)
+        self.assertEqual(strict.exit_stage, InventoryExitStage.STRICT_PROFIT)
+        self.assertEqual(
+            strict.binding_constraint,
+            ExitBindingConstraint.NORMAL_PASSIVE,
+        )
+        self.assertEqual(hold.exit_stage, InventoryExitStage.INVENTORY_HOLD)
+        self.assertTrue(hold.entered_inventory_hold)
+        self.assertFalse(hold.reachable_now)
+        self.assertEqual(
+            hold.binding_constraint,
+            ExitBindingConstraint.EPISODE_CAP,
+        )
+        self.assertEqual(
+            bounded.exit_stage,
+            InventoryExitStage.BOUNDED_PASSIVE_LOSS,
+        )
+        self.assertTrue(bounded.reachable_now)
+        self.assertEqual(
+            bounded.binding_constraint,
+            ExitBindingConstraint.NORMAL_PASSIVE,
+        )
+        self.assertTrue(bounded.entered_inventory_hold)
+        self.assertEqual(
+            bounded.passive_order.intent.kind,
+            OrderIntentKind.PASSIVE_EXIT,
+        )
+        self.assertTrue(bounded.passive_order.intent.entered_inventory_hold)
+        self.assertEqual(bounded.passive_order.intent.revision, 3)
+        self.assertEqual(bounded.passive_order.intent.policy_decision_id, 3)
+        self.assertEqual(bounded.passive_order.intent.inventory_episode_id, 1)
+        self.assertEqual(
+            bounded.passive_order.intent.authenticated_episode_sequence,
+            1,
+        )
+        self.assertTrue(executor.record_authenticated_flat())
+        transitions = executor.execution_snapshot()[
+            "stage_transition_history"
+        ]
+        self.assertEqual(
+            [item["transition_sequence"] for item in transitions],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(
+            transitions[-1]["policy_decision_id"],
+            bounded.policy_decision_id,
+        )
+
+    def test_authenticated_episode_sequence_is_bound_to_exit_intent(self) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+
+        decision = self.evaluate(
+            executor,
+            now=20,
+            account=self.account("-0.2", episode_sequence=9),
+        )
+
+        self.assertEqual(decision.authenticated_episode_sequence, 9)
+        self.assertIsNotNone(decision.passive_order)
+        self.assertEqual(
+            decision.passive_order.intent.authenticated_episode_sequence,
+            9,
+        )
+
+    def test_missing_or_invalid_episode_sequence_suppresses_exit(self) -> None:
+        for sequence in (None, 0, True):
+            with self.subTest(sequence=sequence):
+                decision = self.evaluate(
+                    InventoryEpisodeExecutor(self.config),
+                    now=20,
+                    account=self.account(
+                        "-0.2", episode_sequence=sequence
+                    ),
+                )
+
+                self.assertEqual(decision.state, "passive_wait")
+                self.assertTrue(decision.suppress_passive)
+                self.assertIsNone(decision.passive_order)
+                self.assertIsNone(
+                    decision.authenticated_episode_sequence
+                )
+
+    def test_episode_sequence_drift_blocks_before_flat(self) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+        first = self.evaluate(
+            executor,
+            now=20,
+            account=self.account("-0.2", episode_sequence=4),
+        )
+
+        drift = self.evaluate(
+            executor,
+            now=21,
+            account=self.account("-0.2", episode_sequence=5),
+        )
+
+        self.assertEqual(first.authenticated_episode_sequence, 4)
+        self.assertTrue(drift.blocked)
+        self.assertTrue(drift.suppress_passive)
+        self.assertIsNone(drift.authenticated_episode_sequence)
+        self.assertIn("changed before flat", drift.reason)
+
+    def test_surplus_boundary_has_typed_hold_attribution(self) -> None:
+        decision, _ = self.gate_c_decision()
+
+        self.assertEqual(decision.exit_stage, InventoryExitStage.INVENTORY_HOLD)
+        self.assertEqual(
+            decision.binding_constraint,
+            ExitBindingConstraint.SESSION_SURPLUS,
+        )
+        self.assertEqual(
+            decision.selected_exit_price, decision.passive_order.price
+        )
+        self.assertGreater(
+            decision.available_completed_surplus, decision.surplus_reserve
+        )
+        self.assertEqual(
+            decision.passive_order.intent.exit_stage,
+            InventoryExitStage.INVENTORY_HOLD,
+        )
+
+    def test_active_ioc_has_typed_policy_attribution(self) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+        self.evaluate(executor, now=0, soft_exit_latched=False)
+        decision = self.evaluate(executor, now=30, soft_exit_latched=False)
+
+        self.assertEqual(decision.exit_stage, InventoryExitStage.ACTIVE_IOC)
+        self.assertEqual(
+            decision.binding_constraint,
+            ExitBindingConstraint.ACTIVE_SLIPPAGE,
+        )
+        self.assertEqual(
+            decision.active_order.intent.kind, OrderIntentKind.ACTIVE_EXIT
+        )
+        self.assertEqual(
+            decision.active_order.intent.policy_decision_id,
+            decision.policy_decision_id,
+        )
+        self.assertEqual(
+            decision.selected_exit_price, decision.active_order.price
+        )
+        self.assertIsNotNone(decision.projected_episode_net)
+        self.assertIsNotNone(decision.projected_session_net)
+        self.assertIsNotNone(decision.projected_drawdown)
+
+    def test_stage_transition_history_is_bounded_per_episode(self) -> None:
+        executor = InventoryEpisodeExecutor(self.config)
+        decision = None
+        for policy_id in range(1, 103):
+            decision = self.evaluate(
+                executor,
+                now=1,
+                stranded=False,
+                soft_exit_latched=policy_id % 2 == 0,
+            )
+
+        history = decision.snapshot()["stage_transition_history"]
+        self.assertEqual(len(history), 100)
+        self.assertEqual(history[0]["policy_decision_id"], 3)
+        self.assertEqual(history[-1]["policy_decision_id"], 102)
+        self.assertTrue(all(item["episode_id"] == 1 for item in history))
 
 
 if __name__ == "__main__":

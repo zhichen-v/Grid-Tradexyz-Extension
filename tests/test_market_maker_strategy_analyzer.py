@@ -12,7 +12,89 @@ from scripts.analyze_market_maker_strategy import (
 )
 
 
+GATE_C_GOLDEN = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "market_maker"
+    / "gate_c_inventory_owner_short_live_summary.json"
+)
+
+
 class MarketMakerStrategyAnalyzerTests(unittest.TestCase):
+    def test_gate_c_golden_economics_replay_is_exact_and_diagnostic(self) -> None:
+        records = load_local_records([GATE_C_GOLDEN])
+        report = analyze(records)
+        repeated = analyze(load_local_records([GATE_C_GOLDEN]))
+        fixture = records[0]
+        session = report["session"]
+
+        self.assertEqual(render_json(report), render_json(repeated))
+        self.assertEqual(
+            Decimal(session["completed_exact_fee"]), Decimal("0.01108942080")
+        )
+        self.assertEqual(
+            Decimal(session["completed_gross"]), Decimal("-0.02224000000")
+        )
+        self.assertEqual(
+            Decimal(session["completed_gross"])
+            / Decimal(session["completed_turnover"])
+            * Decimal("10000"),
+            Decimal("-2.406618026434707933528863834"),
+        )
+        self.assertEqual(
+            Decimal(session["completed_net_ex_funding"]),
+            Decimal("-0.03332942080"),
+        )
+        self.assertEqual(
+            Decimal(session["completed_net_turnover_bps"]),
+            Decimal("-3.606618026434707933528863834"),
+        )
+        self.assertEqual(report["episodes"]["count"], 3)
+        self.assertEqual(session["unique_maker_fills"], 6)
+        self.assertEqual(session["unique_taker_fills"], 0)
+        self.assertEqual(
+            Decimal(fixture["eligible_quote_seconds"]),
+            Decimal("585.7500000000073"),
+        )
+        self.assertLess(
+            Decimal(fixture["entry_reserve_remaining"]),
+            Decimal(fixture["required_episode_reserve"]),
+        )
+        self.assertTrue(fixture["final_state"]["flat"])
+        self.assertEqual(
+            Decimal(fixture["final_state"]["authenticated_position"]),
+            Decimal("0"),
+        )
+        self.assertEqual(
+            fixture["final_state"]["authenticated_open_orders"], 0
+        )
+        self.assertEqual(
+            fixture["final_state"]["entry_admission"], "blocked"
+        )
+
+        counterfactual = report["shadow_counterfactual"]
+        self.assertEqual(counterfactual["authenticated_entry_count"], 3)
+        self.assertEqual(counterfactual["classifiable_entry_count"], 0)
+        self.assertEqual(counterfactual["indeterminate_entry_count"], 3)
+        self.assertEqual(
+            counterfactual["excluded_fill_counts"]["passive_exit"], 3
+        )
+        self.assertEqual(
+            {
+                row["classification_reason"]
+                for row in counterfactual["fills"]
+                if row["eligible_authenticated_entry"]
+            },
+            {"event_sequence_incomplete"},
+        )
+        self.assertEqual(fixture["evidence_capability"], "diagnostic_only")
+        self.assertFalse(fixture["promotion_eligible"])
+        self.assertIsNone(fixture["commit_sha"])
+        self.assertIsNone(fixture["config_sha256"])
+        self.assertIsNone(
+            fixture["provenance"]["runtime_event_sequence_run_id"]
+        )
+
     def test_json_analysis_separates_roles_and_marks_proxy(self) -> None:
         snapshot = {
             "account_audit": {
@@ -1092,6 +1174,110 @@ Retained maker fill events: 16.
         self.assertEqual(
             forward["coverage"]["legacy_final_snapshot_episodes"], 0
         )
+
+    def test_episode_policy_coverage_gates_promotion_and_decomposes(self) -> None:
+        report = analyze(
+            [
+                {
+                    "uptime_seconds": 10,
+                    "account_audit": {
+                        "policy_context_missing_count": 1,
+                        "completed_episode_ledger": [
+                            {
+                                "session_id": "session",
+                                "episode_sequence": 1,
+                                "entry_side": "buy",
+                                "entry_vwap": "100",
+                                "exit_vwap": "100.1",
+                                "quantity": "0.1",
+                                "gross": "0.02",
+                                "maker_fee": "0.01",
+                                "taker_fee": "0",
+                                "net_ex_funding": "0.01",
+                                "inventory_duration_seconds": "5",
+                                "final_exit_stage": "strict_profit",
+                                "final_binding_constraint": "normal_passive",
+                                "passive_loss_used": "0",
+                                "surplus_spent": "0",
+                                "max_unlocked_episode_loss": "0",
+                                "entered_inventory_hold": False,
+                                "active_attempts": 0,
+                                "close_policy_coverage": True,
+                            },
+                            {
+                                "session_id": "session",
+                                "episode_sequence": 2,
+                                "gross": "-0.01",
+                                "net_ex_funding": "-0.02",
+                                "close_policy_coverage": False,
+                            },
+                        ],
+                    },
+                }
+            ]
+        )
+
+        episodes = report["episodes"]
+        self.assertEqual(episodes["policy_covered_count"], 1)
+        self.assertEqual(episodes["policy_incomplete_count"], 1)
+        self.assertEqual(episodes["policy_context_missing_count"], 1)
+        self.assertFalse(episodes["promotion_eligible"])
+        self.assertEqual(episodes["promotion_episode_count"], 1)
+        self.assertEqual(
+            episodes["final_exit_stage_distribution"],
+            {"strict_profit": 1},
+        )
+        self.assertEqual(
+            episodes["decomposition"]["final_net"]["mean"],
+            Decimal("0.01"),
+        )
+        self.assertEqual(len(episodes["episode_details"]), 2)
+
+    def test_malformed_claimed_covered_episode_is_not_promotable(self) -> None:
+        report = analyze(
+            [
+                {
+                    "uptime_seconds": 10,
+                    "account_audit": {
+                        "policy_context_missing_count": 0,
+                        "completed_episode_ledger": [
+                            {
+                                "session_id": "session",
+                                "episode_sequence": 1,
+                                "close_policy_coverage": True,
+                            },
+                            {
+                                "session_id": "session",
+                                "episode_sequence": 2,
+                                "entry_side": "buy",
+                                "entry_vwap": "100",
+                                "exit_vwap": "100.1",
+                                "quantity": "0.1",
+                                "gross": "0.02",
+                                "maker_fee": "0.01",
+                                "taker_fee": "0",
+                                "net_ex_funding": "0.01",
+                                "inventory_duration_seconds": "5",
+                                "final_exit_stage": "strict_profit",
+                                "final_binding_constraint": "normal_passive",
+                                "passive_loss_used": "0",
+                                "surplus_spent": "0",
+                                "max_unlocked_episode_loss": "0",
+                                "entered_inventory_hold": None,
+                                "active_attempts": 0,
+                                "close_policy_coverage": True,
+                            }
+                        ],
+                    },
+                }
+            ]
+        )
+
+        episodes = report["episodes"]
+        self.assertEqual(episodes["policy_covered_count"], 0)
+        self.assertEqual(episodes["policy_incomplete_count"], 2)
+        self.assertEqual(episodes["promotion_episode_count"], 0)
+        self.assertFalse(episodes["promotion_eligible"])
 
     def test_incomplete_controller_history_fails_counterfactual_closed(
         self,

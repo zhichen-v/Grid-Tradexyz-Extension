@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -128,6 +129,8 @@ class MarketMakerControllerOrderLifecycleTests(
             "max_position": "1",
             "min_profit_buffer_bps": "0",
             "quote_controller_mode": "active",
+            "toxicity_apply_bid": True,
+            "toxicity_apply_ask": True,
             "toxicity_widen_start_ticks": "1",
             "toxicity_max_extra_spread_ticks": 3,
             "dry_run": False,
@@ -305,13 +308,15 @@ class MarketMakerControllerOrderLifecycleTests(
         self.assertEqual(manager.slots[OrderSide.SELL].order_id, "2")
         self.assertEqual(self.adapter.create_order.await_count, 2)
 
-    async def test_widening_obeys_reprice_threshold_and_minimum_lifetime(
+    async def test_outward_widening_uses_protective_threshold_and_interval(
         self,
     ) -> None:
         coordinator, manager = self.coordinator(
             config=self.config(
-                reprice_threshold_ticks=2,
-                min_order_lifetime_ms=1000,
+                reprice_threshold_ticks=125,
+                min_order_lifetime_ms=30_000,
+                toxicity_outward_reprice_threshold_ticks=1,
+                toxicity_outward_reprice_min_interval_ms=5000,
             )
         )
         await coordinator.run_one_cycle(force=True)
@@ -319,25 +324,49 @@ class MarketMakerControllerOrderLifecycleTests(
         self.controller.bid_extra = 1
         self.clock.value += 0.1
         await coordinator.run_one_cycle(force=True)
-        self.controller.bid_extra = 2
-        await coordinator.run_one_cycle(force=True)
-
-        self.adapter.cancel_order.assert_not_awaited()
-        self.assertEqual(manager.slots[OrderSide.BUY].price, Decimal("99.9"))
-
-        self.clock.value += 1
-        await coordinator.run_one_cycle(force=True)
-
         self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
         self.assertEqual(self.adapter.create_order.await_count, 1)
         self.assertIsNone(manager.slots[OrderSide.BUY])
 
         await coordinator.run_one_cycle(force=True)
         self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.assertEqual(manager.slots[OrderSide.BUY].price, Decimal("99.8"))
+
+        self.controller.bid_extra = 2
+        self.clock.value += 0.1
+        await coordinator.run_one_cycle(force=True)
+        self.assertEqual(self.adapter.cancel_order.await_count, 1)
+        self.assertEqual(manager.slots[OrderSide.BUY].price, Decimal("99.8"))
+
+        self.clock.value += 5
+        coordinator._market = replace(
+            coordinator._market, received_monotonic=self.clock.value
+        )
+        coordinator._position = replace(
+            coordinator._position, received_monotonic=self.clock.value
+        )
+        await coordinator.run_one_cycle(force=True)
+        self.assertEqual(self.adapter.cancel_order.await_count, 2)
+        self.assertIsNone(manager.slots[OrderSide.BUY])
+
+        self.clock.value += 0.1
+        await coordinator.run_one_cycle(force=True)
+        await coordinator.run_one_cycle(force=True)
+        self.assertEqual(
+            self.adapter.create_order.await_count,
+            3,
+            (manager.slots, manager.last_result, self.events),
+        )
         self.assertEqual(manager.slots[OrderSide.BUY].price, Decimal("99.7"))
         self.assertEqual(
             self.events,
-            [("create", "1"), ("cancel", "1"), ("create", "2")],
+            [
+                ("create", "1"),
+                ("cancel", "1"),
+                ("create", "2"),
+                ("cancel", "2"),
+                ("create", "3"),
+            ],
         )
 
     async def test_resume_waits_for_exact_terminal_cancellation_proof(

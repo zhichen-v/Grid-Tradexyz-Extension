@@ -11,6 +11,13 @@ from core.services.market_maker.account_monitor import (
 )
 from core.services.market_maker.config import MarketMakerConfig
 from core.services.market_maker.metrics import MarketMakerMetrics
+from core.services.market_maker.models import (
+    EpisodePolicyObservation,
+    ExitBindingConstraint,
+    InventoryExitStage,
+    OrderIntentKind,
+    OrderIntentMetadata,
+)
 
 
 def trade(
@@ -85,6 +92,8 @@ class AuthenticatedFillRoleTests(unittest.TestCase):
         position: str,
         *,
         active_order_ids: set[str] | None = None,
+        order_intent_contexts: dict[str, OrderIntentMetadata] | None = None,
+        episode_policy_observation: EpisodePolicyObservation | None = None,
     ) -> None:
         active_order_ids = active_order_ids or set()
         economics.apply(
@@ -94,6 +103,8 @@ class AuthenticatedFillRoleTests(unittest.TestCase):
             managed_order_ids={fill.order_id for fill in fills}
             - active_order_ids,
             active_unwind_order_ids=active_order_ids,
+            order_intent_contexts=order_intent_contexts,
+            episode_policy_observation=episode_policy_observation,
         )
 
     def test_roles_use_authenticated_positions_and_partial_order_role_is_stable(
@@ -194,6 +205,402 @@ class AuthenticatedFillRoleTests(unittest.TestCase):
             ],
             ["entry", "risk_increasing", "passive_exit"],
         )
+
+    def test_complete_typed_episode_has_policy_and_vwap_evidence(self) -> None:
+        economics = self.economics()
+        entry_intent = OrderIntentMetadata(
+            kind=OrderIntentKind.CONTROLLER_ENTRY,
+            revision=1,
+            controller_decision_id=11,
+        )
+        exit_intent = OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=1,
+            inventory_episode_id=7,
+            authenticated_episode_sequence=1,
+            exit_stage=InventoryExitStage.STRICT_PROFIT,
+            policy_decision_id=12,
+            binding_constraint=ExitBindingConstraint.NORMAL_PASSIVE,
+        )
+
+        self.apply(
+            economics,
+            [
+                trade(
+                    "1",
+                    "entry",
+                    OrderSide.BUY,
+                    "0.1",
+                    timestamp=1_700_000_000_000,
+                ),
+                trade(
+                    "2",
+                    "exit",
+                    OrderSide.SELL,
+                    "0.1",
+                    timestamp=1_700_000_005_000,
+                ),
+            ],
+            "0",
+            order_intent_contexts={
+                "entry": entry_intent,
+                "exit": exit_intent,
+            },
+            episode_policy_observation=EpisodePolicyObservation(
+                authenticated_episode_sequence=1,
+                entered_inventory_hold=False,
+                active_attempts=0,
+                max_unlocked_episode_loss=Decimal("0"),
+            ),
+        )
+
+        snapshot = economics.snapshot()
+        self.assertEqual(snapshot["policy_context_missing_count"], 0)
+        self.assertEqual(
+            snapshot["authenticated_fill_attributions"][0]["intent_kind"],
+            "controller_entry",
+        )
+        self.assertEqual(
+            snapshot["authenticated_fill_attributions"][0][
+                "controller_decision_id"
+            ],
+            11,
+        )
+        self.assertEqual(
+            snapshot["authenticated_fill_attributions"][1][
+                "policy_decision_id"
+            ],
+            12,
+        )
+        episode = snapshot["completed_episode_ledger"][0]
+        self.assertEqual(episode["entry_vwap"], Decimal("100"))
+        self.assertEqual(episode["exit_vwap"], Decimal("100"))
+        self.assertEqual(episode["quantity"], Decimal("0.1"))
+        self.assertEqual(
+            episode["inventory_duration_seconds"], Decimal("5")
+        )
+        self.assertEqual(episode["final_exit_stage"], "strict_profit")
+        self.assertEqual(
+            episode["final_binding_constraint"], "normal_passive"
+        )
+        self.assertEqual(episode["surplus_spent"], Decimal("0"))
+        self.assertEqual(
+            episode["passive_loss_used"], Decimal("0.0024")
+        )
+        self.assertEqual(
+            episode["max_unlocked_episode_loss"], Decimal("0")
+        )
+        self.assertFalse(episode["entered_inventory_hold"])
+        self.assertEqual(episode["active_attempts"], 0)
+        self.assertTrue(episode["close_policy_coverage"])
+
+    def test_same_audit_flat_without_policy_observation_is_incomplete(self) -> None:
+        economics = self.economics()
+        entry = OrderIntentMetadata(
+            kind=OrderIntentKind.BASE_ENTRY,
+            revision=1,
+        )
+        exit_intent = OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=2,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+            exit_stage=InventoryExitStage.STRICT_PROFIT,
+            policy_decision_id=2,
+            binding_constraint=ExitBindingConstraint.NORMAL_PASSIVE,
+        )
+
+        self.apply(
+            economics,
+            [
+                trade("1", "entry", OrderSide.BUY, "0.1", timestamp=1),
+                trade("2", "exit", OrderSide.SELL, "0.1", timestamp=2),
+            ],
+            "0",
+            order_intent_contexts={"entry": entry, "exit": exit_intent},
+        )
+
+        episode = economics.snapshot()["completed_episode_ledger"][0]
+        self.assertFalse(episode["close_policy_coverage"])
+        self.assertIsNone(episode["entered_inventory_hold"])
+        self.assertIsNone(episode["passive_loss_used"])
+
+    def test_missing_intent_context_softly_degrades_episode_coverage(
+        self,
+    ) -> None:
+        economics = self.economics()
+        entry_intent = OrderIntentMetadata(
+            kind=OrderIntentKind.BASE_ENTRY,
+            revision=1,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+        )
+
+        self.apply(
+            economics,
+            [
+                trade("1", "entry", OrderSide.BUY, "0.1", timestamp=1),
+                trade("2", "exit", OrderSide.SELL, "0.1", timestamp=2),
+            ],
+            "0",
+            order_intent_contexts={"entry": entry_intent},
+        )
+
+        snapshot = economics.snapshot()
+        self.assertEqual(snapshot["policy_context_missing_count"], 1)
+        self.assertIsNone(
+            snapshot["authenticated_fill_attributions"][1]["intent_kind"]
+        )
+        episode = snapshot["completed_episode_ledger"][0]
+        self.assertFalse(episode["close_policy_coverage"])
+        self.assertIsNone(episode["final_exit_stage"])
+        self.assertIsNone(episode["final_binding_constraint"])
+
+    def test_mixed_passive_active_close_preserves_policy_economics(self) -> None:
+        economics = self.economics()
+        entry = OrderIntentMetadata(
+            kind=OrderIntentKind.BASE_ENTRY,
+            revision=0,
+        )
+        passive = OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=2,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+            exit_stage=InventoryExitStage.SURPLUS_FUNDED_PASSIVE,
+            policy_decision_id=2,
+            binding_constraint=ExitBindingConstraint.SESSION_SURPLUS,
+            unlocked_episode_loss=Decimal("0.05"),
+        )
+        cancelled_higher_unlock = OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=3,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+            exit_stage=InventoryExitStage.INVENTORY_HOLD,
+            policy_decision_id=3,
+            binding_constraint=ExitBindingConstraint.EPISODE_CAP,
+            unlocked_episode_loss=Decimal("0.20"),
+            entered_inventory_hold=True,
+        )
+        bounded = OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=3,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+            exit_stage=InventoryExitStage.BOUNDED_PASSIVE_LOSS,
+            policy_decision_id=3,
+            binding_constraint=ExitBindingConstraint.EPISODE_CAP,
+            unlocked_episode_loss=Decimal("0.10"),
+        )
+        active = OrderIntentMetadata(
+            kind=OrderIntentKind.ACTIVE_EXIT,
+            revision=4,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+            exit_stage=InventoryExitStage.ACTIVE_IOC,
+            policy_decision_id=4,
+            binding_constraint=ExitBindingConstraint.ACTIVE_SLIPPAGE,
+        )
+
+        self.apply(
+            economics,
+            [
+                trade("1", "entry", OrderSide.BUY, "0.3", timestamp=1),
+                trade("2", "passive", OrderSide.SELL, "0.1", timestamp=2),
+                trade("3", "bounded", OrderSide.SELL, "0.1", timestamp=3),
+                trade(
+                    "4",
+                    "active",
+                    OrderSide.SELL,
+                    "0.1",
+                    role="taker",
+                    fee_rate="0.0004",
+                    timestamp=4,
+                ),
+            ],
+            "0",
+            active_order_ids={"active"},
+            order_intent_contexts={
+                "entry": entry,
+                "passive": passive,
+                "bounded": bounded,
+                "cancelled": cancelled_higher_unlock,
+                "active": active,
+            },
+            episode_policy_observation=EpisodePolicyObservation(
+                authenticated_episode_sequence=1,
+                entered_inventory_hold=True,
+                active_attempts=1,
+                max_unlocked_episode_loss=Decimal("0.20"),
+            ),
+        )
+
+        episode = economics.snapshot()["completed_episode_ledger"][0]
+        self.assertTrue(episode["close_policy_coverage"])
+        self.assertEqual(episode["final_exit_stage"], "active_ioc")
+        self.assertEqual(
+            episode["passive_loss_used"], Decimal("0.0048")
+        )
+        self.assertEqual(episode["surplus_spent"], Decimal("0.0024"))
+        self.assertEqual(
+            episode["max_unlocked_episode_loss"], Decimal("0.20")
+        )
+        self.assertTrue(episode["entered_inventory_hold"])
+        self.assertEqual(episode["active_attempts"], 1)
+
+    def test_policy_observation_survives_fill_during_hold_cancel(self) -> None:
+        economics = self.economics()
+        entry = OrderIntentMetadata(
+            kind=OrderIntentKind.BASE_ENTRY,
+            revision=0,
+        )
+        passive = OrderIntentMetadata(
+            kind=OrderIntentKind.PASSIVE_EXIT,
+            revision=3,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+            exit_stage=InventoryExitStage.BOUNDED_PASSIVE_LOSS,
+            policy_decision_id=3,
+            binding_constraint=ExitBindingConstraint.EPISODE_CAP,
+        )
+
+        self.apply(
+            economics,
+            [
+                trade("1", "entry", OrderSide.BUY, "0.1", timestamp=1),
+                trade("2", "passive", OrderSide.SELL, "0.1", timestamp=2),
+            ],
+            "0",
+            order_intent_contexts={"entry": entry, "passive": passive},
+            episode_policy_observation=EpisodePolicyObservation(
+                authenticated_episode_sequence=1,
+                entered_inventory_hold=True,
+                active_attempts=1,
+                max_unlocked_episode_loss=Decimal("0.2"),
+            ),
+        )
+
+        episode = economics.snapshot()["completed_episode_ledger"][0]
+        self.assertTrue(episode["entered_inventory_hold"])
+        self.assertEqual(episode["active_attempts"], 1)
+        self.assertEqual(
+            episode["max_unlocked_episode_loss"], Decimal("0.2")
+        )
+
+    def test_inconsistent_intent_context_fails_closed_atomically(self) -> None:
+        cases = (
+            OrderIntentMetadata(
+                kind=OrderIntentKind.PASSIVE_EXIT,
+                revision=1,
+                inventory_episode_id=1,
+                authenticated_episode_sequence=1,
+            ),
+            OrderIntentMetadata(
+                kind=OrderIntentKind.BASE_ENTRY,
+                revision=1,
+                inventory_episode_id=1,
+                authenticated_episode_sequence=2,
+            ),
+        )
+        for intent in cases:
+            with self.subTest(intent=intent):
+                economics = self.economics()
+                before = economics.snapshot()
+                with self.assertRaisesRegex(
+                    AccountAuditError, "intent conflicts"
+                ):
+                    self.apply(
+                        economics,
+                        [trade("1", "entry", OrderSide.BUY, "0.1")],
+                        "0.1",
+                        order_intent_contexts={"entry": intent},
+                    )
+                self.assertEqual(economics.snapshot(), before)
+
+    def test_invalid_trajectory_metadata_fails_closed_atomically(self) -> None:
+        cases = (
+            (
+                OrderIntentMetadata(
+                    kind=OrderIntentKind.BASE_ENTRY,
+                    revision=1,
+                    authenticated_episode_sequence=1,
+                    active_attempts=-1,
+                ),
+                "active_attempts is invalid",
+            ),
+            (
+                OrderIntentMetadata(
+                    kind=OrderIntentKind.BASE_ENTRY,
+                    revision=1,
+                    authenticated_episode_sequence=1,
+                    entered_inventory_hold="yes",
+                ),
+                "entered_inventory_hold is invalid",
+            ),
+        )
+        for intent, reason in cases:
+            with self.subTest(reason=reason):
+                economics = self.economics()
+                before = economics.snapshot()
+                with self.assertRaisesRegex(AccountAuditError, reason):
+                    self.apply(
+                        economics,
+                        [trade("1", "entry", OrderSide.BUY, "0.1")],
+                        "0.1",
+                        order_intent_contexts={"entry": intent},
+                    )
+                self.assertEqual(economics.snapshot(), before)
+
+    def test_partial_fill_keeps_bound_intent_and_rejects_revision_change(
+        self,
+    ) -> None:
+        economics = self.economics()
+        intent = OrderIntentMetadata(
+            kind=OrderIntentKind.CONTROLLER_ENTRY,
+            revision=1,
+            controller_decision_id=9,
+            inventory_episode_id=1,
+            authenticated_episode_sequence=1,
+        )
+        self.apply(
+            economics,
+            [trade("1", "entry", OrderSide.BUY, "0.1", timestamp=1)],
+            "0.1",
+            order_intent_contexts={"entry": intent},
+        )
+        self.apply(
+            economics,
+            [trade("2", "entry", OrderSide.BUY, "0.1", timestamp=2)],
+            "0.2",
+        )
+
+        snapshot = economics.snapshot()
+        self.assertEqual(snapshot["policy_context_missing_count"], 0)
+        self.assertEqual(
+            [
+                item["controller_decision_id"]
+                for item in snapshot["authenticated_fill_attributions"]
+            ],
+            [9, 9],
+        )
+        before = economics.snapshot()
+        with self.assertRaisesRegex(AccountAuditError, "changed across partial"):
+            self.apply(
+                economics,
+                [trade("3", "entry", OrderSide.BUY, "0.1", timestamp=3)],
+                "0.3",
+                order_intent_contexts={
+                    "entry": OrderIntentMetadata(
+                        kind=OrderIntentKind.CONTROLLER_ENTRY,
+                        revision=2,
+                        controller_decision_id=9,
+                        inventory_episode_id=1,
+                        authenticated_episode_sequence=1,
+                    )
+                },
+            )
+        self.assertEqual(economics.snapshot(), before)
 
     def test_authenticated_fill_ledger_is_bounded_and_replay_safe(self) -> None:
         economics = self.economics()

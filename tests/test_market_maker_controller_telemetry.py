@@ -1,12 +1,19 @@
 import unittest
 from decimal import Decimal
 
+from core.adapters.exchanges.models import OrderSide
 from core.services.market_maker.controllers import (
     QuoteControllerDecision,
     SideQuoteAdjustment,
 )
 from core.services.market_maker.metrics import MarketMakerMetrics
-from core.services.market_maker.models import RuntimeState
+from core.services.market_maker.models import (
+    ManagedOrder,
+    OrderIntentKind,
+    OrderIntentMetadata,
+    OrderSlotState,
+    RuntimeState,
+)
 
 
 class MarketMakerControllerTelemetryTests(unittest.TestCase):
@@ -313,6 +320,110 @@ class MarketMakerControllerTelemetryTests(unittest.TestCase):
         self.assertIsInstance(stats["ewma_bps"], Decimal)
         self.assertGreater(stats["ewma_bps"], stats["mean_bps"])
         self.assertLess(stats["ewma_bps"], Decimal("-2"))
+
+    def test_inventory_policy_metrics_use_completed_episodes_once(self) -> None:
+        metrics = MarketMakerMetrics(0.0)
+        metrics.record_inventory_unwind(
+            {
+                "exit_stage": "inventory_hold",
+                "stage_transition_history": [
+                    {
+                        "transition_sequence": 1,
+                        "episode_id": 1,
+                        "policy_decision_id": 1,
+                        "exit_stage": "inventory_hold",
+                    },
+                    {
+                        "transition_sequence": 2,
+                        "episode_id": 1,
+                        "policy_decision_id": 1,
+                        "exit_stage": "strict_profit",
+                    },
+                ],
+            },
+            now=1.0,
+        )
+        metrics.record_account_audit(
+            {
+                "policy_context_missing_count": 1,
+                "completed_episode_ledger": [
+                    {
+                        "session_id": "session",
+                        "episode_sequence": 1,
+                        "final_exit_stage": "strict_profit",
+                        "close_policy_coverage": True,
+                    },
+                    {
+                        "session_id": "session",
+                        "episode_sequence": 2,
+                        "final_exit_stage": "active_ioc",
+                        "close_policy_coverage": False,
+                    },
+                ],
+            }
+        )
+        metrics.record_account_audit(metrics.account_audit)
+
+        first = metrics.snapshot(6.0)
+        metrics.snapshot(4.0)
+        final = metrics.snapshot(7.0)
+
+        self.assertEqual(
+            final["counters"]["exit_stage_transition_count"], 2
+        )
+        self.assertEqual(final["counters"]["strict_profit_exit_count"], 1)
+        self.assertEqual(final["counters"]["active_exit_count"], 0)
+        self.assertEqual(first["inventory_hold_seconds"], 5.0)
+        self.assertEqual(final["inventory_hold_seconds"], 6.0)
+        self.assertEqual(final["policy_context_missing_count"], 1)
+
+    def test_controller_live_revision_and_bounded_score_seconds(self) -> None:
+        metrics = MarketMakerMetrics(0.0)
+        intent = OrderIntentMetadata(
+            kind=OrderIntentKind.CONTROLLER_ENTRY,
+            revision=3,
+            controller_decision_id=3,
+            controller_outward_only=True,
+            controller_extra_spread_ticks=2,
+        )
+        order = ManagedOrder(
+            side=OrderSide.BUY,
+            state=OrderSlotState.LIVE,
+            order_id="order-1",
+            client_id="client-1",
+            price=Decimal("99.8"),
+            amount=Decimal("0.2"),
+            remaining=Decimal("0.2"),
+            reduce_only=False,
+            created_monotonic=10.0,
+            updated_monotonic=10.0,
+            intent=intent,
+        )
+        metrics.record_quote_context(
+            "order-1",
+            {
+                "order_id": "order-1",
+                "toxicity_score_ticks": Decimal("1.5"),
+            },
+        )
+
+        metrics.sync_controller_live_orders((order,), now=10.0)
+        first = metrics.snapshot(15.0)
+        metrics.snapshot(12.0)
+        final = metrics.snapshot(16.0)
+
+        self.assertEqual(
+            first["controller_order_live_seconds_by_score"],
+            {"buy:[1,2)": 5.0},
+        )
+        self.assertEqual(
+            final["controller_order_live_seconds_by_score"],
+            {"buy:[1,2)": 6.0},
+        )
+        self.assertEqual(
+            final["controller_live_order_revisions"]["order-1"]["revision"],
+            3,
+        )
 
 
 if __name__ == "__main__":

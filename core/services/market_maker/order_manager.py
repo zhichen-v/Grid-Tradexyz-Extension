@@ -5,7 +5,9 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, Iterable
+from enum import Enum
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from ...adapters.exchanges.exceptions import (
     OrderSubmissionNotSentError,
@@ -18,6 +20,8 @@ from .models import (
     DesiredQuotes,
     ManagedOrder,
     MarketMetadata,
+    OrderIntentKind,
+    OrderIntentMetadata,
     OrderSlotState,
     RuntimeState,
 )
@@ -36,6 +40,15 @@ _UNCERTAIN_STATES = {
 }
 _ACTIVE_TERMINAL_MAX_POLLS = 10
 _ACTIVE_TERMINAL_POLL_SECONDS = 0.5
+_TERMINAL_INTENT_CONTEXT_LIMIT = 512
+
+
+class ReconcileActionCause(Enum):
+    NORMAL = "normal"
+    SAFETY = "safety"
+    CONTROLLER_PROTECTIVE = "controller_protective"
+    CONTROLLER_BLOCK = "controller_block"
+    CONTROLLER_RESUME = "controller_resume"
 
 
 def _error_category(exc: BaseException) -> str:
@@ -146,6 +159,8 @@ class ReconcileAction:
     reduce_only: bool = False
     success: bool | None = None
     order_id: str | None = None
+    cause: ReconcileActionCause = ReconcileActionCause.NORMAL
+    intent: OrderIntentMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +217,17 @@ class MarketMakerOrderManager:
         self._risk_reducing_create_not_before = 0.0
         self._mutation_generation = 0
         self._known_order_ids: set[str] = set()
+        self._order_intent_contexts: dict[str, OrderIntentMetadata] = {}
+        self._terminal_order_intent_contexts: dict[
+            str, OrderIntentMetadata
+        ] = {}
+        self._controller_protective_cancel_monotonic: dict[
+            OrderSide, float
+        ] = {}
+        self._pending_controller_protective_target: dict[
+            OrderSide, DesiredOrder
+        ] = {}
+        self._controller_blocked_sides: set[OrderSide] = set()
         self._active_unwind_order_ids: set[str] = set()
         self._active_unwind_side: OrderSide | None = None
         self._active_unwind_prepare_sequence = 0
@@ -242,6 +268,18 @@ class MarketMakerOrderManager:
             for proof in self._terminal_orders.values()
             if proof.order_id
         )
+
+    @property
+    def order_intent_contexts(self) -> Mapping[str, OrderIntentMetadata]:
+        """Confirmed live order intent, detached from mutable manager state."""
+        return MappingProxyType(dict(self._order_intent_contexts))
+
+    @property
+    def terminal_order_intent_contexts(
+        self,
+    ) -> Mapping[str, OrderIntentMetadata]:
+        """Bounded intent evidence backed by exact terminal order proof."""
+        return MappingProxyType(dict(self._terminal_order_intent_contexts))
 
     @property
     def active_unwind_order_ids(self) -> frozenset[str]:
@@ -478,6 +516,11 @@ class MarketMakerOrderManager:
                 if live is None:
                     continue
                 if target is None:
+                    controller_block = (
+                        quote_allowed
+                        and side in desired.controller_blocked_sides
+                    )
+                    action_start = len(actions)
                     effect.include(
                         await self._cancel_locked(
                             side,
@@ -485,8 +528,19 @@ class MarketMakerOrderManager:
                             actions,
                             errors,
                             safety=True,
+                            cause=(
+                                ReconcileActionCause.CONTROLLER_BLOCK
+                                if controller_block
+                                else ReconcileActionCause.SAFETY
+                            ),
                         )
                     )
+                    if controller_block and any(
+                        action.operation == "cancel"
+                        and action.success is True
+                        for action in actions[action_start:]
+                    ):
+                        self._controller_blocked_sides.add(side)
                     if self.unresolved_cancellation_count:
                         break
                     continue
@@ -499,9 +553,44 @@ class MarketMakerOrderManager:
                 if replace_reason is None:
                     continue
                 safety = self._is_safety_replacement(live, target, risk)
-                age_ms = (self._monotonic() - live.created_monotonic) * 1000
-                if not safety and age_ms < self.config.min_order_lifetime_ms:
+                protective = self.is_controller_protective_outward_revision(
+                    live, target
+                )
+                now = self._monotonic()
+                if protective:
+                    last = self._controller_protective_cancel_monotonic.get(
+                        side
+                    )
+                    interval_seconds = (
+                        self.config.toxicity_outward_reprice_min_interval_ms
+                        / 1000
+                    )
+                    if last is not None and (
+                        now < last or now - last < interval_seconds
+                    ):
+                        actions.append(
+                            ReconcileAction(
+                                side,
+                                "deferred",
+                                "controller protective reprice interval",
+                                target.price,
+                                target.amount,
+                                target.reduce_only,
+                                cause=(
+                                    ReconcileActionCause.CONTROLLER_PROTECTIVE
+                                ),
+                                intent=target.intent,
+                            )
+                        )
+                        continue
+                age_ms = (now - live.created_monotonic) * 1000
+                if (
+                    not safety
+                    and not protective
+                    and age_ms < self.config.min_order_lifetime_ms
+                ):
                     continue
+                action_start = len(actions)
                 effect.include(
                     await self._cancel_locked(
                         side,
@@ -509,8 +598,27 @@ class MarketMakerOrderManager:
                         actions,
                         errors,
                         safety=safety,
+                        cause=(
+                            ReconcileActionCause.CONTROLLER_PROTECTIVE
+                            if protective
+                            else ReconcileActionCause.SAFETY
+                            if safety
+                            else ReconcileActionCause.NORMAL
+                        ),
                     )
                 )
+                new_actions = actions[action_start:]
+                if protective and any(
+                    action.operation in {"cancel", "would_cancel"}
+                    for action in new_actions
+                ):
+                    self._controller_protective_cancel_monotonic[side] = now
+                if protective and any(
+                    action.operation == "cancel" and action.success is True
+                    for action in new_actions
+                ):
+                    assert target.intent is not None
+                    self._pending_controller_protective_target[side] = target
                 if self.unresolved_cancellation_count:
                     break
 
@@ -765,6 +873,7 @@ class MarketMakerOrderManager:
                 reduce_only=True,
                 created_monotonic=now,
                 updated_monotonic=now,
+                intent=desired.intent,
             )
             self._active_unwind_side = desired.side
             mutation_timestamp = self._record_mutation()
@@ -867,6 +976,7 @@ class MarketMakerOrderManager:
                 errors.append("active unwind terminal proof is unavailable")
                 return self._result(actions, errors, effect)
             slot.order_id = str(order.id)
+            self._bind_order_intent(str(order.id), slot.intent)
             slot.client_id = (
                 str(order.client_id) if order.client_id not in (None, "") else None
             )
@@ -1158,6 +1268,73 @@ class MarketMakerOrderManager:
         risk_reduction: bool,
     ) -> _OrderEffect:
         operation = "would_place" if self.config.dry_run else "place"
+        pending_target = self._pending_controller_protective_target.get(
+            desired.side
+        )
+        if pending_target is not None and desired.reduce_only:
+            self._pending_controller_protective_target.pop(
+                desired.side, None
+            )
+            pending_target = None
+        controller_revision = (
+            desired.intent.revision
+            if desired.intent is not None
+            and desired.intent.kind is OrderIntentKind.CONTROLLER_ENTRY
+            else None
+        )
+        pending_intent = pending_target.intent if pending_target else None
+        protective_target_preserved = (
+            pending_target is not None
+            and pending_intent is not None
+            and desired.intent is not None
+            and desired.intent.kind is OrderIntentKind.CONTROLLER_ENTRY
+            and controller_revision is not None
+            and controller_revision >= pending_intent.revision
+            and desired.intent.controller_extra_spread_ticks is not None
+            and pending_intent.controller_extra_spread_ticks is not None
+            and desired.intent.controller_extra_spread_ticks
+            >= pending_intent.controller_extra_spread_ticks
+            and (
+                desired.price <= pending_target.price
+                if desired.side is OrderSide.BUY
+                else desired.price >= pending_target.price
+            )
+        )
+        if pending_target is not None and not protective_target_preserved:
+            cancelled_at = self._controller_protective_cancel_monotonic.get(
+                desired.side
+            )
+            now = self._monotonic()
+            normal_wait_seconds = self.config.min_order_lifetime_ms / 1000
+            if cancelled_at is None or (
+                now < cancelled_at
+                or now - cancelled_at < normal_wait_seconds
+            ):
+                actions.append(
+                    ReconcileAction(
+                        desired.side,
+                        "deferred",
+                        "controller protective target reverted before replacement",
+                        desired.price,
+                        desired.amount,
+                        desired.reduce_only,
+                        cause=ReconcileActionCause.CONTROLLER_PROTECTIVE,
+                        intent=desired.intent,
+                    )
+                )
+                return _OrderEffect()
+            self._pending_controller_protective_target.pop(
+                desired.side, None
+            )
+
+        action_cause = (
+            ReconcileActionCause.CONTROLLER_PROTECTIVE
+            if protective_target_preserved
+            else ReconcileActionCause.CONTROLLER_RESUME
+            if desired.side in self._controller_blocked_sides
+            and controller_revision is not None
+            else ReconcileActionCause.NORMAL
+        )
         action = ReconcileAction(
             desired.side,
             operation,
@@ -1165,6 +1342,8 @@ class MarketMakerOrderManager:
             desired.price,
             desired.amount,
             desired.reduce_only,
+            cause=action_cause,
+            intent=desired.intent,
         )
         if self.config.dry_run:
             actions.append(action)
@@ -1186,6 +1365,8 @@ class MarketMakerOrderManager:
                     desired.price,
                     desired.amount,
                     desired.reduce_only,
+                    cause=action_cause,
+                    intent=desired.intent,
                 )
             )
             return _OrderEffect()
@@ -1203,6 +1384,7 @@ class MarketMakerOrderManager:
             reduce_only=desired.reduce_only,
             created_monotonic=now,
             updated_monotonic=now,
+            intent=desired.intent,
         )
         self._record_mutation()
         actions.append(action)
@@ -1304,6 +1486,7 @@ class MarketMakerOrderManager:
         actions[action_index] = action
         if order.id is not None:
             self._known_order_ids.add(str(order.id))
+            self._bind_order_intent(str(order.id), desired.intent)
         if fill_observed:
             effect.observed_fill_orders.append(order)
         if order.status in _TERMINAL_STATUSES:
@@ -1316,6 +1499,7 @@ class MarketMakerOrderManager:
                     reason="filled during submission",
                     success=True,
                 )
+                self._complete_controller_create(desired.side)
                 self._slots[desired.side] = None
                 return effect
             actions[action_index] = replace(
@@ -1359,6 +1543,7 @@ class MarketMakerOrderManager:
             errors.append("create outcome uncertain: invalid confirmation")
             return effect
         actions[action_index] = replace(action, success=True)
+        self._complete_controller_create(desired.side)
         return effect
 
     async def _cancel_locked(
@@ -1369,6 +1554,7 @@ class MarketMakerOrderManager:
         errors: list[str],
         *,
         safety: bool,
+        cause: ReconcileActionCause = ReconcileActionCause.NORMAL,
     ) -> _OrderEffect:
         slot = self._slots[side]
         if slot is None:
@@ -1381,6 +1567,8 @@ class MarketMakerOrderManager:
             slot.price,
             slot.remaining,
             slot.reduce_only,
+            cause=cause,
+            intent=slot.intent,
         )
         if self.config.dry_run:
             actions.append(action)
@@ -1393,7 +1581,13 @@ class MarketMakerOrderManager:
             return _OrderEffect()
         if not safety and not self._mutation_budget_available():
             actions.append(
-                ReconcileAction(side, "blocked", "mutation budget exhausted")
+                ReconcileAction(
+                    side,
+                    "blocked",
+                    "mutation budget exhausted",
+                    cause=cause,
+                    intent=slot.intent,
+                )
             )
             return _OrderEffect()
 
@@ -1546,7 +1740,10 @@ class MarketMakerOrderManager:
                     if not self._valid_active_resolution(slot, order):
                         continue
                     if order.id not in (None, ""):
-                        self._active_unwind_order_ids.add(str(order.id))
+                        active_id = str(order.id)
+                        self._active_unwind_order_ids.add(active_id)
+                        self._known_order_ids.add(active_id)
+                        self._bind_order_intent(active_id, slot.intent)
                     if order.status in _TERMINAL_STATUSES:
                         self._apply_order_update(order.side, order)
                     else:
@@ -1703,8 +1900,15 @@ class MarketMakerOrderManager:
                 previous.updated_monotonic = now
             self._pause(f"invalid {side.value} order update")
             return
-        if order.id is not None and self._active_unwind_side is not side:
-            self._known_order_ids.add(str(order.id))
+        if order.id is not None:
+            confirmed_order_id = str(order.id)
+            self._known_order_ids.add(confirmed_order_id)
+            self._bind_order_intent(
+                confirmed_order_id,
+                previous.intent if previous is not None else None,
+            )
+            if self._active_unwind_side is side:
+                self._active_unwind_order_ids.add(confirmed_order_id)
         cancellation_uncertain = bool(
             previous is not None
             and (
@@ -1746,6 +1950,7 @@ class MarketMakerOrderManager:
             updated_monotonic=now,
             submission_uncertain=self._submission_uncertain(order),
             cancellation_uncertain=cancellation_uncertain,
+            intent=previous.intent if previous is not None else None,
         )
         if self._submission_uncertain(order):
             current = self._slots[side]
@@ -1960,6 +2165,45 @@ class MarketMakerOrderManager:
             return f"{desired.side.value} desired price/amount is invalid"
         return None
 
+    def is_controller_protective_outward_revision(
+        self,
+        live: ManagedOrder,
+        desired: DesiredOrder,
+    ) -> bool:
+        live_intent = live.intent
+        target_intent = desired.intent
+        if (
+            live.state is not OrderSlotState.LIVE
+            or live.reduce_only
+            or desired.reduce_only
+            or live.side is not desired.side
+            or live.remaining != live.amount
+            or desired.amount != live.amount
+            or live_intent is None
+            or target_intent is None
+            or live_intent.kind is not OrderIntentKind.CONTROLLER_ENTRY
+            or target_intent.kind is not OrderIntentKind.CONTROLLER_ENTRY
+            or live_intent.controller_outward_only is not True
+            or target_intent.controller_outward_only is not True
+            or type(live_intent.revision) is not int
+            or type(target_intent.revision) is not int
+            or target_intent.revision <= live_intent.revision
+            or type(live_intent.controller_extra_spread_ticks) is not int
+            or type(target_intent.controller_extra_spread_ticks) is not int
+            or target_intent.controller_extra_spread_ticks
+            <= live_intent.controller_extra_spread_ticks
+        ):
+            return False
+        outward = (
+            desired.price < live.price
+            if live.side is OrderSide.BUY
+            else desired.price > live.price
+        )
+        threshold = self.metadata.price_tick * Decimal(
+            self.config.toxicity_outward_reprice_threshold_ticks
+        )
+        return outward and abs(desired.price - live.price) >= threshold
+
     def _replacement_reason(
         self,
         live: ManagedOrder,
@@ -1968,6 +2212,8 @@ class MarketMakerOrderManager:
     ) -> str | None:
         if self._is_safety_replacement(live, desired, risk):
             return "live order no longer matches risk"
+        if self.is_controller_protective_outward_revision(live, desired):
+            return "controller protective outward revision"
         if (
             risk.runtime_state is RuntimeState.RISK_REDUCTION
             and live.reduce_only
@@ -2060,12 +2306,55 @@ class MarketMakerOrderManager:
             client_id=client_id,
             remaining=remaining,
         )
+        if proof.order_id:
+            self._bind_terminal_order_intent(proof.order_id, proof.intent)
         for namespace, value in (
             ("order_id", proof.order_id),
             ("client_id", proof.client_id),
         ):
             if value:
                 self._terminal_orders[(proof.side, namespace, value)] = proof
+
+    def _bind_order_intent(
+        self, order_id: str, intent: OrderIntentMetadata | None
+    ) -> None:
+        if intent is None:
+            return
+        existing = self._order_intent_contexts.get(order_id)
+        terminal = self._terminal_order_intent_contexts.get(order_id)
+        if (existing is not None and existing != intent) or (
+            terminal is not None and terminal != intent
+        ):
+            self._pause("confirmed order id changed intent context")
+            return
+        self._order_intent_contexts[order_id] = intent
+
+    def _complete_controller_create(self, side: OrderSide) -> None:
+        self._pending_controller_protective_target.pop(side, None)
+        self._controller_blocked_sides.discard(side)
+
+    def _bind_terminal_order_intent(
+        self, order_id: str, intent: OrderIntentMetadata | None
+    ) -> None:
+        if intent is None:
+            self._order_intent_contexts.pop(order_id, None)
+            return
+        existing = self._order_intent_contexts.get(order_id)
+        terminal = self._terminal_order_intent_contexts.get(order_id)
+        if (existing is not None and existing != intent) or (
+            terminal is not None and terminal != intent
+        ):
+            self._pause("confirmed order id changed intent context")
+            return
+        self._order_intent_contexts.pop(order_id, None)
+        self._terminal_order_intent_contexts.pop(order_id, None)
+        self._terminal_order_intent_contexts[order_id] = intent
+        while (
+            len(self._terminal_order_intent_contexts)
+            > _TERMINAL_INTENT_CONTEXT_LIMIT
+        ):
+            oldest = next(iter(self._terminal_order_intent_contexts))
+            self._terminal_order_intent_contexts.pop(oldest)
 
     def _terminal_order_replay(
         self, order: OrderData

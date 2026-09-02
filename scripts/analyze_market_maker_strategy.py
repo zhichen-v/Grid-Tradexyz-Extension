@@ -466,10 +466,101 @@ def _markout_analysis(events: list[dict[str, Any]], legacy_pending: int) -> dict
     }
 
 
-def _episode_analysis(episodes: Any) -> dict[str, Any]:
+def _complete_policy_episode(episode: dict[str, Any]) -> bool:
+    if episode.get("close_policy_coverage") is not True:
+        return False
+    if not isinstance(episode.get("session_id"), str) or not episode[
+        "session_id"
+    ].strip():
+        return False
+    sequence = episode.get("episode_sequence")
+    if type(sequence) is not int or sequence <= 0:
+        return False
+    if episode.get("entry_side") not in {"buy", "sell"}:
+        return False
+    for field in ("entry_vwap", "exit_vwap", "quantity"):
+        value = _decimal(episode.get(field))
+        if value is None or value <= 0:
+            return False
+    for field in ("gross", "net_ex_funding"):
+        if _decimal(episode.get(field)) is None:
+            return False
+    for field in (
+        "maker_fee",
+        "taker_fee",
+        "inventory_duration_seconds",
+        "passive_loss_used",
+        "surplus_spent",
+        "max_unlocked_episode_loss",
+    ):
+        value = _decimal(episode.get(field))
+        if value is None or value < 0:
+            return False
+    if episode.get("final_exit_stage") not in {
+        "strict_profit",
+        "surplus_funded_passive",
+        "bounded_passive_loss",
+        "inventory_hold",
+        "active_ioc",
+        "flat_pending_audit",
+        "completed",
+    }:
+        return False
+    if episode.get("final_binding_constraint") not in {
+        "normal_passive",
+        "episode_cap",
+        "session_surplus",
+        "session_loss_cap",
+        "drawdown_cap",
+        "active_slippage",
+        "attempt_cap",
+        "data_untrusted",
+    }:
+        return False
+    if "entered_inventory_hold" not in episode:
+        return False
+    entered_hold = episode["entered_inventory_hold"]
+    if type(entered_hold) is not bool:
+        return False
+    active_attempts = episode.get("active_attempts")
+    return type(active_attempts) is int and active_attempts >= 0
+
+
+def _episode_analysis(
+    episodes: Any, *, policy_context_missing_count: int = 0
+) -> dict[str, Any]:
     if not isinstance(episodes, list):
         episodes = []
     valid = [episode for episode in episodes if isinstance(episode, dict)]
+    covered = [episode for episode in valid if _complete_policy_episode(episode)]
+    details = [
+        {
+            key: episode.get(key)
+            for key in (
+                "session_id",
+                "episode_sequence",
+                "entry_side",
+                "entry_vwap",
+                "exit_vwap",
+                "quantity",
+                "gross",
+                "maker_fee",
+                "taker_fee",
+                "net_ex_funding",
+                "inventory_duration_seconds",
+                "final_exit_stage",
+                "final_binding_constraint",
+                "passive_loss_used",
+                "surplus_spent",
+                "max_unlocked_episode_loss",
+                "entered_inventory_hold",
+                "active_attempts",
+                "close_policy_coverage",
+            )
+        }
+        for episode in valid
+    ]
+    incomplete = len(valid) - len(covered)
     return {
         "count": len(valid),
         "gross": _describe(episode.get("gross") for episode in valid),
@@ -488,6 +579,80 @@ def _episode_analysis(episodes: Any) -> dict[str, Any]:
             if episode.get("active_unwind_used") is True
             or episode.get("active_involvement") is True
         ),
+        "policy_covered_count": len(covered),
+        "policy_incomplete_count": incomplete,
+        "policy_context_missing_count": policy_context_missing_count,
+        "promotion_eligible": bool(covered)
+        and incomplete == 0
+        and policy_context_missing_count == 0,
+        "promotion_episode_count": len(covered),
+        "promotion_gross": _describe(
+            episode.get("gross") for episode in covered
+        ),
+        "promotion_net": _describe(
+            episode.get("net_ex_funding", episode.get("net"))
+            for episode in covered
+        ),
+        "final_exit_stage_distribution": dict(
+            Counter(
+                str(episode.get("final_exit_stage", "unknown"))
+                for episode in covered
+            )
+        ),
+        "binding_constraint_distribution": dict(
+            Counter(
+                str(episode.get("final_binding_constraint", "unknown"))
+                for episode in covered
+            )
+        ),
+        "decomposition": {
+            "entry_quality": {
+                "entry_vwap": _describe(
+                    episode.get("entry_vwap") for episode in covered
+                ),
+                "entry_side_distribution": dict(
+                    Counter(
+                        str(episode.get("entry_side", "unknown"))
+                        for episode in covered
+                    )
+                ),
+            },
+            "inventory_drift": {
+                "duration_seconds": _describe(
+                    episode.get("inventory_duration_seconds")
+                    for episode in covered
+                ),
+                "entered_hold_count": sum(
+                    episode.get("entered_inventory_hold") is True
+                    for episode in covered
+                ),
+            },
+            "exit_concession": {
+                "exit_vwap": _describe(
+                    episode.get("exit_vwap") for episode in covered
+                ),
+                "passive_loss_used": _describe(
+                    episode.get("passive_loss_used")
+                    for episode in covered
+                ),
+                "surplus_spent": _describe(
+                    episode.get("surplus_spent") for episode in covered
+                ),
+            },
+            "fee": {
+                "maker": _describe(
+                    episode.get("maker_fee") for episode in covered
+                ),
+                "taker": _describe(
+                    episode.get("taker_fee") for episode in covered
+                ),
+            },
+            "final_net": _describe(
+                episode.get("net_ex_funding", episode.get("net"))
+                for episode in covered
+            ),
+        },
+        "episode_details": details,
     }
 
 
@@ -1206,6 +1371,7 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
         "seen_trade_id_evictions",
         "order_role_binding_registry_size",
         "order_role_binding_evictions",
+        "policy_context_missing_count",
     )
     session = {key: audit.get(key) for key in session_keys}
     session["completed_maker_fee"] = audit.get(
@@ -1247,7 +1413,12 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "snapshot_count": len(records),
         "session": session,
-        "episodes": _episode_analysis(episodes),
+        "episodes": _episode_analysis(
+            episodes,
+            policy_context_missing_count=int(
+                audit.get("policy_context_missing_count", 0) or 0
+            ),
+        ),
         "markouts": markouts,
         "controller": _controller_analysis(records, history, contexts),
         "shadow_counterfactual": counterfactual,
@@ -1338,6 +1509,18 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Gross distribution: {episodes.get('gross')}",
         f"- Net distribution: {episodes.get('net')}",
         f"- Close types: {episodes.get('close_type_distribution')}",
+        f"- Policy covered / incomplete / missing contexts: "
+        f"{episodes.get('policy_covered_count')} / "
+        f"{episodes.get('policy_incomplete_count')} / "
+        f"{episodes.get('policy_context_missing_count')}",
+        f"- Promotion eligible / episode count: "
+        f"{episodes.get('promotion_eligible')} / "
+        f"{episodes.get('promotion_episode_count')}",
+        f"- Exit stages / binding constraints: "
+        f"{episodes.get('final_exit_stage_distribution')} / "
+        f"{episodes.get('binding_constraint_distribution')}",
+        f"- Entry→drift→exit→fee→net decomposition: "
+        f"{episodes.get('decomposition')}",
         "",
         "## Authenticated entry markouts",
         "",

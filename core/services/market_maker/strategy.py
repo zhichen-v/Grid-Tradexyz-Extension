@@ -13,6 +13,8 @@ from .models import (
     ManagedOrder,
     MarketMetadata,
     MarketSnapshot,
+    OrderIntentKind,
+    OrderIntentMetadata,
     OrderSide,
     OrderSlotState,
     PositionSnapshot,
@@ -663,6 +665,14 @@ class MarketMakerStrategy:
             amount=amount,
             reduce_only=reduce_only,
             reason=reason,
+            intent=(
+                OrderIntentMetadata(
+                    kind=OrderIntentKind.BASE_ENTRY,
+                    revision=0,
+                )
+                if not reduce_only
+                else None
+            ),
         )
 
     @staticmethod

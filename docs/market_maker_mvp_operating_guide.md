@@ -48,6 +48,7 @@ Live 前以 authenticated read-only preflight 核對：
 | 同步 | `position_poll_interval_seconds`、`order_sync_interval_seconds`、`health_check_interval_seconds`；unknown position 不得當成 `0`。 |
 | 帳戶審計 | `account_audit_interval_seconds`、`account_audit_timeout_seconds`、`require_flat_start`、`max_session_drawdown`；live 不可關閉 audit。 |
 | 經濟門檻 | `maker_fee_rate`、`min_profit_buffer_bps`、`economic_min_fills`、`min_completed_net_turnover_bps`、`max_session_loss_for_maker_exit`；completed ledger 與自然 flat equity 都需過門檻，loss budget不是GO豁免。 |
+| Entry controller | Checked-in example的安全預設為`quote_controller_mode: "fixed"`、`toxicity_apply_bid/ask: false`、`toxicity_max_extra_spread_ticks: 0`、`toxicity_block_threshold_ticks: "0"`、`toxicity_use_markout_feedback: false`、`active_unwind_enabled: false`及`dry_run: true`。Protective預設為outward threshold `1` tick、minimum interval `5000 ms`；active profile只能存在ignored/local overlay或明確sanitized candidate，不得打開source default。 |
 | Inventory unwind | `active_unwind_enabled` 預設 `false`。明確 opt-in 時須維持 `exclusive_symbol_control: true`、`cancel_on_shutdown: true`，並逐次核對**正值且已驗證**的 `taker_fee_rate`、`active_unwind_after_seconds`、`active_unwind_loss_trigger`、`active_unwind_max_slippage_ticks`、`active_unwind_max_attempts`、`active_unwind_confirmation_timeout_seconds`、`max_episode_loss_for_unwind`、`max_session_loss_for_unwind`；active deadline須晚於soft exit，maker-exit budget須為正，且必須滿足 loss trigger `<` episode cap `<` session cap `<` drawdown。目前沒有authenticated zero-taker-fee proof，因此不得以`0`啟用。 |
 | 錯誤／流量 | `max_consecutive_errors`、`error_cooldown_seconds`、`max_mutations_per_minute`；安全撤單優先，禁止 busy retry。 |
 | Ownership | `exclusive_symbol_control: true`、`startup_open_order_policy: abort`、`unknown_order_policy: pause`。未知單不可猜測為本策略所有。 |
@@ -223,6 +224,8 @@ Controller硬邊界：
 - Active feature未ready、stale、invalid或feature pipeline exception時，flat entry關閉；non-flat exit仍可收斂。
 - Markout event同時保存raw BBO與own-size-subtracted external mid；side／authenticated summaries、entry feedback與promotion analysis只接受external markout。External book或managed-order truth不可信時不補值，另以coverage／telemetry error揭露；v1 active仍禁止使用feedback，shadow只供校準。
 
+Protective replacement只適用於同側、non-reduce-only controller entry，且target revision較新、BUY價格更低或SELL價格更高、outward delta達專用threshold並通過專用minimum interval。它可繞過普通market-following reprice threshold，但不能繞過mutation limiter或cancel exact-terminal proof；replacement只能在terminal proof後建立，同revision不得重複cancel。若target在普通minimum lifetime前反轉或向內恢復，立即丟棄pending protective target並安全defer，之後回到既有minimum lifetime、normal threshold與controller hysteresis。任何`reduce_only`退出會清除／bypass pending controller target，不得因entry-controller replacement狀態延遲減倉。
+
 本地分析只讀既有log／metrics，不連線交易所：
 
 ```powershell
@@ -230,6 +233,8 @@ Controller硬邊界：
 ```
 
 Shadow輸出是counterfactual proxy，不是queue-fill backtest。Analyzer只把external markout納入策略統計；raw markout僅供diagnostic。若placement後、實際fill前出現shadow block／reprice、controller unavailable或entry不再適用，該fill保守列為`indeterminate`。舊E2ay只有16筆未帶authenticated role join的markout，所以必須維持`pending=16 / indeterminate=16`，不能回溯推斷entry／exit。Periodic checkpoint中的completed episodes依`(session_id, episode_sequence)`合併；無穩定identity的舊schema只讀final snapshot，避免跨checkpoint重複計數。
+
+新schema由`OrderIntentMetadata`明確區分base/controller entry、passive exit與active exit；confirmed live／terminal order ID保留同一intent，partial fill不得改寫，replacement使用新revision，identity或immutable intent衝突須fail closed。Authenticated exit fill必須與同一inventory episode及正整數`episode_sequence`、policy decision、exit stage與binding constraint一致。Executor另以同sequence的policy observation保存無order-ID的active attempt、曾進入inventory hold及最大unlock；沒有該觀察、純telemetry context缺失或schema不完整時，runtime不必因單純telemetry缺失崩潰，但completed episode必須標記`close_policy_coverage:false`、增加missing/incomplete證據並排除promotion／calibration，不得由reason string或舊schema猜補分類。Non-flat期間若authenticated sequence缺失、為`0`／bool／無效或中途漂移，executor必須抑制passive create並維持`passive_wait`／blocked fail-closed，不能沿用舊sequence產生exit intent。
 
 Promotion順序固定：
 
@@ -239,6 +244,8 @@ Promotion順序固定：
 4. Gate D：依authenticated entry markout選較差一側，只開單側widening、不開blocking；base spread、size、mutation、unwind caps與另一側均不變，完整economic/hard-safety gate照舊。
 5. Gate E：只有單側active canary完整GO後才測雙側widening；side blocking仍是另一個單變因。
 6. Gate F：至少2–3次彼此獨立的fresh-flat short sessions通過後才做4小時；4小時GO後才考慮24小時／VPS。
+
+Config validation只要求active至少啟用一側；第一個active canary的操作政策更嚴格，必須恰好一個`toxicity_apply_*`為`true`，另一側維持`false`。只有該單側candidate完成完整short-live GO後，才可另案評估雙側widening；不得直接以兩側enabled啟動第一輪active canary。
 
 本checkpoint沒有執行Gate A–F、network、T3、live、flatten或account mutation，也不授權下一輪。E2ay維持「P0 prevention proof GO／short-live promotion NO-GO／4h未啟動／正式30-fill economics incomplete」。
 
@@ -282,3 +289,11 @@ Offline驗證：review-focused整合`333/333`、全部Market Maker `493/493`；f
 - **完整30分鐘short-live attempt 2**：05:13–05:43，timer exit、uptime`1806.282s`、`369/369`、failed`0`；create／cancel=`16/10`且全成功，6 maker／0 taker fills、3 round trips，三個episode均`maker_flat`，active attempts／blocks／ambiguity全0。Reconciliation`369/0`，unknown、unresolved、429、WS reconnect、account read、mutation limiter、controller與log errors全0；10次cancel warning全由exact-terminal reconciliation收斂。Controller history`62/62 complete`；執行時analyzer分母只有3筆authenticated non-active entry，全部classifiable／likely-filtered，3筆passive exit正確排除。第三輪flat後entry reserve按設計block，沒有為湊樣本重啟。Evidence `logs/market_maker_gate_c_inventory_owner_shadow_active_short_live_20260902-0513_attempt2.log`，SHA `64C04E96...4403`；當時analyzer JSON／Markdown SHA分別為`1E268254...A349`／`A6D3322E...F774`；runtime0、雙postflight`0/0`，費率仍為premium maker／taker `0.00012 / 0.00035`。
 - **場後review hardening**：獨立review重現跨多log／restart時單調sequence可能互相污染，故每個runtime新增不可重用run ID，decision／placement／fill及history completeness只在同run內比較；analyzer再以純state fold輸出`would-place／reprice／block／cancel／resume`、fill當下virtual-live與價格，且維持`true_queue_backtest:false`。第一版fold曾略過「有sequence但缺run ID」的foreign／legacy decision，最終review以cross-input case攔截並修為立即`event_sequence_incomplete`；只有帶有效且明確不同run ID的decision才可略過。另為long surplus boundary的`1 - maker_fee - minimum_rate <= 0`加入fail-closed guard，非正分母不建立passive／active order。這些變更不改正常Gate C quote／mutation路徑；只做offline regression，未重新live。舊attempt2 log產生於run-ID schema之前，因此用最終analyzer重播會把3筆entry保守列為`event_sequence_incomplete`／indeterminate，3筆passive exit仍排除；post-hardening JSON／Markdown SHA=`6A0DF742...8957`／`7AA20EF1...12F`，不得以舊的3/3分類當作新schema可重現證據。
 - **本輪結論**：要求的完整`T3 → 30m short-live`已完成，已執行fingerprint的inventory ownership與hard-safety為GO；但只有`6/30` completed fills，正式economics仍`collecting`。場後hardening只有offline proof；不得升Gate D、不得以負樣本提前宣告正式economic NO-GO，也不得進行long-live。本輪明確未啟動4h。
+
+### Post-27abae Phase 0–2 checkpoint（2026-09-02，code-only）
+
+本checkpoint完成sanitized golden fixture、typed order intent／authenticated exit-policy attribution，以及outward protective controller replacement。Golden fixture來自既有Gate C attempt2 log；artifact `run_id`不是runtime event-sequence ID，原始runtime未嵌入commit/config hash，因此兩者維持`null`，`27abae1845a1d3d4542d0de480518e60eb0d8829`只記為post-run baseline，不能冒充executed fingerprint。Fixture固定為`diagnostic_only`、active-controller proof `indeterminate`、`promotion_eligible:false`，不得補造新schema coverage。
+
+Typed evidence現在以order identity及authenticated episode sequence綁定，另保存episode policy observation，讓HOLD期間舊單在cancel race中成交、未取得order ID的active attempt、以及同單未replacement時的unlock軌跡仍可保守記錄；缺少完整producer evidence一律不可promotion。Controller block/resume只接受arbiter明確標記的side，不能把inventory/risk/economic-stop撤單誤算成toxicity block。Stage transition使用獨立session-monotonic sequence，直接authenticated-flat完成也不會與前一policy decision去重碰撞。
+
+本checkpoint的最終offline驗證數字記於驗證歷史E2bb。本輪未連線交易所、未做account mutation、T3、live、flatten或long-run，亦不改判先前Gate C live結果。下一步仍須fresh fixed T3 → shadow T3 → active dry T3；active live與Gate D promotion尚未取得證據。
