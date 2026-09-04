@@ -1,6 +1,7 @@
 """Read-only Lighter mapping. Execution and credential ownership stay outside V2."""
 
-from decimal import Decimal
+from decimal import Decimal, Inexact, ROUND_DOWN, localcontext
+from dataclasses import replace
 import re
 
 from .domain import (
@@ -59,6 +60,29 @@ def _funding_map(rows):
     return result
 
 
+def _account_state(assets, positions, shares):
+    """Financial/ownership fields shared by REST and fresh account_all snapshots."""
+    if shares != []:
+        raise LighterReadError("nonexclusive pool shares")
+    def rows(values, identity, integers, decimals, strings=()):
+        result = []
+        for row in values:
+            get = row.__getitem__ if type(row) is dict else lambda key: getattr(row, key)
+            whole = tuple(get(key) for key in integers)
+            if any(type(value) is not int for value in whole):
+                raise LighterReadError("invalid account state counters")
+            result.append((get(identity), *whole, *(_number(get(key)) for key in decimals),
+                           *(get(key) for key in strings)))
+        if len({row[0] for row in result}) != len(result):
+            raise LighterReadError("duplicate account state identity")
+        return tuple(sorted(result))
+    return (rows(assets, "asset_id", ("asset_id",), ("balance", "locked_balance", "margin_balance"),
+                 ("symbol", "margin_mode")),
+            rows(positions, "market_id", ("market_id", "sign", "margin_mode", "open_order_count",
+                 "pending_order_count"), ("position", "avg_entry_price", "initial_margin_fraction",
+                 "allocated_margin"), ("symbol",)))
+
+
 class LighterAccountPort:
     """Audit one exclusive account; attach a ledger only after the flat baseline.
 
@@ -86,6 +110,12 @@ class LighterAccountPort:
         self._trades, self._fundings = {}, {}
         self._sequence = -1
         self._funding_time = -1
+        self._mode = self._settlement = None
+        self.stream = None
+        self._stream_count = None
+        self._stream_ids = frozenset()
+        self._fees_cache = self._funding_source = None
+        self._fees_at = self._settlement_at = float("-inf")
 
     def attach_ledger(self, ledger):
         if self._baseline is None or self._ledger is not None:
@@ -122,10 +152,12 @@ class LighterAccountPort:
                 or getattr(account, "index", None) != self._index
                 or str(getattr(account, "l1_address", "")).lower() != self._address):
             raise LighterReadError("account identity mismatch")
-        # Cross/classic USDG accounting only: alternate collateral, pools and
-        # isolated margin need explicit accounting support, never assumptions.
-        if (getattr(account, "account_trading_mode", None) != 0
-                or getattr(account, "shares", None) != []
+        # Only exclusive cross USDG: never reinterpret multi-asset collateral.
+        mode = getattr(account, "account_trading_mode", None)
+        if (type(mode) is not int or mode not in {0, 1}
+                or self._mode is not None and mode != self._mode):
+            raise LighterReadError("unsupported or changed account trading mode")
+        if (getattr(account, "shares", None) != []
                 or getattr(account, "pending_order_count", None) != 0
                 or getattr(account, "total_order_count", None) != len(orders)):
             raise LighterReadError("unsupported or inconsistent account state")
@@ -138,6 +170,9 @@ class LighterAccountPort:
             size = _number(row.position)
             if size < ZERO:
                 raise LighterReadError("negative position magnitude")
+            if mode == 1 and (_number(row.allocated_margin) != ZERO
+                    or not size and _number(row.unrealized_pnl) != ZERO):
+                raise LighterReadError("unsupported Unified position accounting")
             if row.symbol != self.symbol:
                 if size or row.open_order_count or row.pending_order_count:
                     raise LighterReadError("nonexclusive account position")
@@ -158,10 +193,40 @@ class LighterAccountPort:
         collateral = _number(account.collateral)
         if collateral != _number(balance.total) or collateral < ZERO:
             raise LighterReadError("collateral mismatch")
-        return AccountSnapshot(self.symbol, now, position, collateral + unrealized,
+        if mode == 1:
+            collateral = self._unified_cash(account, unrealized)
+        with localcontext() as context:
+            context.traps[Inexact] = True
+            equity = collateral + unrealized
+        self._mode = mode
+        return AccountSnapshot(self.symbol, now, position, equity,
                                _number(fees["maker_fee_rate"]), _number(fees["taker_fee_rate"]),
                                len(orders), True, entry, unrealized,
                                open_order_ids=tuple(row.order_id for row in orders))
+
+    def _unified_cash(self, account, unrealized):
+        meta, assets = self._settlement, account.assets
+        if (not meta or len(assets) != 1 or meta["symbol"] != "USDG"
+                or type(meta["asset_id"]) is not int or meta["asset_id"] < 0
+                or type(meta["decimals"]) is not int or meta["decimals"] != 6
+                or _number(meta["index_price"]) != 1 or _number(meta["loan_to_value"]) != 1
+                or account.total_isolated_order_count != 0 or account.pending_unlocks != []):
+            raise LighterReadError("exclusive unit-valued Unified USDG required")
+        asset = assets[0]
+        if (asset.symbol != "USDG" or type(asset.asset_id) is not int
+                or asset.asset_id != meta["asset_id"] or asset.margin_mode != "enabled"
+                or _number(asset.balance) != ZERO or _number(asset.locked_balance) != ZERO):
+            raise LighterReadError("unsupported Unified collateral asset")
+        cash = _number(asset.margin_balance)
+        quantum = Decimal(1).scaleb(-meta["decimals"])
+        # RH's margin_balance is cash, not additional collateral. Keep all its
+        # digits in the exact ledger bridge. Accept only the observed truncated
+        # summary relationship; no epsilon, rounding cash, or inferred funding.
+        if (cash < ZERO or cash.quantize(quantum, rounding=ROUND_DOWN) != _number(account.collateral)
+                or any(_number(value) != (cash + unrealized).quantize(quantum, rounding=ROUND_DOWN)
+                       for value in (account.total_asset_value, account.cross_asset_value))):
+            raise LighterReadError("Unified cash and summary mismatch")
+        return cash
 
     def _fill(self, trade, now):
         fee, raw = trade.fee, trade.raw_data
@@ -204,22 +269,77 @@ class LighterAccountPort:
                 raise LighterReadError("terminal fills not reflected in account ledger")
             self._terminal_proofs[identifier] = (status, filled, amount)
 
+    async def _stream_read(self):
+        first = await self.stream.request_snapshot("account_all")
+        count = first["total_trades_count"]
+        if (type(count) is not int or count < 0 or first["account"] != self._index
+                or self._stream_count is not None and count < self._stream_count):
+            raise LighterReadError("invalid account activity counter")
+        funding_source = first["funding_histories"]
+        if type(funding_source) not in (dict, list):
+            raise LighterReadError("invalid account funding snapshot")
+        now = self.clock.monotonic()
+        if (not 0 <= now - self._fees_at < 8 or funding_source != self._funding_source):
+            self._fees_cache = await self.adapter.get_account_fee_and_funding(self.symbol, limit=100)
+            self._fees_at = now  # Request start, never restamp cached inputs.
+        if not 0 <= self.clock.monotonic() - self._settlement_at < 8:
+            self._settlement_at = self.clock.monotonic()
+            self._settlement = await self.adapter.get_settlement_asset()
+        orders = self._orders(await self.adapter.get_open_orders())
+        cash_at = self.clock.monotonic()
+        balances = list(await self.adapter.get_balances())
+        trades = (list(await self.adapter.get_account_trades(self.symbol, limit=100))
+                  if self._stream_count is None or count != self._stream_count else [])
+        confirmed = self._orders(await self.adapter.get_open_orders())
+        second = await self.stream.request_snapshot("account_all")
+        def state(snapshot):
+            if type(snapshot["assets"]) is not dict or type(snapshot["positions"]) is not dict:
+                raise LighterReadError("incomplete account activity snapshot")
+            return _account_state(snapshot["assets"].values(), snapshot["positions"].values(), snapshot["shares"])
+        if len(balances) != 1:
+            raise LighterReadError("exclusive collateral account required")
+        raw = balances[0].raw_data["account"]
+        if (first["account"] != second["account"] or type(second["total_trades_count"]) is not int
+                or count != second["total_trades_count"] or orders != confirmed
+                or funding_source != second["funding_histories"] or state(first) != state(second)
+                or state(second) != _account_state(raw.assets, raw.positions, raw.shares)):
+            raise LighterReadError("account changed during stream/REST bracket")
+        if self._stream_count is not None:
+            delta = count - self._stream_count
+            if delta >= 100 or len({str(row.id) for row in trades} - self._stream_ids) != delta:
+                raise LighterReadError("account trade count and history disagree")
+        elif count < len(trades):
+            raise LighterReadError("account history exceeds activity counter")
+        return balances, orders, self._fees_cache, trades, cash_at, count, funding_source
+
     async def snapshot(self):
         try:
             started = self.clock.monotonic()
-            first = list(await self.adapter.get_account_trades(self.symbol, limit=100))
-            fees = await self.adapter.get_account_fee_and_funding(self.symbol, limit=100)
-            orders = self._orders(await self.adapter.get_open_orders())
-            balances = list(await self.adapter.get_balances())
-            second = list(await self.adapter.get_account_trades(self.symbol, limit=100))
-            confirmed_fees = await self.adapter.get_account_fee_and_funding(self.symbol, limit=100)
-            confirmed_orders = self._orders(await self.adapter.get_open_orders())
+            if self.stream is not None:
+                balances, orders, fees, second, cash_at, count, funding_source = await self._stream_read()
+                first, confirmed_fees, confirmed_orders = second, fees, orders
+            else:  # Explicit slow read-only forensic/preflight path, never the runner loop.
+                first = list(await self.adapter.get_account_trades(self.symbol, limit=100))
+                fees = await self.adapter.get_account_fee_and_funding(self.symbol, limit=100)
+                orders = self._orders(await self.adapter.get_open_orders())
+                cash_at = self.clock.monotonic()
+                balances = list(await self.adapter.get_balances())
+                if len(balances) == 1 and getattr(balances[0].raw_data.get("account"),
+                                                "account_trading_mode", None) == 1:
+                    self._settlement = await self.adapter.get_settlement_asset()
+                second = list(await self.adapter.get_account_trades(self.symbol, limit=100))
+                confirmed_fees = await self.adapter.get_account_fee_and_funding(self.symbol, limit=100)
+                confirmed_orders = self._orders(await self.adapter.get_open_orders())
             now = self.clock.monotonic()
             trades, funding = _trade_map(second), _funding_map(fees["fundings"])
             if (not 0 <= now - started <= 10 or _trade_map(first) != trades
                     or fees != confirmed_fees or orders != confirmed_orders):
                 raise LighterReadError("account changed during consistent read")
-            account = self._account(balances, orders, fees, now)
+            account = self._account(balances, orders, fees, cash_at)
+            if self.stream is not None:
+                account = replace(account, inputs_observed_monotonic=min(self._fees_at, self._settlement_at))
+            if not account.fresh(now):
+                raise LighterReadError("account or financial inputs stale")
             if self._baseline is None:
                 if account.position or account.open_order_count:
                     raise LighterReadError("authenticated flat and empty start required")
@@ -267,8 +387,10 @@ class LighterAccountPort:
                             self._fundings[key] = funding[key]
                             self._funding_time = max(self._funding_time, funding[key][0])
                     report = self._ledger.snapshot(now=now)
-                    expected_equity = (self._baseline.equity + report.realized_net_pnl
-                                       + report.external_transfers + account.unrealized_pnl)
+                    with localcontext() as context:
+                        context.traps[Inexact] = True
+                        expected_equity = (self._baseline.equity + report.realized_net_pnl
+                                           + report.external_transfers + account.unrealized_pnl)
                     if expected_equity != account.equity:
                         raise LighterReadError("unattributed account cashflow or equity mismatch")
                 self._trades.update(trades)
@@ -279,20 +401,29 @@ class LighterAccountPort:
             if not 0 <= self.clock.monotonic() - started <= 10:
                 raise LighterReadError("account audit exceeded freshness bound")
             self.latest_orders = orders
+            if self.stream is not None:
+                self._stream_count, self._funding_source = count, funding_source
+                self._stream_ids = frozenset(self._trades)
             return account
+        except LighterReadError:
+            self._fees_at = self._settlement_at = float("-inf")
+            raise  # These are code-owned messages, never raw SDK/account payloads.
         except Exception:
+            self._fees_at = self._settlement_at = float("-inf")
             raise LighterReadError("authenticated account audit unavailable") from None
 
 
 class LighterMarketData:
-    """Bounded REST depth, not unproven WS sequence continuity or cached freshness."""
+    """Fresh nonce-checked stream depth; bounded REST only for explicit diagnostics."""
 
     def __init__(self, adapter, symbol, clock, *, working_orders=lambda: ()):
         self.adapter, self.symbol, self.clock = adapter, symbol, clock
         self._working = working_orders
         self._state = None
         self._valid = False
+        self._last_book = None
         self.min_quote_amount = ZERO
+        self.stream = None
 
     async def initialize(self):
         try:
@@ -320,24 +451,39 @@ class LighterMarketData:
                 raise LighterReadError("market metadata not initialized")
             started = self.clock.monotonic()
             own = self._working()
-            book = await self.adapter.get_orderbook(self.symbol, limit=20)
+            book = (self.stream.book_snapshot() if self.stream is not None
+                    else await self.adapter.get_orderbook(self.symbol, limit=20))
             now = self.clock.monotonic()
-            if book.symbol != self.symbol or not 0 <= now - started <= 3 or own != self._working():
+            if self.stream is not None:
+                observed = book["received_monotonic"]
+                bids, asks = book["bids"], book["asks"]
+            else:
+                observed = started
+                if book.symbol != self.symbol:
+                    raise LighterReadError("book symbol mismatch")
+                bids, asks = book.bids, book.asks
+            if not 0 <= now - observed <= 3 or own != self._working():
                 raise LighterReadError("incoherent or slow book read")
+            source = (observed, tuple(bids), tuple(asks), own)
+            if self.stream is not None and source == self._last_book:
+                result = self._state.snapshot()
+                self._valid = True
+                return result  # Same source, same own sizes; never advance its timestamp.
             def levels(rows):
                 # REST returns individual orders, so equal prices are aggregated.
                 result = {}
                 for row in rows:
-                    price, size = _number(row.price), _number(row.size)
+                    price, size = map(_number, row) if self.stream is not None else (_number(row.price), _number(row.size))
                     if price <= ZERO or size <= ZERO:
                         raise LighterReadError("invalid book level")
                     result[price] = result.get(price, ZERO) + size
                 return tuple(result.items())
-            result = self._state.update(bids=levels(book.bids), asks=levels(book.asks),
+            result = self._state.update(bids=levels(bids), asks=levels(asks),
                 own_bids=tuple((row.price, row.remaining_size) for row in own if row.side == Side.BUY),
                 own_asks=tuple((row.price, row.remaining_size) for row in own if row.side == Side.SELL),
-                observed_monotonic=now, trusted=True)
+                observed_monotonic=observed, trusted=True)
             self._valid = True
+            self._last_book = source
             return result
         except Exception:
             raise LighterReadError("trusted market read unavailable") from None

@@ -1,17 +1,15 @@
 """Read-only fee/spread feasibility diagnostics, not a queue-fill backtest.
 
-Accept V1 shadow JSON arrays or external-BBO JSONL. No network, credentials,
+Accept external-BBO JSONL. No network, credentials,
 account mutations, campaign validation, or interpolation is involved.
 
 CLI: python scripts/mm_v2_feasibility.py bbo.jsonl --fee-evidence fees.json
      --target-edge-bps 0 0.2 0.5 [--tick-size 0.1]
 JSONL rows: timestamp (timezone-qualified ISO or epoch seconds), symbol,
 external_bid, external_ask, tick_size. Use decimal strings for financial values.
-Fee JSON: authenticated=true, observed_at_utc, maker_fee_rate, taker_fee_rate;
-also accepts the historical market_maker_gate_bundle_v1 preflight fee ticks.
+Fee JSON: authenticated=true, observed_at_utc, maker_fee_rate, taker_fee_rate.
 All fee inputs are historical claims, never freshly authenticated by this tool.
 Each snapshot file is one stream; horizons are never paired across files.
-Legacy input needs explicit tick size; tick-based results are conditional on it.
 Candidates use external mid, zero inventory skew and zero volatility buffer;
 they are arithmetic baselines, not live parameter recommendations.
 """
@@ -99,25 +97,12 @@ def _record(value):
 
 def _fees(path):
     record = _record(_json(_read(path)))
-    if record.get("schema") == "market_maker_gate_bundle_v1":
-        preflight = _record(record.get("fresh_read_only_preflight"))
-        for name in ("authenticated_position_count", "authenticated_open_order_count"):
-            if _decimal(preflight.get(name), "authenticated count") < 0:
-                raise ValueError("invalid authenticated count")
-        maker_tick = _decimal(preflight.get("maker_fee_tick"), "maker fee tick")
-        taker_tick = _decimal(preflight.get("taker_fee_tick"), "taker fee tick")
-        if maker_tick != maker_tick.to_integral_value() or taker_tick != taker_tick.to_integral_value():
-            raise ValueError("fee ticks must be integral")
-        maker, taker = maker_tick / 1000000, taker_tick / 1000000
-        observed = preflight.get("local_time")
-        source_type = "gate_b_bundle"
-    else:
-        if record.get("authenticated") is not True:
-            raise ValueError("historical authenticated fee evidence required")
-        maker = _decimal(record.get("maker_fee_rate"), "maker fee rate")
-        taker = _decimal(record.get("taker_fee_rate"), "taker fee rate")
-        observed = record.get("observed_at_utc")
-        source_type = "historical_authenticated_record"
+    if record.get("authenticated") is not True:
+        raise ValueError("historical authenticated fee evidence required")
+    maker = _decimal(record.get("maker_fee_rate"), "maker fee rate")
+    taker = _decimal(record.get("taker_fee_rate"), "taker fee rate")
+    observed = record.get("observed_at_utc")
+    source_type = "historical_authenticated_record"
     if not (0 <= maker < 1 and 0 <= taker < 1):
         raise ValueError("fee rates must be nonnegative and below one; rebates unsupported")
     return {
@@ -147,54 +132,20 @@ def _snapshot(timestamp, symbol, bid, ask, tick):
     return (_timestamp(timestamp), symbol, bid, ask, tick)
 
 
-def _legacy(rows, tick):
-    if tick is None:
-        raise ValueError("legacy snapshots require explicit --tick-size")
-    snapshots, runs = [], set()
-    for row in rows:
-        row = _record(row)
-        identity = (row.get("started_at_utc"), row.get("event_sequence_run_id"))
-        if not any(identity) or any(value is not None and (
-                not isinstance(value, str) or not value.strip()) for value in identity):
-            raise ValueError("legacy snapshots require a nonempty stream identity")
-        if identity[0] is not None:
-            _utc(identity[0])
-        runs.add(identity)
-        features = [row.get("controller_feature_snapshot")]
-        for context in row.get("quote_contexts", []):
-            features.append(_record(context).get("feature_snapshot"))
-        for history in row.get("controller_decision_history", []):
-            features.append(_record(history).get("features"))
-        for feature in features:
-            if not feature:
-                continue
-            feature = _record(feature)
-            snapshots.append(_snapshot(
-                feature.get("received_monotonic"), row.get("symbol"),
-                feature.get("external_best_bid"), feature.get("external_best_ask"), tick,
-            ))
-    if len(runs) > 1:
-        raise ValueError("legacy input must contain one monotonic stream")
-    return sorted(snapshots)
-
-
 def _stream(path, tick):
     text = _read(path)
-    if text.lstrip().startswith("["):
-        snapshots = _legacy(_json(text), tick)
-    else:
-        snapshots = []
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            row = _record(_json(line))
-            row_tick = row.get("tick_size", tick)
-            if tick is not None and row_tick is not None and _decimal(row_tick, "tick size") != tick:
-                raise ValueError("CLI and snapshot tick size disagree")
-            snapshots.append(_snapshot(
-                row.get("timestamp"), row.get("symbol"),
-                row.get("external_bid"), row.get("external_ask"), row_tick,
-            ))
+    snapshots = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        row = _record(_json(line))
+        row_tick = row.get("tick_size", tick)
+        if tick is not None and row_tick is not None and _decimal(row_tick, "tick size") != tick:
+            raise ValueError("CLI and snapshot tick size disagree")
+        snapshots.append(_snapshot(
+            row.get("timestamp"), row.get("symbol"),
+            row.get("external_bid"), row.get("external_ask"), row_tick,
+        ))
     unique = []
     for snapshot in snapshots:
         if unique and snapshot[0] < unique[-1][0]:
@@ -332,7 +283,7 @@ def main(argv=None):
     parser.add_argument("snapshots", nargs="+")
     parser.add_argument("--fee-evidence", required=True)
     parser.add_argument("--target-edge-bps", nargs="+", required=True)
-    parser.add_argument("--tick-size", help="Required for legacy input; never inferred")
+    parser.add_argument("--tick-size", help="Fallback for rows without tick_size; never inferred")
     args = parser.parse_args(argv)
     try:
         report = build_report(args.snapshots, args.fee_evidence, args.target_edge_bps, args.tick_size)

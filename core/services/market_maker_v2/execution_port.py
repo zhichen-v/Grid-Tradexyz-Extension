@@ -1,9 +1,9 @@
-"""V2 ports and narrow compatibility layers around public legacy safety APIs."""
+"""V2 market, account and execution ports with exact order safety boundaries."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from decimal import Decimal, localcontext
 from typing import TYPE_CHECKING, Protocol
 
@@ -28,8 +28,7 @@ from .domain import (
 )
 
 if TYPE_CHECKING:
-    from ..market_maker.order_manager import MarketMakerOrderManager, ReconcileResult
-    from .config import MarketMakerV2Config
+    from .order_manager import MarketMakerOrderManager, ReconcileResult
 
 
 class MarketDataPort(Protocol):
@@ -62,48 +61,11 @@ class ExecutionUnavailable(RuntimeError):
     """Execution is unavailable; backend details are intentionally not exposed."""
 
 
-@dataclass(frozen=True, slots=True)
-class LegacyExecutionSettings:
-    """Structural public OrderManager settings, never a V1 strategy config.
+class DrySafetyExecutionPort:
+    """Exercise the V2 order manager without enabling trading.
 
-    The frozen manager uses these execution fields by attribute. Constructing its
-    full V1 config would require fictitious ping-pong/episode economics just to
-    enable IOC; none of those policies belong to this compatibility boundary.
-    """
-
-    symbol: str
-    order_size: Decimal
-    max_position: Decimal
-    reprice_threshold_ticks: int
-    dry_run: bool
-    post_only: bool = True
-    exclusive_symbol_control: bool = True
-    startup_open_order_policy: str = "abort"
-    unknown_order_policy: str = "pause"
-    cancel_on_shutdown: bool = True
-    active_unwind_enabled: bool = True
-    active_unwind_max_attempts: int = 3
-    active_unwind_confirmation_timeout_seconds: int = 5
-    error_cooldown_seconds: int = 5
-    refresh_interval_ms: int = 1000
-    min_order_lifetime_ms: int = 1000
-    max_mutations_per_minute: int = 30
-
-
-def legacy_execution_settings(config: MarketMakerV2Config) -> LegacyExecutionSettings:
-    from .config import MarketMakerV2Config
-
-    if type(config) is not MarketMakerV2Config:
-        raise ValueError("typed V2 configuration required")
-    return LegacyExecutionSettings(config.symbol, config.quote.order_size,
-        config.inventory.hard_limit, config.quote.reprice_threshold_ticks, config.dry_run)
-
-
-class LegacyDryExecutionPort:
-    """Exercise public V1 safety APIs without enabling trading or V1 policy.
-
-    Phase 2 supports empty quote plans and simulated cancellation only. Nonempty
-    quotes require the V2 risk contract; bounded flatten belongs to Phase 5.
+    Supports empty quote plans and simulated cancellation only. Normal quoting
+    and bounded flatten use the dedicated volume and bounded execution ports.
     A simulated result is not authenticated account or terminal-flat evidence.
     """
 
@@ -124,7 +86,7 @@ class LegacyDryExecutionPort:
     def snapshot(self) -> ExecutionSnapshot:
         self._require_dry()
         try:
-            from ..market_maker.models import RuntimeState
+            from .execution_models import RuntimeState
 
             managed = self.manager.snapshot()
             simulated = all(order.simulated is True for order in managed)
@@ -156,8 +118,8 @@ class LegacyDryExecutionPort:
         snapshot = self.snapshot()
         if snapshot.health is not ExecutionHealth.HEALTHY:
             return ExecutionResult(ExecutionStatus.BLOCKED, snapshot)
-        from ..market_maker.models import DesiredQuotes, RuntimeState
-        from ..market_maker.risk_manager import RiskDecision
+        from .execution_models import DesiredQuotes, RuntimeState
+        from .execution_models import RiskDecision
 
         zero = Decimal("0")
         desired = DesiredQuotes(
@@ -207,12 +169,12 @@ class LegacyDryExecutionPort:
         )
 
 
-class LegacyBoundedExecutionPort:
+class BoundedExecutionPort:
     """One authorized IOC per call; the caller owns the whole-exit attempt cap.
 
     The existing manager retains cancellation and exact terminal semantics. A
     confirmed result includes a new authenticated residual, not a claim of flat.
-    Normal quote execution is deliberately unavailable until Phase 6 wiring.
+    Normal quote execution belongs to VolumeExecutionPort.
     """
 
     def __init__(self, manager: MarketMakerOrderManager, account: AccountPort,
@@ -242,7 +204,7 @@ class LegacyBoundedExecutionPort:
     def snapshot(self) -> ExecutionSnapshot:
         self._require_authorized_mode()
         try:
-            from ..market_maker.models import OrderSlotState, RuntimeState
+            from .execution_models import OrderSlotState, RuntimeState
 
             managed = self.manager.snapshot()
             healthy_orders = all(order.simulated is False and order.order_id
@@ -305,7 +267,7 @@ class LegacyBoundedExecutionPort:
         if (type(account) is not AccountSnapshot or account.symbol != self._symbol
                 or not account.authenticated or account.open_order_count != 0
                 or not after <= account.observed_monotonic <= now
-                or now - account.observed_monotonic > 10):
+                or not account.fresh(now)):
             raise ExecutionUnavailable("fresh authenticated zero-order account required")
         return account
 
@@ -359,7 +321,7 @@ class LegacyBoundedExecutionPort:
 
     async def _flatten_once(self, intent, before):
         from ...adapters.exchanges.models import OrderSide
-        from ..market_maker.models import DesiredOrder
+        from .execution_models import DesiredOrder
 
         deadline = intent.deadline_monotonic
         desired = DesiredOrder(OrderSide(intent.side.value), intent.limit_price,
@@ -412,7 +374,7 @@ def _validate_quote_authorization(value, execution, symbol, now, *, after=0, dry
     if (account.symbol != symbol or market.symbol != symbol or plan.symbol != symbol
             or not account.authenticated or not market.trusted
             or not after <= account.observed_monotonic <= now
-            or now - account.observed_monotonic > 10
+            or not account.fresh(now)
             or not 0 <= now - market.observed_monotonic <= 3
             or account.open_order_ids is None
             or set(account.open_order_ids) != set(expected_ids)
@@ -466,8 +428,8 @@ def _quote_revision(orders, created, authorization, now, threshold, max_age):
     return len(prices) == 2 and prices[Side.BUY] >= prices[Side.SELL]
 
 
-class LegacyVolumeExecutionPort(LegacyBoundedExecutionPort):
-    """Fresh V2 permissions around public V1 execution; no V1 economic policy.
+class VolumeExecutionPort(BoundedExecutionPort):
+    """Fresh V2 permissions around exact order execution.
 
     refresh_quote(snapshot) must audit exact authenticated working orders, ingest
     fills, and recompute ledger/governor/policy. It runs again after cancellation.
@@ -534,7 +496,7 @@ class LegacyVolumeExecutionPort(LegacyBoundedExecutionPort):
         execution = self.snapshot()
         if execution.health is not ExecutionHealth.HEALTHY:
             return ExecutionResult(ExecutionStatus.BLOCKED, execution)
-        authorization = await self._fresh_quote(execution, deadline, started)
+        authorization = await self._fresh_quote(execution, deadline, 0)
         managed = self.manager.snapshot()
         created = {str(order.order_id): order.created_monotonic for order in managed}
         revision = _quote_revision(execution.orders, created, authorization, self.clock.monotonic(),
@@ -553,14 +515,14 @@ class LegacyVolumeExecutionPort(LegacyBoundedExecutionPort):
             authorization = await self._fresh_quote(execution, deadline, self.clock.monotonic())
         self._maker_fee = authorization.account.maker_fee_rate
         # Keep proven working prices below the revision threshold. Passing a new
-        # target to V1 here could cause hidden cancellation without our fresh audit.
+        # target to the manager here could cause hidden cancellation without our fresh audit.
         retained = {order.side: order for order in execution.orders}
         effective = QuotePlan(self._symbol, tuple(
             QuoteIntent(quote.side, retained[quote.side].price,
                         retained[quote.side].remaining_size, quote.reduce_only)
             if quote.side in retained else quote for quote in authorization.plan.quotes))
-        legacy_plan, legacy_risk = self._legacy_quotes(effective, authorization)
-        result = await self._bounded(lambda: self.manager.reconcile(legacy_plan, legacy_risk), deadline)
+        execution_plan, execution_risk = self._execution_quotes(effective, authorization)
+        result = await self._bounded(lambda: self.manager.reconcile(execution_plan, execution_risk), deadline)
         snapshot = self.snapshot()
         status = (ExecutionStatus.BLOCKED if result.errors or snapshot.health is not ExecutionHealth.HEALTHY
                   else ExecutionStatus.CONFIRMED)
@@ -569,10 +531,10 @@ class LegacyVolumeExecutionPort(LegacyBoundedExecutionPort):
             cancelled_count=cancelled, actual_plan=effective)
 
     @staticmethod
-    def _legacy_quotes(plan, authorization):
+    def _execution_quotes(plan, authorization):
         from ...adapters.exchanges.models import OrderSide
-        from ..market_maker.models import DesiredOrder, DesiredQuotes, RuntimeState
-        from ..market_maker.risk_manager import RiskDecision
+        from .execution_models import DesiredOrder, DesiredQuotes, RuntimeState
+        from .execution_models import RiskDecision
 
         risk, account, market = authorization.decision, authorization.account, authorization.market
         state = RuntimeState.RISK_REDUCTION if risk.state is StrategyState.REDUCE_ONLY else RuntimeState.ACTIVE

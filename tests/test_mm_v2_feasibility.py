@@ -177,48 +177,34 @@ class FeasibilityTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["schema"], "mm_v2_feasibility_v1")
         self.assertEqual(before, (bbo.read_bytes(), self.fees.read_bytes()))
 
-    def test_legacy_fee_ticks_override_maker_only_taker_sentinel(self):
-        bundle = {
+    def test_removed_gate_fee_schema_is_rejected(self):
+        self.write_json("fees.json", {
             "schema": "market_maker_gate_bundle_v1",
             "fresh_read_only_preflight": {
                 "local_time": "2026-09-03T21:58:18+08:00",
                 "authenticated_position_count": 0, "authenticated_open_order_count": 0,
                 "maker_fee_tick": 120, "taker_fee_tick": 350,
             },
-            "config": {"taker_fee_rate": "0"},
-        }
-        self.write_json("fees.json", bundle)
-        report = self.report([self.snapshot(0)])
-        self.assertEqual(report["fees"]["observed_at_utc"], "2026-09-03T13:58:18Z")
-        self.assertEqual(Decimal(report["fees"]["taker_fee_bps"]), Decimal("3.5"))
-
-    def test_legacy_uses_only_external_features_and_deduplicates_context(self):
-        feature = {"received_monotonic": "100", "external_best_bid": "100000",
-                   "external_best_ask": "100001"}
-        row = {"symbol": "BTC", "event_sequence_run_id": "run-one",
-               "controller_feature_snapshot": feature,
-               "quote_contexts": [{"feature_snapshot": feature}],
-               "controller_decision_history": [{"features": feature}],
-               "best_bid": "999", "best_ask": "1000"}
-        legacy = self.write_json("legacy.json", [row])
-        report = build_report([legacy], self.fees, ["0"], tick_size="0.1")
-        self.assertEqual(report["market"]["snapshot_count"], 1)
-        self.assertLess(Decimal(report["market"]["spread_bps"]["max"]), Decimal("0.11"))
+        })
         with self.assertRaises(ValueError):
-            build_report([legacy], self.fees, ["0"])
+            self.report([self.snapshot(0)])
 
-    def test_legacy_mixed_runs_and_missing_external_bbo_are_rejected(self):
-        feature = {"received_monotonic": "100", "external_best_bid": "100000",
-                   "external_best_ask": "100001"}
-        row = {"symbol": "BTC", "event_sequence_run_id": "a",
-               "controller_feature_snapshot": feature}
-        for rows in ([row, dict(row, event_sequence_run_id="b")],
-                     [dict(row, event_sequence_run_id=None)],
-                     [dict(row, event_sequence_run_id=" ")],
-                     [{"symbol": "BTC", "best_bid": "100000", "best_ask": "100001"}]):
-            with self.subTest(rows=rows), self.assertRaises(ValueError):
-                build_report([self.write_json("legacy.json", rows)], self.fees,
-                             ["0"], tick_size="0.1")
+    def test_json_array_input_is_rejected(self):
+        path = self.write_json("array.json", [self.snapshot(0)])
+        with self.assertRaises(ValueError):
+            build_report([path], self.fees, ["0"], tick_size="0.1")
+
+    def test_explicit_tick_fallback_is_required_and_cannot_override_row_tick(self):
+        row = self.snapshot(0)
+        del row["tick_size"]
+        path = self.stream([row])
+        with self.assertRaises(ValueError):
+            build_report([path], self.fees, ["0"])
+        report = build_report([path], self.fees, ["0"], tick_size="0.1")
+        self.assertEqual(Decimal(report["market"]["tick_size"]), Decimal("0.1"))
+        path = self.stream([self.snapshot(0)])
+        with self.assertRaises(ValueError):
+            build_report([path], self.fees, ["0"], tick_size="1")
 
     def test_decimal_json_numbers_are_parsed_without_binary_float_roundoff(self):
         path = self.root / "numeric.jsonl"

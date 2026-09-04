@@ -130,10 +130,13 @@ class AccountSnapshot:
     entry_price: Decimal | None = None
     unrealized_pnl: Decimal = ZERO
     open_order_ids: tuple[str, ...] | None = None
+    inputs_observed_monotonic: float | None = None
 
     def __post_init__(self):
         _symbol(self.symbol)
         _time(self.observed_monotonic)
+        if self.inputs_observed_monotonic is not None:
+            _time(self.inputs_observed_monotonic)
         _count(self.open_order_count)
         _boolean(self.authenticated)
         for value in (self.position, self.equity, self.maker_fee_rate,
@@ -152,6 +155,19 @@ class AccountSnapshot:
                 raise ValueError("authenticated order identities must match count")
             for order_id in self.open_order_ids:
                 _identifier(order_id)
+
+    def fresh(self, now):
+        inputs = self.observed_monotonic if self.inputs_observed_monotonic is None else self.inputs_observed_monotonic
+        return 0 <= now - self.observed_monotonic <= 10 and 0 <= now - inputs <= 10
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRunResult:
+    dry_run: bool
+    completed: bool
+    report: "SessionReport | None"
+    final_account: AccountSnapshot | None
+    failure: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,4 +527,4 @@ class FillAccounting:
                 _decimal(value)
 
 
-TelemetryEvent = AccountSnapshot | QuotePlan | ExecutionResult | FillAccounting | MarkEvent | CashflowEvent | SessionReport | BoundedExitReport
+TelemetryEvent = AccountSnapshot | QuotePlan | ExecutionResult | FillAccounting | MarkEvent | CashflowEvent | SessionReport | BoundedExitReport | InventoryDecision

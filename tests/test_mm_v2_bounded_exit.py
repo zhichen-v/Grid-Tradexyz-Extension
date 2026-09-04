@@ -1,4 +1,4 @@
-"""Whole-exit contracts: actual frozen manager, fake exchange, no live connection."""
+"""Whole-exit contracts: actual V2 manager, fake exchange, no live connection."""
 
 import asyncio
 from dataclasses import replace
@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, Mock
 
 import test_mm_v2_bounded_execution as bridge
 from core.adapters.exchanges.models import OrderSide, OrderStatus
-from core.services.market_maker.models import RuntimeState
+from core.services.market_maker_v2.execution_models import RuntimeState
 from core.services.market_maker_v2.domain import (
     AccountSnapshot, ExecutionHealth, ExecutionResult, ExecutionSnapshot,
     ExecutionStatus, ExitStatus, FillEvent, LiquidityRole, Side,
@@ -107,7 +107,7 @@ class BoundedExitTests(unittest.IsolatedAsyncioTestCase):
                 fixture = self.fixture
                 if missing == "terminal":
                     fixture.adapter.create_order.side_effect = None
-                    fixture.adapter.create_order.return_value = bridge.legacy.exchange_order(
+                    fixture.adapter.create_order.return_value = bridge.fixtures.exchange_order(
                         "pending", OrderSide.BUY, price="101.2", status=OrderStatus.PENDING,
                         params={"time_in_force": "IOC", "reduce_only": True})
                 else:

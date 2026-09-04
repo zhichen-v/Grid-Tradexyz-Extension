@@ -1,7 +1,7 @@
 """Bounded session coordination; strategy, accounting and execution stay in ports."""
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from decimal import Decimal, localcontext
 from math import isfinite
 import warnings
@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from .domain import (
     AccountSnapshot, ExecutionHealth, ExecutionResult, ExecutionSnapshot,
     ExecutionStatus, MarketStateSnapshot, QuotePlan, QuoteAuthorization,
-    InventoryDecision, MarkEvent, SessionReport, StrategyState, ZERO,
+    InventoryDecision, MarkEvent, SessionRunResult, StrategyState, ZERO,
     BoundedExitReport, ExitStatus, FlattenIntent, Side, _boolean, _count, _identifier, _symbol, _time,
 )
 from .execution_port import AccountPort, Clock, ExecutionPort, MarketDataPort, TelemetrySink
@@ -50,7 +50,7 @@ async def dry_synthetic_cycle(
         raise DryCycleUnavailable("valid monotonic clock required")
     if (market.symbol != account.symbol or not market.trusted or not account.authenticated
             or not 0 <= now - market.observed_monotonic <= 3
-            or not 0 <= now - account.observed_monotonic <= 10):
+            or not account.fresh(now)):
         raise DryCycleUnavailable("fresh trusted same-symbol snapshots required")
     if account.position != 0 or account.open_order_count != 0:
         raise DryCycleUnavailable("synthetic flat start with zero exchange orders required")
@@ -165,7 +165,7 @@ def _exit_account(result, symbol, boundary, now):
             or not boundary <= result.snapshot.observed_monotonic <= now
             or not account.authenticated or account.symbol != symbol or account.open_order_count != 0
             or not boundary <= account.observed_monotonic <= now
-            or now - account.observed_monotonic > 10):
+            or not account.fresh(now)):
         raise ValueError("fresh post-terminal authenticated exit truth required")
     return account
 
@@ -191,15 +191,6 @@ def _exit_intent(market, account, now, deadline, slippage_ticks):
         return FlattenIntent(account.symbol, side, quantity, limit, deadline)
 
 
-@dataclass(frozen=True, slots=True)
-class SessionRunResult:
-    dry_run: bool
-    completed: bool
-    report: SessionReport | None
-    final_account: AccountSnapshot | None
-    failure: str | None
-
-
 class VolumeSession:
     """One bounded run; recheck CLI authorization before connecting; dry has no fills."""
 
@@ -208,18 +199,16 @@ class VolumeSession:
                  sleep=asyncio.sleep):
         require_authorization(config, authorize_bounded_flatten)
         self.config, self.adapter = config, adapter
-        self.clock, self.sleep = clock or time, sleep
-        self.telemetry = telemetry
+        self.clock, self.sleep = clock or SimpleNamespace(monotonic=time.perf_counter), sleep
+        self.telemetry, self.final_account = telemetry, None
         self.manager = self.execution = self.ledger = self.governor = None
-        self.final_account = None
-        self._stop = None
-        self._stop_at = None
+        self._stop, self._stop_at = None, None
         self._used = False
-        self._exit_id = None
-        self._exit_sequence = 0
+        self._exit_id, self._exit_sequence = None, 0
         self._exit_orders = {}
         self._passive_until = None
         self._cleanup_attempted = False
+        self._quote_account = None
         self.account = LighterAccountPort(adapter, config.symbol, self.clock,
             account_index=account_index, expected_l1_address=expected_l1_address,
             known_order_ids=self._known_ids, flatten_id_for=self._flatten_id,
@@ -280,15 +269,18 @@ class VolumeSession:
         return account
 
     async def _start(self):
-        from ..market_maker.models import MarketMetadata
-        from ..market_maker.order_manager import MarketMakerOrderManager
+        from .execution_models import MarketMetadata
+        from .order_manager import MarketMakerOrderManager
+        from .config import execution_settings
         from .execution_port import (
-            LegacyVolumeExecutionPort, DryVolumeExecutionPort, legacy_execution_settings,
+            VolumeExecutionPort, DryVolumeExecutionPort,
         )
         if await self._io(self.adapter.connect, 30) is not True:
             raise ValueError("connection unavailable")
         if await self._io(self.adapter.authenticate) is not True:
             raise ValueError("authentication unavailable")
+        open_stream = lambda: self.adapter.open_read_stream(self.config.symbol, clock=self.clock.monotonic)
+        self.account.stream = self.market.stream = await self._io(open_stream)
         await self._io(self.market.initialize)
         initial = await self._io(self.snapshot)
         if not initial.authenticated or initial.position or initial.open_order_ids != ():
@@ -319,17 +311,22 @@ class VolumeSession:
             metadata = MarketMetadata(cfg.symbol, -market.tick_size.as_tuple().exponent,
                 -market.size_step.as_tuple().exponent, market.tick_size, market.size_step,
                 market.min_order_size, self.market.min_quote_amount)
-            self.manager = MarketMakerOrderManager(self.adapter, legacy_execution_settings(cfg),
+            self.manager = MarketMakerOrderManager(self.adapter, execution_settings(cfg),
                 metadata, monotonic=self.clock.monotonic, sleep=self.sleep)
             await self._io(self.manager.initialize)
             exit_account = SimpleNamespace(snapshot=lambda: self.snapshot(exiting=True))
-            self.execution = LegacyVolumeExecutionPort(self.manager, exit_account, self.market, self.clock,
+            self.execution = VolumeExecutionPort(self.manager, exit_account, self.market, self.clock,
                 authorize_bounded_flatten=True, refresh_quote=self._authorize,
                 reprice_threshold_ticks=cfg.quote.reprice_threshold_ticks,
                 max_quote_age_ms=cfg.quote.max_quote_age_ms)
 
     async def _authorize(self, exposure):
-        account = await self._io(self.snapshot)
+        key = (self._known_ids(), self.manager.terminal_order_ids if self.manager else frozenset(), exposure.orders)
+        cached = self._quote_account
+        account = (cached[1] if cached and cached[0] == key and cached[1].fresh(self.clock.monotonic())
+                   else await self._io(self.snapshot))
+        self._quote_account = (key, account)
+        await self._io(self.market.refresh)
         now, market = self.clock.monotonic(), self.market.snapshot()
         if self.config.dry_run:
             # Only the governor's exposure input is synthetic. Actual account,
@@ -357,6 +354,7 @@ class VolumeSession:
         # Both normal and reducing proposals obey the current minimum notional.
         plan = replace(plan, quotes=tuple(q for q in plan.quotes
             if q.price * q.size >= self.market.min_quote_amount))
+        self._emit(decision)
         return QuoteAuthorization(account, market, decision, plan)
 
     async def _pause(self, seconds):
@@ -431,6 +429,7 @@ class VolumeSession:
         try:
             await self._start()
             while True:
+                cycle_started, self._quote_account = self.clock.monotonic(), None
                 if self.manager:
                     await self._io(self.manager.sync_open_orders)
                 auth = await self._authorize(self.execution.snapshot())
@@ -451,13 +450,18 @@ class VolumeSession:
                 self._emit(result)
                 if result.status is ExecutionStatus.BLOCKED:
                     raise ValueError("execution blocked")
-                await self._pause(min(1, max(0, self.governor.session_deadline_monotonic - self.clock.monotonic())))
+                await self._pause(max(0, min(cycle_started + 3, self.governor.session_deadline_monotonic) - self.clock.monotonic()))
         except (Exception, asyncio.CancelledError):
             failure = "session_failed_closed"
             stop_event.set()
         finally:
             if self.execution:
                 try:
+                    if (failure and self.account.stream is not None
+                            and not self.account.stream.transport_healthy):
+                        # Exit-only REST proof after transport loss; market stays invalid.
+                        await self._io(self.adapter.close_read_stream)
+                        self.account.stream = None
                     if self.config.dry_run:
                         result = await self._io(self.execution.cancel_all_managed)
                         self._emit(result)

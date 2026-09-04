@@ -22,6 +22,46 @@ class LighterVolumeRuntimeProfile:
 
 
 LIGHTER_VOLUME_RUNTIME_PROFILE = LighterVolumeRuntimeProfile()
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionSettings:
+    """Internal order-safety settings; not an additional YAML strategy schema."""
+
+    symbol: str
+    order_size: Decimal
+    max_position: Decimal
+    reprice_threshold_ticks: int
+    dry_run: bool
+    post_only: bool = True
+    exclusive_symbol_control: bool = True
+    startup_open_order_policy: str = "abort"
+    unknown_order_policy: str = "pause"
+    cancel_on_shutdown: bool = True
+    active_unwind_enabled: bool = True
+    active_unwind_max_attempts: int = 3
+    active_unwind_confirmation_timeout_seconds: int = 5
+    error_cooldown_seconds: int = 5
+    refresh_interval_ms: int = 1000
+    min_order_lifetime_ms: int = 1000
+    max_mutations_per_minute: int = 30
+
+
+def execution_settings(config: "MarketMakerV2Config") -> ExecutionSettings:
+    if type(config) is not MarketMakerV2Config:
+        raise ValueError("typed V2 configuration required")
+    return ExecutionSettings(config.symbol, config.quote.order_size,
+        config.inventory.hard_limit, config.quote.reprice_threshold_ticks, config.dry_run)
+
+
+def is_step_aligned(value: Decimal, step: Decimal) -> bool:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError("value must be a finite Decimal")
+    if not isinstance(step, Decimal) or not step.is_finite() or step <= 0:
+        raise ValueError("step must be a finite positive Decimal")
+    return value % step == 0
+
+
 _FINANCIAL_FIELDS = frozenset({
     "order_size", "target_net_edge_bps", "volatility_multiplier", "soft_limit",
     "hard_limit", "skew_bps_at_hard", "stop_loss_usdg", "max_loss_usdg",

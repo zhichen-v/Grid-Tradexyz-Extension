@@ -120,7 +120,7 @@ class InventoryGovernor:
     def _validate(self, market, account, report, execution, now):
         if (not account.authenticated or report.symbol != account.symbol
                 or self._symbol not in (None, account.symbol)
-                or not 0 <= now - account.observed_monotonic <= 10):
+                or not account.fresh(now)):
             raise GovernorUnavailable("fresh authenticated same-symbol account required")
         if (report.failed or report.complete or report.ledger_position != account.position
                 or report.duration_seconds != Decimal(str(now)) - Decimal(str(self.session_started_monotonic))
@@ -254,7 +254,7 @@ class InventoryGovernor:
         if (account is None or not account.authenticated or account.symbol != self._symbol
                 or account.position != ZERO or account.open_order_count != 0
                 or not self._exit_started < account.observed_monotonic <= now
-                or now - account.observed_monotonic > 10
+                or not account.fresh(now)
                 or execution.health is not ExecutionHealth.HEALTHY
                 or execution.managed_order_count != 0 or execution.orders != ()
                 or execution.symbol != self._symbol or execution.simulated

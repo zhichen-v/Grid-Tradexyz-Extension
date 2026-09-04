@@ -316,6 +316,8 @@ class LighterAdapter(ExchangeAdapter):
     async def disconnect(self):
         """断开连接"""
         try:
+            await self.close_read_stream()
+
             # 关闭WebSocket
             await self._websocket.disconnect()
 
@@ -579,6 +581,37 @@ class LighterAdapter(ExchangeAdapter):
         except Exception:
             raise RuntimeError("authenticated fee/funding read unavailable") from None
 
+    async def get_settlement_asset(self) -> Dict[str, Any]:
+        """Read verified USDG precision for the Robinhood settlement account."""
+        try:
+            rest = self._rest
+            if rest.network not in {"robinhood", "robinhood_testnet"}:
+                raise ValueError("unsupported settlement network")
+            response = await rest._call_api(
+                "settlement asset query", lambda: rest.order_api.asset_details(),
+            )
+            rest._require_success_response(response, "settlement asset query")
+            rows = getattr(response, "asset_details", None)
+            if type(rows) is not list:
+                raise ValueError("settlement asset metadata unavailable")
+            matches = [row for row in rows if getattr(row, "symbol", None) == "USDG"]
+            if len(matches) != 1:
+                raise ValueError("unique USDG metadata required")
+            asset = matches[0]
+            if (type(asset.asset_id) is not int or asset.asset_id < 0
+                    or sum(getattr(row, "asset_id", None) == asset.asset_id for row in rows) != 1
+                    or type(asset.decimals) is not int or not 0 <= asset.decimals <= 18
+                    or asset.margin_mode != "enabled"
+                    or type(asset.index_price) is not str or type(asset.loan_to_value) is not str):
+                raise ValueError("unsupported settlement asset metadata")
+            price, ltv = Decimal(asset.index_price), Decimal(asset.loan_to_value)
+            if not price.is_finite() or not ltv.is_finite() or price != 1 or ltv != 1:
+                raise ValueError("unit USDG valuation required")
+            return {"symbol": "USDG", "asset_id": asset.asset_id, "decimals": asset.decimals,
+                    "index_price": price, "loan_to_value": ltv}
+        except Exception:
+            raise RuntimeError("settlement asset metadata unavailable") from None
+
     async def get_ohlcv(
         self,
         symbol: str,
@@ -634,6 +667,51 @@ class LighterAdapter(ExchangeAdapter):
             OrderData列表
         """
         normalized_symbol = self._normalize_symbol(symbol) if symbol else None
+        stream = getattr(self, "_read_stream", None)
+        if stream is not None:
+            from types import SimpleNamespace
+
+            try:
+                snapshot = await stream.request_snapshot("account_all_orders")
+                orders, seen = [], set()
+                for market, rows in snapshot["orders"].items():
+                    market_id = int(market)
+                    order_symbol = self._rest._get_symbol_from_market_index(market_id)
+                    if rows and not order_symbol:
+                        raise ValueError("unknown order market")
+                    for row in rows:
+                        identifier = row.get("order_index")
+                        if (type(identifier) is not int or identifier < 0 or identifier in seen
+                                or str(row.get("order_id", identifier)) != str(identifier)
+                                or type(row.get("client_order_index")) is not int or row["client_order_index"] < 0
+                                or str(row.get("client_order_id", row["client_order_index"])) != str(row["client_order_index"])
+                                or type(row.get("market_index")) is not int or row["market_index"] != market_id
+                                or type(row.get("owner_account_index")) is not int
+                                or row["owner_account_index"] != self._rest.account_index
+                                or type(row.get("is_ask")) is not bool or type(row.get("reduce_only")) is not bool
+                                or row.get("status") not in {"open", "pending", "in-progress"}):
+                            raise ValueError("untrusted active order identity")
+                        values = []
+                        for field in ("initial_base_amount", "filled_base_amount", "remaining_base_amount",
+                                      "price", "filled_quote_amount"):
+                            if type(row.get(field)) is not str:
+                                raise ValueError("invalid order amount")
+                            value = Decimal(row[field])
+                            if not value.is_finite() or value < 0:
+                                raise ValueError("invalid order amount")
+                            values.append(value)
+                        initial, filled, remaining, price, _ = values
+                        if initial <= 0 or price <= 0 or initial != filled + remaining:
+                            raise ValueError("inconsistent order amount")
+                        seen.add(identifier)
+                        order = self._rest._parse_order(SimpleNamespace(**row), order_symbol)
+                        if normalized_symbol is None or order_symbol == normalized_symbol:
+                            orders.append(order)
+                self._rest._clear_resolved_submissions_from_orders(orders)
+                return orders
+            except Exception:
+                await stream.close()
+                raise RuntimeError("read stream active orders unavailable") from None
         return await self._rest.get_open_orders(normalized_symbol)
 
     async def get_positions(self, symbols: Optional[List[str]] = None) -> List[PositionData]:
@@ -942,6 +1020,49 @@ class LighterAdapter(ExchangeAdapter):
         return cancelled_orders
 
     # ============= WebSocket订阅 =============
+
+    async def close_read_stream(self):
+        """Close the opt-in read route before explicit failure-cleanup REST reads."""
+        stream = getattr(self, "_read_stream", None)
+        if stream is not None:
+            await stream.close()
+            self._read_stream = None
+
+    async def open_read_stream(self, symbol: str, *, clock=time.monotonic):
+        """Open an opt-in read-only stream using this adapter's existing signer."""
+        from .lighter_read_stream import LighterReadStream
+
+        try:
+            rest = self._rest
+            expected_url = {
+                "robinhood": "wss://api.rh.lighter.xyz/stream",
+                "robinhood_testnet": "wss://api.rh-testnet.lighter.xyz/stream",
+            }.get(rest.network)
+            if (not self._connected or not self._authenticated or expected_url is None
+                    or self.ws_url != expected_url or rest.signer_client is None
+                    or getattr(self, "_read_stream", None) is not None):
+                raise ValueError("read stream prerequisites unavailable")
+            market_id = rest.get_market_index(self._normalize_symbol(symbol))
+            if type(market_id) is not int or market_id < 0:
+                raise ValueError("unknown market")
+            if type(rest.account_index) is not int or rest.account_index < 0:
+                raise ValueError("invalid account identity")
+
+            def auth_factory():
+                token, error = rest.signer_client.create_auth_token_with_expiry(
+                    deadline=600, api_key_index=rest.api_key_index,
+                )
+                if error or not token:
+                    raise ValueError("authentication unavailable")
+                return token
+
+            stream = LighterReadStream(self.ws_url, rest.account_index, market_id, auth_factory,
+                                       clock=clock)
+            self._read_stream = stream
+            await stream.start()
+            return stream
+        except Exception:
+            raise RuntimeError("read stream unavailable") from None
 
     async def subscribe_user_data(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """

@@ -1,4 +1,4 @@
-"""Public V2 bridge contracts against the frozen manager and fake exchange only."""
+"""Public V2 bridge contracts against the V2 manager and fake exchange only."""
 
 import asyncio
 from dataclasses import replace
@@ -7,17 +7,18 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-import test_market_maker_order_manager as legacy
+import mm_v2_execution_fixtures as fixtures
 from core.adapters.exchanges.models import OrderSide, OrderStatus
-from core.services.market_maker.models import DesiredOrder, DesiredQuotes, MarketMetadata, RuntimeState
-from core.services.market_maker.order_manager import MarketMakerOrderManager
-from core.services.market_maker.risk_manager import RiskDecision
+from core.services.market_maker_v2.execution_models import DesiredOrder, DesiredQuotes, MarketMetadata, RuntimeState
+from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
+from core.services.market_maker_v2.execution_models import RiskDecision
+from core.services.market_maker_v2.config import ExecutionSettings
 from core.services.market_maker_v2.domain import (
     AccountSnapshot, ExecutionHealth, ExecutionStatus, FlattenIntent,
     MarketStateSnapshot, QuotePlan, Side,
 )
 from core.services.market_maker_v2.execution_port import (
-    ExecutionUnavailable, LegacyBoundedExecutionPort,
+    ExecutionUnavailable, BoundedExecutionPort,
 )
 
 
@@ -26,7 +27,7 @@ D = Decimal
 
 class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.time = legacy.Clock()
+        self.time = fixtures.Clock()
         self.clock = SimpleNamespace(monotonic=self.time)
         self.position = D("-0.2")
         self.fill_size = D("0.2")
@@ -43,8 +44,9 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
             confirm_terminal_cancellation_outcome=Mock(return_value=False),
             resolve_unresolved_submissions=AsyncMock(return_value=[]),
         )
-        # Reuse the proven legacy configuration fixture, not its strategy/runtime.
-        config = legacy.MarketMakerOrderManagerTests().active_unwind_config()
+        config = ExecutionSettings("BTC", D("0.2"), D("1"), 1, False,
+                                   active_unwind_max_attempts=2,
+                                   active_unwind_confirmation_timeout_seconds=1)
         metadata = MarketMetadata("BTC", 1, 1, D("0.1"), D("0.1"), D("0.1"), D("0"))
         self.manager = MarketMakerOrderManager(self.adapter, config, metadata,
                                                monotonic=self.time, sleep=self.no_wait)
@@ -57,7 +59,7 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
         return None
 
     def make_port(self):
-        return LegacyBoundedExecutionPort(self.manager, self.account, self.market,
+        return BoundedExecutionPort(self.manager, self.account, self.market,
                                           self.clock, authorize_bounded_flatten=True)
 
     async def open_orders(self, symbol):
@@ -84,13 +86,13 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(params["reduce_only"], True)
             self.position += fill if side is OrderSide.BUY else -fill
         status = (OrderStatus.FILLED if fill == amount else OrderStatus.CANCELED) if is_ioc else OrderStatus.OPEN
-        return legacy.exchange_order(str(self.sequence), side, status=status,
+        return fixtures.exchange_order(str(self.sequence), side, status=status,
                                      price=str(price), amount=str(amount),
                                      remaining=str(amount - fill), params=params)
 
     async def cancel(self, order_id, symbol):
         self.events.append("cancel")
-        return legacy.exchange_order(order_id, OrderSide.BUY, price="100", amount="0.2",
+        return fixtures.exchange_order(order_id, OrderSide.BUY, price="100", amount="0.2",
                                      status=OrderStatus.CANCELED,
                                      params={"cancel_terminal": True})
 
@@ -109,7 +111,7 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
     def test_authorization_and_live_mode_required_before_any_exchange_call(self):
         for value in (False, None, 1, "true"):
             with self.subTest(value=value), self.assertRaises(ExecutionUnavailable):
-                LegacyBoundedExecutionPort(self.manager, self.account, self.market,
+                BoundedExecutionPort(self.manager, self.account, self.market,
                                            self.clock, authorize_bounded_flatten=value)
         self.manager.config = replace(self.manager.config, dry_run=True)
         with self.assertRaises(ExecutionUnavailable):
@@ -190,7 +192,7 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_exact_terminal_latches_and_never_blind_retries(self):
         self.adapter.create_order.side_effect = None
-        self.adapter.create_order.return_value = legacy.exchange_order(
+        self.adapter.create_order.return_value = fixtures.exchange_order(
             "pending", OrderSide.BUY, price="101.2", status=OrderStatus.PENDING,
             params={"time_in_force": "IOC", "reduce_only": True})
         first = await self.port.flatten_ioc(self.intent)

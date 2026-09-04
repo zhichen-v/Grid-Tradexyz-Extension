@@ -112,7 +112,7 @@ class VolumeQuotePolicy:
             raise QuoteUnavailable("valid monotonic clock required") from None
         if (market.symbol != account.symbol or not market.trusted or not account.authenticated
                 or not 0 <= now - market.observed_monotonic <= 3
-                or not 0 <= now - account.observed_monotonic <= 10):
+                or not account.fresh(now)):
             raise QuoteUnavailable("fresh trusted same-symbol market and account required")
 
     def _prices(self, market, account):

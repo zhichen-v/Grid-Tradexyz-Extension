@@ -23,6 +23,16 @@ Repository 基準：
 
 除非使用者另行授權，Codex 不得執行 live、flatten、margin/leverage mutation、commit 或 push。
 
+## 0.1 使用者覆寫：只保留 V2（2026-09-05）
+
+使用者已明確要求完整移除 V1 Market Maker，包含其程式、設定、腳本、測試與文件，工作樹只保留 V2。這項指示取代原先「凍結保留 V1、4h 後才退役、24h 後再決定刪除」的限制；不建立另一份 V1 archive。
+
+- 必要的已驗證訂單安全語義移入 V2 自有 `order_manager.py`／`execution_models.py`，透過 V2 ports 使用；不得繼續 import 舊 package。
+- 不搬回舊 controller、toxicity、episode、intent-attribution 或 campaign 政策；只承接目前 V2 所需的 execution safety 與相關測試。
+- 保留本計畫與 `docs/mm_v2/`，既有 Phase/run 證據不改寫；下文原 Phase 0–6 的凍結／V1 untouched 敘述只代表當時的歷史驗收。
+- V1 歷史可由既有 Git commit/tag 追溯；目前執行契約只看 V2。Grid 不在移除範圍。
+- 刪除 V1 不代表 V2 已達 production、economic 或 live GO，不改變既有 risk gate 與逐場授權要求。
+
 ---
 
 # 1. 為什麼必須重整，而不是繼續修眼前問題
@@ -118,7 +128,7 @@ Repository 基準：
 ## 1.5 重整的基本決策
 
 1. **停止在 V1 增加新策略功能。**
-2. V1 只接受 critical safety bugfix。
+2. 依 §0.1，V1 只保留於 Git 歷史，不再作為工作樹中的維護或執行目標。
 3. 另建 `market_maker_v2` package 與 runner。
 4. V2 不追求 backward-compatible config。
 5. 不把 V1 的 76 個 config fields、650 個測試與 160 KB campaign/analyzer 原樣搬過去。
@@ -281,15 +291,15 @@ cancel all managed quotes
 
 # 4. Repository 與分支策略
 
-## 4.1 凍結 V1
+## 4.1 移除 V1，只保留 Git 歷史
 
-在最新 commit 建立可追溯 tag，例如：
+原凍結 tag 保持可追溯：
 
 ```text
 mm-v1-guard-driven-20260903
 ```
 
-保留：
+依 §0.1 從工作樹移除以下 V1 範圍，不建立相容入口或 archive：
 
 ```text
 run_market_maker.py
@@ -298,25 +308,11 @@ config/market_maker/
 scripts/analyze_market_maker_strategy.py
 scripts/mm_calibration_campaign.py
 docs/market_maker_*
+docs/CODEX_MARKET_MAKER_MVP_PIPELINE.md
 tests/test_market_maker_*
 ```
 
-V1 狀態：
-
-```text
-legacy / safety reference / no new strategy feature
-```
-
-只允許：
-
-- credential leakage；
-- unauthorized mutation；
-- position/order ownership；
-- exact terminal proof；
-- exchange contract；
-- shutdown cleanup；
-
-相關 critical 修復。
+必要的 ownership、mutation、exact terminal proof 與 bounded IOC 安全語義由 V2 execution modules 承接；舊策略、配置與 campaign 不遷入。刪除前保留既有未提交的 V2 改動與證據，之後驗證 V2 不再 import 已刪除的路徑。
 
 ## 4.2 新建 V2
 
@@ -334,6 +330,8 @@ core/services/market_maker_v2/
   inventory_governor.py
   session_ledger.py
   execution_port.py
+  execution_models.py
+  order_manager.py
   orchestrator.py
   telemetry.py
 
@@ -346,7 +344,6 @@ scripts/
 docs/mm_v2/
   OBJECTIVE.md
   ARCHITECTURE.md
-  OPERATING_GUIDE.md
   EXPERIMENT_LOG.md
 
 tests/
@@ -363,7 +360,7 @@ tests/
 
 不要直接：
 
-- 刪改 `MarketMakerConfig`；
+- 保留舊 `MarketMakerConfig` 的相容層；
 - 將 76 fields 一次改成 nested config；
 - 重寫 119 KB `coordinator.py`；
 - 在 104 KB `order_manager.py` 中增加 V2 分支；
@@ -471,7 +468,7 @@ Execution health 永遠可以覆蓋 Strategy state。
 
 ---
 
-# 6. VolumeQuotePolicy V1 規格
+# 6. VolumeQuotePolicy 起始版規格
 
 ## 6.1 Reference price
 
@@ -937,7 +934,7 @@ LIGHTER_VOLUME_RUNTIME_PROFILE = {
 
 # 10. ExecutionPort：重用安全，不繼續污染策略
 
-## 10.1 初版使用 wrapper
+## 10.1 使用 V2 自有執行模組
 
 不要立刻重寫現有 mutation lifecycle。
 
@@ -951,9 +948,9 @@ class ExecutionPort(Protocol):
     def snapshot(self) -> ExecutionSnapshot: ...
 ```
 
-第一版可由 current `MarketMakerOrderManager` 的 compatibility wrapper實作。
+`VolumeExecutionPort`／`BoundedExecutionPort` 使用 V2 自有 `order_manager.py` 中的 `MarketMakerOrderManager`，資料契約位於 `execution_models.py`。`config.py` 的 `ExecutionSettings` 只包含必要 execution 欄位，不依賴已移除的 V1 config。
 
-## 10.2 凍結現有 OrderManager
+## 10.2 保留安全語義，不保留舊策略依賴
 
 V2 strategy 不得直接：
 
@@ -961,19 +958,13 @@ V2 strategy 不得直接：
 - 解析 current reason string；
 - 新增 controller-specific branch；
 - 新增 campaign telemetry；
-- 新增 V2 config dependency。
+- 將策略參數或 episode 經濟判斷塞入 execution manager。
 
-若 compatibility wrapper無法完成，先寫 adapter layer，不要改 104 KB file。
+Controller、toxicity、intent-attribution 舊政策支援不遷入。策略只使用窄 public ports；必要安全測試由 V2 suite 承接，不保留 V1 測試／package 作為執行依賴。
 
-## 10.3 後續抽取
+## 10.3 不另建第二套 order engine
 
-只有 V2 economics與4h liveness已成立後，才另案抽取：
-
-```text
-LighterSafeOrderEngine
-```
-
-抽取前不得重寫已 live-proven exact terminal semantics。
+§0.1 授權的是為移除 V1 而進行的必要安全模組遷移，不是重寫交易所 mutation lifecycle。保留已驗證的 exact terminal semantics，不同時引入另一套 order engine 或擴充策略。
 
 ---
 
@@ -981,7 +972,7 @@ LighterSafeOrderEngine
 
 ## 11.1 不搬移 649 個 V1 tests
 
-V1 suite保持原樣，作為 legacy regression。
+依 §0.1 刪除 V1 專用 policy suite。V2 自有 execution-safety 測試承接實際仍使用的 cancel／uncertain／IOC／ownership 契約，不複製舊 controller／campaign 測試。
 
 V2 own suite目標：
 
@@ -1037,7 +1028,7 @@ V2 own suite目標：
 mm_v2_fast
 mm_v2_execution
 mm_v2_replay
-legacy_mm_regression
+lighter_grid_regression
 full_repo
 ```
 
@@ -1070,7 +1061,9 @@ Soft limits：
 
 # 12. 完整改動 Pipeline
 
-## Phase 0：Freeze 與重整契約
+## Phase 0：Freeze 與重整契約（歷史階段）
+
+本階段的原凍結動作已成為歷史；目前工作樹保留／移除範圍以 §0.1 為準。
 
 ### 工作
 
@@ -1111,10 +1104,11 @@ docs(mm-v2): define volume-first product and freeze legacy runtime
 scripts/mm_v2_feasibility.py
 ```
 
-輸入：
+目前輸入契約（V2-only）：
 
-- existing orderbook/market logs，或
-- dry-run captured BBO snapshots。
+- external-BBO JSONL：每列包含 `timestamp`、`symbol`、`external_bid`、`external_ask`、`tick_size`；金融值使用字串，時間為含時區 ISO 或 epoch seconds。
+- 另以 `--fee-evidence` 提供 JSON：`authenticated: true`、`observed_at_utc`、`maker_fee_rate`、`taker_fee_rate`。這是明確的歷史費率證據，不代表工具重新 authenticated，也不能代替 live startup 的 current fee 查證。
+- 不再解析 V1 shadow／Gate 報告；既有 feasibility 結果只保留為歷史證據。
 
 輸出：
 
@@ -1565,15 +1559,15 @@ forced flatten loss share
 
 ---
 
-## Phase 12：V1 Decommission
+## Phase 12：V1 Decommission（使用者已提前授權）
 
-只有 V2 完成 4h GO後：
+依 2026-09-05 使用者明確指示，本次即移除 V1，不再等待 V2 4h／24h GO：
 
-1. README將 V2 設為推薦。
-2. V1 runner標示 deprecated。
-3. V1 docs移入 `docs/archive/mm_v1/`。
-4. 舊 calibration scripts不再為 CI required。
-5. 24h GO後再決定是否刪除 V1 runtime。
+1. 工作樹只保留 V2 Market Maker runner／runtime／config／scripts／tests／docs。
+2. 必要 execution safety 移入 V2 自有模組與測試，沒有舊 package import。
+3. 刪除 V1 文件，不建立 `docs/archive/mm_v1/`；Git 歷史保留。
+4. 更新 README、AGENTS 與現行 V2 文件，移除舊操作入口及 legacy-suite 要求。
+5. V2 的 dry／live／economic gate 仍獨立驗收；README 不得把「唯一版本」當成 production 推薦。
 
 ---
 
@@ -1672,7 +1666,7 @@ Public config field count
 Runtime LOC/size change
 Focused tests
 V2 tests
-Legacy MM regression
+V2 execution／Lighter／Grid regression
 Full repo baseline（只在 milestone）
 Behavioral acceptance results
 Known blockers
@@ -1725,7 +1719,7 @@ docs(mm-v2): promote validated volume-first profile
 
 V2 MVP 完成條件：
 
-1. V1 已 frozen，沒有繼續膨脹。
+1. V1 已依 §0.1 從工作樹移除；V2 execution 不再依賴舊 package，且必要安全契約有測試覆蓋。
 2. V2 user-facing config <= 18 fields。
 3. Live volume session必須顯式授權 bounded flatten。
 4. 一筆 short 遇到持續上漲時：

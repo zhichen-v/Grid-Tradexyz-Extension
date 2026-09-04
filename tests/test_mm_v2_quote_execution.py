@@ -1,4 +1,4 @@
-"""Normal V2 execution: frozen manager and fake exchange; no actual connection."""
+"""Normal V2 execution: V2 manager and fake exchange; no actual connection."""
 
 from dataclasses import replace
 from decimal import Decimal as D
@@ -6,26 +6,26 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-import test_market_maker_order_manager as legacy
+import mm_v2_execution_fixtures as fixtures
 from core.adapters.exchanges.models import OrderSide, OrderStatus
-from core.services.market_maker.models import MarketMetadata, RuntimeState
-from core.services.market_maker.order_manager import MarketMakerOrderManager
+from core.services.market_maker_v2.execution_models import MarketMetadata, RuntimeState
+from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
 from core.services.market_maker_v2.domain import (
     AccountSnapshot, ExecutionHealth, ExecutionStatus, FlattenIntent,
     InventoryDecision, MarketStateSnapshot, QuoteAuthorization, QuoteIntent,
     QuotePlan, SessionReport, Side, StrategyState,
 )
 from core.services.market_maker_v2.execution_port import (
-    DryVolumeExecutionPort, ExecutionUnavailable, LegacyVolumeExecutionPort,
-    LegacyExecutionSettings, legacy_execution_settings,
+    DryVolumeExecutionPort, ExecutionUnavailable, VolumeExecutionPort,
 )
+from core.services.market_maker_v2.config import ExecutionSettings, execution_settings
 from core.services.market_maker_v2.inventory_governor import InventoryGovernor
 from core.services.market_maker_v2.quote_policy import VolumeQuotePolicy
 
 
 class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.time = legacy.Clock()
+        self.time = fixtures.Clock()
         self.clock = SimpleNamespace(monotonic=self.time)
         self.position, self.maker_fee = D("0"), D("0")
         self.sequence, self.events, self.open, self.history = 0, [], {}, []
@@ -41,7 +41,7 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
             confirm_terminal_cancellation_outcome=Mock(return_value=False),
             resolve_unresolved_submissions=AsyncMock(return_value=[]),
         )
-        settings = LegacyExecutionSettings("BTC", D("0.2"), D("1"), 5, False)
+        settings = ExecutionSettings("BTC", D("0.2"), D("1"), 5, False)
         metadata = MarketMetadata("BTC", 1, 1, D("0.1"), D("0.1"), D("0.1"), D("0"))
         self.manager = MarketMakerOrderManager(self.adapter, settings, metadata, monotonic=self.time)
         self.account = SimpleNamespace(snapshot=AsyncMock(side_effect=self.account_snapshot))
@@ -59,14 +59,14 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
     def make_port(self, **changes):
         values = dict(refresh_quote=self.refresh, reprice_threshold_ticks=5,
                       max_quote_age_ms=5000, authorize_bounded_flatten=True)
-        return LegacyVolumeExecutionPort(self.manager, self.account, self.market,
+        return VolumeExecutionPort(self.manager, self.account, self.market,
                                          self.clock, **(values | changes))
 
     async def create(self, symbol, side, order_type, amount, price, params):
         self.sequence += 1
         self.events.append(("create", side, amount, price))
         self.assertEqual(params.get("time_in_force"), "POST_ONLY")
-        order = legacy.exchange_order(str(self.sequence), side, amount=str(amount),
+        order = fixtures.exchange_order(str(self.sequence), side, amount=str(amount),
                                       price=str(price), params=params)
         self.open[order.id] = order
         return order
@@ -298,7 +298,7 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
     def test_settings_builder_is_execution_only_and_accepts_public_manager_constructor(self):
         from core.services.market_maker_v2.config import load_config
         config = load_config("config/market_maker_v2/lighter_btc_volume.example.yaml")
-        settings = legacy_execution_settings(config)
+        settings = execution_settings(config)
         self.assertTrue(settings.dry_run)
         self.assertEqual(settings.max_position, config.inventory.hard_limit)
         self.assertFalse(hasattr(settings, "ping_pong_enabled"))

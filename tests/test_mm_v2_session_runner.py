@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal as D
 from types import SimpleNamespace as NS
 import unittest
+import time
 from unittest.mock import patch
 
 from core.adapters.exchanges.models import OrderData, OrderSide, OrderStatus, OrderType
@@ -14,7 +15,7 @@ from core.services.market_maker_v2.config import (
 )
 from core.services.market_maker_v2.domain import BoundedExitReport, ExitStatus, QuotePlan
 from core.services.market_maker_v2 import orchestrator
-from test_mm_v2_lighter_runtime import Adapter, ADDRESS, Clock, trade
+from test_mm_v2_lighter_runtime import Adapter, ADDRESS, Clock, ReadStream, trade
 
 
 def config(*, dry=True, duration=2):
@@ -43,6 +44,9 @@ class RuntimeAdapter(Adapter):
 
     async def authenticate(self):
         return True
+
+    async def open_read_stream(self, symbol, *, clock=None):
+        return ReadStream(self, NS(monotonic=clock) if clock else self.clock)
 
     async def disconnect(self):
         self.disconnections += 1
@@ -171,6 +175,13 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
             session = self.session(dry=False)
             await session.run(asyncio.Event())
         self.assertEqual((self.adapter.connections, self.adapter.creates, self.adapter.cancels), (0, 0, 0))
+
+    def test_default_clock_is_high_resolution_and_shared_with_all_v2_inputs(self):
+        session = orchestrator.VolumeSession(config(), self.adapter, account_index=7,
+                                             expected_l1_address=ADDRESS)
+        self.assertIs(session.clock.monotonic, time.perf_counter)
+        self.assertIs(session.account.clock, session.clock)
+        self.assertIs(session.market.clock, session.clock)
 
     async def test_default_dry_quotes_are_simulated_and_deadline_postflight_no_mutations(self):
         result = await self.session().run(asyncio.Event())
@@ -324,6 +335,25 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.report.complete)
         self.assertNotIn("IOC", self.adapter.created_tifs)
         self.assertEqual(self.adapter.disconnections, 1)
+
+    async def test_transport_loss_uses_exit_only_rest_to_cancel_and_prove_flat(self):
+        session = None
+        detached = []
+        async def close_stream():
+            detached.append(True)
+        async def fail_then_advance(seconds):
+            session.account.stream.transport_healthy = False
+            self.adapter.read_failure = True
+            self.clock.now += float(seconds)
+            await asyncio.sleep(0)
+        self.adapter.close_read_stream = close_stream
+        session = self.session(dry=False, authorized=True, sleep=fail_then_advance)
+        result = await session.run(asyncio.Event())
+        self.assertFalse(result.completed)
+        self.assertEqual(detached, [True])
+        self.assertGreater(self.adapter.cancels, 0)
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertNotIn("IOC", self.adapter.created_tifs)
 
 
 if __name__ == "__main__":

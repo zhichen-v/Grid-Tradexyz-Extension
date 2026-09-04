@@ -1,33 +1,34 @@
-"""Phase 2 public dry-port contracts; no live adapter or private legacy state."""
+"""Phase 2 public dry-port contracts; no live adapter or private strategy state."""
 
 import subprocess
 import sys
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from core.services.market_maker.config import MarketMakerConfig
-from core.services.market_maker.models import MarketMetadata, RuntimeState
-from core.services.market_maker.order_manager import (
+from core.services.market_maker_v2.config import ExecutionSettings
+from core.services.market_maker_v2.execution_models import MarketMetadata, RuntimeState
+from core.services.market_maker_v2.order_manager import (
     MarketMakerOrderManager, ReconcileAction, ReconcileResult,
 )
 from core.services.market_maker_v2.domain import (
     ExecutionHealth, ExecutionStatus, FlattenIntent, QuoteIntent, QuotePlan, Side,
 )
 from core.services.market_maker_v2.execution_port import (
-    ExecutionUnavailable, LegacyDryExecutionPort,
+    ExecutionUnavailable, DrySafetyExecutionPort,
 )
 
 
 D = Decimal
 
 
-class LegacyDryExecutionPortTests(unittest.IsolatedAsyncioTestCase):
+class DrySafetyExecutionPortTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.clock = SimpleNamespace(monotonic=lambda: 100.0)
         self.manager = self.stub_manager()
-        self.port = LegacyDryExecutionPort(self.manager)
+        self.port = DrySafetyExecutionPort(self.manager)
         self.empty = QuotePlan("BTC")
         self.flatten = FlattenIntent("BTC", Side.BUY, D("0.0002"), D("80000"), 105.0)
 
@@ -48,7 +49,7 @@ class LegacyDryExecutionPortTests(unittest.IsolatedAsyncioTestCase):
         manager.cancel_managed_orders.assert_not_called()
         manager.snapshot.assert_not_called()
 
-    async def test_real_legacy_empty_reconcile_and_cancel_make_no_exchange_calls(self):
+    async def test_real_manager_empty_reconcile_and_cancel_make_no_exchange_calls(self):
         network = {name: AsyncMock(side_effect=AssertionError("exchange call forbidden"))
                    for name in ("connect", "create_order", "cancel_order", "cancel_all_orders",
                                 "get_open_orders", "get_order_history",
@@ -57,13 +58,14 @@ class LegacyDryExecutionPortTests(unittest.IsolatedAsyncioTestCase):
             **network, get_unresolved_submissions=Mock(return_value=[]),
             get_unresolved_cancellations=Mock(return_value=[]),
         )
-        config = MarketMakerConfig(symbol="BTC", order_size=D("0.0002"),
-                                   max_position=D("0.0004"), dry_run=True)
+        config = ExecutionSettings(symbol="BTC", order_size=D("0.0002"),
+                                   max_position=D("0.0004"), reprice_threshold_ticks=1,
+                                   dry_run=True)
         metadata = MarketMetadata("BTC", 1, 5, D("0.1"), D("0.00001"),
                                   D("0.0002"), D("10"))
         manager = MarketMakerOrderManager(adapter, config, metadata,
                                           monotonic=self.clock.monotonic)
-        port = LegacyDryExecutionPort(manager)
+        port = DrySafetyExecutionPort(manager)
         for result in (await port.reconcile_quotes(self.empty),
                        await port.cancel_all_managed()):
             self.assertEqual(result.status, ExecutionStatus.SIMULATED)
@@ -114,7 +116,7 @@ class LegacyDryExecutionPortTests(unittest.IsolatedAsyncioTestCase):
                 manager = self.stub_manager()
                 manager.config.dry_run = dry
                 with self.assertRaises(ExecutionUnavailable):
-                    LegacyDryExecutionPort(manager)
+                    DrySafetyExecutionPort(manager)
                 self.assert_no_delegation(manager)
 
     async def test_every_operation_rechecks_dry_config_after_construction(self):
@@ -133,13 +135,13 @@ class LegacyDryExecutionPortTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(flag=flag):
                 manager = self.stub_manager()
                 setattr(manager, flag, True)
-                port = LegacyDryExecutionPort(manager)
+                port = DrySafetyExecutionPort(manager)
                 self.assertEqual(port.snapshot().health, ExecutionHealth.PAUSED_ORDER_STATE)
                 for result in (await port.reconcile_quotes(self.empty),
                                await port.cancel_all_managed()):
                     self.assertEqual(result.status, ExecutionStatus.BLOCKED)
                     self.assertEqual(result.snapshot.health, ExecutionHealth.PAUSED_ORDER_STATE)
-                # Do not enter legacy reconciliation's possible REST resolver path.
+                # Do not enter manager reconciliation's possible REST resolver path.
                 manager.reconcile.assert_not_called()
                 manager.cancel_managed_orders.assert_not_called()
 
@@ -185,9 +187,18 @@ class LegacyDryExecutionPortTests(unittest.IsolatedAsyncioTestCase):
                     await operation(*args)
                 self.assertNotIn("DO_NOT_ECHO_SECRET", str(caught.exception))
 
-    def test_importing_pure_ports_does_not_load_legacy_runtime(self):
+    def test_removed_runtime_and_launch_paths_are_absent(self):
+        root = Path(__file__).resolve().parents[1]
+        for relative in ("core/services/market_maker", "run_market_maker.py",
+                         "config/market_maker"):
+            with self.subTest(path=relative):
+                self.assertFalse((root / relative).exists())
+
+    def test_importing_current_entrypoint_and_ports_does_not_load_removed_runtime(self):
         check = subprocess.run(
-            [sys.executable, "-c", "import sys; "
+            [sys.executable, "-c", "import sys; import run_volume_market_maker; "
+             "from core.services.market_maker_v2.orchestrator import VolumeSession; "
+             "from core.services.market_maker_v2.order_manager import MarketMakerOrderManager; "
              "from core.services.market_maker_v2.execution_port import "
              "MarketDataPort, AccountPort, Clock, TelemetrySink, ExecutionPort; "
              "assert not any(name == 'core.services.market_maker' or "

@@ -8,7 +8,8 @@ import tempfile
 import unittest
 
 from core.services.market_maker_v2.domain import (
-    AccountSnapshot, FillAccounting, FillEvent, LiquidityRole, MarkEvent, QuotePlan, Side,
+    AccountSnapshot, FillAccounting, FillEvent, FlattenIntent, InventoryDecision,
+    LiquidityRole, MarkEvent, QuotePlan, Side, StrategyState,
 )
 from core.services.market_maker_v2.session_ledger import SessionLedger
 from core.services.market_maker_v2.telemetry import JsonlTelemetrySink, TelemetryError
@@ -42,6 +43,20 @@ class JsonlTelemetryTests(unittest.TestCase):
         with self.assertRaises(TelemetryError):
             JsonlTelemetrySink(self.path)
         self.assertEqual(self.path.read_bytes(), original)
+
+    def test_inventory_state_and_nested_flatten_keep_typed_decimal_contract(self):
+        with JsonlTelemetrySink(self.path) as sink:
+            sink.emit(InventoryDecision(StrategyState.QUOTING, buy_capacity=D("0.00020"),
+                                        sell_capacity=D("0.00020")))
+            sink.emit(InventoryDecision(StrategyState.FLATTENING,
+                flatten=FlattenIntent("BTC", Side.BUY, D("0.00010"), D("80100.1"), 30.0)))
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.assertEqual([row["event"] for row in rows], ["inventory_decision"] * 2)
+        self.assertEqual(rows[0]["data"], {"state": "quoting", "flatten": None,
+            "buy_capacity": "0.00020", "sell_capacity": "0.00020"})
+        self.assertEqual(rows[1]["data"], {"state": "flattening", "buy_capacity": "0",
+            "sell_capacity": "0", "flatten": {"symbol": "BTC", "side": "buy",
+                "size": "0.00010", "limit_price": "80100.1", "deadline_monotonic": 30.0}})
 
     def test_raw_dicts_or_subclass_extra_credentials_are_never_serialized(self):
         @dataclass(frozen=True)

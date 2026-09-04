@@ -1,8 +1,10 @@
 # Market Maker V2 — Volume-first objective
 
-> 狀態：Phase 6 runner 已完成離線驗收，尚未通過 dry/live promotion。完整任務以使用者的 [V2 rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md) 為準；本檔只固定產品契約，不另開優化路線。
+> 狀態：Phase 6 已提交；Phase 7 replay、Unified 映射與10min dry smoke_03通過。T3_01／T3_02分別於約18.6／26.9分鐘停止；讀取429已未重現，但來源時間誤差仍阻擋30min dry gate。最終獨立authenticated position0/orders0、程序已退出；目前無run。下一步先驗證host/source時鐘誤差處理，再重跑T3；live另有mutation／exit讀取預算No-Go，不因flat dry部分通過自動promotion。完整任務以使用者的 [V2 rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md) 為準；本檔只固定產品契約，不另開優化路線。
 
 ## 目標與判定
+
+2026-09-05 依使用者覆寫完成 V1 清除：必要 execution safety 已移入 V2，無舊 package 依賴；V2 345 tests PASS，全專案 619 tests 為同組既有 8 failures + 4 errors，無新增失敗。此離線驗證不改變上方 dry/live gate 狀態。
 
 在 session all-in net cost、drawdown 與 hard inventory 限額內，提高 `maker_turnover_per_quote_hour`。正常狀態持續雙邊 `POST_ONLY` 報價，允許單筆虧損；持倉逾時、虧損、session deadline 或 stop 必須進入有界退出流程。允許為整場風險控制付出 taker flatten 成本，不再等待不虧損的自然 flat。
 
@@ -40,4 +42,4 @@ V2 live 啟動時必須在任何連線／mutation 前要求 `--authorize-bounded
 
 V2 起始策略 config 為計畫的 **18 個 leaf fields**；安全不變量由 profile/code 擁有，不另開開關。Orchestrator ≤500 LOC、QuotePolicy ≤350、InventoryGovernor ≤400、session analyzer ≤500、Phase 1 feasibility ≤500；函式盡量 ≤60 LOC。只保留所需 port、標準庫與公開契約測試。
 
-按 Phase 0 → 1 → skeleton → ledger → quote → governor → runner → replay/dry → 授權 canary 逐步驗收。架構見 [ARCHITECTURE](ARCHITECTURE.md)，唯一 phase/run 記錄見 [EXPERIMENT_LOG](EXPERIMENT_LOG.md)。V1 凍結於 `mm-v1-guard-driven-20260903`（commit `59f313e7cc03c423877baa4b71e5467c67998e38`）；V2 4h GO 前不退役 V1，24h GO 前不決定刪除其 runtime。
+按 Phase 0 → 1 → skeleton → ledger → quote → governor → runner → replay/dry → 授權 canary 逐步驗收。架構見 [ARCHITECTURE](ARCHITECTURE.md)，唯一 phase/run 記錄見 [EXPERIMENT_LOG](EXPERIMENT_LOG.md)。依 2026-09-05 使用者明確指示，Market Maker 工作樹只保留 V2；原本等待 4h／24h 才刪除 V1 的限制已被取代。V1 歷史仍可由 Git tag `mm-v1-guard-driven-20260903` 追溯；必要的訂單安全語義由 V2 自有 execution modules 與測試承接，不保留舊策略或相容入口。這不是 V2 live／economic GO，也不改變逐場授權要求。

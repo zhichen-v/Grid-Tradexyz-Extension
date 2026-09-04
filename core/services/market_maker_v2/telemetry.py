@@ -9,7 +9,7 @@ from pathlib import Path
 from .domain import (
     AccountSnapshot, CashflowEvent, ExecutionResult, ExecutionSnapshot,
     FillAccounting, FillEvent, MarkEvent, QuoteIntent, QuotePlan, SessionReport,
-    TelemetryEvent, WorkingOrder, BoundedExitReport,
+    TelemetryEvent, WorkingOrder, BoundedExitReport, InventoryDecision, FlattenIntent,
 )
 
 
@@ -18,8 +18,9 @@ _EVENTS = {
     ExecutionResult: "execution_result", FillAccounting: "fill",
     MarkEvent: "mark", CashflowEvent: "cashflow", SessionReport: "session_report",
     BoundedExitReport: "bounded_exit",
+    InventoryDecision: "inventory_decision",
 }
-_MODELS = {*_EVENTS, ExecutionSnapshot, QuoteIntent, FillEvent, WorkingOrder}
+_MODELS = {*_EVENTS, ExecutionSnapshot, QuoteIntent, FillEvent, WorkingOrder, FlattenIntent}
 
 
 class TelemetryError(RuntimeError):

@@ -6,7 +6,11 @@ supporting code for other exchange integrations.
 
 Market Maker V2 is an isolated **rebuild in progress**, not a production recommendation.
 Its current task contract is the [volume-first V2 plan](docs/CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)
-and [V2 objective](docs/mm_v2/OBJECTIVE.md). The guard-driven V1 documents are frozen history.
+and [V2 objective](docs/mm_v2/OBJECTIVE.md). Market Maker V1 has been removed from
+the working tree at the user's request; historical material remains in Git.
+V2 owns its execution safety modules and is the only Market Maker entrypoint:
+`run_volume_market_maker.py` (dry-run default; each live run requires explicit
+bounded-flatten authorization). Removing V1 does not imply V2 live readiness.
 
 This README is written for someone starting from zero: clone the repo, install the
 environment, configure credentials, choose a grid config, and run the bot.
@@ -14,6 +18,7 @@ environment, configure credentials, choose a grid config, and run the bot.
 ## 1. What This Repository Contains
 
 - Grid strategy execution entrypoint: `run_grid_trading.py`
+- Market Maker V2 entrypoint and package: `run_volume_market_maker.py`, `core/services/market_maker_v2/`
 - Exchange adapters: `core/adapters/exchanges/`
 - Grid coordinator, engine, tracker, and TUI: `core/services/grid/`
 - Exchange configs: `config/exchanges/`
