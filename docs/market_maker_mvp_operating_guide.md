@@ -1,6 +1,8 @@
 # Market Maker MVP 操作指南
 
-本指南是單一 Lighter 永續合約 Market Maker MVP 的操作與安全來源。所有命令由 repository 根目錄執行；歷史逐輪證據另見 [驗證歷史](market_maker_mvp_validation_history.md)。
+> **LEGACY / FROZEN — V1 only（2026-09-04）**。本檔保留 V1 安全規則與事故證據，不是下一輪工作指令；下文的「目前／下一步」、Gate、maker-only 與 cancel-only stop 都只描述 V1。V2 重構唯一任務來源為 [新計畫](CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)，摘要見 [V2 objective](mm_v2/OBJECTIVE.md)。不得以舊授權重啟 live，也不得將 V1 退出政策套入 V2。
+
+本指南是單一 Lighter 永續合約 Market Maker **V1** 的操作與安全歷史。所有命令由 repository 根目錄執行；歷史逐輪證據另見 [驗證歷史](market_maker_mvp_validation_history.md)。所有帳戶讀值都是當時快照，不代表目前狀態。
 
 ## 1. 不可放寬的規則
 

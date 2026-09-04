@@ -1,5 +1,7 @@
 # Market Maker MVP 驗證歷史索引
 
+> **LEGACY / FROZEN — V1 only（2026-09-04）**。本檔僅保存歷史證據，不授予新的 rollout、live 或平倉權限。V2 不沿用舊 Gate／campaign；請由 [重構計畫](CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md) 與 [V2 objective](mm_v2/OBJECTIVE.md) 進入。
+
 本檔保存 `market_maker_mvp_operating_guide.md` 的歷次本地驗證索引，讓主操作指南只保留目前可執行規則與最新候選。表內帳戶、餘額、持倉、訂單、fee、config SHA與測試數字都是**當時快照**，不得作為目前狀態或下一輪 preflight 的替代品。
 
 原 `12.1–12.19` 的完整逐輪原文可由已push的commit讀取：

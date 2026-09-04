@@ -4,6 +4,10 @@ This repository contains a grid trading runtime centered on `run_grid_trading.py
 It is currently used mainly with the `tradexyz` exchange adapter, and also contains
 supporting code for other exchange integrations.
 
+Market Maker V2 is an isolated **rebuild in progress**, not a production recommendation.
+Its current task contract is the [volume-first V2 plan](docs/CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)
+and [V2 objective](docs/mm_v2/OBJECTIVE.md). The guard-driven V1 documents are frozen history.
+
 This README is written for someone starting from zero: clone the repo, install the
 environment, configure credentials, choose a grid config, and run the bot.
 
