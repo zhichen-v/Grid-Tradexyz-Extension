@@ -1,6 +1,10 @@
 # Market Maker V2 — Architecture contract
 
-> 設計契約，尚未實作。權威來源：[rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)。產品目標／fee floor／授權／complexity budget 見 [OBJECTIVE](OBJECTIVE.md)。Phase/run 驗收只記在 [EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+> 設計契約，逐階段實作。權威來源：[rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)。產品目標／fee floor／授權／complexity budget 見 [OBJECTIVE](OBJECTIVE.md)。Phase/run 驗收只記在 [EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+
+Phase 2 已有 immutable domain models、五個 ports、`dry_synthetic_cycle` 與 `LegacyDryExecutionPort`。相容層只接受 empty dry plan／simulated managed-order cancellation；非空報價、IOC 與 live config 明確拒絕。Unknown/unresolved 或非 simulated managed order 在 delegate 前封鎖；V1 strategy package 不會由純 V2 contracts/synthetic cycle 的 import 載入。
+
+這不是 live-ready execution。`AccountPort` 目前由 synthetic fixture 驗收，不能把其 `authenticated=True` 當成真實帳戶證據。V1 AccountMonitor 內含舊 episode 經濟政策，因此不包裝它；現有 Adapter 沒有公開 current fee-schedule API，Phase 6 接線時需由窄 adapter layer 取得真正 authenticated account/fee truth，不可讀 private signer／REST client 或用歷史費率冒充。非空 quote reconciliation 的 V2 risk contract 留待後續 quote/governor 階段，bounded IOC 留待 Phase 5。
 
 ## 隔離與 ownership
 
