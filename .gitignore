@@ -36,3 +36,4 @@ README_old.md
 config/grid/tradexyz_*.yaml
 config/grid/test_*.yaml
 config/market_maker/test_*.yaml
+config/market_maker_v2/test_*.yaml

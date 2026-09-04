@@ -1,6 +1,6 @@
 # Market Maker V2 — Volume-first objective
 
-> 狀態：重構中，尚無 V2 runner，未通過 dry/live promotion。完整任務以使用者的 [V2 rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md) 為準；本檔只固定產品契約，不另開優化路線。
+> 狀態：Phase 6 runner 已完成離線驗收，尚未通過 dry/live promotion。完整任務以使用者的 [V2 rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md) 為準；本檔只固定產品契約，不另開優化路線。
 
 ## 目標與判定
 
@@ -30,7 +30,7 @@ full_spread_bps = 2f + e + 2v
 
 ## 授權與邊界
 
-目前僅有本機重構與唯讀分析授權，沒有新 live、平倉、margin/leverage、commit 或 push 授權。舊 V1 campaign 的剩餘風險預算不自動轉成 V2 授權。
+Live、平倉及 margin/leverage 操作須逐場明確授權；commit/push 另依操作者當次指示。舊 V1 campaign 的剩餘風險預算不自動轉成 V2 授權。
 
 V2 live 啟動時必須在任何連線／mutation 前要求 `--authorize-bounded-flatten`，並取得當場明確授權；非 flat start、unknown order 或不可信 account/market state 必須拒絕／暫停。授權涵蓋預先約定的 reducing LIMIT IOC、slippage、attempt/deadline 與 stop loss 範圍，不能由 YAML 關閉。
 

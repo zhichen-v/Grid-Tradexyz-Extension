@@ -516,6 +516,69 @@ class LighterAdapter(ExchangeAdapter):
         normalized_symbol = self._normalize_symbol(symbol)
         return await self._rest.get_account_trades(normalized_symbol, limit)
 
+    async def get_account_fee_and_funding(
+        self, symbol: str, limit: int = 100
+    ) -> Dict[str, Any]:
+        """Read current authenticated fee ticks and realized funding, without mutation.
+
+        V2 owns no second signer. Only finite financial values and stable funding
+        identities leave this bridge; SDK responses, tokens and errors do not.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("funding limit must be between 1 and 100")
+        try:
+            rest = self._rest
+            if rest.signer_client is None:
+                raise ValueError("authentication unavailable")
+            market_id = rest.get_market_index(self._normalize_symbol(symbol))
+            if market_id is None:
+                raise ValueError("unknown market")
+            token, error = rest.signer_client.create_auth_token_with_expiry(
+                deadline=600, api_key_index=rest.api_key_index,
+            )
+            if error or not token:
+                raise ValueError("authentication unavailable")
+            limits = await rest._call_api(
+                "current account fees query",
+                lambda: rest.account_api.account_limits(
+                    account_index=rest.account_index, authorization=token,
+                ),
+            )
+            rest._require_success_response(limits, "current account fees query")
+            rates = []
+            for field in ("current_maker_fee_tick", "current_taker_fee_tick"):
+                tick = getattr(limits, field, None)
+                if type(tick) is not int or not 0 <= tick < 1000000:
+                    raise ValueError("invalid current fee tick")
+                rates.append(Decimal(tick) / Decimal("1000000"))
+            response = await rest._call_api(
+                "account funding query",
+                lambda: rest.account_api.position_funding(
+                    account_index=rest.account_index, authorization=token,
+                    market_id=market_id, limit=limit,
+                ),
+            )
+            rest._require_success_response(response, "account funding query")
+            rows = getattr(response, "position_fundings", None)
+            if not isinstance(rows, list):
+                raise ValueError("funding rows unavailable")
+            fundings = []
+            for row in rows:
+                identifier, timestamp = row.funding_id, row.timestamp
+                amount = Decimal(row.change)
+                if (type(identifier) is not int or identifier < 0
+                        or type(timestamp) is not int or timestamp < 0
+                        or row.market_id != market_id or not amount.is_finite()):
+                    raise ValueError("invalid funding event")
+                # Discount is not cash received: deferred rebates need their own
+                # realized cashflow evidence, never an estimated PnL credit.
+                fundings.append({"id": str(identifier), "timestamp": timestamp,
+                                 "change": amount})
+            return {"maker_fee_rate": rates[0], "taker_fee_rate": rates[1],
+                    "fundings": tuple(fundings)}
+        except Exception:
+            raise RuntimeError("authenticated fee/funding read unavailable") from None
+
     async def get_ohlcv(
         self,
         symbol: str,

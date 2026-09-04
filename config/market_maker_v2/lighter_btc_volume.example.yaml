@@ -1,0 +1,28 @@
+# Schema example only, not a live recommendation. No account or secrets belong here.
+market_maker_v2:
+  symbol: "BTC"
+  profile: "fee_neutral_volume_v1"
+  dry_run: true
+
+  quote:
+    order_size: "0.00020"
+    target_net_edge_bps: "0.20"
+    volatility_multiplier: "1.0"
+    reprice_threshold_ticks: 5
+    max_quote_age_ms: 5000
+
+  inventory:
+    soft_limit: "0.00020"
+    hard_limit: "0.00040"
+    skew_bps_at_hard: "2.0"
+
+  flatten:
+    max_hold_seconds: 180
+    stop_loss_usdg: "0.05"
+    passive_grace_seconds: 10
+    ioc_slippage_ticks: 2
+
+  session:
+    duration_seconds: 1800
+    max_loss_usdg: "0.20"
+    cooldown_seconds: 30

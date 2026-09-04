@@ -4,6 +4,8 @@
 
 本指南是單一 Lighter 永續合約 Market Maker **V1** 的操作與安全歷史。所有命令由 repository 根目錄執行；歷史逐輪證據另見 [驗證歷史](market_maker_mvp_validation_history.md)。所有帳戶讀值都是當時快照，不代表目前狀態。
 
+V2 各階段驗收與 rollout 狀態只更新於 [V2 experiment log](mm_v2/EXPERIMENT_LOG.md)，不在本檔重複追加 V2 紀錄。
+
 ## 1. 不可放寬的規則
 
 - 一般、passive unwind 與停機後人工 recovery quote 一律 `POST_ONLY`。唯一可成為 taker 的例外是**明確 opt-in 且預設關閉**的 active-unwind lane；該 lane 只能送 `reduce_only LIMIT + IOC`，禁止 market／FOK、加倉、反手、self-trade、跨帳戶互成交或任何形式的洗量。
