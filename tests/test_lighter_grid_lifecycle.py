@@ -29,9 +29,9 @@ from core.services.grid.models import (
     GridState,
     GridType,
 )
-from core.services.market_maker.config import MarketMakerConfig
-from core.services.market_maker.models import MarketMetadata, OrderSlotState
-from core.services.market_maker.order_manager import MarketMakerOrderManager
+from core.services.market_maker_v2.config import ExecutionSettings
+from core.services.market_maker_v2.execution_models import MarketMetadata, OrderSlotState
+from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
 
 
 def exchange_order(
@@ -2122,11 +2122,11 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         cancel_order = AsyncMock()
         manager = MarketMakerOrderManager(
             SimpleNamespace(cancel_order=cancel_order),
-            MarketMakerConfig(
+            ExecutionSettings(
                 symbol="BTC",
                 order_size=Decimal("0.00020"),
                 max_position=Decimal("0.001"),
-                min_profit_buffer_bps=Decimal("0"),
+                reprice_threshold_ticks=1,
                 dry_run=False,
             ),
             MarketMetadata(
