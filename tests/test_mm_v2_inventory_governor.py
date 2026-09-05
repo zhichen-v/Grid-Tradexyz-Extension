@@ -16,6 +16,25 @@ from core.services.market_maker_v2.quote_policy import VolumeQuotePolicy
 
 
 class InventoryGovernorTests(unittest.TestCase):
+    def test_pretrade_reserve_uses_remaining_drawdown_and_recovers_with_equity(self):
+        from test_mm_v2_session_ledger import account, fill
+        from core.services.market_maker_v2.session_ledger import SessionLedger
+
+        ledger = SessionLedger(account())
+        for i, (side, price) in enumerate(((Side.BUY, "100"), (Side.SELL, "200"),
+                                         (Side.BUY, "200"), (Side.SELL, "101")), 1):
+            ledger.ingest_fill(fill(str(i), side, "1", price, float(i), fee="0"))
+        report = ledger.snapshot(now=100)
+        self.assertEqual((report.realized_net_pnl, report.max_drawdown), (D("1"), D("99")))
+        governor = self.governor(max_session_loss_usdg=D("100"))
+        decision = self.evaluate(governor, report=report)
+        self.assertEqual((decision.buy_capacity, decision.sell_capacity), (D("0"), D("0")))
+        # Existing inventory can earn back current headroom; historical maximum DD remains 99.
+        ledger.ingest_fill(fill("recover-buy", Side.BUY, "1", "100", 101.0, fee="0"))
+        ledger.ingest_fill(fill("recover-sell", Side.SELL, "1", "199", 102.0, fee="0"))
+        recovered = self.evaluate(governor, now=103, report=ledger.snapshot(now=103))
+        self.assertEqual((recovered.buy_capacity, recovered.sell_capacity), (D("1"), D("1")))
+
     def governor(self, **changes):
         values = dict(order_size=D("1"), soft_limit=D("2"), hard_limit=D("3"),
             stop_loss_usdg=D("10"), max_hold_seconds=60, cooldown_seconds=5,

@@ -1,5 +1,6 @@
 """Normal V2 execution: V2 manager and fake exchange; no actual connection."""
 
+import asyncio
 from dataclasses import replace
 from decimal import Decimal as D
 from types import SimpleNamespace
@@ -105,15 +106,18 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(result.status, ExecutionStatus.CONFIRMED)
         self.assertEqual(len(self.open), 2)
 
-    async def test_real_manager_places_one_fresh_authorized_post_only_side_per_cycle(self):
+    async def test_cycle_places_both_sides_with_fresh_authority_between_creates(self):
         first = await self.port.reconcile_quotes(self.proposal)
         self.assertIs(first.status, ExecutionStatus.CONFIRMED)
-        self.assertEqual(first.submitted_count, 1)
-        self.assertEqual(len(first.snapshot.orders), 1)
+        self.assertEqual(first.submitted_count, 2)
+        self.assertEqual(len(first.snapshot.orders), 2)
         self.assertIsNone(first.account_snapshot)
-        self.assertEqual(self.adapter.create_order.call_args.args[4], D("100"))
+        kinds = [event[0] for event in self.events]
+        creates = [i for i, kind in enumerate(kinds) if kind == "create"]
+        self.assertIn("authorize", kinds[creates[0] + 1:creates[1]])
+        self.assertIn("account", kinds[creates[0] + 1:creates[1]])
         second = await self.port.reconcile_quotes(self.proposal)
-        self.assertEqual(second.submitted_count, 1)
+        self.assertEqual(second.submitted_count, 0)
         self.assertEqual({o.side for o in second.snapshot.orders}, {Side.BUY, Side.SELL})
         self.assertEqual(second.actual_plan.symbol, "BTC")
         self.assertFalse(second.snapshot.simulated)
@@ -128,6 +132,37 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.submitted_count, 0)
         self.adapter.cancel_order.assert_not_called()
         self.assertEqual({q.price for q in result.actual_plan.quotes}, {D("100"), D("100.1")})
+
+    async def test_first_create_fill_is_reaudited_before_reducing_opposite_create(self):
+        async def filled_first(*args, **kwargs):
+            order = await self.create(*args, **kwargs)
+            if self.sequence == 1:
+                self.position = order.amount
+                self.open.pop(order.id)
+                order = replace(order, status=OrderStatus.FILLED,
+                                filled=order.amount, remaining=D("0"))
+                self.history.append(order)
+            return order
+        self.adapter.create_order.side_effect = filled_first
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+        self.assertEqual([e[1] for e in self.events if e[0] == "create"],
+                         [OrderSide.BUY, OrderSide.SELL])
+        self.assertEqual([e[2] for e in self.events if e[0] == "authorize"],
+                         [D("0"), D("0.2")])
+
+    async def test_second_read_uses_original_deadline_and_retains_first_create_count(self):
+        original = self.refresh_quote
+        async def delayed(execution):
+            if self.sequence:
+                self.time.value += 11
+            return await original(execution)
+        self.refresh.side_effect = delayed
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.BLOCKED)
+        self.assertEqual(result.submitted_count, 1)
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+        self.assertIs(result.snapshot.health, ExecutionHealth.HEALTHY)
 
     async def test_quote_age_and_reprice_threshold_force_cancel_proof_then_new_authority(self):
         for cause in ("age", "price"):
@@ -147,8 +182,9 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
                 kinds = [event[0] for event in self.events]
                 self.assertLess(max(i for i, kind in enumerate(kinds) if kind == "cancel"),
                                 max(i for i, kind in enumerate(kinds) if kind == "authorize"))
-                self.assertLess(max(i for i, kind in enumerate(kinds) if kind == "authorize"),
-                                kinds.index("create"))
+                first_create = kinds.index("create")
+                last_cancel = max(i for i, kind in enumerate(kinds) if kind == "cancel")
+                self.assertIn("authorize", kinds[last_cancel + 1:first_create])
 
     async def test_cancel_fill_race_recomputes_hard_band_before_any_new_create(self):
         self.position = D("-0.9")
@@ -174,6 +210,10 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.cancelled_count, 2)
 
     async def test_retained_price_cannot_cross_a_new_opposite_quote(self):
+        async def buy_only(execution):
+            value = await self.refresh_quote(execution)
+            return replace(value, plan=QuotePlan("BTC", value.plan.quotes[:1]))
+        self.refresh.side_effect = buy_only
         await self.port.reconcile_quotes(self.proposal)
         original = self.refresh_quote
         async def fresh(execution):
@@ -220,6 +260,48 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.refresh.assert_not_called()
         self.adapter.create_order.assert_not_called()
         self.adapter.get_open_orders.assert_not_called()
+
+    async def test_cancelled_create_keeps_uncertainty_and_blocks_further_mutations(self):
+        self.adapter.create_order.side_effect = asyncio.CancelledError
+        with self.assertRaises(asyncio.CancelledError):
+            await self.port.reconcile_quotes(self.proposal)
+        self.assertTrue(self.manager.has_uncertain_state)
+        result = await self.port.cancel_all_managed()
+        self.assertIs(result.status, ExecutionStatus.BLOCKED)
+        self.adapter.cancel_order.assert_not_called()
+
+    async def test_moving_book_never_starves_the_opposite_side(self):
+        for _ in range(6):
+            result = await self.port.reconcile_quotes(self.proposal)
+            self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+            self.assertEqual({o.side for o in result.snapshot.orders}, {Side.BUY, Side.SELL})
+            self.time.value += 3
+            self.bid += 1
+            self.ask += 1
+
+    async def test_post_only_rejection_requires_new_book_then_resumes_after_cooldown(self):
+        async def canceled(*args, **kwargs):
+            order = await self.create(*args, **kwargs)
+            self.open.pop(order.id)
+            terminal = replace(order, status=OrderStatus.CANCELED,
+                               raw_data={"post_only_canceled": True})
+            self.history.append(terminal)
+            return terminal
+
+        self.adapter.create_order.side_effect = canceled
+        stale_book = self.market_snapshot()
+        await self.port.reconcile_quotes(self.proposal)
+        self.adapter.create_order.side_effect = self.create
+        self.market.snapshot.side_effect = lambda: stale_book
+        self.time.value += 0.5
+        await self.port.reconcile_quotes(self.proposal)
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+        self.assertTrue(self.manager.post_only_book_refresh_required)
+        self.market.snapshot.side_effect = self.market_snapshot
+        self.time.value += 10
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertEqual({o.side for o in result.snapshot.orders}, {Side.BUY, Side.SELL})
+        self.assertFalse(self.manager.post_only_book_refresh_required)
 
     async def test_same_count_but_wrong_authenticated_order_identity_is_rejected(self):
         await self.quote_both()

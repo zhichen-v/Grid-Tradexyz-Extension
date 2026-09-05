@@ -24,6 +24,8 @@ def account_message(channel="account_all"):
     result = {"type": f"subscribed/{channel}", "channel": f"{channel}:7"}
     if channel == "account_all_orders":
         result["orders"] = {}
+    elif channel == "account_orders":
+        result.update(channel="account_orders:0", account=7, nonce=11, orders={})
     else:
         result.update(account=7, assets={}, positions={}, shares=[], trades={},
                       funding_histories={}, total_trades_count=10)
@@ -53,14 +55,15 @@ class Socket:
         self.sent.append(message)
         if message["type"] == "unsubscribe":
             self.orders_subscribed = False
-            response = self.unsubscribe_reply()
+            response = ({"type": "unsubscribed", "channel": "account_orders:0"}
+                        if message["channel"].startswith("account_orders/") else self.unsubscribe_reply())
             if response is not None:
                 await self.push(response)
             return
         if message["type"] != "subscribe":
             return
         channel = message["channel"].split("/")[0]
-        if channel == "account_all_orders":
+        if channel in {"account_all_orders", "account_orders"}:
             if self.orders_subscribed:
                 await self.push({"code": 30003})
                 return
@@ -120,6 +123,36 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(pending.done())
         await socket.push(account_message())
         self.assertEqual((await pending)["total_trades_count"], 10)
+
+    async def test_market_order_watermark_waits_for_book_and_resubscribes(self):
+        stream, socket, _ = await self.make_stream()
+        await stream.request_snapshot("account_orders")
+        self.assertEqual(stream.order_nonce, 11)
+        pending = asyncio.create_task(stream.book_at_or_after(11, after=42))
+        await self.flush()
+        self.assertFalse(pending.done())
+        await socket.push(book_message(initial=False, nonce=11, offset=21))
+        book = await pending
+        self.assertEqual((book["nonce"], book["received_monotonic"]), (11, 42.5))
+        socket.reply = lambda _: {**account_message("account_orders"), "nonce": 12}
+        await stream.request_snapshot("account_orders")
+        self.assertEqual(stream.order_nonce, 12)
+        self.assertEqual([(row["type"], row["channel"]) for row in socket.sent[-2:]],
+                         [("unsubscribe", "account_orders/0/7"), ("subscribe", "account_orders/0/7")])
+        pending = asyncio.create_task(stream.book_at_or_after(99, after=42))
+        await self.flush()
+        await stream.close()
+        with self.assertRaises(RuntimeError):
+            await pending
+
+    async def test_market_order_snapshot_rejects_missing_or_backward_nonce_and_other_market(self):
+        for changes in ({"nonce": None}, {"nonce": 10}, {"orders": {"1": []}}):
+            stream, socket, _ = await self.make_stream()
+            await stream.request_snapshot("account_orders")
+            socket.reply = lambda _: account_message("account_orders") | changes
+            with self.assertRaises(RuntimeError):
+                await stream.request_snapshot("account_orders")
+            self.assertFalse(stream.transport_healthy)
 
     async def test_snapshot_requests_are_serialized(self):
         stream, socket, _ = await self.make_stream()
@@ -294,6 +327,54 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             stream.book_snapshot()
 
+    async def test_source_failure_reports_age_and_wall_elapsed_error_without_relaxing_guard(self):
+        for wall_value, kind, age in ((0.98, "future", "-20.00"), (4.001, "stale", "3001.000")):
+            wall = [1]
+            stream, _, _ = await self.make_stream(wall_clock=lambda: wall[0])
+            wall[0] = wall_value
+            with self.assertRaises(RuntimeError):
+                stream.book_snapshot()
+            self.assertEqual(stream.last_source_time_failure[:2], (kind, age))
+            self.assertEqual(Decimal(stream.last_source_time_failure[2]), Decimal(str(wall_value))*1000-1000)
+            self.assertTrue(stream.transport_healthy)
+
+    async def test_old_aligned_source_expires_even_while_latest_book_is_fresh(self):
+        wall, monotonic = [3.9], [42.5]
+        stream, socket, _ = await self.make_stream(wall_clock=lambda: wall[0], clock=lambda: monotonic[0])
+        old = stream.book_snapshot()
+        update = book_message(initial=False, nonce=11, offset=21)
+        update["timestamp"] = 3900
+        await socket.push(update)
+        await self.flush()
+        wall[0], monotonic[0] = 4.01, 42.61
+        self.assertEqual(stream.book_snapshot()["timestamp"], 3900)
+        with self.assertRaises(RuntimeError):
+            stream.check_book_source(old["timestamp"])
+        self.assertEqual(stream.last_source_time_failure[0], "stale")
+        self.assertTrue(stream.transport_healthy)
+        with self.assertRaises(RuntimeError):
+            stream.check_book_source(3900)
+
+    async def test_host_clock_jump_fails_book_but_keeps_account_cleanup_on_either_platform(self):
+        for quantum in (0.015625, 0.000000001):
+            for jump in (-0.2, 0.2):
+                with self.subTest(quantum=quantum, jump=jump):
+                    wall, monotonic = [1.5], [42.5]
+                    with patch("core.adapters.exchanges.adapters.lighter_read_stream.time.get_clock_info",
+                               return_value=SimpleNamespace(resolution=quantum)):
+                        stream, _, _ = await self.make_stream(
+                            wall_clock=lambda: wall[0], clock=lambda: monotonic[0])
+                    wall[0] += 1
+                    monotonic[0] += 1
+                    self.assertEqual(stream.book_snapshot()["received_monotonic"], 42.5)
+                    wall[0] += jump  # Source age remains within 0..3000 ms.
+                    with self.assertRaises(RuntimeError):
+                        stream.book_snapshot()
+                    self.assertEqual(stream.last_book_failure[1], "clock_discontinuity")
+                    self.assertEqual(stream.last_source_time_failure[0], "clock_jump")
+                    self.assertTrue(stream.transport_healthy)
+                    self.assertEqual((await stream.request_snapshot("account_all"))["total_trades_count"], 10)
+
     async def test_one_wall_tick_wait_rechecks_strict_bounds_without_refreshing_receipt(self):
         wall, monotonic = [1], [42.5]
 
@@ -442,7 +523,7 @@ class LighterReadStreamOwnershipTests(unittest.IsolatedAsyncioTestCase):
         adapter._websocket = SimpleNamespace(disconnect=AsyncMock())
         adapter._rest = LighterRest.__new__(LighterRest)
         adapter._rest.network, adapter._rest.account_index, adapter._rest.api_key_index = "robinhood", 7, 2
-        adapter._rest.get_market_index = lambda _: 0
+        adapter._rest.get_market_index = lambda symbol: {"ETH": 0, "BTC": 1}[symbol]
         adapter._rest.close, adapter._rest.signer_client = AsyncMock(), MagicMock()
         adapter._rest._markets_cache = {0: {"symbol": "ETH"}, 1: {"symbol": "BTC"}}
         adapter._rest.signer_client.create_auth_token_with_expiry.return_value = ("test-auth", None)
@@ -484,6 +565,7 @@ class LighterReadStreamOwnershipTests(unittest.IsolatedAsyncioTestCase):
                "remaining_base_amount": "0.2", "price": "99", "filled_quote_amount": "9.9"}
         other = {**row, "order_index": 124, "order_id": "124", "market_index": 1}
         adapter._read_stream = SimpleNamespace(
+            market_id=1,
             request_snapshot=AsyncMock(return_value={"orders": {"0": [row], "1": [other]}}),
             close=AsyncMock())
         adapter._rest.get_open_orders = AsyncMock(side_effect=AssertionError("REST must not run"))
@@ -491,7 +573,9 @@ class LighterReadStreamOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([order.id for order in orders], ["123", "124"])
         self.assertEqual(orders[0].remaining, Decimal("0.2"))
         self.assertFalse(orders[0].raw_data["order_info"].reduce_only)
+        adapter._read_stream.request_snapshot.return_value = {"orders": {"1": [other]}, "nonce": 11}
         self.assertEqual([order.symbol for order in await adapter.get_open_orders("BTC")], ["BTC"])
+        adapter._read_stream.request_snapshot.assert_awaited_with("account_orders")
         adapter._rest.get_open_orders.assert_not_awaited()
         adapter._read_stream.request_snapshot.return_value = {"orders": {}}
         self.assertEqual(await adapter.get_open_orders(), [])

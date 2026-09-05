@@ -101,7 +101,8 @@ class InventoryGovernor:
                   market.tick_size, market.size_step, market.min_order_size,
                   account.position, account.entry_price or ZERO, account.unrealized_pnl,
                   account.maker_fee_rate, account.taker_fee_rate,
-                  ledger_report.realized_net_pnl, ledger_report.max_drawdown]
+                  ledger_report.realized_net_pnl, ledger_report.max_drawdown,
+                  ledger_report.current_drawdown, ledger_report.marked_net_pnl or ZERO]
         values += [value for order in execution_snapshot.orders or ()
                    for value in (order.remaining_size, order.price)]
         precision = (sum(len(v.as_tuple().digits) for v in values)
@@ -126,6 +127,7 @@ class InventoryGovernor:
                 or report.duration_seconds != Decimal(str(now)) - Decimal(str(self.session_started_monotonic))
                 or not ZERO <= report.inventory_age <= report.duration_seconds
                 or report.max_drawdown < ZERO
+                or report.current_drawdown < ZERO
                 or (account.position == ZERO and report.inventory_age != ZERO)):
             raise GovernorUnavailable("fresh coherent open session ledger required",
                                       ExecutionHealth.PAUSED_ORDER_STATE)
@@ -209,6 +211,12 @@ class InventoryGovernor:
             o.price - market.external_bid if o.side is Side.BUY else market.external_ask - o.price)
             for o in orders), ZERO)
         current_loss = max(ZERO, -report.realized_net_pnl) + inventory_loss + old_gap
+        marked = report.marked_net_pnl if report.marked_net_pnl is not None else report.realized_net_pnl
+        # Reserve against the same equity peak used by the drawdown stop. Current
+        # headroom can recover; historical maximum drawdown must not consume it forever.
+        drawdown_loss = max(ZERO, report.current_drawdown + marked
+                            - report.realized_net_pnl + inventory_loss) + old_gap
+        current_loss = max(current_loss, drawdown_loss)
         slip = market.tick_size * self.ioc_slippage_ticks
 
         def allowed(buy, sell):

@@ -212,9 +212,10 @@ class VolumeSession:
         self.account = LighterAccountPort(adapter, config.symbol, self.clock,
             account_index=account_index, expected_l1_address=expected_l1_address,
             known_order_ids=self._known_ids, flatten_id_for=self._flatten_id,
+            mutation_generation=lambda: self.manager.mutation_generation if self.manager else None,
             terminal_order_ids=lambda: self.manager.terminal_order_ids if self.manager else frozenset())
         self.market = LighterMarketData(adapter, config.symbol, self.clock,
-                                        working_orders=lambda: self.account.latest_orders)
+            working_orders=lambda: self.account.latest_orders, aligned_book=lambda: self.account.aligned_book)
 
     def _known_ids(self):
         return (self.manager.known_order_ids | self.manager.active_unwind_order_ids
@@ -243,7 +244,8 @@ class VolumeSession:
             try:
                 market = self.market.snapshot()
                 self.ledger.observe(MarkEvent(self.config.symbol, self.clock.monotonic(),
-                    (market.external_bid + market.external_ask) / 2, bool(event.snapshot.orders)))
+                    (market.external_bid + market.external_ask) / 2, bool(event.snapshot.orders),
+                    tuple(dict.fromkeys(o.side for o in event.snapshot.orders or ()))))
             except Exception:
                 pass  # No fresh reference: retain observed intervals, never invent a mark.
         if self.telemetry:
@@ -265,7 +267,7 @@ class VolumeSession:
         if self.ledger:
             self.ledger.observe(MarkEvent(self.config.symbol, self.clock.monotonic(),
                 (market.external_bid + market.external_ask) / 2,
-                bool(account.open_order_count)))
+                bool(account.open_order_count), tuple(dict.fromkeys(o.side for o in self.account.latest_orders))))
         return account
 
     async def _start(self):
@@ -312,7 +314,8 @@ class VolumeSession:
                 -market.size_step.as_tuple().exponent, market.tick_size, market.size_step,
                 market.min_order_size, self.market.min_quote_amount)
             self.manager = MarketMakerOrderManager(self.adapter, execution_settings(cfg),
-                metadata, monotonic=self.clock.monotonic, sleep=self.sleep)
+                metadata, monotonic=self.clock.monotonic, sleep=self.sleep,
+                read_open_orders=self.account.read_execution_orders)
             await self._io(self.manager.initialize)
             exit_account = SimpleNamespace(snapshot=lambda: self.snapshot(exiting=True))
             self.execution = VolumeExecutionPort(self.manager, exit_account, self.market, self.clock,
@@ -373,6 +376,7 @@ class VolumeSession:
         self._stop_at = self.clock.monotonic()
 
     async def _exit(self, *, allow_passive=True):
+        self.account.begin_quote_cycle()
         self._cleanup_attempted = True
         deadline = self.governor.exit_deadline
         if deadline is None:
@@ -382,28 +386,33 @@ class VolumeSession:
         self._exit_sequence += 1
         self._exit_id = f"exit-{self._exit_sequence}"
         try:
-            if allow_passive and self.config.flatten.passive_grace_seconds:
-                # Cancel increasing quotes and prove residual before the grace.
-                result = await self._io(self.execution.cancel_all_managed)
-                self._emit(result)
-                account = _exit_account(result, self.config.symbol, 0, self.clock.monotonic())
-                self._passive_until = min(self.clock.monotonic()
-                    + self.config.flatten.passive_grace_seconds, deadline - 10)
-                while (account.position and abs(account.position) <= self.config.inventory.hard_limit
-                       and self.clock.monotonic() < self._passive_until):
-                    await self._io(self.manager.sync_open_orders)
-                    auth = await self._authorize(self.execution.snapshot())
-                    if not auth.plan.quotes:
-                        break
-                    before_ids = self._known_ids()
-                    result = await self._io(lambda: self.execution.reconcile_quotes(auth.plan))
-                    for order_id in self._known_ids() - before_ids:
-                        self._exit_orders[order_id] = self._exit_id
+            try:
+                if allow_passive and self.config.flatten.passive_grace_seconds:
+                    # Cancel increasing quotes and prove residual before the grace.
+                    result = await self._io(self.execution.cancel_all_managed)
                     self._emit(result)
-                    if result.status is ExecutionStatus.BLOCKED:
-                        raise ValueError("passive execution blocked")
-                    await self._io(lambda: self.sleep(max(0, min(1, self._passive_until - self.clock.monotonic()))))
-                    account = await self._io(self.snapshot)
+                    account = _exit_account(result, self.config.symbol, 0, self.clock.monotonic())
+                    self._passive_until = min(self.clock.monotonic()
+                        + self.config.flatten.passive_grace_seconds, deadline - 10)
+                    while (account.position and abs(account.position) <= self.config.inventory.hard_limit
+                           and self.clock.monotonic() < self._passive_until):
+                        await self._io(self.manager.sync_open_orders)
+                        auth = await self._authorize(self.execution.snapshot())
+                        if not auth.plan.quotes:
+                            break
+                        before_ids = self._known_ids()
+                        result = await self._io(lambda: self.execution.reconcile_quotes(auth.plan))
+                        for order_id in self._known_ids() - before_ids:
+                            self._exit_orders[order_id] = self._exit_id
+                        self._emit(result)
+                        if result.status is ExecutionStatus.BLOCKED:
+                            raise ValueError("passive execution blocked")
+                        await self._io(lambda: self.sleep(max(0, min(1, self._passive_until - self.clock.monotonic()))))
+                        account = await self._io(self.snapshot)
+            except (Exception, asyncio.CancelledError):
+                # Grace is optional; preserve the same exit deadline and IOC budget.
+                # Unknown mutations remain blocked by the execution port.
+                pass
             self._passive_until = None
             report = await bounded_exit(self.execution, self.market, self.clock,
                 symbol=self.config.symbol, flatten_id=self._exit_id,
@@ -430,6 +439,7 @@ class VolumeSession:
             await self._start()
             while True:
                 cycle_started, self._quote_account = self.clock.monotonic(), None
+                self.account.begin_quote_cycle()
                 if self.manager:
                     await self._io(self.manager.sync_open_orders)
                 auth = await self._authorize(self.execution.snapshot())

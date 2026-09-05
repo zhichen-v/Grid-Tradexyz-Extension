@@ -25,7 +25,10 @@ class LighterReadStream:
         self._invalid = False
         self._book_invalid = False
         self._last_book_failure = None
-        self._orders_subscribed = False
+        self._last_source_time_failure = self._wall_observation = None
+        self._orders_subscribed = set()
+        self._order_nonce = None
+        self._book_changed = asyncio.Event()
         self._book = None
         self._levels = {"bids": {}, "asks": {}}
 
@@ -38,6 +41,10 @@ class LighterReadStream:
         return self._market
 
     @property
+    def order_nonce(self):
+        return self._order_nonce
+
+    @property
     def transport_healthy(self):
         return self._socket is not None and not self._invalid
 
@@ -45,9 +52,14 @@ class LighterReadStream:
     def last_book_failure(self):
         return self._last_book_failure
 
+    @property
+    def last_source_time_failure(self):
+        return self._last_source_time_failure
+
     def _fail_book(self, stage, error):
         reasons = {"invalid book sequence": "invalid_sequence",
                    "stale or future source book timestamp": "source_time_out_of_bounds",
+                   "host clock discontinuity": "clock_discontinuity",
                    "wrong book channel": "wrong_channel", "unexpected book snapshot": "unexpected_snapshot",
                    "conflicting book offset": "conflicting_offset", "discontinuous book": "discontinuous_book",
                    "invalid book depth": "invalid_depth", "invalid book level": "invalid_level",
@@ -56,6 +68,7 @@ class LighterReadStream:
         reason = reasons.get(candidate, "invalid_payload") if type(candidate) is str else "invalid_payload"
         self._last_book_failure = stage, reason
         self._book_invalid = True
+        self._book_changed.set()
 
     async def start(self):
         if self._invalid or self._socket is not None:
@@ -86,8 +99,9 @@ class LighterReadStream:
         future = asyncio.get_running_loop().create_future()
         reply = "unsubscribed" if action == "unsubscribe" else f"subscribed/{channel}"
         self._pending = reply, channel, future
-        message = {"type": action, "channel": f"{channel}/{self._account}"}
-        if action == "subscribe" and channel == "account_all_orders":
+        suffix = f"{self._market}/{self._account}" if channel == "account_orders" else str(self._account)
+        message = {"type": action, "channel": f"{channel}/{suffix}"}
+        if action == "subscribe" and channel in {"account_all_orders", "account_orders"}:
             token = self._auth()
             if not isinstance(token, str) or not token:
                 raise ValueError("authentication unavailable")
@@ -96,13 +110,13 @@ class LighterReadStream:
 
     async def request_snapshot(self, channel):
         """Return only the requested subscription acknowledgement, never an update."""
-        if channel not in {"account_all", "account_all_orders"}:
+        if channel not in {"account_all", "account_all_orders", "account_orders"}:
             raise ValueError("unsupported read snapshot channel")
         async with self._lock:
             self._check()
             try:
                 async with asyncio.timeout(self._timeout):
-                    if channel == "account_all_orders" and self._orders_subscribed:
+                    if channel in self._orders_subscribed:
                         await self._request_reply("unsubscribe", channel)
                     return await self._request_reply("subscribe", channel)
             except BaseException as exc:
@@ -139,22 +153,24 @@ class LighterReadStream:
                             if not self._book_invalid:
                                 self._update_book(message)
                                 self._book["received_monotonic"] = received
+                                self._book_changed.set()
                         except Exception as error:
                             # A bad book must not disable fresh account cleanup proofs.
                             self._fail_book("receive_book", error)
                     if not self._book_ready.done():
                         self._book_ready.set_result(None)
-                elif kind in {"subscribed/account_all", "subscribed/account_all_orders"}:
+                elif kind in {"subscribed/account_all", "subscribed/account_all_orders", "subscribed/account_orders"}:
                     self._accept_snapshot(message)
                 elif kind == "unsubscribed":
-                    self._check_account(message, "account_all_orders")
-                    if (not self._orders_subscribed or self._pending is None
-                            or self._pending[:2] != ("unsubscribed", "account_all_orders")
+                    channel = self._pending[1] if self._pending else None
+                    if (channel not in self._orders_subscribed or self._pending is None
+                            or self._pending[0] != "unsubscribed"
                             or self._pending[2].done()):
                         raise ValueError("unexpected unsubscribe acknowledgement")
-                    self._orders_subscribed = False
+                    self._check_account(message, channel)
+                    self._orders_subscribed.remove(channel)
                     self._pending[2].set_result(None)
-                elif kind in {"update/account_all", "update/account_all_orders"}:
+                elif kind in {"update/account_all", "update/account_all_orders", "update/account_orders"}:
                     channel = kind.split("/", 1)[1]
                     self._check_account(message, channel)
                     # Updates are intentionally not merged into fresh snapshots.
@@ -168,10 +184,12 @@ class LighterReadStream:
             await self.close()
 
     def _check_account(self, message, channel):
-        if message.get("channel") != f"{channel}:{self._account}":
+        suffix = self._market if channel == "account_orders" else self._account
+        if message.get("channel") != f"{channel}:{suffix}":
             raise ValueError("wrong account channel")
         account = message.get("account")
-        if ((channel == "account_all" or account is not None)
+        required = channel in {"account_all", "account_orders"} and message.get("type") != "unsubscribed"
+        if ((required or account is not None)
                 and (type(account) is not int or account != self._account)):
             raise ValueError("wrong account identity")
 
@@ -181,7 +199,7 @@ class LighterReadStream:
         if (self._pending is None or self._pending[:2] != (message["type"], channel)
                 or self._pending[2].done()):
             raise ValueError("unexpected snapshot acknowledgement")
-        if channel == "account_all_orders":
+        if channel in {"account_all_orders", "account_orders"}:
             orders = message.get("orders")
             if (type(orders) is not dict or any(
                     not str(market).isdigit() or type(rows) is not list
@@ -189,6 +207,13 @@ class LighterReadStream:
                     for market, rows in orders.items())):
                 raise ValueError("incomplete order snapshot")
             fields = {"orders", "account", "type", "channel"}
+            if channel == "account_orders":
+                nonce = self._integer(message.get("nonce"))
+                if (self._order_nonce is not None and nonce < self._order_nonce
+                        or any(str(key) != str(self._market) for key in orders)):
+                    raise ValueError("incoherent market order snapshot")
+                self._order_nonce = nonce
+                fields.add("nonce")
         else:
             fields = {"account", "assets", "positions", "shares", "funding_histories",
                       "trades", "type", "channel", "total_trades_count", "total_volume",
@@ -196,8 +221,8 @@ class LighterReadStream:
                       "weekly_volume", "monthly_trades_count", "monthly_volume"}
         result = {key: value for key, value in message.items() if key in fields}
         result["_received_monotonic"] = self._clock()
-        if channel == "account_all_orders":
-            self._orders_subscribed = True
+        if channel in {"account_all_orders", "account_orders"}:
+            self._orders_subscribed.add(channel)
         self._pending[2].set_result(result)
 
     @staticmethod
@@ -212,8 +237,21 @@ class LighterReadStream:
     def _check_source_time(self, timestamp):
         # No inferred clock correction: a lagging/jumping host clock fails closed.
         age_ms = self._source_age_ms(timestamp)
+        wall, now = age_ms + timestamp, Decimal(str(self._clock())) * 1000
+        previous = self._wall_observation
+        self._wall_observation = wall, now
+        elapsed_error = wall - previous[0] - (now - previous[1]) if previous else None
         if not age_ms.is_finite() or not 0 <= age_ms <= 3000:
+            kind = "unusable" if not age_ms.is_finite() else "future" if age_ms < 0 else "stale"
+            # Diagnostic only: no inferred offset or change to acceptance bounds.
+            self._last_source_time_failure = (kind, str(age_ms),
+                str(elapsed_error) if elapsed_error is not None else None)
             raise ValueError("stale or future source book timestamp")
+        # This is a continuity bound, NOT an allowance for future source data.
+        # 50 ms exceeds two capped wall-clock quanta on either supported host.
+        if elapsed_error is not None and abs(elapsed_error) > 50:
+            self._last_source_time_failure = ("clock_jump", str(age_ms), str(elapsed_error))
+            raise ValueError("host clock discontinuity")
 
     def _update_book(self, message):
         if message.get("channel") != f"order_book:{self._market}":
@@ -254,21 +292,37 @@ class LighterReadStream:
                       "received_monotonic": self._clock(),
                       "last_updated_at": book.get("last_updated_at")}
 
-    def book_snapshot(self):
+    def check_book_source(self, timestamp):
+        """Revalidate even a previously aligned packet against current stream health."""
         self._check()
         if self._book_invalid or self._book is None:
             raise RuntimeError("read book unavailable")
         try:
-            self._check_source_time(self._book["timestamp"])
+            self._check_source_time(self._integer(timestamp))
         except Exception as error:
             self._fail_book("book_snapshot", error)
             raise RuntimeError("read book source timestamp unavailable") from None
+
+    def book_snapshot(self):
+        self.check_book_source(self._book["timestamp"] if self._book else None)
         return {**self._book, "bids": tuple(sorted(self._levels["bids"].items(), reverse=True)),
                 "asks": tuple(sorted(self._levels["asks"].items()))}
+
+    async def book_at_or_after(self, nonce, *, after):
+        """Wait for a received book covering the opening order watermark; no sends."""
+        self._integer(nonce)
+        async with asyncio.timeout(3):
+            while True:
+                self._book_changed.clear()
+                book = self.book_snapshot()
+                if book["nonce"] >= nonce and book["received_monotonic"] >= after:
+                    return book
+                await self._book_changed.wait()
 
     async def close(self):
         """Permanently invalidate before any awaited cleanup."""
         self._invalid = True
+        self._book_changed.set()
         for future in (self._book_ready, self._pending[2] if self._pending else None):
             if future is not None and not future.done():
                 future.set_exception(RuntimeError("read stream unavailable"))

@@ -405,12 +405,16 @@ class SessionReport:
     realized_net_pnl: Decimal = ZERO
     marked_net_pnl: Decimal | None = None
     max_drawdown: Decimal = ZERO
+    current_drawdown: Decimal = ZERO
     average_abs_inventory: Decimal = ZERO
     p95_abs_inventory: Decimal = ZERO
     inventory_age: Decimal = ZERO
     forced_flatten_count: int = 0
     forced_flatten_loss: Decimal = ZERO
     quote_uptime_seconds: Decimal = ZERO
+    buy_quote_seconds: Decimal | None = None
+    sell_quote_seconds: Decimal | None = None
+    two_sided_quote_seconds: Decimal | None = None
     duration_seconds: Decimal = ZERO
     fee_cover_ratio: Decimal | None = None
     maker_turnover_per_quote_hour: Decimal | None = None
@@ -485,12 +489,19 @@ class MarkEvent:
     observed_monotonic: float
     reference_price: Decimal
     quoting: bool
+    quote_sides: tuple[Side, ...] | None = None
 
     def __post_init__(self):
         _symbol(self.symbol)
         _time(self.observed_monotonic)
         _decimal(self.reference_price, positive=True)
         _boolean(self.quoting)
+        if self.quote_sides is not None and (
+                type(self.quote_sides) is not tuple
+                or any(type(side) is not Side for side in self.quote_sides)
+                or len(set(self.quote_sides)) != len(self.quote_sides)
+                or bool(self.quote_sides) != self.quoting):
+            raise ValueError("quote sides must match observed working orders")
 
 
 @dataclass(frozen=True, slots=True)

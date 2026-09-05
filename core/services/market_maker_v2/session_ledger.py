@@ -49,6 +49,10 @@ class _State:
     opened_at: Decimal | None = None
     quoting: bool = False
     quote_seconds: Decimal = ZERO
+    quote_sides: tuple[Side, ...] | None = ()
+    buy_seconds: Decimal | None = ZERO
+    sell_seconds: Decimal | None = ZERO
+    both_seconds: Decimal | None = ZERO
     max_drawdown: Decimal = ZERO
     spread: Decimal = ZERO
     drift: Decimal = ZERO
@@ -118,6 +122,12 @@ class SessionLedger:
             state.inventory_seconds[quantity] = state.inventory_seconds.get(quantity, ZERO) + duration
             if state.quoting:
                 state.quote_seconds += duration
+                if state.quote_sides is None:
+                    state.buy_seconds = state.sell_seconds = state.both_seconds = None
+                elif state.buy_seconds is not None:
+                    state.buy_seconds += duration if Side.BUY in state.quote_sides else ZERO
+                    state.sell_seconds += duration if Side.SELL in state.quote_sides else ZERO
+                    state.both_seconds += duration if len(state.quote_sides) == 2 else ZERO
         state.time = now
         return state
 
@@ -278,6 +288,7 @@ class SessionLedger:
             state = self._event_state(mark)
             self._reference(state, mark.reference_price)
             state.quoting = mark.quoting
+            state.quote_sides = mark.quote_sides if mark.quoting else ()
             self._sample_drawdown(state)
         except (ValueError, ArithmeticError, TypeError):
             self._fail("mark accounting rejected")
@@ -301,6 +312,9 @@ class SessionLedger:
         average, p95 = self._inventory_stats(state, duration)
         turnover, fees = state.maker_buy + state.maker_sell, state.maker_fee + state.taker_fee
         net = self._net(state)
+        marked = self._marked_net(state)
+        current_drawdown = max(ZERO, state.high_water - self._initial.equity
+                               - (marked if marked is not None else net))
         return SessionReport(
             symbol=self._initial.symbol, complete=complete,
             final_position=final.position if final is not None else state.position,
@@ -316,12 +330,15 @@ class SessionLedger:
             maker_fill_count=state.maker_fills, taker_fill_count=state.taker_fills,
             realized_gross_pnl=state.gross, maker_fee=state.maker_fee, taker_fee=state.taker_fee,
             funding=state.funding, external_transfers=state.transfers, realized_net_pnl=net,
-            marked_net_pnl=self._marked_net(state), max_drawdown=state.max_drawdown,
+            marked_net_pnl=marked, max_drawdown=state.max_drawdown,
+            current_drawdown=current_drawdown,
             average_abs_inventory=average, p95_abs_inventory=p95,
             inventory_age=state.time - state.opened_at if state.opened_at is not None else ZERO,
             forced_flatten_count=len(state.flatten_net),
             forced_flatten_loss=sum((max(ZERO, -net) for net in state.flatten_net.values()), ZERO),
             quote_uptime_seconds=state.quote_seconds, duration_seconds=duration,
+            buy_quote_seconds=state.buy_seconds, sell_quote_seconds=state.sell_seconds,
+            two_sided_quote_seconds=state.both_seconds,
             fee_cover_ratio=state.gross / fees if complete and fees else None,
             maker_turnover_per_quote_hour=turnover * D("3600") / state.quote_seconds if state.quote_seconds else None,
             fills_per_quote_hour=D(state.maker_fills) * D("3600") / state.quote_seconds if state.quote_seconds else None,
@@ -355,6 +372,7 @@ class SessionLedger:
             difference = final.equity - self._initial.equity - state.transfers - self._net(state)
             proof_valid = (
                 clock_valid and final.authenticated and final.symbol == self._initial.symbol
+                and final.fresh(now)
                 and self._state.time <= _time(final.observed_monotonic) <= state.time
                 and state.time - _time(final.observed_monotonic) <= D("10")
             )

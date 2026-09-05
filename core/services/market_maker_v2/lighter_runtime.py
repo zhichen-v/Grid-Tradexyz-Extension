@@ -2,6 +2,8 @@
 
 from decimal import Decimal, Inexact, ROUND_DOWN, localcontext
 from dataclasses import replace
+from copy import deepcopy
+import asyncio
 import re
 
 from .domain import (
@@ -95,7 +97,7 @@ class LighterAccountPort:
     def __init__(self, adapter, symbol, clock, *, account_index,
                  expected_l1_address, known_order_ids=lambda: frozenset(),
                  flatten_id_for=lambda order_id: None,
-                 terminal_order_ids=lambda: frozenset()):
+                 terminal_order_ids=lambda: frozenset(), mutation_generation=lambda: None):
         if (type(account_index) is not int or account_index < 0
                 or not isinstance(expected_l1_address, str)
                 or not re.fullmatch(r"0x[0-9a-fA-F]{40}", expected_l1_address)):
@@ -104,6 +106,9 @@ class LighterAccountPort:
         self._index, self._address = account_index, expected_l1_address.lower()
         self._known, self._flatten = known_order_ids, flatten_id_for
         self._terminal = terminal_order_ids
+        self._generation = mutation_generation
+        self._opening_orders = self._audited_orders = None
+        self._audited_book = None
         self._terminal_proofs = {}
         self.latest_orders = ()
         self._ledger = self._baseline = None
@@ -124,6 +129,44 @@ class LighterAccountPort:
         if report.ledger_position != ZERO or report.duration_seconds != ZERO:
             raise LighterReadError("ledger must start at the account baseline")
         self._ledger = ledger
+
+    def begin_quote_cycle(self):
+        """Order observations are single-use handoffs, never a cross-cycle cache."""
+        self._opening_orders = self._audited_orders = None
+        self._audited_book = None
+
+    @property
+    def aligned_book(self):
+        if self._audited_book is not None and self._audited_book[0] == self._generation():
+            return self._audited_book[1]
+        return None
+
+    def _take_orders(self, name):
+        observation = getattr(self, name)
+        setattr(self, name, None)
+        if (observation is not None and self.stream is not None and self.stream.transport_healthy
+                and observation[0] is not None and observation[0] == self._generation()
+                and 0 <= self.clock.monotonic() - observation[1] <= 3):
+            return observation
+        return None
+
+    async def _read_orders(self):
+        generation, started = self._generation(), self.clock.monotonic()
+        rows = deepcopy(tuple(await self.adapter.get_open_orders(self.symbol)))
+        if generation != self._generation():
+            raise LighterReadError("execution changed during order read")
+        return generation, started, rows, getattr(self.stream, "order_nonce", None)
+
+    async def read_execution_orders(self, symbol):
+        """OM consumes the completed account audit, or supplies its first bookend."""
+        if symbol != self.symbol:
+            raise LighterReadError("order observation symbol mismatch")
+        audited = self._take_orders("_audited_orders")
+        if audited is not None:
+            return deepcopy(audited[2])
+        self._opening_orders = None
+        self._opening_orders = await self._read_orders()
+        return deepcopy(self._opening_orders[2])
 
     def _orders(self, rows):
         result = []
@@ -249,7 +292,15 @@ class LighterAccountPort:
                          flatten_id=self._flatten(order_id))
 
     async def _check_terminal_fills(self):
-        for identifier in sorted(set(self._terminal()) | self._terminal_proofs.keys()):
+        identifiers = set(self._terminal()) | self._terminal_proofs.keys()
+        pending = identifiers - self._terminal_proofs.keys()
+        history = {}
+        if pending:
+            rows = await self.adapter.get_order_history(self.symbol, limit=100)
+            history = {str(row.id): row for row in rows}
+            if len(rows) > 100 or len(history) != len(rows):
+                raise LighterReadError("invalid terminal history window")
+        for identifier in sorted(identifiers):
             accepted = sum((_number(row[4]) for row in self._trades.values()
                             if row[1] == identifier), ZERO)
             if identifier in self._terminal_proofs:
@@ -258,7 +309,9 @@ class LighterAccountPort:
                 continue
             if identifier not in self._known():
                 raise LighterReadError("unattributed terminal order")
-            order = await self.adapter.get_order(identifier, self.symbol)
+            order = history.get(identifier)
+            if order is None:
+                raise LighterReadError("exact terminal order proof unavailable")
             status = _value(order.status)
             if (str(order.id) != identifier or order.symbol != self.symbol
                     or status not in {"filled", "canceled", "expired", "rejected"}):
@@ -270,12 +323,26 @@ class LighterAccountPort:
             self._terminal_proofs[identifier] = (status, filled, amount)
 
     async def _stream_read(self):
-        first = await self.stream.request_snapshot("account_all")
-        count = first["total_trades_count"]
-        if (type(count) is not int or count < 0 or first["account"] != self._index
+        # Exact order bookends bracket cash. The closing account snapshot must
+        # match that cash state; its counter bounds the subsequently read history.
+        opening = self._take_orders("_opening_orders") or await self._read_orders()
+        orders = self._orders(opening[2])
+        book = None
+        if opening[3] is not None:
+            try:
+                book = await self.stream.book_at_or_after(opening[3], after=opening[1])
+            except (RuntimeError, TimeoutError):
+                pass  # An unusable book must not prevent authenticated flat cleanup.
+        cash_at = self.clock.monotonic()
+        balances = deepcopy(list(await self.adapter.get_balances()))
+        closing = await self._read_orders()
+        confirmed = self._orders(closing[2])
+        account = await self.stream.request_snapshot("account_all")
+        count = account["total_trades_count"]
+        if (type(count) is not int or count < 0 or account["account"] != self._index
                 or self._stream_count is not None and count < self._stream_count):
             raise LighterReadError("invalid account activity counter")
-        funding_source = first["funding_histories"]
+        funding_source = account["funding_histories"]
         if type(funding_source) not in (dict, list):
             raise LighterReadError("invalid account funding snapshot")
         now = self.clock.monotonic()
@@ -285,13 +352,8 @@ class LighterAccountPort:
         if not 0 <= self.clock.monotonic() - self._settlement_at < 8:
             self._settlement_at = self.clock.monotonic()
             self._settlement = await self.adapter.get_settlement_asset()
-        orders = self._orders(await self.adapter.get_open_orders())
-        cash_at = self.clock.monotonic()
-        balances = list(await self.adapter.get_balances())
         trades = (list(await self.adapter.get_account_trades(self.symbol, limit=100))
                   if self._stream_count is None or count != self._stream_count else [])
-        confirmed = self._orders(await self.adapter.get_open_orders())
-        second = await self.stream.request_snapshot("account_all")
         def state(snapshot):
             if type(snapshot["assets"]) is not dict or type(snapshot["positions"]) is not dict:
                 raise LighterReadError("incomplete account activity snapshot")
@@ -299,24 +361,24 @@ class LighterAccountPort:
         if len(balances) != 1:
             raise LighterReadError("exclusive collateral account required")
         raw = balances[0].raw_data["account"]
-        if (first["account"] != second["account"] or type(second["total_trades_count"]) is not int
-                or count != second["total_trades_count"] or orders != confirmed
-                or funding_source != second["funding_histories"] or state(first) != state(second)
-                or state(second) != _account_state(raw.assets, raw.positions, raw.shares)):
+        if (opening[0] != closing[0] or orders != confirmed
+                or state(account) != _account_state(raw.assets, raw.positions, raw.shares)):
             raise LighterReadError("account changed during stream/REST bracket")
+        if book is not None and not opening[3] <= book["nonce"] <= closing[3]:
+            book = None
         if self._stream_count is not None:
             delta = count - self._stream_count
             if delta >= 100 or len({str(row.id) for row in trades} - self._stream_ids) != delta:
                 raise LighterReadError("account trade count and history disagree")
         elif count < len(trades):
             raise LighterReadError("account history exceeds activity counter")
-        return balances, orders, self._fees_cache, trades, cash_at, count, funding_source
+        return balances, orders, self._fees_cache, trades, cash_at, count, funding_source, (opening, closing, book)
 
     async def snapshot(self):
         try:
             started = self.clock.monotonic()
             if self.stream is not None:
-                balances, orders, fees, second, cash_at, count, funding_source = await self._stream_read()
+                balances, orders, fees, second, cash_at, count, funding_source, bookends = await self._stream_read()
                 first, confirmed_fees, confirmed_orders = second, fees, orders
             else:  # Explicit slow read-only forensic/preflight path, never the runner loop.
                 first = list(await self.adapter.get_account_trades(self.symbol, limit=100))
@@ -337,7 +399,8 @@ class LighterAccountPort:
                 raise LighterReadError("account changed during consistent read")
             account = self._account(balances, orders, fees, cash_at)
             if self.stream is not None:
-                account = replace(account, inputs_observed_monotonic=min(self._fees_at, self._settlement_at))
+                account = replace(account, inputs_observed_monotonic=min(
+                    self._fees_at, self._settlement_at, bookends[0][1]))
             if not account.fresh(now):
                 raise LighterReadError("account or financial inputs stale")
             if self._baseline is None:
@@ -402,13 +465,22 @@ class LighterAccountPort:
                 raise LighterReadError("account audit exceeded freshness bound")
             self.latest_orders = orders
             if self.stream is not None:
+                if bookends[1][0] != self._generation():
+                    raise LighterReadError("execution changed during account audit")
                 self._stream_count, self._funding_source = count, funding_source
                 self._stream_ids = frozenset(self._trades)
+                self._audited_orders = bookends[1]
+                self._audited_book = (bookends[1][0], bookends[2])
             return account
+        except asyncio.CancelledError:
+            self.begin_quote_cycle()
+            raise
         except LighterReadError:
+            self.begin_quote_cycle()
             self._fees_at = self._settlement_at = float("-inf")
             raise  # These are code-owned messages, never raw SDK/account payloads.
         except Exception:
+            self.begin_quote_cycle()
             self._fees_at = self._settlement_at = float("-inf")
             raise LighterReadError("authenticated account audit unavailable") from None
 
@@ -416,9 +488,10 @@ class LighterAccountPort:
 class LighterMarketData:
     """Fresh nonce-checked stream depth; bounded REST only for explicit diagnostics."""
 
-    def __init__(self, adapter, symbol, clock, *, working_orders=lambda: ()):
+    def __init__(self, adapter, symbol, clock, *, working_orders=lambda: (), aligned_book=None):
         self.adapter, self.symbol, self.clock = adapter, symbol, clock
         self._working = working_orders
+        self._aligned_book = aligned_book
         self._state = None
         self._valid = False
         self._last_book = None
@@ -451,8 +524,14 @@ class LighterMarketData:
                 raise LighterReadError("market metadata not initialized")
             started = self.clock.monotonic()
             own = self._working()
-            book = (self.stream.book_snapshot() if self.stream is not None
-                    else await self.adapter.get_orderbook(self.symbol, limit=20))
+            if self.stream is not None and self._aligned_book is not None and hasattr(self.stream, "book_at_or_after"):
+                book = self._aligned_book()
+                if book is None or not self.stream.transport_healthy:
+                    raise LighterReadError("book lacks coherent order watermarks")
+                self.stream.check_book_source(book["timestamp"])
+            else:
+                book = (self.stream.book_snapshot() if self.stream is not None
+                        else await self.adapter.get_orderbook(self.symbol, limit=20))
             now = self.clock.monotonic()
             if self.stream is not None:
                 observed = book["received_monotonic"]

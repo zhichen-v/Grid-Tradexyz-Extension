@@ -190,12 +190,14 @@ class MarketMakerOrderManager:
         *,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        read_open_orders=None,
     ) -> None:
         self.adapter = adapter
         self.config = config
         self.metadata = metadata
         self._monotonic = monotonic
         self._sleep = sleep
+        self._read_open_orders = read_open_orders
         self._lock = asyncio.Lock()
         self._slots: dict[OrderSide, ManagedOrder | None] = {
             OrderSide.BUY: None,
@@ -1012,7 +1014,7 @@ class MarketMakerOrderManager:
             effect.fill_observed = bool(effect.observed_fill_orders)
             effect.position_refresh_required = effect.fill_observed
             open_orders = self._active_symbol_orders(
-                await self.adapter.get_open_orders(self.config.symbol)
+                await (self._read_open_orders or self.adapter.get_open_orders)(self.config.symbol)
             )
             if self.config.dry_run:
                 if open_orders:

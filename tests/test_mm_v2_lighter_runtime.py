@@ -59,7 +59,7 @@ class Adapter:
     async def get_account_fee_and_funding(self, symbol, limit):
         return self.fees.copy()
 
-    async def get_open_orders(self):
+    async def get_open_orders(self, symbol=None):
         return self.orders[:]
 
     async def get_balances(self):
@@ -129,11 +129,47 @@ class LighterAccountTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter, self.clock = Adapter(), Clock()
         self.flatten = {}
+        self.generation = 0
         self.terminal = set()
         self.port = LighterAccountPort(self.adapter, "BTC", self.clock,
             account_index=7, expected_l1_address=ADDRESS,
             known_order_ids=lambda: {"10", "11"}, flatten_id_for=self.flatten.get,
-            terminal_order_ids=lambda: self.terminal)
+            terminal_order_ids=lambda: self.terminal, mutation_generation=lambda: self.generation)
+
+    async def test_order_observations_are_shared_once_without_repeating_bookends(self):
+        self.port.stream = ReadStream(self.adapter, self.clock)
+        await self.start()
+        self.port.begin_quote_cycle()
+        self.adapter.get_open_orders = AsyncMock(wraps=self.adapter.get_open_orders)
+        await self.port.read_execution_orders("BTC")
+        await self.port.snapshot()
+        await self.port.read_execution_orders("BTC")
+        self.assertEqual(self.adapter.get_open_orders.await_count, 2)
+        await self.port.read_execution_orders("BTC")
+        self.assertEqual(self.adapter.get_open_orders.await_count, 3)
+
+    async def test_mutation_expiry_new_cycle_and_failed_audit_discard_order_handoff(self):
+        self.port.stream = ReadStream(self.adapter, self.clock)
+        await self.start()
+        self.adapter.get_open_orders = AsyncMock(wraps=self.adapter.get_open_orders)
+        for cause in ("mutation", "expiry", "cycle", "failure"):
+            with self.subTest(cause=cause):
+                await self.port.snapshot()
+                if cause == "mutation":
+                    self.generation += 1
+                elif cause == "expiry":
+                    self.clock.now += 4
+                elif cause == "cycle":
+                    self.port.begin_quote_cycle()
+                else:
+                    original = self.adapter.account.collateral
+                    self.adapter.account.collateral = "99"
+                    with self.assertRaises(LighterReadError):
+                        await self.port.snapshot()
+                    self.adapter.account.collateral = original
+                before = self.adapter.get_open_orders.await_count
+                await self.port.read_execution_orders("BTC")
+                self.assertEqual(self.adapter.get_open_orders.await_count, before + 1)
 
     async def start(self):
         initial = await self.port.snapshot()
@@ -357,8 +393,8 @@ class LighterAccountTests(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_fill_proof_blocks_fully_lagging_flat_rest(self):
         await self.start()
         self.terminal.add("10")
-        self.adapter.get_order = AsyncMock(return_value=NS(id="10", symbol="BTC",
-            status="filled", amount=D("1"), filled=D("1")))
+        self.adapter.get_order_history = AsyncMock(return_value=[NS(id="10", symbol="BTC",
+            status="filled", amount=D("1"), filled=D("1"))])
         with self.assertRaises(LighterReadError):
             await self.port.snapshot()
         self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count, 0)
@@ -366,26 +402,41 @@ class LighterAccountTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.position.position = "1"
         self.adapter.account.collateral = "99.99"
         await self.port.snapshot()
-        calls = self.adapter.get_order.await_count
+        calls = self.adapter.get_order_history.await_count
         self.clock.now = 3
         await self.port.snapshot()
-        self.assertEqual(self.adapter.get_order.await_count, calls)
+        self.assertEqual(self.adapter.get_order_history.await_count, calls)
 
     async def test_terminal_cancel_partial_amount_and_exact_identity_required(self):
         await self.start()
         self.terminal.add("10")
-        self.adapter.get_order = AsyncMock(return_value=NS(id="10", symbol="BTC",
-            status="canceled", amount=D("1"), filled=D("0.4")))
+        self.adapter.get_order_history = AsyncMock(return_value=[NS(id="10", symbol="BTC",
+            status="canceled", amount=D("1"), filled=D("0.4"))])
         self.adapter.trades = [trade(size="0.4")]
         self.adapter.position.position = "0.4"
         self.adapter.account.collateral = "99.996"
         await self.port.snapshot()
         self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count, 1)
         self.terminal.add("11")
-        self.adapter.get_order.return_value = NS(id="foreign", symbol="BTC", status="canceled",
-                                               amount=D("1"), filled=D("0"))
+        self.adapter.get_order_history.return_value = [NS(id="foreign", symbol="BTC", status="canceled",
+                                                        amount=D("1"), filled=D("0"))]
         with self.assertRaises(LighterReadError):
             await self.port.snapshot()
+
+    async def test_two_terminal_orders_share_one_exact_history_window(self):
+        await self.start()
+        self.terminal.update({"10", "11"})
+        rows = [NS(id=identifier, symbol="BTC", status="canceled", amount=D("1"), filled=D("0"))
+                for identifier in ("10", "11")]
+        self.adapter.get_order_history = AsyncMock(return_value=[rows[0], rows[0]])
+        with self.assertRaises(LighterReadError):
+            await self.port.snapshot()
+        self.adapter.get_order_history.reset_mock()
+        self.adapter.get_order_history.return_value = rows
+        await self.port.snapshot()
+        self.adapter.get_order_history.assert_awaited_once_with("BTC", limit=100)
+        await self.port.snapshot()
+        self.adapter.get_order_history.assert_awaited_once()
 
 
 class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
@@ -430,18 +481,57 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
     async def test_activity_or_position_change_inside_bracket_is_rejected(self):
         await self.start()
         original = self.port.stream.request_snapshot
-        calls = 0
         async def changed(channel):
-            nonlocal calls
-            calls += 1
             row = await original(channel)
-            if calls == 2:
-                row["positions"]["1"]["position"] = "1"
+            row["positions"]["1"]["position"] = "1"
             return row
         self.port.stream.request_snapshot = changed
         with self.assertRaisesRegex(LighterReadError, "account changed during stream/REST bracket"):
             await self.port.snapshot()
         self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count, 0)
+
+    async def test_later_fill_cannot_rewrite_cash_snapshot_or_escape_counter_bound(self):
+        await self.start()
+        orders = self.adapter.get_open_orders
+        reads = 0
+        async def fill_after_cash(symbol=None):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                self.adapter.trades = [trade()]
+                self.adapter.position.position = "1"
+                self.adapter.account.collateral = "99.99"
+            return await orders()
+        self.adapter.get_open_orders = fill_after_cash
+        with self.assertRaisesRegex(LighterReadError, "account changed during stream/REST bracket"):
+            await self.port.snapshot()
+        self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count, 0)
+        self.adapter.get_open_orders = orders
+        await self.port.snapshot()
+        original = self.adapter.get_account_trades
+        self.adapter.trades.append(trade("2", side="sell", price="101"))
+        self.adapter.position.position = "0"
+        self.adapter.account.collateral = "100.9799"
+        async def extra_fill(*args, **kwargs):
+            rows = await original(*args, **kwargs)
+            return rows + [trade("3")]
+        self.adapter.get_account_trades = extra_fill
+        with self.assertRaisesRegex(LighterReadError, "account trade count and history disagree"):
+            await self.port.snapshot()
+        self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count, 1)
+
+    async def test_book_outside_order_watermarks_cannot_authorize_but_flat_proof_survives(self):
+        await self.start()
+        self.port.stream.order_nonce = 10
+        self.port.stream.book_at_or_after = AsyncMock(return_value={"nonce": 11})
+        current = await self.port.snapshot()
+        self.assertTrue(current.authenticated)
+        self.assertIsNone(self.port.aligned_book)
+        self.port.stream.book_at_or_after.side_effect = RuntimeError("book unavailable")
+        current = await self.port.snapshot()
+        self.assertTrue(current.authenticated)
+        self.assertEqual(current.open_order_ids, ())
+        self.assertIsNone(self.port.aligned_book)
 
     async def test_decreasing_counter_is_rejected(self):
         self.adapter.trades = [trade()]
@@ -468,6 +558,23 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LighterMarketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_aligned_packet_rechecks_source_health_before_cached_quote_reuse(self):
+        adapter, clock = Adapter(), Clock()
+        stream = ReadStream(adapter, clock)
+        packet = stream.book_snapshot() | {"timestamp": 1000}
+        stream.book_at_or_after = AsyncMock(return_value=packet)
+        stream.check_book_source = Mock()
+        market = LighterMarketData(adapter, "BTC", clock, aligned_book=lambda: packet)
+        market.stream = stream
+        await market.initialize()
+        await market.refresh()
+        stream.check_book_source.assert_called_once_with(1000)
+        stream.check_book_source.side_effect = RuntimeError("book source became invalid")
+        with self.assertRaises(LighterReadError):
+            await market.refresh()
+        with self.assertRaises(LighterReadError):
+            market.snapshot()
+
     async def test_same_stream_book_can_be_read_twice_without_restamping(self):
         adapter, clock = Adapter(), Clock()
         market = LighterMarketData(adapter, "BTC", clock)

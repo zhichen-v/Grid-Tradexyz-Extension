@@ -102,6 +102,10 @@ class ScenarioReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assert_flat_complete(result)
         self.assertEqual((result.report.maker_fill_count, result.report.taker_fill_count), (2, 0))
         self.assertGreater(result.report.quote_uptime_seconds, D("2"))
+        self.assertGreater(result.report.two_sided_quote_seconds, D("0"))
+        self.assertEqual(result.report.quote_uptime_seconds,
+                         result.report.buy_quote_seconds + result.report.sell_quote_seconds
+                         - result.report.two_sided_quote_seconds)
         self.assertGreater(sum(isinstance(event, QuotePlan) and bool(event.quotes) for event in self.events), 2)
 
     async def adverse(self, opening, mid):
@@ -111,6 +115,11 @@ class ScenarioReplayTests(unittest.IsolatedAsyncioTestCase):
                 self.fill_side(opening)
             elif step == 1:
                 skewed.extend(self.adapter.orders)
+                # The fixture has no public matching engine. Confirm withdrawal
+                # of the increasing quote before jumping the external book through it.
+                for row in self.adapter.orders[:]:
+                    if row.side == opening:
+                        await self.adapter.cancel_order(row.id, "BTC")
                 self.adapter.move(mid)
         result = await self.replay(hook, duration=8, size="0.2", passive=1, stop_loss="0.2", skew="4")
         self.assert_flat_complete(result)

@@ -170,6 +170,55 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
             account_index=7, expected_l1_address=ADDRESS, authorize_bounded_flatten=authorized,
             telemetry=NS(emit=self.events.append), clock=self.clock, sleep=sleep or advance)
 
+    async def test_delayed_immutable_book_is_bracketed_by_order_watermarks(self):
+        class Buffered(ReadStream):
+            engine_nonce = 1
+            order_nonce = 1
+            deliveries = 0
+
+            def book_snapshot(inner):
+                return inner.packet
+
+            def check_book_source(inner, timestamp):
+                if self.clock.now * 1000 - timestamp > 3000:
+                    raise RuntimeError("fixture source expired")
+
+            async def book_at_or_after(inner, nonce, *, after):
+                # Deliver a new WS packet only after the account request. Reads of
+                # the buffered packet never restamp it or insert new own orders.
+                self.clock.now += 0.05
+                await asyncio.sleep(0)
+                inner.packet = ReadStream.book_snapshot(inner) | {
+                    "nonce": inner.engine_nonce, "timestamp": self.clock.now * 1000}
+                inner.deliveries += 1
+                return inner.packet
+
+        async def open_stream(symbol, *, clock):
+            stream = Buffered(self.adapter, self.clock)
+            stream.packet = ReadStream.book_snapshot(stream) | {"nonce": 1, "timestamp": self.clock.now * 1000}
+            self.adapter.stream = stream
+            return stream
+        self.adapter.open_read_stream = open_stream
+        for name in ("create_order", "cancel_order"):
+            original = getattr(self.adapter, name)
+            async def changed(*args, _original=original, **kwargs):
+                result = await _original(*args, **kwargs)
+                self.adapter.stream.engine_nonce += 1
+                return result
+            setattr(self.adapter, name, changed)
+        original_read = self.adapter.get_open_orders
+        async def orders(symbol=None):
+            self.adapter.stream.order_nonce = self.adapter.stream.engine_nonce
+            return await original_read(symbol)
+        self.adapter.get_open_orders = orders
+        result = await self.session(dry=False, duration=12, authorized=True).run(asyncio.Event())
+        self.assertTrue(result.completed, result.failure)
+        self.assertGreater(self.adapter.creates, 2)
+        self.assertEqual(self.adapter.creates, self.adapter.cancels)
+        self.assertGreater(self.adapter.stream.deliveries, 2)
+        self.assertEqual(result.final_account.open_order_ids, ())
+        self.assertEqual(result.final_account.position, D("0"))
+
     async def test_unauthorized_live_rejected_before_connection(self):
         with self.assertRaises((ConfigError, ValueError)):
             session = self.session(dry=False)
@@ -255,6 +304,62 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.completed)
         self.assertEqual(len(attempts), 1, "cleanup must not grant another three IOC attempts")
         self.assertEqual(self.adapter.disconnections, 1)
+
+    async def test_quote_read_timeout_preserves_known_order_cleanup(self):
+        session = self.session(dry=False, duration=20, authorized=True)
+        original_start = session._start
+
+        async def start():
+            await original_start()
+            original_refresh = session.execution.refresh_quote
+
+            async def refresh(exposure):
+                if self.adapter.creates:
+                    raise TimeoutError("pre-mutation account read timed out")
+                return await original_refresh(exposure)
+
+            session.execution.refresh_quote = refresh
+
+        session._start = start
+        result = await session.run(asyncio.Event())
+        self.assertFalse(result.completed)
+        self.assertGreater(self.adapter.cancels, 0)
+        self.assertEqual(result.final_account.open_order_ids, ())
+        self.assertEqual(result.final_account.position, D("0"))
+        self.assertEqual(self.adapter.disconnections, 1)
+        self.assertNotIn("IOC", self.adapter.created_tifs)
+
+    async def test_passive_read_refusal_still_cancels_and_exits_in_original_budget(self):
+        session = self.session(dry=False, duration=2, authorized=True, passive=10)
+        filled = failed = False
+
+        async def advance(seconds):
+            nonlocal filled
+            self.clock.now += float(seconds)
+            if self.adapter.orders and not filled and session._passive_until is None:
+                self.adapter.fill(self.adapter.orders[0])
+                filled = True
+            await asyncio.sleep(0)
+
+        original_snapshot = session.snapshot
+
+        async def snapshot(*, exiting=False):
+            nonlocal failed
+            if (not failed and session._passive_until is not None
+                    and any(row.params.get("reduce_only") for row in self.adapter.orders)):
+                failed = True
+                raise ValueError("one-shot passive read refusal")
+            return await original_snapshot(exiting=exiting)
+
+        session.sleep, session.snapshot = advance, snapshot
+        result = await session.run(asyncio.Event())
+        self.assertTrue(filled and failed)
+        self.assertTrue(result.completed, result.failure)
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertGreater(self.adapter.cancels, 0)
+        self.assertEqual(self.adapter.created_tifs.count("IOC"), 1)
+        self.assertEqual(result.report.forced_flatten_count, 1)
+        self.assertLess(self.adapter.created_records[-1][0], 34)
 
     async def test_nonzero_passive_grace_only_reduces_then_ioc_inside_original_deadline(self):
         filled = False

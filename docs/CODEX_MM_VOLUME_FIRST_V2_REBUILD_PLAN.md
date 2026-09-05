@@ -33,6 +33,17 @@ Repository 基準：
 - V1 歷史可由既有 Git commit/tag 追溯；目前執行契約只看 V2。Grid 不在移除範圍。
 - 刪除 V1 不代表 V2 已達 production、economic 或 live GO，不改變既有 risk gate 與逐場授權要求。
 
+## 0.2 重新審查與後續執行順序（2026-09-05）
+
+本次依使用者要求重新 review Phase 0–7 並優化計畫。Review 基準為 `260be69`；首次 review 僅更新文件。使用者後續已授權按 R1→R5 開始修復，目前 worktree 已修 R1／R2 的程式缺口，R3 資料／預算與 T3 尚未通過；實作進度見 §19.4。歷史 run 結果維持原樣。
+
+- 保留 continuous maker quoting、session-level fee cover、允許單筆虧損及 bounded exit 的產品方向，不再全面重寫 V2。
+- 主目標改為固定完整時間窗的真實 maker turnover；quote-hour efficiency 改作診斷，避免把 cooldown、故障及撤換單的時間成本排除。
+- Phase 7 尚未完成；先修已重現的 cleanup／quote lifecycle 缺口，再處理 clock、account/book coherence 與完整 live 讀取預算，不能只修時鐘後重跑 T3。
+- 三個 spread candidates 是初步篩選，不能證明整個單市場策略不可能 fee-neutral。證據不足與「已測條件下未找到可行點」分開回報。
+- 使用者提供測試帳戶約 **299 USDG**，尚未設定成交量目標。這是資金背景，非本輪 authenticated balance，也不是可損失額度；不據此提高 size、inventory、leverage 或 loss cap。
+- 本輪無 live／帳戶 mutation／commit／push 授權。修復不需要重新 rebuild Grid，也不把提高帳戶 tier 當成預設解法。
+
 ---
 
 # 1. 為什麼必須重整，而不是繼續修眼前問題
@@ -188,7 +199,7 @@ V2 必須快速建立 volume/fee Pareto curve。若不存在可行點，應停�
 V2 的第一目標：
 
 ```text
-maximize maker_turnover_per_quote_hour
+maximize maker_turnover_per_wall_hour
 ```
 
 受以下硬限制約束：
@@ -201,11 +212,14 @@ final position/orders = 0/0
 hard safety incidents = 0
 ```
 
+`maker_turnover_per_wall_hour = maker_turnover_total × 3600 / evaluation_seconds`。
+每個比較窗口在開始前固定時長；包含 startup、quote replacement、單邊／減倉、cooldown、pause 及收尾。提早停止仍保留整個預定窗口，收尾超時則延長分母至实际收尾；不得挑出有掛單的秒數或刪去失敗窗口。`maker_turnover_per_quote_hour` 保留作有單時的條件效率，另報雙邊 working uptime 及 capital turnover，不代替主目標。實作與最小 analyzer 待 §19 R4。
+
 若目標是完整 fee cover：
 
 ```text
 all_in_net_cost_bps <= 0
-fee_cover_ratio >= 1
+fee_cover_ratio >= 1  # fees > 0 時；零費用以 net/cost 判定
 ```
 
 其中 all-in 必須包含：
@@ -512,6 +526,8 @@ bid_half_spread >= f
 ask_half_spread >= f
 ```
 
+這是首版**相對 reservation price 的報價 baseline**，不是每筆成交 cover fee 的證明，也不是所有可行做市策略的數學下界。買賣可能在不同 reference／inventory 下成交，還有 adverse selection、funding 及退出成本；必須以整段真實現金流判定。減倉／止損不得重新加入 entry breakeven 限制。首輪保留公式以隔離變因，先量測 distance／實際 fills／成交後 markout；若要測更積極的 inventory-reducing price，另以既有風險額度內的單一實驗比較，不能偷偷降低 baseline 或放寬 stop。
+
 價格：
 
 ```text
@@ -785,8 +801,11 @@ forced_flatten_count
 forced_flatten_loss
 quote_uptime_seconds
 maker_turnover_per_quote_hour
+maker_turnover_per_wall_hour
 fills_per_quote_hour
 ```
+
+新增 wall-hour 等比較指標為 §0.2 後的待實作報表契約；現有 `SessionReport` 尚不提供完整 candidate aggregation，不能把上述清單視為全部已完成。
 
 ## 8.3 Gross decomposition
 
@@ -1355,6 +1374,8 @@ feat(mm-v2): add minimal config and bounded-session runner
 
 ## Phase 7：Replay 與 Dry Validation
 
+2026-09-05 review 後，實際後續工作先依 §19 R1–R3 執行：修 cleanup／雙邊與恢復報價、帳務／行情時間契約、完整 rolling API reserve，再重跑 timed dry。以下既有 replay 與 dry 的通過紀錄不撤銷，但不足以覆蓋新發現的真 execution 路徑。
+
 ### 工作
 
 1. Scenario replay。
@@ -1416,12 +1437,14 @@ wide
 - session結束強制 flat；
 - 全部 flatten成本納入。
 
+開始前完成 §19 R4 的小型 analyzer 與資料覆蓋檢查。候選使用相同預先固定窗口，在多個時段交錯排序，避免將行情先後誤判成參數效果；後續以另一段未參與選參的窗口確認。不得把一筆 fill 當成獨立統計樣本，也不因三次結果恰好為正就宣稱穩定 fee cover。
+
 ### 產出 Pareto
 
 每個 candidate：
 
 ```text
-maker turnover/hour
+maker turnover/wall-clock hour
 all-in net cost bps
 fee cover
 quote uptime
@@ -1436,6 +1459,8 @@ max drawdown
 在 net cost約束下 turnover最高
 ```
 
+聚合先加總 `maker turnover`、`net`、`gross`、`fees` 與時間再相除：`cost_bps = -Σnet / Σmaker_turnover × 10000`，不可平均每場 bps／ratio。所有預先登記窗口與失敗均保留；若某場 final accounting 不完整，整組不能宣稱 economic GO。另列不含 funding 的交易 net，避免靠正 funding 或單邊 drift 誤認 spread capture；最終 all-in 仍包含 actual funding 及全部退出成本。零費用時 fee-cover ratio 不適用，以 net/cost 判定。
+
 不是：
 
 ```text
@@ -1444,26 +1469,27 @@ max drawdown
 
 ### Kill criterion
 
-若三個 spread candidate都無法同時：
+若三個 spread candidate 都未在完整帳務與足夠觀測下同時達到：
 
 ```text
-fee cover >= 1
-且 maker turnover明顯高於V1
+all-in net cost <= 0
+fees > 0 時 fee cover >= 1；零費用以 net/cost 判定
+且固定時間窗的 maker turnover 達到預先約定的量級
 ```
 
 則標記：
 
 ```text
-single_venue_fee_neutral_volume_infeasible
+no_feasible_point_in_tested_region
 ```
 
-停止加策略參數，改評估 fee tier、incentive、symbol或 hedge。
+若成交太少、時間覆蓋不足或帳務不完整，改記 `insufficient_economic_evidence`。使用者的絕對 volume 目標尚待測量後設定，不以退役 V1 的低成交量作成功門檻。無可行點時停止盲目加參數，先判斷是 execution uptime、queue/fill、adverse selection 或 forced exit 成本；再决定是否值得在相同風險上限內做一個 inventory／quote persistence 實驗。費率、symbol 或 hedge 是另行評估；points 不以未兌現估值冒充交易 fee cover。三個 candidates 不足以作全市場不可行的結論。
 
 ---
 
 ## Phase 9：Inventory Parameter Matrix
 
-只有 Phase 8 存在可行 spread點後才測：
+只有 Phase 8 出現可行／接近可行且成本來源可解釋的 spread 點後才測；或依 §19 R4 證明最低下單量與 inventory bands 使原候選無法表現 continuous quoting 時，先做一個保持原風險額度的可執行性修正。測：
 
 1. `soft_limit`
 2. `hard_limit`
@@ -1600,17 +1626,18 @@ stop/deadline後在flatten deadline內authenticated flat
 使用：
 
 ```text
-maker_turnover_per_quote_hour
+maker_turnover_per_wall_hour
 ```
 
 輔助：
 
 ```text
 maker_fills_per_quote_hour
+maker_turnover_per_quote_hour
 quote_uptime
 ```
 
-不以 completed episode數作主要 volume gate。
+依 §2.2 計完整固定時間窗，另報雙邊 uptime、實際 elapsed-hour rate 與 turnover / allocated capital；不以 completed episode 或有掛單秒數作主分母。約 299 USDG 只作測試資金背景；尚無絕對成交量門檻，不虛構 GO。
 
 ## 13.4 Economic Gate
 
@@ -1732,12 +1759,8 @@ V2 MVP 完成條件：
 6. Session結束不依賴 natural flat。
 7. 最終 report包含 maker/taker fee與 flatten成本。
 8. 至少建立三個 spread candidate的 volume/cost Pareto curve。
-9. 找到至少一個：
-   - fee cover >= 1；
-   - 或明確的最低 acquisition cost bps；
-   - 且 maker turnover顯著高於 V1；
-   的 candidate。
-10. 若找不到，正式得出 single-venue economic infeasibility，而不是繼續增加 guard。
+9. 以完整 all-in accounting 的聚合及獨立確認窗口，找到 `net cost <= 0`、費用非零時 `fee cover >= 1`，且固定時間 turnover 達預定目標的 candidate。若只找到正 acquisition cost，須明確列為「未達 fee-neutral」，只有使用者另接受正成本目標才可依新目標驗收。
+10. 若找不到，回報已測條件下無可行點或證據不足及限制原因，不聲稱三個 candidates 證明全市場不可行，也不繼續盲目增加 guard。
 11. V2 strategy tests維持 public-contract導向，沒有複製 V1 的測試爆炸。
 12. 4h GO 前不建 24h campaign/evidence infrastructure。
 
@@ -1763,3 +1786,83 @@ V2：
 ```
 
 這才符合「短時間高交易量、整體盡量 cover fee、單筆可以虧損」的原始方向。
+
+---
+
+# 19. 2026-09-05 Review：從目前 Phase 7 接續
+
+## 19.1 審查结論與證據範圍
+
+`260be69` 的策略分層值得保留：quote policy 未使用 entry breakeven 錨；ledger 接受虧損交易、區分 maker/taker 費用並計入退出成本。主要缺口在 execution/data 接線、正常事件的恢復能力、dry fidelity 與經濟驗收，沒有證據支持再全面 rebuild 或加入多層／toxicity／ML。
+
+本輪從乾淨 worktree 重新執行 V2 **345 tests PASS**；full repo **619 tests，8 failures + 4 errors**，符合現有 Grid/Lighter baseline。除此之外，以真 V2 ports／session／ledger 和既有 fake exchange 做以下離線重現。通過既有 suite 不代表下列問題已被覆盖；本輪未修 runtime，也未重跑網路 dry／live。下表行號指 review 基準，修改後應以 symbol 和契約定位。
+
+| ID / 優先度 | 位置 | 可重現觸發、影響與最小方向 |
+|---|---|---|
+| F1 / P1 | `execution_port.py:485`；`cancel_all_managed:281`；`orchestrator.py:124` | 已有掛單時，純讀取 `TimeoutError` 把 bridge `_failed` 永久設為 true；cancel／bounded exit 又要求 HEALTHY。完整 session 重現 **creates=1、cancels=0、open orders=1，然後 disconnect**。區分 data refusal 和未知 mutation；前者須保留對已知 ID 的安全撤單與對帳能力，不能靠清掉所有 uncertainty 來恢復。 |
+| F2 / P1 | `orchestrator.py:406–414,470` | passive reducing POST_ONLY 建立後，下一次 snapshot 一次讀取失敗便跳過 `bounded_exit`；`_cleanup_attempted` 阻止 finally 再收尾。重現 **position=0.1、open orders=1、cancels=0、execution HEALTHY，然後 disconnect**（synthetic quantity）。Grace 中止仍須在原 deadline／同一退出額度內執行安全收尾，不能重開 3 次 IOC 額度。 |
+| F3 / P1 | `execution_port.py:499–525`；`order_manager.py:356,555` | POST_ONLY canceled 啟動 book-refresh generation fence，但 V2 沒有 production caller acknowledge；唯一 caller 在 OM test。重現第一次 canceled 後每隔 10s 授權，共四輪仍 **CONFIRMED／0 新單**。Bridge 需證明 rejection 後的新可信 book，再 acknowledge 對應 generation，保留 cooldown。 |
+| F4 / P2 | `execution_port.py:506`；`order_manager.py:613` | 每 3s BBO 移動超過 reprice threshold，bridge 全撤，OM 每輪一筆 create 即 return，flat 時 BUY 優先；重現 **六輪只有 BUY、沒有 SELL**。Dry 直接建立雙邊，掩蓋差異。修正有界 cycle 內的逐筆重新授權／補另一邊流程，不能直接取消 one-create safety boundary。 |
+| F5 / P1 | `lighter_runtime.py:467–484`；`market_state.py:85` | normal revision 已確認 own order 撤銷，而下一份 WS book 尚未抵達；own 變更造成 cache miss，同一 source time 再 update 被拒。真 session 重現 **20s 目標在約3.095 fake秒退出，book 僅38ms舊**。Ownership 變更需與 book 對齊；有界等候可證明覆蓋變更的新 book，不能 restamp 或盲目從舊 book 扣新 own size。 |
+| F6 / P2 | `inventory_governor.py:211–222`，對照 `:148–150` | Stop 以 high-water drawdown 判定，但新單 reserve 只計負的 realized net 等損失。真 ledger synthetic 路徑先 +100 再 -99，net=+1／DD=99；cap=100／stop=10 仍授權新單，下一個合法 stop 後 DD=109。需以 **current drawdown** 的剩餘額度預留風險，同時保留起始 equity loss 限制；不能把歷史最大 DD 永久扣掉，造成恢復後失去容量。 |
+| F7 / P2，public contract | `session_ledger.py:357–359` | Final account `observed=100`、`inputs_observed=0` 時 `fresh(100)=False`，但 `finalize` 仍回 complete。應納入 `final.fresh(now)`，過期即 incomplete。現行 Lighter provider 有額外 freshness 檢查，**尚未證明正常 live 路徑可觸發**，優先度低於 F1–F6。 |
+
+既有 No-Go 仍獨立成立：source age `-17.3067ms` 超過 host quantum；高改價 fixture 的 rolling REST `26,700`、現 WS 握手換算約 `308/min`；Unified nonflat／funding liveness 未驗證；正常 fill 穿過多來源 account bracket 會觸發 refusal。詳細歷史以唯一 [EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md) 為準，不將這些已知問題當成新發現。
+
+## 19.2 修正順序與可驗收成果
+
+每個 R 是獨立、可 review 的工作單位，不另建 campaign／checkpoint 文件；以下為驗收要求，實際完成範圍見 §19.4，未授權 live 或 Git mutation。
+
+### R1 — 修復退出路徑（先於任何下一次 run）
+
+- 修 F1／F2。禁止新增風險與可安全 cleanup 分開；只有已知 ID、確定 ownership 與可核對 mutation 的撤單才可執行。未知終態須先 reconciliation，不把 HALTED 改成無條件可送單。
+- Passive grace 是退出的可選前段；資料錯誤中止 grace 後，繼續同一次 bounded cancel／fresh truth／IOC。共用原 deadline、固定價格及最多三次額度，失聯或無流動性仍如實報 residual。
+- 驗收：上述兩個 session 重現改為 recovered truth 下 final authenticated `0/0`；unknown submit/cancel、持續資料故障、deadline、partial IOC 仍 fail closed，不能誤報完成。實際已知訂單不能只因純讀取錯誤被跳過撤單。
+
+### R2 — 修復持續雙邊與風險額度
+
+- 修 F3／F4／F6，補 F7。使用現有 execution public ports；不要直接操縱 slots 或另建 engine。
+- POST_ONLY rejection 必須可在新 book／cooldown 後恢復，舊 book 仍不能解 fence。兩邊有效時，改價、partial fill、fee change 不能讓固定一邊永久餓死；每筆 create 後重新授權，不以一次舊 account proof 連下兩單。
+- 讓 dry／replay 覆蓋與 live 相同的逐筆 execution cadence；報告 actual working 的買側、賣側和雙邊時間，不能只看至少一張單。
+- 驗收：真 OM＋fake exchange 的多輪移動 BBO、rejection 後恢復、profit→drawdown→下一單 reserve、stale final proof；測 public behavior，保留 bounded exit／cancel race 回歸。
+
+### R3 — 整合資料一致性、clock 與 API 退出餘額，再驗 Phase 7
+
+- 修 F5。Book source/receipt time、own-order version、account/fill watermark 分別保留；fixture 不得每次讀取都改寫 source time 或瞬間把 own order 混入 book。
+- Clock 要處理跨主機誤差與 clock jump，先定義可量測的誤差界線；高解析 monotonic 只解決本機計時粒度。對 stale／future／jump 分類，不能無限加等待或删除 source-age 檢查。
+- 對正常 fills／REST-WS 到達不同步，暫停新增風險，在**同一 deadline 與 read budget**內取得 coherent proof；未知、超時或耗盡才進失敗收尾。保留 exact cash bridge，不以 epsilon 填平帳務差額。Fill source time 與 ingestion time 的差異也須在 hold-age replay 中驗證，不能用較晚的 audit 時間證明實際持倉未超時。
+- 先在現有窄接線去除同一 cycle 的重複讀取，再評估持續 WS account/order 狀態加事件後 reconciliation 是否有足夠完整性證據。官方 channel 有 nonce 並不自動代表任意增量可當完整 authenticated order list；需要先驗協定。
+- 明確預留退出需求：任意 rolling60 window 的已用讀取量＋正常 cycle 新增量＋最壞安全收尾 reserve 必須在 applicable REST／WS 上限內。計入 auth/history、unsubscribe/subscribe、keepalive、fills、cancel terminal、三次 IOC 及 final proof；共用 IP／L1 的其他工作負载也占額度。額度不足先停止新增風險，不能等 429 才退出。
+- 驗收順序：真 execution 路徑離線測量（calm、每輪改價、多 partial fills、正常 arrival race、stop／三次 IOC）→ 短唯讀協定檢查 → 完整30min T3。保留 smoke_03 歷史；資料接線大改時只重做受影響 smoke，不盲目重跑原失敗程序。Dry 全程零 mutation，並保留獨立 postflight 與 process-exit 證據。
+- 盡量限制在 V2；若 shared Lighter opt-in stream 必須修改，說明 Grid 影響、保留原預設行為並跑相關 Lighter／Grid 回歸。
+
+### R4 — 用小型經濟報表與可執行配置，準備 Phase 8
+
+- `scripts/analyze_mm_v2_session.py` 尚未存在。完成最小 JSONL→單場／candidate aggregate 表格即可；復用 ledger 定義，拒絕 incomplete economics，不另建 recorder database、campaign authority 或新的設定框架。
+- 先補密集、可揭露覆蓋率的外部 book／trade 觀測。既有 Phase 1 僅184列、無1s配對、5s配對12/183，足以示範工具，不能證明 fill opportunities。記 effective quote distance、quote lifetime、revisions 與成交後1s/5s markout（診斷，不作新 blocking controller）；沒有可信成交時只能報 touch／trade-through 候選機會，不能當自身 queue fills。
+- 對每個 candidate 產生 flat／soft／hard 的**實際可執行數量表**，通過 tick、lot、minimum notional、已掛單最壞 exposure 和退出 reserve。例：純示意 BTC=80,000、minimum notional=10 時，example 的 `order_size=soft_limit=0.00020`；一整筆 BUY 後增加風險側縮成0.00010、notional約8，被 runner 刪去，只剩 SELL。即使全撤重算也相同，因此 example 不保證 continuous accumulation。這是配置耦合，不是要恢復 V1 或無條件放大 size。
+- 使用者約299 USDG 背景下，同報 `turnover / allocated capital`、maximum gross exposure 及每10,000 USDG成交的净成本；帳戶餘額、配置資金與風險額度分開。成交目標待資料支持後約定；不直接用全額資金當 inventory 或 loss cap。
+- 策略優先保持簡單單層；若有交易但經濟差，先用 fills 的 realized spread／markout／forced-exit 分解判定原因，再測一個 quote persistence 或 inventory 變因。較複雜 reservation 模型只作參考，不能代替本市場的 fill-versus-distance 證據。
+
+### R5 — 執行授權 canary，依證據決定是否延長
+
+- R1–R4 的對應驗收完成後才提出具體 reviewable run：network／account／symbol、order size、預定窗口、hard exposure、單場與整組累積 loss、flatten price/attempt/time limits、停止條件。仍需當場明確 live＋bounded-flatten 授權。
+- 先做最小 execution/accounting canary，驗證真實 nonflat、partial fills、fee／funding 與正常撤換單可用性；通過不算 economic GO。再按 Phase 8 三組 spread 的固定窗口交錯比較，所有成本与失敗保留；選出可行或接近可行點後，依 Phase 9 驗證一個 inventory 變因及獨立確認窗口。
+- 只有穩定 execution、完整 aggregate fee cover 及量級目標有證據才延長2h／4h；24h persistence／recovery 仍依 Phase 11，不先為短期未知 economics 建大型基礎設施。
+
+## 19.3 外部資料與推論界線
+
+2026-09-05 查閱 [RH 官方 rate limits](https://apidocs.rh.lighter.xyz/docs/rate-limits.md)：Premium REST 為24,000 weighted requests／rolling minute，WS client messages為200／minute、按IP計，超限可能影響連線。這支持 R3 必須保留完整退出讀取餘額；不是本輪已驗證使用者帳戶 tier 或可用額度。
+
+[RH 官方 WebSocket](https://apidocs.rh.lighter.xyz/docs/websocket.md) 說明 book 初始全量與 nonce continuity、account_all 重訂閱全量及各 account channel。R3 的協定重構方向是待驗證設計，不能從文件直接推論現有多來源帳務已原子一致。
+
+[Avellaneda–Stoikov 原論文](https://math.nyu.edu/inmemoriam/avellaneda/HighFrequencyTrading.pdf) 同時處理 inventory reservation 與隨報價距離變化的成交到達率；本文据此把 fill/quote distance 觀測列入 R4，沒有假設該論文的市場模型已適用於 RH BTC。[Hummingbot V2 架構](https://hummingbot.org/strategies/v2-strategies/) 的資料、策略與執行分工支持保留目前 V2 邊界，不構成搬入整個框架的理由。
+
+## 19.4 修復進度（2026-09-05，worktree on `260be69`）
+
+- **R1 已修並通過離線驗收**：quote 純讀取 timeout／task cancellation 不再永久鎖住已知委託 cleanup；中斷 mutation 仍由 OM 保留 uncertainty。Passive grace 讀取失敗後進入同一次 bounded exit，沿用原 deadline／最多三次 IOC 額度。兩個原 session 缺口在恢復可信資料後均驗證 authenticated `position=0/orders=0`，持續失敗與 unknown execution 仍不得假稱成功。
+- **R2 程式缺口已修並通過離線驗收**：一個原 10s execution deadline 內最多兩次 one-create reconcile，中間重新核對 account／risk／market；首筆即成交也先重算持倉再掛減倉側。第二次讀取 timeout 不加時，保留第一筆已送出計數。POST_ONLY fence 必須由 rejection 後新可信 book 解鎖，cooldown 保留。Reserve 同時計入起始 equity loss 與 current drawdown headroom，恢復後不永久扣歷史 maximum DD；finalize 檢查底層 account inputs freshness。實際觀測新增 buy／sell／two-sided quote seconds，時間聯集不重複相加，缺 side 證據為 unavailable。網路 dry 仍是零成交意圖模型；execution cadence 用真 V2 OM＋fake exchange replay 驗證，不將 dry 通過當作 live 接線驗收。
+- **R3 部分修復，仍未達 T3／canary gate**：F5 改為 authenticated target-market order nonce → 原始 receipt 的 book → closing order nonce；opening/closing 完整訂單相同且 book nonce 落在兩端之間才供 quote 使用。OM 與 account 在同一 cycle、同一 mutation generation、3s 內交接一次完整 order observation；失敗／取消／新 cycle／mutation 立即作廢。只保留 cash 後的一次 full account_all，仍核對全帳戶 identity、持倉、order counts、funding、exact cash bridge 與 trade-history counter。Terminal fills 改用一次100-row history 核對多筆 exact IDs，缺漏／重複／成交量不符仍拒絕。延遲且不重打時間戳的 book fixture 通過；短真實唯讀 nonce／unsubscribe 協定與三次 aligned account/book 檢查通過，但僅證明 flat 現況，沒有真實 fill／cancel 因果證據。
+- **Clock 已有主機證據與可攜式拒絕條件**：Windows Time 原未啟動，獨立 NTP 顯示慢約0.4s，對應 source age 約−359ms。依使用者明確授權啟用 Automatic／Running 並校時後，NTP 偏差降為約5–8ms，唯讀對齊通過。Runtime 保留 strict source age 0..3000ms／receipt 3s，以及最多一個 host quantum、cap20ms 的等待；新增相鄰 wall elapsed 與 monotonic elapsed 差額超過50ms的 jump refusal，這是連續性界線，不是允許 future source。VPS 入口 `Desktop/vps_lighter/Open-Grid-Tradexyz-VPS.cmd` 指向 SSH alias `grid-tradexyz-vps`；唯讀核對 chrony active、NTP synchronized、偏差約2µs。未改 VPS 設定／部署；其 checkout 仍是舊 MM 分支 `feat/lighter-market-maker-mvp`／`2de97c4`，不能當成 V2 部署或測試通過。
+- **API reserve 仍是獨立 No-Go**：同一90 fake-second高改價 fixture，合併 order observations／account_all 後，原 public-method 模型 WS 下限由330降至195/min；該模型漏算 shared adapter 的 create lookup／cancel terminal reconciliation／get_order 內部請求。按已讀 source 補入每 create 至少300、每 cancel 至少400、terminal get_order 400 的 REST 權重，峰值下限為35,600；terminal history 合批後降至30,000，WS195不變。仍未含 retry／全部 confirmation latency／auth／keepalive／三次IOC／final proof，不能以195低於200宣稱餘額成立。短期不得以加長 cycle、假回 terminal 或放寬 freshness 掩蓋；下一個工作單位須處理 shared confirmation reads 的重複證據與完整 request admission／退出 reserve，並補 normal arrival-race recovery／fill source-time hold-age。
+- 受影響的10min dry smoke已完成602.247s，flat authenticated0/0、rolling60量測REST14,100／WS113（不含native signer startup checks）；只驗證新的flat read path與校時後穩定性，載入版本及後續補碼驗證範圍見唯一EXPERIMENT_LOG；不取代真 execution／三次IOC 的 API reserve 驗收，30min T3 尚未開始。R4 analyzer／candidate 配置表與 R5 授權 canary尚未開始；18個設定欄位、size/risk與Grid production不變。Shared改動僅 opt-in Lighter read stream及其target-market snapshot路由，原Grid預設REST不變；有真實唯讀account連線，沒有交易／帳戶mutation、commit或push。

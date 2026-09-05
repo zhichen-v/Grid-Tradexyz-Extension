@@ -672,7 +672,10 @@ class LighterAdapter(ExchangeAdapter):
             from types import SimpleNamespace
 
             try:
-                snapshot = await stream.request_snapshot("account_all_orders")
+                channel = ("account_orders" if normalized_symbol is not None
+                           and self._rest.get_market_index(normalized_symbol) == stream.market_id
+                           else "account_all_orders")
+                snapshot = await stream.request_snapshot(channel)
                 orders, seen = [], set()
                 for market, rows in snapshot["orders"].items():
                     market_id = int(market)

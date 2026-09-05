@@ -27,6 +27,29 @@ def fill(identifier, side, size, price, time, *, fee=None, role=LiquidityRole.MA
 
 
 class SessionLedgerTests(unittest.TestCase):
+    def test_observed_side_uptime_keeps_union_and_unknown_coverage_distinct(self):
+        ledger = self.ledger()
+        for when, sides in ((1, (Side.BUY,)), (3, (Side.BUY, Side.SELL)),
+                            (7, (Side.SELL,)), (10, ())):
+            ledger.observe(MarkEvent("BTC", when, D("100"), bool(sides), sides))
+        report = ledger.snapshot(now=12)
+        self.assertEqual((report.quote_uptime_seconds, report.buy_quote_seconds,
+                          report.sell_quote_seconds, report.two_sided_quote_seconds),
+                         (D("9"), D("6"), D("7"), D("4")))
+        ledger.observe(MarkEvent("BTC", 12, D("100"), True))
+        self.assertIsNone(ledger.snapshot(now=13).two_sided_quote_seconds)
+        for sides in ((Side.BUY, Side.BUY), ("buy",), ()):
+            with self.assertRaises(ValueError):
+                MarkEvent("BTC", 14, D("100"), True, sides)
+
+    def test_finalization_rejects_stale_underlying_account_inputs(self):
+        ledger = self.ledger()
+        final = account(100.0, inputs_observed_monotonic=0.0)
+        self.assertFalse(final.fresh(100.0))
+        report = ledger.finalize(final, now=100.0)
+        self.assertFalse(report.complete)
+        self.assertIsNone(report.all_in_net_pnl)
+
     def ledger(self, **kwargs):
         return SessionLedger(account(), **kwargs)
 

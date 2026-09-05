@@ -452,6 +452,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
         self.refresh_quote = refresh_quote
         self.reprice_threshold_ticks, self.max_quote_age_ms = reprice_threshold_ticks, max_quote_age_ms
         self._maker_fee = None
+        self._post_only_refresh = (0, 0.0)
 
     async def _fresh_quote(self, execution, deadline, after):
         value = await self._bounded(lambda: self.refresh_quote(execution), deadline)
@@ -477,26 +478,44 @@ class VolumeExecutionPort(BoundedExecutionPort):
             before = self.snapshot()
             if before.health is not ExecutionHealth.HEALTHY:
                 return ExecutionResult(ExecutionStatus.BLOCKED, before)
+            submitted = cancelled = 0
             try:
-                return await self._reconcile_volume()
+                deadline = self.clock.monotonic() + 10
+                first = await self._reconcile_volume(deadline)
+                submitted, cancelled = first.submitted_count, first.cancelled_count
+                desired = {q.side for q in first.actual_plan.quotes} if first.actual_plan else set()
+                working = {o.side for o in first.snapshot.orders or ()}
+                if (first.status is not ExecutionStatus.CONFIRMED or not first.submitted_count
+                        or desired <= working):
+                    return first
+                # The manager still creates one order per call. Read back and reauthorize
+                # before filling the other side, within the original cycle deadline.
+                second = await self._reconcile_volume(deadline, after=self.clock.monotonic())
+                return replace(second, submitted_count=first.submitted_count + second.submitted_count,
+                               cancelled_count=first.cancelled_count + second.cancelled_count)
             except asyncio.CancelledError:
-                self._failed = True
+                # The manager latches uncertainty if cancellation interrupted a mutation.
+                # Cancelling a read must not disable known-order cleanup.
                 raise
-            except TimeoutError:
-                self._failed = True
-                return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot())
             except Exception:
                 # A pre-mutation data refusal must still permit known-safe cleanup.
-                return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot())
+                return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot(), submitted, cancelled)
 
-    async def _reconcile_volume(self):
-        started = self.clock.monotonic()
-        deadline = started + 10
+    def _capture_post_only_rejection(self):
+        count, generation = self.manager.consume_post_only_cancellations()
+        if count:
+            self._post_only_refresh = (generation, self.clock.monotonic())
+
+    async def _reconcile_volume(self, deadline, *, after=0):
         await self._bounded(self.manager.sync_open_orders, deadline)
+        self._capture_post_only_rejection()
         execution = self.snapshot()
         if execution.health is not ExecutionHealth.HEALTHY:
             return ExecutionResult(ExecutionStatus.BLOCKED, execution)
-        authorization = await self._fresh_quote(execution, deadline, 0)
+        authorization = await self._fresh_quote(execution, deadline, after)
+        generation, rejected_at = self._post_only_refresh
+        if generation and authorization.market.observed_monotonic > rejected_at:
+            self.manager.acknowledge_post_only_book_refresh(generation)
         managed = self.manager.snapshot()
         created = {str(order.order_id): order.created_monotonic for order in managed}
         revision = _quote_revision(execution.orders, created, authorization, self.clock.monotonic(),
@@ -523,6 +542,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
             if quote.side in retained else quote for quote in authorization.plan.quotes))
         execution_plan, execution_risk = self._execution_quotes(effective, authorization)
         result = await self._bounded(lambda: self.manager.reconcile(execution_plan, execution_risk), deadline)
+        self._capture_post_only_rejection()
         snapshot = self.snapshot()
         status = (ExecutionStatus.BLOCKED if result.errors or snapshot.health is not ExecutionHealth.HEALTHY
                   else ExecutionStatus.CONFIRMED)
