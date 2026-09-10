@@ -204,15 +204,14 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.manager.has_uncertain_state)
         self.adapter.create_order.assert_awaited_once()
 
-    async def test_untrusted_or_pre_prepare_truth_and_price_outside_bound_block(self):
+    async def test_untrusted_or_pre_prepare_truth_blocks(self):
         account = await self.account_snapshot()
         market = self.market_snapshot()
         cases = (("account", replace(account, authenticated=False)),
                  ("account", replace(account, observed_monotonic=99)),
                  ("account", replace(account, open_order_count=1)),
                  ("market", replace(market, trusted=False)),
-                 ("market", replace(market, observed_monotonic=99)),
-                 ("market", replace(market, external_ask=D("102"))))
+                 ("market", replace(market, observed_monotonic=99)))
         for name, snapshot in cases:
             with self.subTest(name=name, snapshot=snapshot):
                 self.setUp()
@@ -227,14 +226,79 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.adapter.create_order.assert_not_called()
                 values = {row.name: row.value for row in diagnostics[0].values}
                 if name == "market" and snapshot.trusted:
-                    if snapshot.observed_monotonic == 99:
-                        self.assertEqual(values, {"exit_book_age_ms": D("1000"),
-                                                  "exit_book_after_prepare_ms": D("-1000")})
-                    else:
-                        self.assertEqual(values, {"exit_bid": D("100.9"),
-                                                  "exit_ask": D("102"), "exit_limit": D("101.2")})
+                    self.assertEqual(values, {"exit_book_age_ms": D("1000"),
+                                              "exit_book_after_prepare_ms": D("-1000")})
                 else:
                     self.assertEqual(values, {})
+
+    async def test_nonmarketable_fixed_ioc_returns_known_zero_fill_on_each_side(self):
+        for side, position, limit, bid, ask in (
+                (Side.BUY, D("-0.2"), D("101.2"), D("101.9"), D("102")),
+                (Side.SELL, D("0.2"), D("100.7"), D("100.6"), D("100.8"))):
+            with self.subTest(side=side):
+                self.setUp()
+                self.position, self.fill_size = position, D("0")
+                market = replace(self.market_snapshot(), external_bid=bid, external_ask=ask)
+                self.market.snapshot.side_effect = lambda: market
+                result = await self.port.flatten_ioc(replace(
+                    self.intent, side=side, limit_price=limit))
+                self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+                self.assertIs(result.snapshot.health, ExecutionHealth.HEALTHY)
+                self.assertEqual(result.account_snapshot.position, position)
+                self.assertEqual(result.submitted_count, 1)
+                call = self.adapter.create_order.call_args
+                self.assertEqual(call.args[3:5], (D("0.2"), limit))
+                self.assertEqual(call.kwargs["params"], {"time_in_force": "IOC", "reduce_only": True})
+                self.assertFalse(self.manager.has_uncertain_state)
+                self.assertTrue(self.manager.active_unwind_order_ids <= self.manager.terminal_order_ids)
+
+    async def test_moving_book_exit_preserves_bound_until_recovery_or_exhaustion(self):
+        from core.services.market_maker_v2.domain import ExitStatus
+        from core.services.market_maker_v2.orchestrator import bounded_exit
+
+        for side in (Side.BUY, Side.SELL):
+            for recovers in (False, True):
+                with self.subTest(side=side, recovers=recovers):
+                    self.setUp()
+                    self.position = D("-0.2") if side is Side.BUY else D("0.2")
+                    initial = self.market_snapshot()
+                    outside = replace(initial, external_bid=D("102"), external_ask=D("102.1")) \
+                        if side is Side.BUY else replace(initial, external_bid=D("100"), external_ask=D("100.1"))
+                    # The initial book sets the bound. The first IOC observes
+                    # a moved book and is terminal with zero fill; only a later
+                    # price recovery permits execution at the original limit.
+                    books = iter([initial, outside, initial if recovers else outside, outside])
+                    current = initial
+
+                    def market_snapshot():
+                        nonlocal current
+                        current = next(books)
+                        return current
+
+                    async def create(symbol, order_side, order_type, amount, price, params):
+                        marketable = (current.external_ask <= price if order_side is OrderSide.BUY
+                                      else current.external_bid >= price)
+                        self.fill_size = amount if marketable else D("0")
+                        return await self.create(symbol, order_side, order_type, amount, price, params)
+
+                    self.market.snapshot.side_effect = market_snapshot
+                    self.adapter.create_order.side_effect = create
+                    self.port.flatten_ioc = AsyncMock(wraps=self.port.flatten_ioc)
+                    report = await bounded_exit(self.port, self.market, self.clock, symbol="BTC",
+                        flatten_id="exit-moving-book", deadline_monotonic=105,
+                        ioc_slippage_ticks=2, authorize_bounded_flatten=True)
+                    self.assertIs(report.status, ExitStatus.FLAT if recovers else ExitStatus.ATTEMPTS_EXHAUSTED)
+                    self.assertEqual(report.attempts, 2 if recovers else 3)
+                    expected_position = D("0") if recovers else (D("-0.2") if side is Side.BUY else D("0.2"))
+                    self.assertEqual(report.final_result.account_snapshot.position, expected_position)
+                    self.assertIs(report.final_result.snapshot.health, ExecutionHealth.HEALTHY)
+                    self.assertFalse(self.manager.has_uncertain_state)
+                    intents = [call.args[0] for call in self.port.flatten_ioc.call_args_list]
+                    self.assertEqual({intent.limit_price for intent in intents},
+                                     {D("101.2") if side is Side.BUY else D("100.7")})
+                    self.assertEqual({intent.deadline_monotonic for intent in intents}, {105})
+                    self.assertEqual({intent.size for intent in intents}, {D("0.2")})
+                    self.assertEqual(self.adapter.create_order.await_count, report.attempts)
 
     async def test_missing_post_ioc_audit_cannot_claim_terminal_flat(self):
         initial = await self.account_snapshot()

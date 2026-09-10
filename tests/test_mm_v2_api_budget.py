@@ -18,6 +18,22 @@ ZERO = {"rest": 0, "ws": 0, "tx": 0}
 
 
 class ApiBudgetTests(unittest.TestCase):
+    def test_phase_costs_count_actual_rest_attempts_and_preserve_local_limits(self):
+        phase = ["startup"]
+        budget = ApiBudget(lambda: 1.0, work_phase=lambda: phase[0])
+        budget.observe("rest", "account")
+        phase[0] = "normal"
+        budget.observe("rest", "trades")
+        budget.observe("rest", "sendTx")
+        budget.observe("ws", 1)
+        phase[0] = "exit"
+        budget.observe("rest", "accountInactiveOrders")
+        result = budget.snapshot()
+        self.assertEqual(result["rest_weight_by_phase"], {"startup": 300, "normal": 600, "exit": 100})
+        self.assertEqual(sum(result["rest_weight_by_phase"].values()), result["used"]["rest"])
+        self.assertEqual(result["limits"], {"rest": 24000, "ws": 200, "tx": 40})
+        self.assertIsNone(result["account_profile"])
+
     def test_scheduled_exit_distinguishes_uniform_and_burst_expirations(self):
         def usage(times):
             now = [0.0]
@@ -148,6 +164,111 @@ class ApiBudgetTests(unittest.TestCase):
 
 
 class OwnedRequestObserverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sdk_mm_cancel_bound_covers_four_terminal_reads_and_nonce_refresh(self):
+        from lighter.signer_client import SignerClient
+        from lighter.nonce_manager import OptimisticNonceManager
+        from lighter.exceptions import BadRequestException
+        for invalid_nonce in (False, True):
+            with self.subTest(invalid_nonce=invalid_nonce):
+                budget = ApiBudget(lambda: 1.0)
+                transport = SimpleNamespace(request=AsyncMock())
+                client = SimpleNamespace(rest_client=transport)
+                signer = object.__new__(SignerClient)
+                signer.api_client = client
+                signer.nonce_manager = OptimisticNonceManager(7, client, [0])
+                signer.sign_cancel_order = Mock(return_value=(15, "{}", "test-tx", None))
+                async def next_nonce(**kwargs):
+                    await transport.request("GET", "https://example.invalid/api/v1/nextNonce")
+                    return SimpleNamespace(nonce=123)
+                async def send_tx(**kwargs):
+                    await transport.request("POST", "https://example.invalid/api/v1/sendTx")
+                    if invalid_nonce:
+                        raise BadRequestException(status=400, reason="invalid nonce")
+                    return SimpleNamespace(code=200, tx_hash="test-tx")
+                signer.tx_api = SimpleNamespace(send_tx=AsyncMock(side_effect=send_tx))
+                rest = object.__new__(LighterRest)
+                rest.signer_client = signer
+                rest.get_market_index = Mock(return_value=1)
+                rest.enable_terminal_cancellation_outcomes()
+                rest.get_open_orders = AsyncMock()
+                async def history(*args, **kwargs):
+                    await transport.request("GET", "https://example.invalid/api/v1/accountInactiveOrders")
+                    return []
+                rest.get_order_history = AsyncMock(side_effect=history)
+                adapter = object.__new__(LighterAdapter)
+                adapter._rest, adapter._connected = rest, False
+                adapter.set_market_maker_request_observer(budget.observe, enforce_admission=True)
+                with patch("lighter.nonce_manager.TransactionApi", return_value=SimpleNamespace(next_nonce=next_nonce)), \
+                     patch("lighter.signer_client.CancelOrder.from_json", return_value=object()), \
+                     patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+                    self.assertFalse(await rest.cancel_order("BTC", "987"))
+                counts = budget.snapshot()["attempts"]
+                self.assertEqual(counts["rest:sendTx"], 1)
+                self.assertEqual(counts["rest:nextNonce"], 2 if invalid_nonce else 1)
+                self.assertEqual(counts.get("rest:accountInactiveOrders", 0), 0 if invalid_nonce else 4)
+                self.assertLessEqual(budget.snapshot()["used"]["rest"], 412)
+                self.assertEqual(budget.snapshot()["used"]["tx"], 1)
+                self.assertNotIn("ws", budget.snapshot()["used"])
+                rest.get_open_orders.assert_not_awaited()
+
+    def test_normal_cancel_admission_counts_selected_sides_and_skips_exit(self):
+        from core.services.market_maker_v2.orchestrator import VolumeSession
+        session = object.__new__(VolumeSession)
+        session._budget_active, session._budget_exiting = True, False
+        session.api_budget = SimpleNamespace(require_normal=Mock())
+        session._admit_cancel(0)
+        session.api_budget.require_normal.assert_not_called()
+        session._admit_cancel(1)
+        session.api_budget.require_normal.assert_called_once_with({"rest": 412, "ws": 0, "tx": 1})
+        session._admit_cancel(2)
+        session.api_budget.require_normal.assert_called_with({"rest": 824, "ws": 0, "tx": 2})
+        session._admit_mutation()
+        session.api_budget.require_normal.assert_called_with({"rest": 1400, "ws": 8, "tx": 2})
+        session.api_budget.require_normal.reset_mock()
+        session._budget_exiting = True
+        session._admit_cancel(2)
+        session.api_budget.require_normal.assert_not_called()
+        for count in (-1, 3, True, 1.0):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                session._admit_cancel(count)
+
+    async def test_empty_quote_plan_only_admits_existing_cancellations(self):
+        from core.services.market_maker_v2.domain import QuotePlan
+        from test_mm_v2_quote_execution import QuoteExecutionTests
+        fixture = QuoteExecutionTests()
+        fixture.setUp()
+        fixture.port.before_cancel = Mock()
+        fixture.port.before_mutation = Mock()
+        await fixture.port.reconcile_quotes(QuotePlan("BTC"))
+        fixture.port.before_cancel.assert_not_called()
+        fixture.port.before_mutation.assert_not_called()
+        await fixture.quote_both()
+        fixture.port.before_mutation.reset_mock()
+        await fixture.port.reconcile_quotes(QuotePlan("BTC"))
+        fixture.port.before_cancel.assert_called_once_with(2)
+        fixture.port.before_mutation.assert_not_called()
+
+    async def test_selected_quote_revision_separately_admits_one_cancel_and_one_create(self):
+        from dataclasses import replace
+        from decimal import Decimal
+        from core.services.market_maker_v2.domain import QuotePlan, Side
+        from test_mm_v2_quote_execution import QuoteExecutionTests
+        fixture = QuoteExecutionTests()
+        fixture.setUp()
+        await fixture.quote_both()
+        before = {order.side: order for order in fixture.port.snapshot().orders}
+        async def one_side(execution):
+            value = await fixture.refresh_quote(execution)
+            return replace(value, plan=QuotePlan("BTC", tuple(
+                replace(quote, price=before[Side.BUY].price - Decimal("1"))
+                if quote.side is Side.BUY else quote for quote in value.plan.quotes)))
+        fixture.refresh.side_effect = one_side
+        fixture.port.before_cancel, fixture.port.before_mutation = Mock(), Mock()
+        result = await fixture.port.reconcile_quotes(fixture.proposal)
+        self.assertEqual((result.cancelled_count, result.submitted_count), (1, 1))
+        fixture.port.before_cancel.assert_called_once_with(1)
+        fixture.port.before_mutation.assert_called_once_with()
+
     async def test_cached_execution_order_handoff_still_admits_following_terminal_reads(self):
         from core.services.market_maker_v2.lighter_runtime import LighterAccountPort
         from test_mm_v2_lighter_runtime import Adapter, Clock, ReadStream, ADDRESS

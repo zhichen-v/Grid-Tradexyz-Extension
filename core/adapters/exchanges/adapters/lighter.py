@@ -656,7 +656,9 @@ class LighterAdapter(ExchangeAdapter):
             if hasattr(self, "_mm_exact_funding"):
                 fundings = await self._exact_market_maker_fundings(rows, market_id,
                     allow_unsettled=allow_unsettled_funding is True)
-                return {"maker_fee_rate": rates[0], "taker_fee_rate": rates[1], "fundings": fundings}
+                tier = getattr(limits, "user_tier", None)
+                return {"maker_fee_rate": rates[0], "taker_fee_rate": rates[1], "fundings": fundings,
+                        "account_tier": tier if tier in {"standard", "premium", "plus"} else None}
             fundings = []
             for row in rows:
                 identifier, timestamp = row.funding_id, row.timestamp

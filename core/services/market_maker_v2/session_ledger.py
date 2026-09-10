@@ -36,6 +36,7 @@ class _State:
     cost_basis: Decimal = ZERO
     signed_cash: Decimal = ZERO
     gross: Decimal = ZERO
+    exchange_realized: bool | None = None
     maker_buy: Decimal = ZERO
     maker_sell: Decimal = ZERO
     taker_turnover: Decimal = ZERO
@@ -176,23 +177,41 @@ class SessionLedger:
     @staticmethod
     def _fill_cost(state: _State, fill: FillEvent) -> Decimal:
         old_position, old_gross = state.position, state.gross
+        exchange_realized = fill.realized_pnl is not None
+        if state.exchange_realized is not None and state.exchange_realized != exchange_realized:
+            raise LedgerError("mixed realized PnL sources")
+        state.exchange_realized = exchange_realized
         signed_size = fill.size if fill.side is Side.BUY else -fill.size
         state.signed_cash -= signed_size * fill.price
         if old_position == ZERO or _sign(old_position) == _sign(signed_size):
+            if exchange_realized and fill.realized_pnl != ZERO:
+                raise LedgerError("nonreducing fill cannot realize position PnL")
             state.cost_basis += fill.size * fill.price
         else:
             closed = min(abs(old_position), fill.size)
-            released = (state.cost_basis if closed == abs(old_position)
-                        else state.cost_basis * closed / abs(old_position))
-            state.gross += _sign(old_position) * (closed * fill.price - released)
+            if exchange_realized:
+                # The authenticated fill owns cash realization and its rounded
+                # cost allocation; a repeating model average cannot prove cash.
+                released = closed * fill.price - _sign(old_position) * fill.realized_pnl
+                state.gross += fill.realized_pnl
+                if closed == abs(old_position) and released != state.cost_basis:
+                    # Venue rounding is cash evidence, not a modeled spread or
+                    # drift component; do not publish an exact decomposition.
+                    state.decomposition_complete = False
+            else:
+                released = (state.cost_basis if closed == abs(old_position)
+                            else state.cost_basis * closed / abs(old_position))
+                state.gross += _sign(old_position) * (closed * fill.price - released)
             state.cost_basis -= released
             if fill.size > abs(old_position):
                 state.cost_basis = (fill.size - abs(old_position)) * fill.price
         state.position += signed_size
         if state.position == ZERO:
             state.cost_basis = ZERO
-            # Closing gets the fractional cost-basis remainder, never an account/equity plug.
-            state.gross = state.signed_cash
+            # Legacy replays allocate their fractional model remainder here.
+            # Authenticated realization must never be replaced by model cash.
+            if not exchange_realized:
+                state.gross = state.signed_cash
             state.opened_at = None
         elif old_position == ZERO or _sign(old_position) != _sign(state.position):
             state.opened_at = state.time

@@ -265,11 +265,10 @@ class BoundedExecutionPort:
                 "exit_book_age_ms": (Decimal(str(now)) - Decimal(str(market.observed_monotonic))) * 1000,
                 "exit_book_after_prepare_ms": (Decimal(str(market.observed_monotonic))
                                               - Decimal(str(prepared_at))) * 1000})
-        if ((intent.side is Side.BUY and market.external_ask > intent.limit_price)
-                or (intent.side is Side.SELL and market.external_bid < intent.limit_price)):
-            raise ExecutionUnavailable("exit market outside fixed price bound", values={
-                "exit_bid": market.external_bid, "exit_ask": market.external_ask,
-                "exit_limit": intent.limit_price})
+        # A moving book can leave this fixed limit nonmarketable. IOC then
+        # cancels its unfilled quantity; that is a known outcome, not execution
+        # uncertainty. Preserve the limit and require exact terminal/account
+        # proof below before the caller can attempt the remaining quantity.
         desired = replace(desired, amount=self._ioc_chunk(account.position.copy_abs()))
         previous_ids = self.manager.active_unwind_order_ids
         result = await self._bounded(
@@ -333,6 +332,7 @@ def _validate_quote_authorization(value, execution, symbol, now, *, after=0, dry
 def _quote_revision(orders, created, authorization, now, threshold, max_age):
     targets = {quote.side: quote for quote in authorization.plan.quotes}
     market = authorization.market
+    revised = set()
     for order in orders:
         target = targets.get(order.side)
         if now < created[order.order_id]:
@@ -343,10 +343,12 @@ def _quote_revision(orders, created, authorization, now, threshold, max_age):
                 or target.size != order.remaining_size
                 or abs(order.price - target.price) >= market.tick_size * threshold
                 or (now - created[order.order_id]) * 1000 >= max_age):
-            return True
-    retained = {order.side: order.price for order in orders}
+            revised.add(order.side)
+    retained = {order.side: order.price for order in orders if order.side not in revised}
     prices = {side: retained.get(side, target.price) for side, target in targets.items()}
-    return len(prices) == 2 and prices[Side.BUY] >= prices[Side.SELL]
+    if len(prices) == 2 and prices[Side.BUY] >= prices[Side.SELL]:
+        revised.update(retained)
+    return revised
 
 
 class VolumeExecutionPort(BoundedExecutionPort):
@@ -359,7 +361,8 @@ class VolumeExecutionPort(BoundedExecutionPort):
 
     def __init__(self, manager, account, market, clock, *, refresh_quote,
                  reprice_threshold_ticks: int, max_quote_age_ms: int,
-                 authorize_bounded_flatten: bool = False, before_mutation=None, on_failure=None):
+                 authorize_bounded_flatten: bool = False, before_mutation=None, before_cancel=None,
+                 on_failure=None):
         for value in (reprice_threshold_ticks, max_quote_age_ms):
             _count(value)
             if value == 0:
@@ -372,9 +375,17 @@ class VolumeExecutionPort(BoundedExecutionPort):
             raise ExecutionUnavailable("normal volume quotes require POST_ONLY")
         self.refresh_quote = refresh_quote
         self.before_mutation = before_mutation
+        self.before_cancel = before_cancel
         self.reprice_threshold_ticks, self.max_quote_age_ms = reprice_threshold_ticks, max_quote_age_ms
         self._maker_fee = None
         self._post_only_refresh = (0, 0.0)
+
+    def _admit_cancel(self, count):
+        if count:
+            if self.before_cancel is not None:
+                self.before_cancel(count)
+            elif self.before_mutation is not None:
+                self.before_mutation()
 
     async def _fresh_quote(self, execution, deadline, after):
         value = await self._bounded(lambda: self.refresh_quote(execution), deadline)
@@ -404,8 +415,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
         if self.manager.config.post_only is not True:
             raise ExecutionUnavailable("normal volume quotes require POST_ONLY")
         if not plan.quotes:
-            if self.before_mutation is not None:
-                self.before_mutation()
+            self._admit_cancel(len(self.manager.snapshot()))
             return await self.cancel_all_managed()
         async with self._lock:
             before = self.snapshot()
@@ -463,23 +473,32 @@ class VolumeExecutionPort(BoundedExecutionPort):
         generation, rejected_at = self._post_only_refresh
         if generation and authorization.market.observed_monotonic > rejected_at:
             self.manager.acknowledge_post_only_book_refresh(generation)
-        managed = self.manager.snapshot()
-        created = {str(order.order_id): order.created_monotonic for order in managed}
-        revision = _quote_revision(execution.orders, created, authorization, self.clock.monotonic(),
-                                   self.reprice_threshold_ticks, self.max_quote_age_ms)
-        revision |= bool(managed and authorization.account.maker_fee_rate != self._maker_fee)
         cancelled = 0
-        if managed and revision:
-            if self.before_mutation is not None:
-                self.before_mutation()
+        # A one-side revision must not discard a still-authorized opposite order.
+        # Cancellation can change inventory; recheck the retained side before
+        # any create. At most two existing sides can need cancellation.
+        for _ in range(2):
+            managed = self.manager.snapshot()
+            created = {str(order.order_id): order.created_monotonic for order in managed}
+            revision = _quote_revision(execution.orders, created, authorization, self.clock.monotonic(),
+                                       self.reprice_threshold_ticks, self.max_quote_age_ms)
+            if managed and authorization.account.maker_fee_rate != self._maker_fee:
+                revision.update(order.side for order in execution.orders)
+            if not revision:
+                break
+            from ...adapters.exchanges.models import OrderSide
+            selected = {order.order_id for order in execution.orders if order.side in revision}
+            self._admit_cancel(len(selected))
             result = await self._bounded(
-                lambda: self.manager.cancel_managed_orders("v2 quote revision"), deadline)
-            if (result.errors or not set(created) <= self.manager.terminal_order_ids
-                    or self.manager.snapshot()):
+                lambda: self.manager.cancel_managed_orders("v2 quote revision",
+                    sides=frozenset(OrderSide(side.value) for side in revision)), deadline)
+            execution = self.snapshot()
+            if (result.errors or not selected <= self.manager.terminal_order_ids
+                    or execution.orders is None
+                    or any(order.side in revision for order in execution.orders)):
                 self._failed = True
                 raise ExecutionUnavailable("quote cancellation lacks exact terminal proof")
-            cancelled = len(managed)
-            execution = self.snapshot()
+            cancelled += len(selected)
             authorization = await self._fresh_quote(execution, deadline, self.clock.monotonic())
             execution = self.snapshot()
         self._maker_fee = authorization.account.maker_fee_rate
@@ -553,10 +572,11 @@ class DryVolumeExecutionPort:
         now = self.clock.monotonic()
         revision = _quote_revision(self._orders, self._created, authorization, now,
                                    self.reprice_threshold_ticks, self.max_quote_age_ms)
-        revision |= bool(self._orders and authorization.account.maker_fee_rate != self._maker_fee)
+        if self._orders and authorization.account.maker_fee_rate != self._maker_fee:
+            revision.update(order.side for order in self._orders)
         self._maker_fee = authorization.account.maker_fee_rate
-        cancelled = len(self._orders) if revision else 0
-        previous = {} if revision else {order.side: order for order in self._orders}
+        cancelled = sum(order.side in revision for order in self._orders)
+        previous = {order.side: order for order in self._orders if order.side not in revision}
         result, submitted = [], 0
         for quote in authorization.plan.quotes:
             order = previous.get(quote.side)

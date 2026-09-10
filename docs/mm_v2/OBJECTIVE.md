@@ -1,6 +1,6 @@
 # Market Maker V2 — Volume-first objective
 
-> 狀態：2026-09-07 01:11，分步admission後新實盤000201在22分49秒失敗：maker602.901337 USDG、realized net−0.12995240744，尚有殘倉，all-in／fee-cover不可判定。01:11:08 authenticated唯讀確認BTC long0.00017／掛單0、cash297.938824540532；不是risk_capacity_exhausted正常停場。已修maker minimum被誤套至reducing IOC的退出契約，正常POST_ONLY minimum保留；完整V2 469項PASS，含BTC .00017／partial後.00001的多空runner退出及精確對帳，未實際平倉。API deferrals10／account race1，quota仍待改善。VPS暫緩，Grid不動；公平時間窗比較及證據界線見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)與計畫§19.8。
+> 狀態：2026-09-10，204643實盤在第三次API背壓退出時，將行情移出固定IOC限價誤判為HALTED，殘留long0.00020；21:06:28獨立唯讀已0/0，不能回填原場成功。本地完成IOC零成交語義、單側撤換、Unified非零現金證據8s重用與分段admission修正。固定600s集中成交壓力仍531.546s／14of15後第三次API保護早停，未達完整窗口，不能稱穩定／fee-cover成功；保留本地重現，未啟動新live、Grid/VPS不動。實際腳本仍60分鐘。詳細證據見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
 
 ## 目標與判定
 

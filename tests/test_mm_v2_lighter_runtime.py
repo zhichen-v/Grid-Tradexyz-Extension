@@ -2,6 +2,7 @@
 
 import unittest
 from copy import deepcopy
+from dataclasses import replace
 from decimal import Decimal as D, ROUND_DOWN
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock, call
@@ -24,7 +25,7 @@ class Clock:
         return self.now
 
 
-def trade(identifier="1", *, side="buy", price="100", size="1", role="maker", order="10"):
+def trade(identifier="1", *, side="buy", price="100", size="1", role="maker", order="10", realized="0"):
     rate = D("0.0001") if role == "maker" else D("0.0003")
     amount, price = D(size), D(price)
     return NS(id=identifier, order_id=order, symbol="BTC", side=side,
@@ -32,7 +33,7 @@ def trade(identifier="1", *, side="buy", price="100", size="1", role="maker", or
               fee=dict(role=role, rate=rate, tick=int(rate * 1000000),
                        cost=amount * price * rate, currency="USDG"),
               raw_data=dict(timestamp=int(identifier) * 1000,
-                            trade_sequence=int(identifier), integrator_fee_tick=0))
+                            trade_sequence=int(identifier), integrator_fee_tick=0, realized_pnl=D(realized)))
 
 
 class Adapter:
@@ -225,8 +226,8 @@ class LighterAccountTests(unittest.IsolatedAsyncioTestCase):
         self.clock.now = 3
         await self.port.snapshot()
         self.assertEqual(self.ledger.snapshot(now=3).maker_fill_count, 1)
-        self.adapter.trades += [trade("2", side="sell", price="101", size="0.4"),
-                                trade("3", side="sell", price="101", size="0.6")]
+        self.adapter.trades += [trade("2", side="sell", price="101", size="0.4", realized="0.4"),
+                                trade("3", side="sell", price="101", size="0.6", realized="0.6")]
         self.adapter.position.position = "0"
         self.adapter.account.collateral = "100.9799"
         final = await self.port.snapshot()
@@ -288,7 +289,7 @@ class LighterAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.equity, cash - D("0.000003"))
         self.clock.now = 3
         self.flatten["11"] = "exit-1"
-        self.adapter.trades += [trade("2", side="sell", price="100.1001", size="0.01", role="taker", order="11")]
+        self.adapter.trades += [trade("2", side="sell", price="100.1001", size="0.01", role="taker", order="11", realized="0.001")]
         self.adapter.fees["fundings"] = ({"id": "9", "timestamp": 2100, "change": D("-0.00000001")},)
         self.adapter.position.position = self.adapter.position.unrealized_pnl = "0"
         cash += D("0.001") - self.adapter.trades[1].fee["cost"] - D("0.00000001")
@@ -308,6 +309,76 @@ class LighterAccountTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(LighterReadError, "unattributed account cashflow"):
             await self.port.snapshot()
         self.assertEqual(self.ledger.snapshot(now=2).external_transfers, D("0"))
+
+    async def test_scaled_short_partial_close_uses_exchange_cash_and_reconciles_exactly(self):
+        baseline = D("297.931743512682")
+        self.adapter.unified(str(baseline))
+        self.adapter.fees.update(maker_fee_rate=D("0.00012"), taker_fee_rate=D("0.00035"))
+        self.port.stream = ReadStream(self.adapter, self.clock)
+        await self.start()
+        cash, position = baseline, D("0")
+        rows = [("sell", "0.00040", "77590.9", "0", "maker"),
+                ("sell", "0.00020", "77602.1", "0", "maker"),
+                ("buy", "0.00040", "77577.7", "0.006774", "maker"),
+                # Synthetic closing evidence at the later manual fill's price;
+                # this fixture does not attribute the real manual fill to the runner.
+                ("buy", "0.00020", "77513.5", "0.016226", "taker")]
+        for index, (side, size, price, realized, role) in enumerate(rows, 1):
+            self.clock.now += 1
+            order = "11" if role == "taker" else "10"
+            if role == "taker":
+                self.flatten[order] = "exit-1"
+            row = trade(str(index), side=side, size=size, price=price,
+                        realized=realized, role=role, order=order)
+            rate = self.adapter.fees[f"{role}_fee_rate"]
+            row.fee.update(rate=rate, tick=int(rate * 1000000), cost=row.cost * rate)
+            self.adapter.trades.append(row)
+            position += D(size) * (1 if side == "buy" else -1)
+            self.adapter.position.position, self.adapter.position.sign = str(abs(position)), -1
+            cash += D(realized) - row.fee["cost"]
+            self.adapter.unified_cash(cash)
+            current = await self.port.snapshot()
+            self.assertEqual(current.equity, cash)
+            self.assertEqual(current.position, position)
+            if index == 3:
+                report = self.ledger.snapshot(now=self.clock.now)
+                self.assertEqual(report.realized_gross_pnl, D("0.006774"))
+                self.assertEqual(report.realized_net_pnl, D("-0.00253654320"))
+                exit_account = await self.port.snapshot(allow_unreconciled_cash=True)
+                self.assertEqual(exit_account.position, D("-0.00020"))
+        await self.port.snapshot()  # Immutable duplicate fills remain idempotent.
+        report = self.ledger.finalize(current, now=self.clock.now)
+        self.assertTrue(report.complete)
+        self.assertEqual(report.all_in_net_pnl, D("0.00826351180"))
+        self.assertEqual((report.maker_fill_count, report.taker_fill_count), (3, 1))
+
+    async def test_exit_only_proof_does_not_evaluate_unreconciled_cash_arithmetic(self):
+        await self.start()
+        snapshot = self.ledger.snapshot
+        self.ledger.snapshot = Mock(side_effect=lambda **kwargs: replace(snapshot(**kwargs),
+            realized_net_pnl=D("0.006773333333333333333333333333")))
+        with self.assertRaises(LighterReadError):
+            await self.port.snapshot()
+        current = await self.port.snapshot(allow_unreconciled_cash=True)
+        self.assertTrue(current.authenticated)
+        self.assertEqual((current.position, current.open_order_count), (D("0"), 0))
+        with self.assertRaises(LighterReadError):
+            await self.port.snapshot()  # Exit proof cannot authorize normal quotes.
+
+    async def test_fill_realization_is_required_finite_and_immutable(self):
+        for invalid in (None, "NaN", "Infinity", 0.1):
+            row = trade()
+            row.raw_data["realized_pnl"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaises(LighterReadError):
+                self.port._fill(row, 2)
+        await self.start()
+        self.adapter.trades = [trade()]
+        self.adapter.position.position = "1"
+        self.adapter.account.collateral = "99.99"
+        await self.port.snapshot()
+        self.adapter.trades[0].raw_data["realized_pnl"] = D("0.000001")
+        with self.assertRaises(LighterReadError):
+            await self.port.snapshot()
 
     async def test_unified_precision_loss_cannot_hide_cash_changes(self):
         for cash in ("100.000000560760000000000000001", "100.000000560760000000000000009"):
@@ -357,7 +428,7 @@ class LighterAccountTests(unittest.IsolatedAsyncioTestCase):
         await self.port.snapshot()
         self.flatten["11"] = "exit-1"
         self.clock.now = 3
-        self.adapter.trades += [trade("2", side="sell", price="99", role="taker", order="11")]
+        self.adapter.trades += [trade("2", side="sell", price="99", role="taker", order="11", realized="-1")]
         self.adapter.position.position = "0"
         self.adapter.account.collateral = "98.9603"
         final = await self.port.snapshot()
@@ -619,7 +690,8 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
             setattr(self.adapter, name, AsyncMock(wraps=getattr(self.adapter, name)))
         await self.start()
         second = await self.port.snapshot()
-        self.assertEqual((second.observed_monotonic, second.inputs_observed_monotonic), (2, 1))
+        self.assertEqual((second.observed_monotonic, second.inputs_observed_monotonic,
+                          second.terms_observed_monotonic), (2, 2, 1))
         self.clock.now = 9
         third = await self.port.snapshot()
         self.assertEqual(third.inputs_observed_monotonic, 9)
@@ -627,7 +699,81 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.get_account_trades.await_count, 1)
         self.assertEqual(self.adapter.get_account_fee_and_funding.await_count, 2)
         self.assertEqual(self.adapter.get_settlement_asset.await_count, 2)
-        self.assertFalse(second.fresh(12))
+        self.assertFalse(second.fresh(12.001))
+
+    async def test_normal_terms_cache_has_separate_age_without_extending_cash_freshness(self):
+        for name in ("get_balances", "get_account_fee_and_funding", "get_settlement_asset"):
+            setattr(self.adapter, name, AsyncMock(wraps=getattr(self.adapter, name)))
+        await self.start()
+        self.clock.now = 20
+        current = await self.port.snapshot(allow_metadata_cache=True)
+        self.assertEqual((current.observed_monotonic, current.inputs_observed_monotonic,
+                          current.terms_observed_monotonic), (20, 20, 1))
+        self.assertTrue(current.fresh(20))
+        self.assertFalse(current.fresh(30.001))  # Fresh terms cannot renew cash/order truth.
+        self.adapter.get_account_fee_and_funding.assert_awaited_once()
+        self.adapter.get_settlement_asset.assert_awaited_once()
+        self.assertEqual(self.adapter.get_balances.await_count, 2)
+        self.clock.now = 28.999
+        last_cached = await self.port.snapshot(allow_metadata_cache=True)
+        self.assertEqual(last_cached.terms_observed_monotonic, 1)
+        self.assertFalse(last_cached.fresh(31.001))  # Fresh cash cannot renew terms.
+        self.clock.now = 29  # Refresh before the 30-second proof limit.
+        refreshed = await self.port.snapshot(allow_metadata_cache=True)
+        self.assertEqual(refreshed.terms_observed_monotonic, 29)
+        self.assertEqual(self.adapter.get_account_fee_and_funding.await_count, 2)
+        self.assertEqual(self.adapter.get_settlement_asset.await_count, 2)
+
+    async def test_exit_and_replaced_transport_do_not_inherit_normal_terms_ttl(self):
+        for boundary in ("exit", "new_stream"):
+            with self.subTest(boundary=boundary):
+                await self.asyncSetUp()
+                await self.start()
+                self.adapter.get_account_fee_and_funding = AsyncMock(wraps=self.adapter.get_account_fee_and_funding)
+                self.adapter.get_settlement_asset = AsyncMock(wraps=self.adapter.get_settlement_asset)
+                self.clock.now = 12
+                cached = await self.port.snapshot(allow_metadata_cache=True)
+                self.assertEqual(cached.terms_observed_monotonic, 1)
+                if boundary == "new_stream":
+                    self.port.stream = ReadStream(self.adapter, self.clock)
+                current = await self.port.snapshot(allow_metadata_cache=boundary == "new_stream")
+                self.assertEqual(current.terms_observed_monotonic, 12)
+                self.adapter.get_account_fee_and_funding.assert_awaited_once()
+                self.adapter.get_settlement_asset.assert_awaited_once()
+
+    async def test_new_fill_fee_increase_refreshes_terms_within_original_audit(self):
+        await self.start()
+        self.adapter.fees["maker_fee_rate"] = D("0.0002")
+        fill = trade()
+        fill.fee.update(rate=D("0.0002"), tick=200, cost=D("0.02"))
+        self.adapter.trades = [fill]
+        self.adapter.position.position = "1"
+        self.adapter.account.collateral = "99.98"
+        self.adapter.get_account_fee_and_funding = AsyncMock(wraps=self.adapter.get_account_fee_and_funding)
+        self.port.before_read = Mock()
+        current = await self.port.snapshot(allow_metadata_cache=True)
+        self.assertEqual(current.maker_fee_rate, D("0.0002"))
+        self.assertEqual(self.ledger.snapshot(now=self.clock.now).maker_fee, D("0.02"))
+        self.adapter.get_account_fee_and_funding.assert_awaited_once()
+        self.assertIn(call("funding_refresh"), self.port.before_read.call_args_list)
+        self.assertIn(call("retry"), self.port.before_read.call_args_list)
+
+    async def test_fresh_fee_discount_does_not_reject_earlier_fill_or_exit_proof(self):
+        for normal in (False, True):
+            with self.subTest(normal=normal):
+                await self.asyncSetUp()
+                await self.start()
+                fill = trade()
+                fill.fee.update(rate=D("0.00012"), tick=120, cost=D("0.012"))
+                self.adapter.trades = [fill]
+                self.adapter.position.position = "1"
+                self.adapter.account.collateral = "99.988"
+                self.adapter.get_account_fee_and_funding = AsyncMock(wraps=self.adapter.get_account_fee_and_funding)
+                current = await self.port.snapshot(allow_metadata_cache=normal,
+                                                   allow_unreconciled_cash=not normal)
+                self.assertEqual((current.position, current.maker_fee_rate), (D("1"), D("0.0001")))
+                self.assertEqual(self.ledger.snapshot(now=2).maker_fee, D("0.012"))
+                self.adapter.get_account_fee_and_funding.assert_awaited_once()
 
     async def test_cash_reuse_requires_new_full_proofs_and_keeps_original_eight_second_age(self):
         self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
@@ -672,6 +818,76 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.equity, D("100.47"))
         self.assertEqual(current.observed_monotonic, 4)
         self.assertEqual(self.adapter.get_balances.await_count, before + 1)
+
+    async def test_unified_nonflat_reuses_cash_not_valuation_time_and_keeps_fresh_price_stop(self):
+        from core.services.market_maker_v2.domain import ExecutionHealth, ExecutionSnapshot, MarketStateSnapshot, StrategyState
+        from core.services.market_maker_v2.inventory_governor import InventoryGovernor
+        for side in ("buy", "sell"):
+            with self.subTest(side=side):
+                await self.asyncSetUp()
+                self.adapter.unified("100")
+                await self.start()
+                self.adapter.trades = [trade(side=side)]
+                self.adapter.position.position, self.adapter.position.sign = "1", 1 if side == "buy" else -1
+                self.adapter.position.unrealized_pnl = "1"
+                self.adapter.unified_cash("99.99")
+                original = await self.port.snapshot()
+                self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
+                self.clock.now = 3
+                self.adapter.position.unrealized_pnl = "-5"
+                self.adapter.unified_cash("99.99")
+                current = await self.port.snapshot(allow_cash_reuse=True)
+                self.assertEqual((current.equity, current.unrealized_pnl, current.observed_monotonic),
+                                 (original.equity, D("1"), 2))
+                self.adapter.get_balances.assert_not_awaited()
+                governor = InventoryGovernor(order_size=D("1"), soft_limit=D("1"), hard_limit=D("2"),
+                    stop_loss_usdg=D("1"), max_hold_seconds=60, cooldown_seconds=5,
+                    max_session_loss_usdg=D("10"), session_started_monotonic=1,
+                    session_deadline_monotonic=100, ioc_slippage_ticks=2)
+                bid = D("95") if side == "buy" else D("105")
+                market = MarketStateSnapshot("BTC", 3, bid, bid + D("0.1"),
+                    D("0.1"), D("0.1"), D("0.1"), True)
+                execution = ExecutionSnapshot(ExecutionHealth.HEALTHY, 0, False, "BTC", 3, ())
+                risk = governor.evaluate(market, current, self.ledger.snapshot(now=3), execution, now=3)
+                self.assertIs(risk.state, StrategyState.FLATTENING)
+                self.clock.now = 10  # Exactly eight seconds: fresh REST is mandatory.
+                current = await self.port.snapshot(allow_cash_reuse=True)
+                self.assertEqual((current.observed_monotonic, current.unrealized_pnl), (10, D("-5")))
+                self.adapter.get_balances.assert_awaited_once()
+                await self.port.snapshot()  # Exit/final defaults do not reuse even this new proof.
+                self.assertEqual(self.adapter.get_balances.await_count, 2)
+
+    async def test_unified_nonflat_cash_and_position_core_changes_invalidate_cache(self):
+        for change in ("cash", "entry", "sign", "margin", "count"):
+            with self.subTest(change=change):
+                await self.asyncSetUp()
+                self.adapter.unified("100")
+                await self.start()
+                self.adapter.trades = [trade()]
+                self.adapter.position.position = "1"
+                self.adapter.unified_cash("99.99")
+                await self.port.snapshot()
+                self.clock.now = 3
+                self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
+                if change == "cash":
+                    self.adapter.unified_cash("99.99000000001")
+                elif change == "entry":
+                    self.adapter.position.avg_entry_price = "101"
+                elif change == "sign":
+                    self.adapter.position.sign = -1
+                elif change == "margin":
+                    self.adapter.position.initial_margin_fraction = "200"
+                else:
+                    self.adapter.trades += [trade("2", side="sell", order="11"), trade("3")]
+                    self.adapter.unified_cash("99.97")
+                if change in {"entry", "count"}:
+                    current = await self.port.snapshot(allow_cash_reuse=True)
+                    self.assertEqual(current.observed_monotonic, 3)
+                else:
+                    with self.assertRaises(LighterReadError):
+                        await self.port.snapshot(allow_cash_reuse=True)
+                self.adapter.get_balances.assert_awaited_once()
+                self.assertEqual(self.ledger.snapshot(now=3).external_transfers, D("0"))
 
     async def test_generation_error_and_missing_generation_prevent_cash_reuse(self):
         await self.start()
@@ -936,7 +1152,7 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.get_open_orders = orders
         await self.port.snapshot()
         original = self.adapter.get_account_trades
-        self.adapter.trades.append(trade("2", side="sell", price="101"))
+        self.adapter.trades.append(trade("2", side="sell", price="101", realized="1"))
         self.adapter.position.position = "0"
         self.adapter.account.collateral = "100.9799"
         async def extra_fill(*args, **kwargs):

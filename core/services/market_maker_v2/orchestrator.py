@@ -178,7 +178,8 @@ class VolumeSession:
         exact_funding = getattr(adapter, "enable_market_maker_exact_funding", None)
         if exact_funding is not None:
             exact_funding()
-        self.api_budget = ApiBudget(self.clock.monotonic)
+        self.api_budget = ApiBudget(self.clock.monotonic, work_phase=lambda:
+            "exit" if self._budget_exiting else "normal" if self.ledger else "startup")
         observe_requests = getattr(adapter, "set_market_maker_request_observer", None)
         self._budget_active = observe_requests is not None and not config.dry_run
         self._budget_exiting, self._exit_read_retries = False, 0
@@ -190,6 +191,7 @@ class VolumeSession:
         self.phase = "starting"  # Local console diagnostics; never execution authority.
         self.manager = self.execution = self.ledger = self.governor = None
         self._stop, self._stop_at = None, None
+        self._stop_reason = None
         self._used = False
         self._exit_id, self._exit_sequence = None, 0
         self._exit_orders = {}
@@ -226,14 +228,25 @@ class VolumeSession:
             # Conditional REST reads are admitted when needed. The later
             # trades/history gates preserve exit capacity after metadata reads.
             conditional = {"fees": 900, "settlement": 300, "trades": 600, "terminal_history": 100}
-            rest = {"audit": 1000, "sync": 200, **conditional}.get(kind, 0)
+            # Only cash precedes the next REST gate. Trades and terminal
+            # history each retain their own admission, including on retries.
+            rest = {"audit": 300, "sync": 200, **conditional}.get(kind, 0)
             self.api_budget.require_normal({"rest": rest,
                 "ws": 0 if kind in conditional else 5 if kind == "audit" else 2, "tx": 0})
 
     def _admit_mutation(self):
         if self._budget_active and not self._budget_exiting:
-            # Two cancellations or one create with bounded SDK lookup/history.
+            # One create with bounded SDK lookup/history.
             self.api_budget.require_normal({"rest": 1400, "ws": 8, "tx": 2})
+
+    def _admit_cancel(self, count):
+        if type(count) is not int or not 0 <= count <= 2:
+            raise ValueError("normal cancellation count must be between zero and two")
+        if count and self._budget_active and not self._budget_exiting:
+            # MM terminal-only cancellation: at most four history reads (400),
+            # initial nonce plus invalid-nonce refresh (12), and one send.
+            # No active-order WS or market-metadata lookup occurs in this path.
+            self.api_budget.require_normal({"rest": 412 * count, "ws": 0, "tx": count})
 
     def _known_ids(self):
         return (self.manager.known_order_ids | self.manager.active_unwind_order_ids
@@ -286,6 +299,7 @@ class VolumeSession:
             # mutation. Do not reuse an earlier same-generation book handoff.
             self.account.begin_quote_cycle()
         account = await self.account.snapshot(allow_cash_reuse=not exiting,
+                                              allow_metadata_cache=not exiting,
                                               allow_unreconciled_cash=exiting)
         self.final_account = account
         try:
@@ -330,6 +344,11 @@ class VolumeSession:
         initial = await self._io(self.snapshot)
         if not initial.authenticated or initial.position or initial.open_order_ids != ():
             raise ValueError("authenticated flat empty start required")
+        self.api_budget.account_profile = {
+            "tier": self.account.account_tier, "symbol": self.config.symbol,
+            "maker_fee_rate": str(initial.maker_fee_rate), "taker_fee_rate": str(initial.taker_fee_rate),
+            "observed_monotonic": initial.terms_observed_monotonic or initial.observed_monotonic,
+            "limits_source": "local_conservative_guard"}
         market, cfg = self.market.snapshot(), self.config
         if (cfg.quote.order_size < market.min_order_size
                 or cfg.quote.order_size % market.size_step
@@ -365,7 +384,8 @@ class VolumeSession:
             exit_account = SimpleNamespace(snapshot=lambda: self.snapshot(exiting=True))
             self.execution = VolumeExecutionPort(self.manager, exit_account, self.market, self.clock,
                 authorize_bounded_flatten=True, refresh_quote=self._authorize,
-                before_mutation=self._admit_mutation, on_failure=self._diagnose,
+                before_mutation=self._admit_mutation, before_cancel=self._admit_cancel,
+                on_failure=self._diagnose,
                 reprice_threshold_ticks=cfg.quote.reprice_threshold_ticks,
                 max_quote_age_ms=cfg.quote.max_quote_age_ms)
 
@@ -574,12 +594,14 @@ class VolumeSession:
                     if (not self._budget_active or self._budget_exiting
                             or not self.manager.can_reconcile_known_orders):
                         raise
+                    repeated_backpressure = False
                     if type(error) is AccountReadRace:
                         if self.account.stream is None or not self.account.stream.transport_healthy:
                             raise
                         self.api_budget.account_read_deferrals += 1
                     elif isinstance(error, ApiBudgetUnavailable):
-                        self.api_budget.deferrals += 1
+                        repeated_backpressure = self.api_budget.record_backpressure_exit(
+                            phase=self.phase, exit_id=f"exit-{self._exit_sequence + 1}", error=error) >= 3
                     else:
                         raise
                 else:
@@ -589,6 +611,11 @@ class VolumeSession:
                 cleaned = await self._exit(allow_passive=False)
                 if not cleaned:
                     raise ValueError("deferred normal work cleanup incomplete")
+                if repeated_backpressure:
+                    # Stop only after the existing bounded exit; finally still
+                    # requires fresh authenticated 0/0 and exact accounting.
+                    self._stop_reason = "api_backpressure_repeated"
+                    break
                 if self._session_complete:
                     break
         except (Exception, asyncio.CancelledError) as error:
@@ -648,4 +675,5 @@ class VolumeSession:
             failure = failure or "cleanup_unconfirmed"
         return SessionRunResult(self.config.dry_run, cleaned and failure is None,
                                 report, self.final_account, failure, self._allow_delayed_dry_book,
-                                self.cleanup_account, getattr(self.governor, "stop_reason", None))
+                                self.cleanup_account,
+                                self._stop_reason or getattr(self.governor, "stop_reason", None))

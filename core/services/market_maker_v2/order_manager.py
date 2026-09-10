@@ -1118,19 +1118,27 @@ class MarketMakerOrderManager:
             )
             return effect.position_refresh_required
 
-    async def cancel_managed_orders(self, reason: str) -> ReconcileResult:
+    async def cancel_managed_orders(
+        self, reason: str, *, sides: frozenset[OrderSide] | None = None,
+    ) -> ReconcileResult:
+        """Cancel selected owned sides; omitted sides retains full cleanup."""
+        if sides is not None and (type(sides) is not frozenset
+                                  or any(type(side) is not OrderSide for side in sides)):
+            raise ValueError("cancellation sides must be a frozenset of OrderSide")
         self._begin_safety_requests()
         try:
-            return await self._cancel_managed_orders(reason)
+            return await self._cancel_managed_orders(reason, sides=sides)
         finally:
             self._end_safety_requests()
 
-    async def _cancel_managed_orders(self, reason: str) -> ReconcileResult:
+    async def _cancel_managed_orders(
+        self, reason: str, *, sides: frozenset[OrderSide] | None = None,
+    ) -> ReconcileResult:
         async with self._lock:
             actions: list[ReconcileAction] = []
             errors: list[str] = []
             effect = await self._cancel_confirmable_locked(
-                reason, actions, errors
+                reason, actions, errors, sides=sides
             )
             return self._result(actions, errors, effect)
 
@@ -1617,6 +1625,8 @@ class MarketMakerOrderManager:
         reason: str,
         actions: list[ReconcileAction],
         errors: list[str],
+        *,
+        sides: frozenset[OrderSide] | None = None,
     ) -> _OrderEffect:
         effect = _OrderEffect()
         for side in (OrderSide.BUY, OrderSide.SELL):
@@ -1631,6 +1641,8 @@ class MarketMakerOrderManager:
                 break
             if slot.state is OrderSlotState.UNCERTAIN_SUBMISSION:
                 errors.append(f"{side.value} order state is uncertain")
+                continue
+            if sides is not None and side not in sides:
                 continue
             effect.include(
                 await self._cancel_locked(

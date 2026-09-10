@@ -702,6 +702,60 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             safe=safe,
         )
 
+    async def test_selected_cancel_preserves_other_side_and_default_still_cleans_all(self):
+        for _ in range(2):
+            await self.manager.reconcile(self.desired(), self.risk())
+        retained = self.manager.slots[OrderSide.SELL]
+        before = replace(retained)
+
+        result = await self.manager.cancel_managed_orders(
+            "revise buy", sides=frozenset({OrderSide.BUY}))
+
+        self.assertFalse(result.errors)
+        self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
+        self.assertIsNone(self.manager.slots[OrderSide.BUY])
+        self.assertEqual(self.manager.slots[OrderSide.SELL], retained)
+        self.assertEqual(retained, before)
+        self.assertEqual(self.manager.terminal_order_ids, frozenset({"1"}))
+        result = await self.manager.cancel_managed_orders("full cleanup")
+        self.assertFalse(result.errors)
+        self.assertEqual(self.manager.snapshot(), ())
+        self.assertEqual(self.manager.terminal_order_ids, frozenset({"1", "2"}))
+
+    async def test_selected_cancel_uncertain_outcome_blocks_new_risk(self):
+        for _ in range(2):
+            await self.manager.reconcile(self.desired(), self.risk())
+        retained = replace(self.manager.slots[OrderSide.SELL])
+        self.adapter.cancel_order.side_effect = RuntimeError("unknown cancellation outcome")
+        result = await self.manager.cancel_managed_orders(
+            "revise buy", sides=frozenset({OrderSide.BUY}))
+        self.assertTrue(result.errors)
+        self.assertTrue(self.manager.has_uncertain_state)
+        self.assertNotIn("1", self.manager.terminal_order_ids)
+        self.assertEqual(self.manager.slots[OrderSide.SELL], retained)
+        self.adapter.create_order.reset_mock()
+        await self.manager.reconcile(self.desired(bid_price="99.8"), self.risk())
+        self.adapter.create_order.assert_not_awaited()
+
+    async def test_selected_cancel_does_not_skip_unselected_uncertainty(self):
+        for _ in range(2):
+            await self.manager.reconcile(self.desired(), self.risk())
+        self.manager._slots[OrderSide.BUY].state = OrderSlotState.UNCERTAIN_CANCELLATION
+        self.manager._slots[OrderSide.BUY].cancellation_uncertain = True
+        result = await self.manager.cancel_managed_orders(
+            "revise sell", sides=frozenset({OrderSide.SELL}))
+        self.assertTrue(result.errors)
+        self.adapter.cancel_order.assert_not_awaited()
+        self.assertIsNotNone(self.manager.slots[OrderSide.SELL])
+
+    async def test_selected_cancel_rejects_invalid_sides_before_wire(self):
+        for sides in ({OrderSide.BUY}, frozenset({"buy"}), frozenset({None})):
+            with self.subTest(sides=sides), self.assertRaises(ValueError):
+                await self.manager.cancel_managed_orders("invalid", sides=sides)
+        result = await self.manager.cancel_managed_orders("nothing", sides=frozenset())
+        self.assertFalse(result.errors)
+        self.adapter.cancel_order.assert_not_awaited()
+
     async def test_initial_bid_and_ask_are_post_only(self) -> None:
         results = (
             await self.manager.reconcile(self.desired(), self.risk()),

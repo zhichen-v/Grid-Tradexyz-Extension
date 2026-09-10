@@ -102,6 +102,93 @@ class SessionLedgerTests(unittest.TestCase):
         self.assertEqual(report.equity_reconciliation_difference, 0)
         self.assertEqual(report.all_in_net_pnl, D("1.9798"))
 
+    def test_exchange_partial_realization_uses_exact_allocated_cost_in_both_directions(self):
+        # The short case reproduces the 2026-09-10 account's actual fill cash;
+        # the mirrored long case exercises the same finite cost allocation.
+        for opening, closing, factor in ((Side.SELL, Side.BUY, D("1")),
+                                         (Side.BUY, Side.SELL, D("-1"))):
+            with self.subTest(opening=opening):
+                initial = D("297.931743512682")
+                ledger = SessionLedger(account(equity=str(initial)))
+                rows = ((opening, ".00040", "77590.9", ".00372436320", "0"),
+                        (opening, ".00020", "77602.1", ".00186245040", "0"),
+                        (closing, ".00040", "77577.7", ".00372372960", ".006774"),
+                        (closing, ".00020", "77513.5", ".005425945", ".016226"))
+                for index, (side, size, price, fee, pnl) in enumerate(rows, 1):
+                    event = replace(fill(str(index), side, size, price, index, fee=fee,
+                                         reference="77577.7"), realized_pnl=D(pnl) * factor)
+                    ledger.ingest_fill(event)
+                    if index == 3:
+                        partial = ledger.snapshot(now=3)
+                        self.assertEqual(partial.realized_gross_pnl, D(".006774") * factor)
+                        self.assertEqual(partial.realized_net_pnl,
+                                         D(".006774") * factor - D(".00931054320"))
+                        # Settled gross and remaining inventory conserve the
+                        # fill cash value at the mark despite average thirds.
+                        self.assertEqual(partial.marked_net_pnl,
+                                         D(".010160") * factor - D(".00931054320"))
+                net = D(".023") * factor - D(".0147364882")
+                report = ledger.finalize(account(5, str(initial + net)), now=5)
+                self.assertTrue(report.complete)
+                self.assertEqual(report.realized_gross_pnl, D(".023") * factor)
+                self.assertEqual(report.all_in_net_pnl, net)
+                self.assertEqual(report.equity_reconciliation_difference, 0)
+
+    def test_exchange_flat_cash_retains_reported_realization_instead_of_model_plug(self):
+        ledger = self.ledger()
+        ledger.ingest_fill(replace(fill("open", Side.BUY, "1", "100", 1, fee="0"),
+                                   realized_pnl=D("0")))
+        ledger.ingest_fill(replace(fill("close", Side.SELL, "1", "101", 2, fee="0"),
+                                   realized_pnl=D(".999999")))
+        report = ledger.finalize(account(3, "100.999999"), now=3)
+        self.assertTrue(report.complete)
+        self.assertEqual(report.realized_gross_pnl, D(".999999"))
+        self.assertFalse(report.decomposition_complete)
+
+    def test_exchange_reversal_prices_new_inventory_without_reallocating_settled_gross(self):
+        ledger = self.ledger()
+        for identifier, side, size, price, realized in (
+                ("open", Side.BUY, "1", "100", "0"),
+                ("reverse", Side.SELL, "2", "101", "1.000001"),
+                ("close", Side.BUY, "1", "100", "1")):
+            ledger.ingest_fill(replace(fill(identifier, side, size, price, 1, fee="0"),
+                                       realized_pnl=D(realized)))
+            if identifier == "reverse":
+                ledger.observe(MarkEvent("BTC", 1, D("101"), False))
+                self.assertEqual(ledger.snapshot(now=1).marked_net_pnl, D("1.000001"))
+        report = ledger.finalize(account(2, "102.000001"), now=2)
+        self.assertTrue(report.complete)
+        self.assertEqual(report.realized_gross_pnl, D("2.000001"))
+
+    def test_realized_source_cannot_change_or_disappear_mid_session(self):
+        for first, second in ((D("0"), None), (None, D("0"))):
+            with self.subTest(first=first):
+                ledger = self.ledger()
+                ledger.ingest_fill(replace(fill("first", Side.BUY, "1", "100", 1),
+                                           realized_pnl=first))
+                with self.assertRaises(LedgerError):
+                    ledger.ingest_fill(replace(fill("second", Side.BUY, "1", "100", 2),
+                                               realized_pnl=second))
+                self.assertEqual(ledger.snapshot(now=2).maker_fill_count, 1)
+
+    def test_realized_pnl_is_finite_immutable_and_zero_for_nonreducing_fills(self):
+        original = replace(fill("first", Side.BUY, "1", "100", 1), realized_pnl=D("0"))
+        for value in (D("NaN"), D("Infinity"), "0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                replace(original, realized_pnl=value)
+        for adding in (False, True):
+            ledger = self.ledger()
+            if adding:
+                ledger.ingest_fill(original)
+            with self.assertRaises(LedgerError):
+                ledger.ingest_fill(replace(original, fill_id="bad", observed_monotonic=2,
+                                           realized_pnl=D(".000001")))
+        ledger = self.ledger()
+        ledger.ingest_fill(original)
+        self.assertFalse(ledger.ingest_fill(original))
+        with self.assertRaises(LedgerError):
+            ledger.ingest_fill(replace(original, realized_pnl=D(".000001")))
+
     def test_losing_roundtrip_is_complete_without_a_per_trade_profit_gate(self):
         ledger = self.ledger()
         self.roundtrip(ledger, sell="99")

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from contextlib import contextmanager
+from decimal import Decimal
 import json
 import logging
 from pathlib import Path
@@ -13,7 +14,10 @@ import time
 
 from core.services.market_maker_v2 import orchestrator
 from core.services.market_maker_v2.config import load_config, require_authorization
-from core.services.market_maker_v2.domain import AccountSnapshot, SessionReport
+from core.services.market_maker_v2.domain import (
+    AccountSnapshot, BoundedExitReport, ExecutionResult, FailureDiagnostic,
+    FillAccounting, InventoryDecision, SessionReport,
+)
 from core.services.market_maker_v2.telemetry import JsonlTelemetrySink
 from lighter_preflight import build_adapter, load_settings, ROBINHOOD_NETWORKS
 
@@ -34,7 +38,7 @@ def parse_cli(argv=None):
     parser.add_argument("--allow-delayed-dry-book", action="store_true",
                         help="dry testing only: allow book source age -100..10000ms; records the relaxed profile")
     parser.add_argument("--progress", action="store_true",
-                        help="show local phase and elapsed time every 10 seconds; no extra API reads")
+                        help="show important events and a 60-second heartbeat; no extra API reads")
     return parser.parse_args(argv)
 
 
@@ -67,12 +71,84 @@ def _stop_signals(event):
             signal.signal(sig, previous)
 
 
-async def _show_progress(session):
-    started = time.monotonic()
+class _ConsoleProgress:
+    """Compact operator view; the complete typed journal remains authoritative."""
+
+    def __init__(self, sink):
+        self.sink = sink
+        self.started = time.monotonic()
+        self.last_status = self.started
+        self.phase = None
+        self.inventory_state = None
+        self.account = None
+        self.account_at = None
+        self.turnover = {"maker": Decimal("0"), "taker": Decimal("0")}
+        self.fees = Decimal("0")
+        self.fills = 0
+        self.enabled = True
+
+    def _write(self, text):
+        if self.enabled:
+            try:
+                print(f"MM V2: elapsed={time.monotonic() - self.started:.0f}s {text}",
+                      file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                self.enabled = False  # A closed console must not interrupt bounded cleanup.
+
+    def _account(self, account):
+        if (type(account) is AccountSnapshot
+                and (self.account_at is None or account.observed_monotonic >= self.account_at)):
+            self.account, self.account_at = account, account.observed_monotonic
+
+    def emit(self, event):
+        self.sink.emit(event)  # Never sample, deduplicate, or drop financial evidence.
+        if type(event) is AccountSnapshot:
+            self._account(event)
+        elif type(event) is ExecutionResult:
+            self._account(event.account_snapshot)
+        elif type(event) is FillAccounting:
+            fill = event.fill
+            self.fills += 1
+            self.turnover[fill.liquidity.value] += fill.size * fill.price
+            self.fees += fill.fee
+            self._write(f"fill={fill.liquidity.value}/{fill.side.value} "
+                        f"size={fill.size} price={fill.price} fee={fill.fee}")
+        elif type(event) is InventoryDecision:
+            if event.state != self.inventory_state:
+                self.inventory_state = event.state
+                self._write(f"inventory={event.state.value}")
+        elif type(event) is BoundedExitReport:
+            if event.final_result is not None:
+                self._account(event.final_result.account_snapshot)
+            account = event.final_result.account_snapshot if event.final_result else None
+            proof = (f"position={account.position} orders={account.open_order_count} "
+                     f"authenticated={account.authenticated}" if account else "account=unconfirmed")
+            self._write(f"exit={event.status.value} exit_id={event.flatten_id} attempts={event.attempts} {proof}")
+        elif type(event) is FailureDiagnostic:
+            self._write(f"error={event.error_type} stage={event.stage}; details in JSONL")
+
+    def status(self, phase):
+        # These are steps of one quote cycle, not operator-visible state changes.
+        if phase in {"running", "syncing_orders", "authorizing_quotes",
+                     "reconciling_quotes", "waiting"}:
+            phase = "quoting"
+        now = time.monotonic()
+        if phase == self.phase and now - self.last_status < 60:
+            return
+        self.phase, self.last_status = phase, now
+        account = (f" account_position={self.account.position} "
+                   f"orders={self.account.open_order_count} "
+                   f"account_age={now - self.account_at:.0f}s" if self.account else "")
+        self._write(f"phase={phase} fills={self.fills} "
+                    f"maker_volume={self.turnover['maker']:.2f} "
+                    f"taker_volume={self.turnover['taker']:.2f} fees={self.fees:.6f}{account}")
+
+
+async def _show_progress(session, console):
     while True:
-        print(f"MM V2: phase={session.phase} elapsed={time.monotonic() - started:.0f}s",
-              file=sys.stderr, flush=True)
-        await asyncio.sleep(10)
+        console._account(getattr(session, "final_account", None))
+        console.status(session.phase)
+        await asyncio.sleep(1)
 
 
 async def run_session(config, settings, *, output, authorized=False, stop_event=None,
@@ -88,13 +164,14 @@ async def run_session(config, settings, *, output, authorized=False, stop_event=
         with (JsonlTelemetrySink(output) as sink, _stop_signals(event),
               Path(str(output) + ".budget.json").open("x", encoding="utf-8") as budget_output):
             adapter = build_adapter(settings)
+            console = _ConsoleProgress(sink) if progress else None
             session = orchestrator.VolumeSession(
                 config, adapter, account_index=settings["account_index"],
                 expected_l1_address=settings["expected_l1_address"],
-                authorize_bounded_flatten=authorized, telemetry=sink,
+                authorize_bounded_flatten=authorized, telemetry=console or sink,
                 allow_delayed_dry_book=allow_delayed_dry_book,
             )
-            progress_task = asyncio.create_task(_show_progress(session)) if progress else None
+            progress_task = asyncio.create_task(_show_progress(session, console)) if progress else None
             try:
                 return await session.run(event)
             finally:
@@ -128,7 +205,7 @@ def _summary(config, result):
                "source_time_profile": "delayed_dry" if delayed else "strict"}
     stop_reason = getattr(result, "stop_reason", None)
     if stop_reason is not None:
-        if stop_reason != "risk_capacity_exhausted":
+        if stop_reason not in {"risk_capacity_exhausted", "api_backpressure_repeated"}:
             raise ValueError("invalid session stop reason")
         summary["stop_reason"] = stop_reason
     account = result.final_account

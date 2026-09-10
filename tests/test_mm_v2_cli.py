@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, patch
 
 import run_volume_market_maker as cli
 from core.services.market_maker_v2.config import load_config
-from core.services.market_maker_v2.domain import AccountSnapshot, SessionReport
+from core.services.market_maker_v2.domain import (
+    AccountSnapshot, BoundedExitReport, ExitStatus, FailureDiagnostic, FillAccounting,
+    FillEvent, InventoryDecision, LiquidityRole, MarkEvent, SessionReport, Side, StrategyState,
+)
+from core.services.market_maker_v2.telemetry import JsonlTelemetrySink
 from core.services.market_maker_v2.api_budget import ApiBudget
 
 
@@ -63,16 +67,17 @@ class CliTests(unittest.TestCase):
             with (redirect_stderr(stderr),
                   patch.object(cli.asyncio, "sleep", side_effect=asyncio.CancelledError)):
                 with self.assertRaises(asyncio.CancelledError):
-                    await cli._show_progress(SimpleNamespace(phase="api_quarantine_60s"))
+                    await cli._show_progress(SimpleNamespace(phase="api_quarantine_60s"),
+                                             cli._ConsoleProgress(None))
         asyncio.run(check())
-        self.assertIn("phase=api_quarantine_60s elapsed=", stderr.getvalue())
+        self.assertIn("phase=api_quarantine_60s", stderr.getvalue())
         self.assertNotIn("private-sentinel", stderr.getvalue())
         self.assertTrue(cli.parse_cli(["--output", "unused.jsonl", "--progress"]).progress)
 
     def test_progress_task_is_cancelled_on_session_failure(self):
         async def check(folder):
             started, stopped = asyncio.Event(), asyncio.Event()
-            async def progress(session):
+            async def progress(session, console):
                 started.set()
                 try:
                     await asyncio.Future()
@@ -92,6 +97,89 @@ class CliTests(unittest.TestCase):
             self.assertTrue(stopped.is_set())
         with TemporaryDirectory() as folder:
             asyncio.run(check(folder))
+
+    def test_heartbeat_uses_existing_session_account_without_restamping_or_reading(self):
+        d = Decimal
+        account = AccountSnapshot("BTC", 45.0, d("0"), d("299"),
+                                  d("0.00012"), d("0.00035"), 0, True)
+        stale = replace(account, observed_monotonic=40.0)
+        session = SimpleNamespace(phase="waiting", final_account=account)
+        stderr = io.StringIO()
+        async def check():
+            with (redirect_stderr(stderr), patch.object(cli.time, "monotonic", return_value=50),
+                  patch.object(cli.asyncio, "sleep", side_effect=asyncio.CancelledError)):
+                console = cli._ConsoleProgress(None)
+                with self.assertRaises(asyncio.CancelledError):
+                    await cli._show_progress(session, console)
+                self.assertIs(console.account, account)
+                self.assertEqual(console.account_at, 45.0)
+                console._account(stale)
+                console._account(None)
+                self.assertIs(console.account, account)
+        asyncio.run(check())
+        self.assertIn("account_age=5s", stderr.getvalue())
+
+    def test_progress_coalesces_quote_steps_and_keeps_one_minute_heartbeat(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), patch.object(cli.time, "monotonic", return_value=0) as clock:
+            console = cli._ConsoleProgress(None)
+            console.status("waiting")
+            for second in range(1, 60):
+                clock.return_value = second
+                console.status(("syncing_orders", "authorizing_quotes", "reconciling_quotes")[second % 3])
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            clock.return_value = 60
+            console.status("waiting")
+            clock.return_value = 61
+            console.status("api_cooldown")
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("elapsed=60s phase=quoting", lines[1])
+        self.assertIn("phase=api_cooldown", lines[2])
+
+    def test_console_keeps_every_journal_event_and_exact_fill_totals(self):
+        d = Decimal
+        fill = FillEvent("f1", "o1", "BTC", Side.BUY, d("0.00017"), d("79594.1"),
+                         d("0.00162371964"), LiquidityRole.MAKER, 1.0)
+        events = [AccountSnapshot("BTC", 0.0, d("0"), d("299"), d("0.00012"),
+                    d("0.00035"), 0, True),
+                  InventoryDecision(StrategyState.QUOTING),
+                  InventoryDecision(StrategyState.QUOTING),
+                  MarkEvent("BTC", 1.0, d("79594.1"), True),
+                  FillAccounting(fill, d("0"), None, None, None),
+                  BoundedExitReport("exit-1", "BTC", 2.0, ExitStatus.BLOCKED, 0),
+                  FailureDiagnostic("BTC", "bounded_exit", "ValueError")]
+        stderr = io.StringIO()
+        with (TemporaryDirectory() as folder, redirect_stderr(stderr),
+              patch.object(cli.time, "monotonic", return_value=50)):
+            quiet, verbose = Path(folder) / "quiet.jsonl", Path(folder) / "verbose.jsonl"
+            with JsonlTelemetrySink(quiet) as plain, JsonlTelemetrySink(verbose) as sink:
+                console = cli._ConsoleProgress(sink)
+                for event in events:
+                    plain.emit(event)
+                    console.emit(event)
+                console.status("waiting")
+            self.assertEqual(quiet.read_bytes(), verbose.read_bytes())
+        self.assertEqual(console.fills, 1)
+        self.assertEqual(console.turnover["maker"], d("13.530997"))
+        self.assertEqual(console.fees, fill.fee)
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 5)
+        self.assertIn("fill=maker/buy size=0.00017 price=79594.1 fee=0.00162371964", lines[1])
+        self.assertIn("exit=blocked exit_id=exit-1 attempts=0 account=unconfirmed", lines[2])
+        self.assertIn("error=ValueError stage=bounded_exit", lines[3])
+        self.assertIn("account_age=50s", lines[4])
+        self.assertNotIn("all_in_net_pnl", stderr.getvalue())
+
+    def test_closed_console_does_not_drop_journal_or_interrupt_cleanup(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "session.jsonl"
+            with JsonlTelemetrySink(path) as sink, patch("builtins.print", side_effect=BrokenPipeError):
+                console = cli._ConsoleProgress(sink)
+                console.status("bounded_exit")
+                console.emit(BoundedExitReport("exit-1", "BTC", 2.0, ExitStatus.BLOCKED, 0))
+            self.assertFalse(console.enabled)
+            self.assertEqual(json.loads(path.read_text())["event"], "bounded_exit")
 
     def test_delayed_data_is_explicit_dry_only_and_recorded_without_live_authority(self):
         with TemporaryDirectory() as folder:
@@ -246,9 +334,10 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("all_in_net_pnl", summary)
 
     def test_risk_capacity_stop_is_explicit_without_echoing_arbitrary_text(self):
-        result = SimpleNamespace(**vars(self.result), stop_reason="risk_capacity_exhausted")
-        summary = cli._summary(self.config, result)
-        self.assertEqual(summary["stop_reason"], "risk_capacity_exhausted")
+        for reason in ("risk_capacity_exhausted", "api_backpressure_repeated"):
+            result = SimpleNamespace(**vars(self.result), stop_reason=reason)
+            summary = cli._summary(self.config, result)
+            self.assertEqual(summary["stop_reason"], reason)
         result.stop_reason = "private-sentinel"
         with self.assertRaisesRegex(ValueError, "invalid session stop reason"):
             cli._summary(self.config, result)

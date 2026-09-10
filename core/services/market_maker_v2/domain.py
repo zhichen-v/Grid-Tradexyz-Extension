@@ -131,12 +131,15 @@ class AccountSnapshot:
     unrealized_pnl: Decimal = ZERO
     open_order_ids: tuple[str, ...] | None = None
     inputs_observed_monotonic: float | None = None
+    terms_observed_monotonic: float | None = None
 
     def __post_init__(self):
         _symbol(self.symbol)
         _time(self.observed_monotonic)
         if self.inputs_observed_monotonic is not None:
             _time(self.inputs_observed_monotonic)
+        if self.terms_observed_monotonic is not None:
+            _time(self.terms_observed_monotonic)
         _count(self.open_order_count)
         _boolean(self.authenticated)
         for value in (self.position, self.equity, self.maker_fee_rate,
@@ -158,7 +161,9 @@ class AccountSnapshot:
 
     def fresh(self, now):
         inputs = self.observed_monotonic if self.inputs_observed_monotonic is None else self.inputs_observed_monotonic
-        return 0 <= now - self.observed_monotonic <= 10 and 0 <= now - inputs <= 10
+        terms = inputs if self.terms_observed_monotonic is None else self.terms_observed_monotonic
+        return (0 <= now - self.observed_monotonic <= 10 and 0 <= now - inputs <= 10
+                and 0 <= now - terms <= 30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +469,7 @@ class FillEvent:
     reference_price: Decimal | None = None
     flatten_id: str | None = None
     source_timestamp_ms: int | None = None
+    realized_pnl: Decimal | None = None
 
     def __post_init__(self):
         _identifier(self.fill_id)
@@ -483,6 +489,8 @@ class FillEvent:
             _identifier(self.flatten_id)
         if self.source_timestamp_ms is not None:
             _count(self.source_timestamp_ms)
+        if self.realized_pnl is not None:
+            _decimal(self.realized_pnl)
         if self.liquidity == LiquidityRole.TAKER and self.flatten_id is None:
             raise ValueError("taker fills must belong to bounded flatten")
 

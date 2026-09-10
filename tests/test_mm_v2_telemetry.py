@@ -16,6 +16,7 @@ from core.services.market_maker_v2.session_ledger import SessionLedger
 from core.services.market_maker_v2.telemetry import JsonlTelemetrySink, TelemetryError, failure_diagnostic
 from core.services.market_maker_v2.lighter_runtime import LighterReadError
 from core.services.market_maker_v2.execution_port import ExecutionUnavailable
+from scripts.analyze_mm_v2_session import _events
 
 
 class JsonlTelemetryTests(unittest.TestCase):
@@ -157,6 +158,20 @@ class JsonlTelemetryTests(unittest.TestCase):
         self.assertEqual(D(rows[-2]["data"]["equity"]) - D(rows[0]["data"]["equity"]),
                          D(rows[-1]["data"]["all_in_net_pnl"]))
         self.assertEqual(D(rows[-1]["data"]["all_in_net_pnl"]), D("0.9799"))
+
+    def test_exchange_realization_survives_journal_replay_and_legacy_missing_field(self):
+        fill = FillEvent("f1", "o1", "BTC", Side.BUY, D("0.00040"), D("77577.7"),
+                         D("0.00372372960"), LiquidityRole.MAKER, 1.0,
+                         realized_pnl=D("0.006774"))
+        accounting = FillAccounting(fill, D("0.006774"), None, None, None)
+        with JsonlTelemetrySink(self.path) as sink:
+            sink.emit(accounting)
+        self.assertEqual(list(_events(self.path)), [accounting])
+        row = json.loads(self.path.read_text())
+        self.assertEqual(row["data"]["fill"]["realized_pnl"], "0.006774")
+        del row["data"]["fill"]["realized_pnl"]
+        self.path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        self.assertIsNone(next(_events(self.path)).fill.realized_pnl)
 
 
 if __name__ == "__main__":

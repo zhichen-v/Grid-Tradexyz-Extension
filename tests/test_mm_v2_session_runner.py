@@ -135,6 +135,7 @@ class RuntimeAdapter(Adapter):
             gross = min(abs(old_position), abs(signed)) * (price - D(self.position.avg_entry_price))
             gross *= 1 if old_position > 0 else -1
         current = old_position + signed
+        fill.raw_data["realized_pnl"] = gross
         self.position.position = str(abs(current))
         self.position.sign = 1 if current >= 0 else -1
         if not old_position:
@@ -743,7 +744,10 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         # Activate production admission; this fixture's one synthetic burst is
         # fault injection, not measured or estimated exchange wire traffic.
         self.adapter.set_market_maker_request_observer = lambda observer, *, enforce_admission: None
-        session = self.session(dry=False, duration=90, authorized=True)
+        # Metadata now refreshes at ~30s; allow its 60s injected burst to expire
+        # before asserting re-entry, without renewing the configured deadline.
+        session = self.session(dry=False, duration=120 if boundary in {"fees", "settlement"} else 90,
+                               authorized=True)
         original_start, original_admit = session._start, session.account.before_read
         original_available = session.api_budget.scheduled_live_available
         original_cancel = self.adapter.cancel_order

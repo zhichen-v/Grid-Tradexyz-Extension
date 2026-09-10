@@ -93,6 +93,14 @@ class LighterExactFundingTests(unittest.IsolatedAsyncioTestCase):
             "change": Decimal("-0.000384")},))
         self.rest.candlestick_api.fundings.assert_not_awaited()
 
+    async def test_mm_fee_terms_include_only_sanitized_account_tier(self):
+        limits = self.rest.account_api.account_limits.return_value
+        limits.user_tier = "premium"
+        self.assertNotIn("account_tier", await self.adapter.get_account_fee_and_funding("BTC"))
+        self.assertEqual((await self.start())["account_tier"], "premium")
+        limits.user_tier = "untrusted-account-payload"
+        self.assertIsNone((await self.adapter.get_account_fee_and_funding("BTC"))["account_tier"])
+
     async def test_baseline_only_normalizes_time_and_never_fetches_public_history(self):
         self.rows = [self.funding()]
         result = await self.start()

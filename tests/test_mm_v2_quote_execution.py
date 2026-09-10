@@ -293,6 +293,55 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result.status, ExecutionStatus.CONFIRMED)
         self.assertEqual(result.cancelled_count, 2)
 
+    async def test_one_side_revision_preserves_opposite_order_and_queue_age(self):
+        for side in (Side.BUY, Side.SELL):
+            with self.subTest(side=side):
+                self.setUp()
+                await self.quote_both()
+                before = {order.side: order for order in self.port.snapshot().orders}
+                opposite = Side.SELL if side is Side.BUY else Side.BUY
+                kept_id = before[opposite].order_id
+                kept_age = next(order.created_monotonic for order in self.manager.snapshot()
+                                if str(order.order_id) == kept_id)
+                async def one_side(execution):
+                    value = await self.refresh_quote(execution)
+                    return replace(value, plan=QuotePlan("BTC", tuple(
+                        replace(q, price=before[side].price + (D("-1") if side is Side.BUY else D("1")))
+                        if q.side is side else q for q in value.plan.quotes)))
+                self.refresh.side_effect = one_side
+                self.adapter.cancel_order.reset_mock()
+                result = await self.port.reconcile_quotes(self.proposal)
+                self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+                self.assertEqual((result.cancelled_count, result.submitted_count), (1, 1))
+                self.assertEqual({o.side: o.order_id for o in result.snapshot.orders}[opposite], kept_id)
+                self.assertEqual(next(order.created_monotonic for order in self.manager.snapshot()
+                                      if str(order.order_id) == kept_id), kept_age)
+                self.adapter.cancel_order.assert_awaited_once()
+
+    async def test_cancel_race_revokes_retained_side_before_new_create(self):
+        await self.quote_both()
+        before = {order.side: order for order in self.port.snapshot().orders}
+        async def revise_buy(execution):
+            value = await self.refresh_quote(execution)
+            if self.position == 0:
+                value = replace(value, plan=QuotePlan("BTC", tuple(
+                    replace(q, price=q.price - 1) if q.side is Side.BUY else q
+                    for q in value.plan.quotes)))
+            return value
+        async def race(order_id, symbol):
+            self.position = D("1")  # Old non-reduce-only sell no longer has authority.
+            return await self.cancel(order_id, symbol)
+        self.refresh.side_effect, self.adapter.cancel_order.side_effect = revise_buy, race
+        self.events.clear()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+        self.assertEqual((result.cancelled_count, result.submitted_count), (2, 1))
+        self.assertEqual([e[1] for e in self.events if e[0] == "cancel"],
+                         [before[Side.BUY].order_id, before[Side.SELL].order_id])
+        self.assertTrue(all(q.side is Side.SELL and q.reduce_only for q in result.actual_plan.quotes))
+        kinds = [e[0] for e in self.events]
+        self.assertLess(max(i for i, kind in enumerate(kinds) if kind == "cancel"), kinds.index("create"))
+
     async def test_retained_price_cannot_cross_a_new_opposite_quote(self):
         async def buy_only(execution):
             value = await self.refresh_quote(execution)

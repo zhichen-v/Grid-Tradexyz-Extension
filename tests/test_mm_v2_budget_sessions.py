@@ -12,11 +12,13 @@ from decimal import Decimal as D
 import json
 from types import SimpleNamespace as NS
 import unittest
+from unittest.mock import patch
 
 from core.adapters.exchanges.models import OrderSide, OrderStatus
-from core.services.market_maker_v2.api_budget import ApiBudgetUnavailable
+from core.services.market_maker_v2.api_budget import ApiBudget, ApiBudgetUnavailable
 from core.services.market_maker_v2.domain import BoundedExitReport, CashflowEvent, FailureDiagnostic
 from core.services.market_maker_v2.orchestrator import VolumeSession
+from core.services.market_maker_v2.lighter_runtime import AccountReadRace
 from test_mm_v2_session_runner import ADDRESS, RuntimeAdapter, RuntimeClock, config
 
 
@@ -108,6 +110,235 @@ class MinimumCostAdapter(RuntimeAdapter):
 
 
 class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def run_bursty_tape(self, *, whole_pair):
+        """Fixed 10-minute synthetic order flow; missed opportunities never wait.
+
+        This tests operational cost and cleanup, not venue fills or profitability.
+        Each maker event fills at most 0.1 of a 0.2 working order at its price.
+        Both implementations see the same one-edge-at-a-time external price tape.
+        """
+        from core.services.market_maker_v2 import execution_port
+        adapter, clock, stop = MinimumCostAdapter(), RuntimeClock(), asyncio.Event()
+        adapter.clock = clock
+        adapter.unified("299.00000056076")
+        configured = config(dry=False, duration=600)
+        configured = replace(configured, quote=replace(configured.quote,
+            order_size=D("0.2"), max_quote_age_ms=60000))
+        schedule = [(wave * 120 + offset, side) for wave in range(5)
+            for offset, side in zip((10, 25, 45),
+                (OrderSide.SELL, OrderSide.SELL, OrderSide.BUY) if wave % 2 == 0
+                else (OrderSide.BUY, OrderSide.BUY, OrderSide.SELL))]
+        fills, missed, events, callback_errors = [], [], [], []
+        started, last_ping = None, 0
+        original_fill = adapter.fill
+
+        def fill(order, *, role="maker", price=None):
+            old = D(adapter.position.position) * adapter.position.sign
+            entry = D(adapter.position.avg_entry_price)
+            if role == "taker":
+                price = (adapter.book.bids[0].price if order.side is OrderSide.SELL
+                         else adapter.book.asks[0].price)
+                self.assertTrue(price >= order.price if order.side is OrderSide.SELL
+                                else price <= order.price, "fixture cannot fill beyond the IOC limit")
+            original_fill(order, role=role, price=price)
+            signed = order.remaining if order.side is OrderSide.BUY else -order.remaining
+            if old * signed > 0:
+                adapter.position.avg_entry_price = str((abs(old) * entry
+                    + order.remaining * (order.price if price is None else price)) / abs(old + signed))
+        adapter.fill = fill
+
+        async def advance(seconds):
+            nonlocal started, last_ping
+            try:
+                if adapter.observer and clock.now - last_ping >= 30:
+                    adapter.charge(9)
+                    last_ping = clock.now
+                if session.ledger is not None and started is None:
+                    started = clock.now - float(session.ledger.snapshot(now=clock.now).duration_seconds)
+                if started is not None:
+                    elapsed = clock.now - started
+                    step = int(elapsed // 15) % 4
+                    adapter.book.bids[0].price = D("99") + (1 if step in (1, 2) else 0)
+                    adapter.book.asks[0].price = D("101") + (1 if step in (2, 3) else 0)
+                    if schedule and elapsed >= schedule[0][0]:
+                        due, side = schedule.pop(0)
+                        candidates = [order for order in adapter.orders if order.side is side]
+                        if session.phase == "waiting" and candidates:
+                            order = candidates[0]
+                            quantity = min(D("0.1"), order.remaining)
+                            adapter.fill(replace(order, amount=quantity, remaining=quantity))
+                            remaining = order.remaining - quantity
+                            if remaining:
+                                active = replace(order, filled=order.filled + quantity,
+                                    remaining=remaining, status=OrderStatus.OPEN)
+                                adapter.orders.append(active)
+                                adapter.history[order.id] = active
+                                adapter._counts()
+                            else:
+                                adapter.history[order.id] = replace(adapter.history[order.id],
+                                    amount=order.amount, filled=order.amount)
+                            fills.append((due, elapsed, side))
+                        else:
+                            missed.append((due, elapsed, side))
+                    position = D(adapter.position.position) * adapter.position.sign
+                    mid = (adapter.book.bids[0].price + adapter.book.asks[0].price) / 2
+                    adapter.position.unrealized_pnl = str(position * (mid - D(adapter.position.avg_entry_price)))
+                    adapter.unified_cash(D(adapter.account.assets[0].margin_balance))
+                clock.now += float(seconds)
+                await asyncio.sleep(0)
+            except Exception as error:
+                callback_errors.append(error)
+                raise
+        session = VolumeSession(configured, adapter, account_index=7,
+            expected_l1_address=ADDRESS, authorize_bounded_flatten=True,
+            telemetry=NS(emit=events.append), clock=clock, sleep=advance)
+        revision = execution_port._quote_revision
+        def all_sides(orders, *args):
+            return {order.side for order in orders} if revision(orders, *args) else set()
+        with patch.object(execution_port, "_quote_revision", all_sides if whole_pair else revision):
+            result = await session.run(stop)
+        self.assertFalse(callback_errors)
+        self.assertTrue(result.completed, result.failure)
+        self.assertTrue(result.report.complete)
+        self.assertFalse(any(isinstance(event, FailureDiagnostic) for event in events))
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertEqual(result.report.equity_reconciliation_difference, D("0"))
+        self.assertEqual(len(fills) + len(missed) + len(schedule), 15)
+        if result.report.duration_seconds < 600:
+            self.assertEqual(result.stop_reason, "api_backpressure_repeated")
+            self.assertEqual(session.api_budget.deferrals, 3)
+        for bucket, peak in session.api_budget.peaks.items():
+            self.assertLessEqual(peak, ApiBudget.LIMITS[bucket])
+        budget = session.api_budget.snapshot()
+        return {"duration": str(result.report.duration_seconds), "stop": result.stop_reason,
+            "maker_opportunities_filled": len(fills), "maker_opportunities_total": 15,
+            "deferrals": budget["deferrals"], "rest": sum(budget["rest_weight_by_phase"].values()),
+            "tx": budget["attempts"].get("rest:sendTx", 0), "ioc": result.report.taker_fill_count}
+
+    async def test_bursty_partial_fills_measure_churn_and_keep_exact_cleanup(self):
+        selected = await self.run_bursty_tape(whole_pair=False)
+        whole = await self.run_bursty_tape(whole_pair=True)
+        self.assertGreaterEqual(selected["maker_opportunities_filled"], whole["maker_opportunities_filled"])
+        self.assertLess(selected["tx"] * whole["maker_opportunities_filled"],
+                        whole["tx"] * selected["maker_opportunities_filled"])
+        print("BURSTY_SIMULATED_SESSION_METRICS " + json.dumps(
+            {"selected_sides": selected, "whole_pair": whole}, sort_keys=True))
+
+    def test_backpressure_diagnostics_are_bounded_and_window_is_inclusive(self):
+        now = [0.0]
+        budget = ApiBudget(lambda: now[0])
+        def record():
+            return budget.record_backpressure_exit(phase="authorizing_quotes",
+                exit_id=f"exit-{budget.deferrals + 1}",
+                error=ApiBudgetUnavailable("no payload retained", values={"api_next_rest": D("900")}))
+        self.assertEqual(record(), 1)
+        now[0] = 600
+        self.assertEqual(record(), 2)
+        now[0] += 0.001
+        self.assertEqual(record(), 2)
+        for _ in range(65):
+            now[0] += 601
+            self.assertEqual(record(), 1)
+        snapshot = budget.snapshot()
+        self.assertEqual(len(snapshot["recent_backpressure_exits"]), 64)
+        self.assertEqual(snapshot["deferrals"], 68)
+        self.assertEqual(snapshot["recent_backpressure_exits"][-1]["next"], {"rest": 900})
+        self.assertEqual(snapshot["limits"], ApiBudget.LIMITS)
+        self.assertNotIn("no payload retained", json.dumps(snapshot))
+
+    async def run_injected_backpressure(self, schedule, *, fail_cleanup=False, fail_final=False):
+        adapter, clock, stop = MinimumCostAdapter(), RuntimeClock(), asyncio.Event()
+        adapter.clock = clock
+        configured = config(dry=False, duration=schedule[-1][0] + 100)
+        configured = replace(configured, quote=replace(configured.quote, max_quote_age_ms=60000))
+        pending, injected, events = [], [], []
+        started = None
+        async def advance(seconds):
+            nonlocal started
+            if session.phase == "waiting" and adapter.orders:
+                if started is None:
+                    started = clock.now
+                if len(injected) < len(schedule):
+                    when, error_type = schedule[len(injected)]
+                    if clock.now - started >= when:
+                        adapter.fill(next(row for row in adapter.orders if row.side is OrderSide.BUY))
+                        injected.append((clock.now, len(adapter.transactions)))
+                        pending.append(error_type)
+            clock.now += float(seconds)
+            await asyncio.sleep(0)
+        session = VolumeSession(configured, adapter, account_index=7,
+            expected_l1_address=ADDRESS, authorize_bounded_flatten=True,
+            telemetry=NS(emit=events.append), clock=clock, sleep=advance)
+        original_authorize = session._authorize
+        async def authorize(exposure):
+            if pending and not session._budget_exiting:
+                raise pending.pop(0)("injected local admission pressure")
+            return await original_authorize(exposure)
+        session._authorize = authorize
+        original_cancel, original_balances = adapter.cancel_order, adapter.get_balances
+        async def cancel(*args, **kwargs):
+            if fail_cleanup and len(injected) == 3:
+                raise RuntimeError("injected cleanup failure")
+            return await original_cancel(*args, **kwargs)
+        async def balances():
+            if fail_final and session.phase == "final_account":
+                raise RuntimeError("injected final proof failure")
+            return await original_balances()
+        adapter.cancel_order, adapter.get_balances = cancel, balances
+        result = await session.run(stop)
+        self.assertEqual(adapter.disconnections, 1)
+        self.assertEqual(len(injected), len(schedule), result.failure)
+        return session, adapter, result, events, injected
+
+    async def test_third_backpressure_exit_stops_after_cleanup_and_fresh_final_proof(self):
+        session, adapter, result, events, injected = await self.run_injected_backpressure(
+            [(20, ApiBudgetUnavailable), (120, ApiBudgetUnavailable), (220, ApiBudgetUnavailable)])
+        self.assertTrue(result.completed, result.failure)
+        self.assertTrue(result.report.complete)
+        self.assertEqual(result.stop_reason, "api_backpressure_repeated")
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertLess(result.report.duration_seconds, D("320"))
+        self.assertEqual(result.report.taker_fill_count, 3)
+        self.assertFalse(any(tif == "POST_ONLY" for _, _, tif in adapter.transactions[injected[-1][1]:]))
+        exits = [row for row in events if isinstance(row, BoundedExitReport)]
+        self.assertEqual(len(exits), 3)
+        self.assertTrue(all(row.complete for row in exits))
+        rows = session.api_budget.snapshot()["recent_backpressure_exits"]
+        self.assertEqual([row["exit_id"] for row in rows], [row.flatten_id for row in exits])
+        self.assertEqual([row["number"] for row in rows], [1, 2, 3])
+        self.assertTrue(all(row["reason"] == "local_api_budget" for row in rows))
+        self.assertEqual(session.api_budget.deferrals, 3)
+        self.assertEqual(session.api_budget.account_read_deferrals, 0)
+
+    async def test_backpressure_window_expires_and_account_races_do_not_count(self):
+        for schedule in (
+            [(20, ApiBudgetUnavailable), (400, ApiBudgetUnavailable), (750, ApiBudgetUnavailable)],
+            [(20, AccountReadRace), (120, ApiBudgetUnavailable),
+             (220, AccountReadRace), (320, ApiBudgetUnavailable)],
+        ):
+            with self.subTest(schedule=schedule):
+                session, adapter, result, events, injected = await self.run_injected_backpressure(schedule)
+                self.assertTrue(result.completed, result.failure)
+                self.assertIsNone(result.stop_reason)
+                self.assertGreaterEqual(result.report.duration_seconds, D(schedule[-1][0] + 100))
+                self.assertTrue(any(tif == "POST_ONLY" for _, _, tif in adapter.transactions[injected[-1][1]:]))
+                self.assertEqual(session.api_budget.deferrals,
+                    sum(error_type is ApiBudgetUnavailable for _, error_type in schedule))
+                self.assertEqual(session.api_budget.account_read_deferrals,
+                    sum(error_type is AccountReadRace for _, error_type in schedule))
+
+    async def test_repeated_backpressure_does_not_disguise_cleanup_or_final_proof_failure(self):
+        for failure in ("fail_cleanup", "fail_final"):
+            with self.subTest(failure=failure):
+                session, adapter, result, events, injected = await self.run_injected_backpressure(
+                    [(20, ApiBudgetUnavailable), (120, ApiBudgetUnavailable), (220, ApiBudgetUnavailable)],
+                    **{failure: True})
+                self.assertFalse(result.completed)
+                self.assertIsNotNone(result.failure)
+                self.assertFalse(result.report.complete)
+                self.assertEqual(session.api_budget.deferrals, 3)
+                self.assertFalse(any(tif == "POST_ONLY" for _, _, tif in adapter.transactions[injected[-1][1]:]))
+
     async def run_session(self, *, calm=False, partial_exit=False, moving_inventory=False, cooldown_end=None):
         adapter, clock, stop = MinimumCostAdapter(), RuntimeClock(), asyncio.Event()
         adapter.clock = clock
@@ -392,16 +623,17 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(fills), 20)
         self.assertEqual({side for _, side in fills}, {OrderSide.BUY, OrderSide.SELL})
         self.assertFalse(schedule, "the session must resume enough to execute every planned maker event")
-        self.assertTrue(denials)
-        self.assertTrue(waits)
-        self.assertGreater(session.api_budget.deferrals, 0)
         # This unchanged workload formerly passed despite 41 forced cleanups
         # and only 64.7% quoting. Guard the operational improvement, not profit:
         # scheduled fills wait for eligible orders and do not model a venue.
-        self.assertLessEqual(session.api_budget.deferrals, 30)
-        self.assertGreaterEqual(result.report.quote_uptime_seconds, D("2520"))
-        self.assertGreaterEqual(result.report.two_sided_quote_seconds, D("2520"))
+        self.assertLessEqual(session.api_budget.deferrals, 1)
+        self.assertGreaterEqual(result.report.quote_uptime_seconds, D("3240"))
+        self.assertGreaterEqual(result.report.two_sided_quote_seconds, D("3240"))
         self.assertLessEqual(result.report.taker_fill_count, 10)
+        rest_weight = sum(session.api_budget.WEIGHTS.get(endpoint, 0)
+            * session.api_budget.counts["rest:" + endpoint]
+            for endpoint in session.api_budget.WEIGHTS)
+        self.assertLessEqual(rest_weight, 400000)
         self.assertEqual({int(at // 600) for at in quote_times}, set(range(6)))
         for denied_at, index in denials:
             following = adapter.transactions[index:]
@@ -424,9 +656,8 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
             "quote_uptime_seconds": str(result.report.quote_uptime_seconds),
             "two_sided_quote_seconds": str(result.report.two_sided_quote_seconds),
             "exit_rest_weight": exit_rest_weight,
-            "rest_weight": sum(session.api_budget.WEIGHTS.get(endpoint, 0)
-                * session.api_budget.counts["rest:" + endpoint]
-                for endpoint in session.api_budget.WEIGHTS),
+            "rest_weight": rest_weight,
+            "rest_weight_by_phase": session.api_budget.snapshot()["rest_weight_by_phase"],
             "send_tx_count": session.api_budget.counts["rest:sendTx"],
             "ten_minute_windows_with_quotes": sorted({int(at // 600) for at in quote_times}),
         }, sort_keys=True))

@@ -24,14 +24,18 @@ class ApiBudget:
                **dict.fromkeys(("account", "accountLimits", "assetDetails", "positionFunding",
                                 "orderBooks", "orderBookDetails", "accountActiveOrders", "fundings"), 300)}
 
-    def __init__(self, clock):
+    def __init__(self, clock, *, work_phase=lambda: "unclassified"):
         self.clock = clock
+        self.work_phase = work_phase
+        self.rest_weight_by_phase = Counter()
         self._events = deque()
         self._used = Counter()
         self.peaks = Counter()
         self.counts = Counter()
         self.deferrals = 0
         self.account_read_deferrals = 0
+        self.account_profile = None
+        self._backpressure_exits = deque(maxlen=64)
         self._last = 0
 
     def _expire(self):
@@ -62,6 +66,10 @@ class ApiBudget:
         self._used[bucket] += weight
         self.peaks[bucket] = max(self.peaks[bucket], self._used[bucket])
         self.counts[name] += 1
+        if bucket == "rest":
+            phase = self.work_phase()
+            self.rest_weight_by_phase[phase if phase in {"startup", "normal", "exit"}
+                                      else "unclassified"] += weight
 
     def available(self, *, normal, reserve):
         self._expire()
@@ -113,8 +121,25 @@ class ApiBudget:
                 **{f"api_used_{key}": Decimal(self._used[key]) for key in self.LIMITS},
                 **{f"api_next_{key}": Decimal(normal[key]) for key in self.LIMITS}})
 
+    def record_backpressure_exit(self, *, phase, exit_id, error):
+        """Keep bounded, sanitized attribution; account-read races are separate."""
+        now = self._expire()
+        self.deferrals += 1
+        self._backpressure_exits.append({
+            "number": self.deferrals, "observed_monotonic": now,
+            "reason": "local_api_budget", "phase": phase, "exit_id": exit_id,
+            "used": {key: int(error.diagnostic_values.get(f"api_used_{key}", self._used[key]))
+                     for key in self.LIMITS},
+            "next": {key: int(error.diagnostic_values[f"api_next_{key}"])
+                     for key in self.LIMITS if f"api_next_{key}" in error.diagnostic_values}})
+        return sum(row["observed_monotonic"] >= now - 600 for row in self._backpressure_exits)
+
     def snapshot(self):
         self._expire()
-        return {"used": dict(self._used), "peaks": dict(self.peaks),
+        return {"used": dict(self._used), "peaks": dict(self.peaks), "limits": dict(self.LIMITS),
+                "rest_weight_by_phase": dict(self.rest_weight_by_phase),
+                "account_profile": self.account_profile,
                 "attempts": dict(self.counts), "scope": "owned_python_transports",
-                "deferrals": self.deferrals, "account_read_deferrals": self.account_read_deferrals}
+                "deferrals": self.deferrals, "account_read_deferrals": self.account_read_deferrals,
+                "backpressure_window_seconds": 600,
+                "recent_backpressure_exits": list(self._backpressure_exits)}
