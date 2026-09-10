@@ -48,6 +48,7 @@ class InventoryGovernor:
         self._last_now = session_started_monotonic
         self._symbol = None
         self._terminal_stop = False
+        self.stop_reason = None
         self._exit_started = None
         self._cooldown_until = None
 
@@ -188,6 +189,14 @@ class InventoryGovernor:
             return self._reducing(account, market)
         capacities = self._capacities(market, account, report, execution.orders, loss)
         if not any(capacities):
+            if quantity == ZERO and account.open_order_count == 0:
+                # No executable quote can fit the remaining reserve. A flat
+                # session cannot earn back that headroom by waiting unquoted.
+                # Completion still requires the existing fresh exit proof.
+                self._terminal_stop = True
+                self.stop_reason = "risk_capacity_exhausted"
+                self._begin_exit(now)
+                return InventoryDecision(self._state)
             return self._reducing(account, market)
         self._state = StrategyState.SKEWED if quantity >= self.soft_limit else StrategyState.QUOTING
         return InventoryDecision(self._state, buy_capacity=capacities[0], sell_capacity=capacities[1])
@@ -220,17 +229,20 @@ class InventoryGovernor:
         slip = market.tick_size * self.ioc_slippage_ticks
 
         def allowed(buy, sell):
-            worst = max(abs(position), abs(position + old_buy + buy),
-                        abs(position - old_sell - sell))
-            # ponytail: pessimistically coexist old and desired quotes until exact
-            # cancellation/re-evaluation; no fill-sequence model or episode budget.
+            # Capacities are total targets for the executor's one slot per side.
+            # A replacement requires terminal cancellation and a fresh evaluation;
+            # retaining one side while adding the other still reserves both sides.
+            # Keep every old quantity at risk until that cancellation is proven.
+            buy_exposure, sell_exposure = max(old_buy, buy), max(old_sell, sell)
+            worst = max(abs(position), abs(position + buy_exposure),
+                        abs(position - sell_exposure))
             stop = max(self.stop_loss_usdg, worst * self.stop_loss_usdg / self.order_size) if worst else ZERO
             reserve = (stop + worst * ((price + slip) * account.taker_fee_rate + slip)
-                       + (old_buy + old_sell + buy + sell) * price * account.maker_fee_rate)
+                       + (buy_exposure + sell_exposure) * price * account.maker_fee_rate)
             return worst <= self.hard_limit and current_loss + reserve < self.max_session_loss_usdg
 
-        buy_cap = min(self.order_size, max(ZERO, self.hard_limit - position - old_buy))
-        sell_cap = min(self.order_size, max(ZERO, self.hard_limit + position - old_sell))
+        buy_cap = min(self.order_size, max(ZERO, self.hard_limit - position))
+        sell_cap = min(self.order_size, max(ZERO, self.hard_limit + position))
         if abs(position) >= self.soft_limit:
             if position > ZERO:
                 buy_cap = min(buy_cap, self.order_size / 2)

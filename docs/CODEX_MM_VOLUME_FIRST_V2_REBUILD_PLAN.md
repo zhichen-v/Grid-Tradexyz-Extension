@@ -2,11 +2,13 @@
 
 ## 0. 文件地位
 
-本文件是新的最高優先級重整任務，**取代並停止延伸**先前的：
+本文件是 V2 的專案計畫，**取代並停止延伸**先前的：
 
 - `CODEX_MM_POST_27ABAE_CHANGE_PIPELINE.md`
 - 以 Gate A/B/C/D/F、toxicity calibration campaign、每筆 inventory episode 自然 flat 為核心的後續擴充
 - 針對每次 live 事故逐項新增 guard、telemetry、schema、campaign validator 的開發方式
+
+**目前執行入口：§19.8。** 使用者已要求延長經濟驗證，並明確授權本輪live及後續taker殘倉處理；不因重啟或階段轉換重問同一範圍授權。日常短dry不是fee-cover證據。VPS仍暫緩；agent可完成本地程式、離線驗證與唯讀分析，真實交易啟動／委託操作由使用者執行。歷史「本輪未授權」只描述當時狀態，程式內每筆order的risk authorization仍是自動檢查。
 
 本任務不是繼續修補 `core/services/market_maker/`，而是：
 
@@ -42,7 +44,7 @@ Repository 基準：
 - Phase 7 尚未完成；先修已重現的 cleanup／quote lifecycle 缺口，再處理 clock、account/book coherence 與完整 live 讀取預算，不能只修時鐘後重跑 T3。
 - 三個 spread candidates 是初步篩選，不能證明整個單市場策略不可能 fee-neutral。證據不足與「已測條件下未找到可行點」分開回報。
 - 使用者提供測試帳戶約 **299 USDG**，尚未設定成交量目標。這是資金背景，非本輪 authenticated balance，也不是可損失額度；不據此提高 size、inventory、leverage 或 loss cap。
-- 本輪無 live／帳戶 mutation／commit／push 授權。修復不需要重新 rebuild Grid，也不把提高帳戶 tier 當成預設解法。
+- 2026-09-05首次review當時無 live／帳戶 mutation／commit／push 授權；後續範圍依使用者明確指示，不由此歷史句撤銷。修復不需要重新 rebuild Grid，也不把提高帳戶 tier 當成預設解法。
 
 ---
 
@@ -1811,7 +1813,7 @@ V2：
 
 ## 19.2 修正順序與可驗收成果
 
-每個 R 是獨立、可 review 的工作單位，不另建 campaign／checkpoint 文件；以下為驗收要求，實際完成範圍見 §19.4，未授權 live 或 Git mutation。
+每個 R 是可 review 的工作單位，不另建 campaign／checkpoint 文件，也不形成新的人工批准階段。以下保留原驗收設計；目前完成範圍與時間安排以§19.7為準，live／Git授權依當次使用者指示核對。
 
 ### R1 — 修復退出路徑（先於任何下一次 run）
 
@@ -1833,12 +1835,12 @@ V2：
 - 對正常 fills／REST-WS 到達不同步，暫停新增風險，在**同一 deadline 與 read budget**內取得 coherent proof；未知、超時或耗盡才進失敗收尾。保留 exact cash bridge，不以 epsilon 填平帳務差額。Fill source time 與 ingestion time 的差異也須在 hold-age replay 中驗證，不能用較晚的 audit 時間證明實際持倉未超時。
 - 先在現有窄接線去除同一 cycle 的重複讀取，再評估持續 WS account/order 狀態加事件後 reconciliation 是否有足夠完整性證據。官方 channel 有 nonce 並不自動代表任意增量可當完整 authenticated order list；需要先驗協定。
 - 明確預留退出需求：任意 rolling60 window 的已用讀取量＋正常 cycle 新增量＋最壞安全收尾 reserve 必須在 applicable REST／WS 上限內。計入 auth/history、unsubscribe/subscribe、keepalive、fills、cancel terminal、三次 IOC 及 final proof；共用 IP／L1 的其他工作負载也占額度。額度不足先停止新增風險，不能等 429 才退出。
-- 驗收順序：真 execution 路徑離線測量（calm、每輪改價、多 partial fills、正常 arrival race、stop／三次 IOC）→ 短唯讀協定檢查 → 完整30min T3。保留 smoke_03 歷史；資料接線大改時只重做受影響 smoke，不盲目重跑原失敗程序。Dry 全程零 mutation，並保留獨立 postflight 與 process-exit 證據。
+- 原验收順序為真execution離線測量→短唯讀協定檢查→30min T3；日常時長已由§19.7覆寫為5分鐘本機dry。保留長測未通過與smoke_03歷史；只因受影響接線、新故障或較長運行需求重做對應測試，不盲目重跑。Dry全程零mutation，保留獨立postflight及process-exit證據。
 - 盡量限制在 V2；若 shared Lighter opt-in stream 必須修改，說明 Grid 影響、保留原預設行為並跑相關 Lighter／Grid 回歸。
 
 ### R4 — 用小型經濟報表與可執行配置，準備 Phase 8
 
-- `scripts/analyze_mm_v2_session.py` 尚未存在。完成最小 JSONL→單場／candidate aggregate 表格即可；復用 ledger 定義，拒絕 incomplete economics，不另建 recorder database、campaign authority 或新的設定框架。
+- 最小工具為 `scripts/analyze_mm_v2_session.py`：JSONL→單場／candidate aggregate 表格；復用 ledger 定義，拒絕 incomplete economics，不另建 recorder database、campaign authority 或新的設定框架。實作及資料覆蓋範圍見下方續作與唯一 EXPERIMENT_LOG。
 - 先補密集、可揭露覆蓋率的外部 book／trade 觀測。既有 Phase 1 僅184列、無1s配對、5s配對12/183，足以示範工具，不能證明 fill opportunities。記 effective quote distance、quote lifetime、revisions 與成交後1s/5s markout（診斷，不作新 blocking controller）；沒有可信成交時只能報 touch／trade-through 候選機會，不能當自身 queue fills。
 - 對每個 candidate 產生 flat／soft／hard 的**實際可執行數量表**，通過 tick、lot、minimum notional、已掛單最壞 exposure 和退出 reserve。例：純示意 BTC=80,000、minimum notional=10 時，example 的 `order_size=soft_limit=0.00020`；一整筆 BUY 後增加風險側縮成0.00010、notional約8，被 runner 刪去，只剩 SELL。即使全撤重算也相同，因此 example 不保證 continuous accumulation。這是配置耦合，不是要恢復 V1 或無條件放大 size。
 - 使用者約299 USDG 背景下，同報 `turnover / allocated capital`、maximum gross exposure 及每10,000 USDG成交的净成本；帳戶餘額、配置資金與風險額度分開。成交目標待資料支持後約定；不直接用全額資金當 inventory 或 loss cap。
@@ -1846,7 +1848,7 @@ V2：
 
 ### R5 — 執行授權 canary，依證據決定是否延長
 
-- R1–R4 的對應驗收完成後才提出具體 reviewable run：network／account／symbol、order size、預定窗口、hard exposure、單場與整組累積 loss、flatten price/attempt/time limits、停止條件。仍需當場明確 live＋bounded-flatten 授權。
+- 按§19.7完成對應本機修復／短dry後，準備具體reviewable run：network／account／symbol、order size、預定窗口、hard exposure、單場與整組累積loss、flatten price/attempt/time limits、停止條件及未驗證部分。不要為準備最小canary另加長測或工具關卡；實際啟動仍需當場明確live＋bounded-flatten授權。一次授權涵蓋該場限額內正常報價、撤單與退出，不逐筆詢問。
 - 先做最小 execution/accounting canary，驗證真實 nonflat、partial fills、fee／funding 與正常撤換單可用性；通過不算 economic GO。再按 Phase 8 三組 spread 的固定窗口交錯比較，所有成本与失敗保留；選出可行或接近可行點後，依 Phase 9 驗證一個 inventory 變因及獨立確認窗口。
 - 只有穩定 execution、完整 aggregate fee cover 及量級目標有證據才延長2h／4h；24h persistence／recovery 仍依 Phase 11，不先為短期未知 economics 建大型基礎設施。
 
@@ -1866,3 +1868,94 @@ V2：
 - **Clock 已有主機證據與可攜式拒絕條件**：Windows Time 原未啟動，獨立 NTP 顯示慢約0.4s，對應 source age 約−359ms。依使用者明確授權啟用 Automatic／Running 並校時後，NTP 偏差降為約5–8ms，唯讀對齊通過。Runtime 保留 strict source age 0..3000ms／receipt 3s，以及最多一個 host quantum、cap20ms 的等待；新增相鄰 wall elapsed 與 monotonic elapsed 差額超過50ms的 jump refusal，這是連續性界線，不是允許 future source。VPS 入口 `Desktop/vps_lighter/Open-Grid-Tradexyz-VPS.cmd` 指向 SSH alias `grid-tradexyz-vps`；唯讀核對 chrony active、NTP synchronized、偏差約2µs。未改 VPS 設定／部署；其 checkout 仍是舊 MM 分支 `feat/lighter-market-maker-mvp`／`2de97c4`，不能當成 V2 部署或測試通過。
 - **API reserve 仍是獨立 No-Go**：同一90 fake-second高改價 fixture，合併 order observations／account_all 後，原 public-method 模型 WS 下限由330降至195/min；該模型漏算 shared adapter 的 create lookup／cancel terminal reconciliation／get_order 內部請求。按已讀 source 補入每 create 至少300、每 cancel 至少400、terminal get_order 400 的 REST 權重，峰值下限為35,600；terminal history 合批後降至30,000，WS195不變。仍未含 retry／全部 confirmation latency／auth／keepalive／三次IOC／final proof，不能以195低於200宣稱餘額成立。短期不得以加長 cycle、假回 terminal 或放寬 freshness 掩蓋；下一個工作單位須處理 shared confirmation reads 的重複證據與完整 request admission／退出 reserve，並補 normal arrival-race recovery／fill source-time hold-age。
 - 受影響的10min dry smoke已完成602.247s，flat authenticated0/0、rolling60量測REST14,100／WS113（不含native signer startup checks）；只驗證新的flat read path與校時後穩定性，載入版本及後續補碼驗證範圍見唯一EXPERIMENT_LOG；不取代真 execution／三次IOC 的 API reserve 驗收，30min T3 尚未開始。R4 analyzer／candidate 配置表與 R5 授權 canary尚未開始；18個設定欄位、size/risk與Grid production不變。Shared改動僅 opt-in Lighter read stream及其target-market snapshot路由，原Grid預設REST不變；有真實唯讀account連線，沒有交易／帳戶mutation、commit或push。
+
+### 19.5 `cd1ac04`後續作
+
+使用者已授權一次commit/push，`cd1ac0406a86538179c5a1a3be825cd22d77f93c`已推送並核對`origin/refactor/lighter-volume-mm-v2`；後續變更仍留worktree。
+
+R3再去重shared confirmation：已開owned stream的V2才使用submission lookup→OM sync→account opening的一次完整order observation；相同generation／3s／cycle限制不變。這條MM opt-in取消查證只接受exact exchange ID＋symbol的positive terminal history，省略不能證明終態的active-list reads；missing、fill race與unknown仍不重送mutation。Grid原路徑不改。Active partial fills另與trade history exact cumulative quantity交叉核對，避免cash和counter一起落後造成false flat。
+
+同一最低成本fixture的REST30,000→20,400，但WS195→211，因每輪第二筆confirmation尚無下一個同cycle消費者；真SDK確認／retry／keepalive與三次IOC reserve仍未完整測量。這顯示只搬移REST到WS不能解決總配額：下一步須在**完整確認及退出路徑**建立計量與admission，並處理正常arrival race；不能用低估成本、改慢cycle或放寬coherence直接放行T3。最終366V2 PASS、full645維持同組8F+4E；沒有新network dry/live或VPS部署。
+
+### 19.6 2026-09-06 續作：R3程式驗收、T3主機阻礙與R4
+
+以下保留當時證據；後續順序與驗收時間由§19.7使用者最新指示覆寫，VPS不再是下一步。
+
+R1／R2離線修復維持。R3新增正常到達race的一次有界重讀、同generation／原request-start<8s且全量financial state及orders不變的cash重用、保守持倉age，以及owned REST／WS實際attempt計量與normal-action admission。獨立取證／exit／final仍fresh REST；多餘retry不能重開deadline。SDK reduce-only IOC直接核對positive terminal history；已確認terminal session exit直接進final proof，不重返normal quota gate。細節與健康退出前綴公式見[ARCHITECTURE](mm_v2/ARCHITECTURE.md)，不把一次race／一次funding-refresh envelope宣稱任意斷網或重複429都能成功退出。
+
+真VolumeSession／OM＋最低成本fake adapter已驗calm90s、頻繁改價quota refusal後只撤單、同一次stop三筆partial IOC後0/0；SDK與production observer另有獨立契約測試。**頻繁改價約9.218 fake秒即花到退出預留邊界而停止**，安全成立但持續報價量能未成立。沒有加長3s cycle、降低fee、放寬freshness或自動放大size。後續以既有quote persistence參數及觀測quote lifetime分析成本，不能在尚無fill資料時聲稱經濟改善。
+
+T3 `r3_t3_01`在637.028s／預定1800s遇incoming source age3988.4553ms而停止；clock elapsed差−0.5866ms，原因仍可能是上游／傳輸延遲、舊封包或本機停頓，不能歸咎Windows clock。重新加上loop／檔案IO延遲診斷的`r3_t3_02`在2.618s遇future−3.3282ms，loop最大延遲17.9ms、telemetry write最大0.244ms；獨立重連亦有future−15.926ms。兩次均fresh final0/0，另有獨立REST postflight0/0與process-exit證據。**完整30min T3仍未通過**。Windows早先校時不保證長時精度；VPS目前chrony正常、SDK主要版本與本機一致，下一步是經授權的隔離VPS dry-run，不放寬來源時間條件。
+
+R4最小工具已完成：重播SessionLedger核對financial events／final bridge；單場與candidate聚合保留完整預定失敗窗口；記錄actual／simulated邊界、order snapshot lifetime／revisions、已分配資金比率。FillEvent可選source_timestamp_ms保存exchange來源時間，舊資料為None，ingestion monotonic不變；maker fills可與公開book來源時間配對1s／5s、揭露coverage及費用前signed markout，缺來源或成交就unavailable。公開BBO非自身queue／external-own-adjusted證明；quote distance初篩復用既有feasibility工具，不新增控制器或資料庫。
+
+994筆失敗窗口BBO的spread中位數0.3764bps；該場authenticated maker／taker為1.2／3.5bps。Edges0／0.2／0.5的靜態fee-floor baseline距touch中位數81／89／101ticks，當筆觸價0/994；不是後續fill機率。較密集資料仍不足宣稱cover fee，所有實際成交／費用為0。
+
+另依[公開BTC metadata](https://api.rh.lighter.xyz/api/v1/orderBooks)核對tick0.1、size step0.00001、**minimum base0.00020**、minimum notional10；public fee欄位不能代替authenticated tier費率。實際policy／governor的三組edge各驗flat／±soft／±hard、保留初始舊單的最壞共存。以下capital與size均為算術假設，未改example或local設定，也不是增額授權：
+
+| order size／soft／hard | 假設配置USDG | flat | ±soft | ±hard | 最壞gross exposure（含舊單） |
+|---|---:|---|---|---|---:|
+| 0.00020／0.00020／0.00040 | 50 | 雙邊 | 只有減倉方向 | 單邊reduce-only | 31.88132 |
+| 0.00026／0.00026／0.00052 | 50 | 雙邊 | 只有減倉方向 | 單邊reduce-only | 41.445716 |
+| 0.00040／0.00040／0.00080 | 80 | 雙邊 | 雙邊，增加側0.00020 | 單邊reduce-only | 63.76896 |
+
+舊示意只看10 USDG notional不夠；0.00026減半後0.00013仍小於最小base。這不構成放大單量的建議：先完成T3與最小execution/accounting canary，再決定是否值得測quote persistence或一個inventory參數。R5尚未授權；約299USDG背景值不代替allocated capital或單場／整組loss授權。
+
+本輪410V2 PASS，full689仍是同組8F+4E、12個方法差異0。18YAML leaves及Grid production/config/tests不變；runtime（含自有OM/DTO與runner）6395 LOC／287640 UTF8-LF bytes、orchestrator565 LOC、analyzer493 LOC。Orchestrator超過500目標的例外限於單一啟停／退出與API接線，保留可追溯deadline流程，未新增框架或依賴。Git仍以已推送`cd1ac04`為基底，以上續作尚未commit/push。具體run、source hashes、主機方案與限制統一記在[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+### 19.7 2026-09-06 使用者覆寫：先落地本機短測
+
+使用者要求VPS先不動、放寬延遲以繼續策略測試，並縮短測試及冗長程式。日常驗收改為**受影響測試＋5分鐘本機dry**；30分鐘strict T3保留為未完成的長測證據，不再阻擋本機策略、報價持續時間及退出測試。只有新故障、shared改動或里程碑才擴大回歸；不反覆跑相同長測。
+
+- 明確CLI `--allow-delayed-dry-book`僅dry接受source age−100..10000ms，live在連線前拒絕；strict預設0..3000ms、receipt3s、50ms clock jump、nonce/offset及帳戶／風險檢查不變。結果標記delayed_dry、保存out-of-strict封包與重驗counter，不重打timestamp或將dry資料升格live證據。
+- Windows原SpecialPollInterval32768s，Automatic服務不足以維持先前校正。依既有時間設定授權改為64s polling並核對連續自動更新；細節及backup見EXPERIMENT_LOG。此為本機設定，VPS未更動。
+- 移除無runtime caller的Phase2空計畫helper及dry port，production−156 LOC、過時測試−18；保留DTO、完整退出scenario與V1隔離契約。Orchestrator521 LOC，未為湊500行拆開現行安全退出；analyzer493 LOC，18個YAML欄位不變。
+- 以T3_01既有208組提案重播真DryVolumeExecutionPort，單改reprice5→10ticks使simulated mutations648→568（−12.3%）、rolling60峰值80→72；單改max-age5→10s為604、峰值仍80。這是固定flat提案的離線比較，未改設定、無queue/fill或實際配額證明；後續需要調參時先試一個persistence變數。
+- 最新395V2 PASS；full678仍是既有8F+4E，12個失敗方法相同。5分鐘本機dry **302.095s PASS**、final與獨立postflight均0/0、process已退出；2618個行情封包皆落在strict範圍，REST／WS rolling60峰值9900／112。Shared Lighter只有opt-in變更，Grid production/config/tests未動。詳細來源hash及證據統一記於EXPERIMENT_LOG。
+
+R4最小分析工具已可使用；不等待更多工具再進下一步。短dry驗收後，下一個有資訊價值的階段是逐場授權的最小execution/accounting canary，先確認真實nonflat／fees／退出。約299USDG仍只是背景，不自動配置資金或授權live；沒有實際成交前不宣稱cover fee或大成交量。VPS方案暫緩，舊review ZIP不代表本輪來源。
+
+### 19.8 2026-09-06 延長 volume／fee-cover 驗證
+
+**2026-09-07 01:02最新實盤：** 使用者場次000201原定3600s，ledger1369.2596237s（22分49秒）／wall1432.1511296s後failed/code1；maker602.901337 USDG、23個唯一fills／21張委託，gross−0.007440、maker/taker fee0.07234816044／0.05016424700、funding0、realized net−0.12995240744。Exit-11撤單後因maker minimum被套至0.00017 BTC部分成交殘量，IOC attempts0、blocked；不是`risk_capacity_exhausted`正常停場。01:02:36 authenticated唯讀仍long0.00017／orders0、cash297.938824540532，sanitized同stem `.postflight.json`已保存，尚未實際平倉；原report差額0.002108是當次uPnL而非未知cash gap，all-in／fee-cover保持不可用。
+
+與214814同取前1369.2596s，新輪maker382.882640→602.901337、有單915.336→964.723s、雙邊893.255→933.375s、退出12→11、需IOC10→4、taker fee0.11168629675→0.05016424700；市場條件及final狀態不同，只是觀察改善，不能以舊輪後28分鐘空轉或新輪早停縮短分母宣稱達標。新輪API deferrals10／account-read deferrals1，quota問題尚未解決，無BUY-only復發或source超界證據。[官方交易規格](https://apidocs.lighter.xyz/docs/trading)明示base／quote minimum只適用maker；已修orchestrator／V2 OM的reducing IOC gate，保持normal POST_ONLY minimum、正殘量／step、reduce-only、固定價格與原bounded exit限額。**完整V2 469項PASS（50.396s）**，含BTC多空部分成交.00017／IOC partial後.00001的完整runner退出及精確對帳。01:11:08 authenticated唯讀仍long.00017／orders0，未實際平倉，修後live退出尚未驗證；sanitized同stem `.postflight_final.json`保留新觀測。詳細分窗及歷史均留在[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+**23:58優化更新：** 完成V2 normal account分步admission：起始1000，只有實際query才逐步檢查fees900／settlement300／trades600／terminal history100；原TTL/source、3 IOC／30s及完整exit reserve不變，拒絕不改快取時間。相同3600s離線工作量的API背壓退出41→24、quote2328.170→2666.051s、sendTx440→404，42maker／10taker與final0/0維持；總REST因更多運行增加480000→515600，不能冒稱API總量或手續費已下降。465項V2已有通過證據（完整套件加舊assert定向補驗），並加入固定工作量至少70%雙邊掛單與deferrals≤30的運作回歸；不是新增經濟GO門檻或放寬下表實盤驗收。下面兩輪仍是最新live結果，本批未啟動交易、未調risk/quote/config。詳細比較與未證實事項見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+**23:35最新狀態：** 使用者新場次214814完整ledger3602.310s／wall3665.568s、code0；230100 ledger282.705s／wall345.606s後account read race、code1。Maker分別590.072700／158.896160USDG、net−0.34698980775／−0.05684180220、final0/0，23:25:02獨立authenticated亦0/0。完整輪全wall579.518USDG/h，兩輪僅24張不同maker委託且第二輪不足時長；fee-cover與原驗收未過。先前capacity修正已消除BUY-only撤建循環，API deferrals54→18，但完整輪第32min後剩餘risk headroom不足最小新單預留，空轉約28min。已補flat/無單/無可執行capacity的terminal bounded exit及明示stop_reason；account activity race保留2讀/10s，只在healthy/known狀態完成原bounded cleanup與strict reauth後恢復，cash gap/unknown/cleanup failure仍停止。461 V2 tests PASS；風險/報價/API/source設定未改，未啟動交易，修後live證據仍未取得。完整成本與證據界線見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+**17:32本地修復狀態：** 使用者17:02啟動的第一場未完成（策略50.658s／全程序113.427s）；不是60min通過。已補完整audit的一次arrival-race重讀、execution port／runner原始故障診斷及相應API預留，415項V2離線測試通過；尚無修後live證據。原場根因仍不能由舊日誌確證，實際持倉只能依fresh authenticated查核判斷。詳細證據統一見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+取代前述兩個短canary的經濟成功線：**預先登記兩場各3600秒的live窗口，同一候選參數，共至少兩小時策略時間**。啟動、退出及超時亦納入wall-time；不得只取有報價或盈利的秒數。第一場中止、費率改變、改碼或調參時先記為失敗／不同候選，不連續重啟直到出現好看結果。兩小時只支持該期間的初步經濟結果，不代表長期盈利能力。
+
+| 項目 | 固定設計與驗收 |
+|---|---|
+| 對象 | 本機既有robinhood帳戶／BTC，啟動時重新驗證identity、exclusive、cross1x、fees及position/orders0/0；VPS/Grid不動。 |
+| 配置 | ignored `config/market_maker_v2/test_live_economics_60m.yaml`；沿用canary_02參數，僅duration300→3600。order/soft/hard=.00040/.00040/.00080 BTC；edge.20bps、reprice500ticks、max-age60s；資金比较基準80USDG。 |
+| 成本／風險 | 每場max_loss.50USDG、inventory stop.15、hold180s、cooldown30s；整輪原20USDG上限不因重啟歸零，不將20當成每場預算。尚未歸因的舊場退出／費用也不能抹除。停止價不是成交保證。 |
+| taker退出 | 使用者已授權處理殘留倉位。程式既有reduce-only IOC、最多3次／30秒／首次退出BBO固定200ticks價格界線適用（20:20本地候選，歷史場次為20ticks）；只處理實際殘量，不做taker增倉或自成交。超出界線／未知執行狀態則不宣稱清倉完成。每場維持CLI bounded-flatten旗標。 |
+| 成交量 | 兩場合計maker turnover／合計max(planned,完整process wall-time) ≥1000USDG/h，為本次工程驗收目標；另列每場，避免合計掩蓋其中一場零成交。taker turnover另列，不灌入maker volume。 |
+| 樣本 | 至少50個不同maker order IDs有實際成交，且每場皆有maker買／賣成交。部分成交碎片不算獨立訂單；此為稀疏樣本下限，不是統計顯著性保證。不足即記「證據不足」，不因時間到便通過。 |
+| fee cover | 兩場aggregate all-in net≥0，含實際maker/taker fee、funding及全部退出成本；另外要求不含funding的交易net≥0，避免補貼掩蓋負交易成本。不要求每筆成交或每次inventory cycle盈利。報告gross/fees、cost per10000、inventory markout與flatten concession，不能單憑帳戶餘額上升歸因spread capture。 |
+| 完整性 | 兩場都完成3600秒，程序退出且有fresh authenticated final position/orders0/0，fill/account/fee ledger一致；未完成或無法歸因的場次完整保留且阻止整輪GO，不把replay/dry当live。 |
+
+不因「未成交」放寬來源可信度、不調高size或把POST_ONLY改成taker追單；只有固定窗口完成後，才依成交距離、庫存、成本及API證據選下一個單一變數。既有analyzer維持`objective_met=null`，上表的時長、不同order IDs、獨立退出查核須隨報告一併判讀，不能把CLI正常退出當作自動晉級。
+
+使用者本機執行一場的命令（agent不執行這段交易命令）：
+
+目前也可直接在專案PowerShell執行` .\run_live_test.ps1`；該腳本會顯示啟動提示並每10秒輸出phase。`api_quarantine_60s`是原有啟動等待，開始報價後顯示`syncing_orders`、`authorizing_quotes`、`reconciling_quotes`或`waiting`。狀態輸出不新增API請求，並不等於獨立風控監控。
+
+```powershell
+$runStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$runOutput = "logs/mm_v2_economics_$runStamp.jsonl"
+$runTimer = [Diagnostics.Stopwatch]::StartNew()
+& .\.venv\Scripts\python.exe -u .\run_volume_market_maker.py --config .\config\market_maker_v2\test_live_economics_60m.yaml --output $runOutput --authorize-bounded-flatten --progress
+$runCode = $LASTEXITCODE
+$runTimer.Stop()
+[ordered]@{ output=$runOutput; planned_seconds=3600; wall_seconds=$runTimer.Elapsed.TotalSeconds; exit_code=$runCode } | ConvertTo-Json | Set-Content -LiteralPath "$runOutput.window.json" -Encoding utf8
+```
+
+第一場退出／帳戶確認完成後再執行同一命令第二場，產生不同輸出檔。把两個實際JSONL路徑與各自`.window.json`的wall_seconds傳給既有`analyze_mm_v2_session.py --candidate extended_60m --mode live --planned-seconds 3600 --wall-seconds <第一場秒數> <第二場秒數> --allocated-capital 80`；所有失敗窗口另外保留在EXPERIMENT_LOG，不用縮短分母或換檔排除。舊canary_02程序退出後的成交／外部平倉尚未完整歸因，需補齊其成本才能宣稱整輪損益通過。
+
+16:28:54 +08:00唯讀確認帳戶0/0；此為該時點狀態，不代替稍後啟動查核。延長離線檢查與本次實際完成範圍見EXPERIMENT_LOG；原定第一場已由使用者啟動但提早失敗；目前沒有完成的live長測證據。

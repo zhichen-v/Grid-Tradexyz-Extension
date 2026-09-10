@@ -61,6 +61,20 @@ class VolumeQuotePolicyTests(unittest.TestCase):
             self.assertEqual(quote.time_in_force, "POST_ONLY")
             self.assertFalse(quote.reduce_only)
 
+    def test_two_hour_unchanged_book_remains_quotable(self):
+        state = MarketState("BTC", tick_size=D("0.1"), size_step=D("0.001"),
+                            min_order_size=D("0.002"))
+        policy, risk, expected = self.policy(), self.risk(), None
+        for index in range(2401):
+            now = index * 3.001
+            market = state.update(bids=((D("9999"), D("1")),),
+                asks=((D("10001"), D("1")),), own_bids=(), own_asks=(),
+                observed_monotonic=now, trusted=True)
+            plan = policy.propose(market, self.account(observed_monotonic=now), risk, now=now)
+            if expected is None:
+                expected = plan
+            self.assertEqual(plan, expected)
+
     def test_current_authenticated_fee_changes_spread_without_policy_restart(self):
         policy = self.policy()
         before = self.by_side(self.propose(policy=policy))

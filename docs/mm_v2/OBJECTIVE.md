@@ -1,6 +1,6 @@
 # Market Maker V2 — Volume-first objective
 
-> 狀態：2026-09-05 重新 review `260be69`，Phase 7 仍未完成。歷史 replay／10min smoke_03通過，兩次30min T3未完成；本輪另離線重現 cleanup、POST_ONLY恢復、雙邊報價、own/book對齊及drawdown預留缺口。**先依 [rebuild plan §19](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md#19-2026-09-05-review從目前-phase-7-接續) 修復，再驗資料／API budget與完整T3**；不能只修clock後進live。本輪只更新計畫，runtime尚未修復、未跑網路dry或live。歷史run的postflight只代表當時狀態。
+> 狀態：2026-09-07 01:11，分步admission後新實盤000201在22分49秒失敗：maker602.901337 USDG、realized net−0.12995240744，尚有殘倉，all-in／fee-cover不可判定。01:11:08 authenticated唯讀確認BTC long0.00017／掛單0、cash297.938824540532；不是risk_capacity_exhausted正常停場。已修maker minimum被誤套至reducing IOC的退出契約，正常POST_ONLY minimum保留；完整V2 469項PASS，含BTC .00017／partial後.00001的多空runner退出及精確對帳，未實際平倉。API deferrals10／account race1，quota仍待改善。VPS暫緩，Grid不動；公平時間窗比較及證據界線見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)與計畫§19.8。
 
 ## 目標與判定
 
@@ -10,7 +10,7 @@
 
 - Safety：unknown orders、unresolved mutations、reconciliation failures、self-trades、position-cap breaches 都必須為零；結束時 authenticated position / open orders 為 `0 / 0`。
 - Liveness：stop/deadline 後須在有界期限內 authenticated flat；撤單成功不等於平倉成功。
-- Volume：以 maker turnover / 固定完整時間窗為主，包含startup、撤換單、cooldown、pause與收尾；早停不縮短預定窗口，收尾超時延長分母。Quote-hour效率、雙邊working uptime、capital turnover作診斷；這些新增比較指標待計畫R4實作。
+- Volume：以 maker turnover / 固定完整時間窗為主，包含startup、撤換單、cooldown、pause與收尾；早停不縮短預定窗口，收尾超時延長分母。Quote-hour效率、雙邊working uptime、capital turnover作診斷；R4 analyzer提供這些比較，缺allocated capital或working-side證據時保持unavailable。
 - Economics：納入全部 maker/taker fills、fees、final flatten，另列 funding/cashflow；只在可信的 final-flat 邊界判定 all-in net cost、fee cover、drawdown 與 flatten loss share。未平倉或資料不全不能宣稱通過。
 
 使用者於2026-09-05提供測試資金約299 USDG，成交量目標尚未設定；不是本輪authenticated餘額或損失授權。先建立volume/cost frontier與實際可執行lot／inventory band表，再約定量級。正acquisition cost必須明示尚未fee-neutral，不可當成原目標通過。
@@ -42,7 +42,7 @@ V2 live 啟動時必須在任何連線／mutation 前要求 `--authorize-bounded
 
 ## 複雜度預算與進度
 
-2026-09-05 後續修復已落實 R1 退出與 R2 雙邊報價／drawdown reserve／final freshness，並補實際觀測的買側、賣側與雙邊時間。均為離線驗收；R3 own/book／clock／API reserve與30min T3仍未完成，最小analyzer及授權canary依序在後。完整進度與限制見 rebuild plan §19.4及EXPERIMENT_LOG，不把程式修復當作fee-neutral或live GO。
+R1退出、R2雙邊報價／drawdown reserve／final freshness、R3 own/book對齊／arrival race／保守hold age及健康transport的API退出預留均已有離線契約驗收。日常短dry可明確放寬source至−100..10000ms；live拒絕該選項並保留strict檢查。頻繁改價仍可提前花到quota保留邊界，尚未證明持續大成交量。R4 analyzer493 LOC；真實BTC minimum base為0.00020，因此0.00026半單仍無法保持soft邊界雙邊報價，較大數量表僅是算術假設。完整限制見rebuild plan §19.7及EXPERIMENT_LOG，不自動放大size或授權canary。
 
 V2 起始策略 config 為計畫的 **18 個 leaf fields**；安全不變量由 profile/code 擁有，不另開開關。Orchestrator ≤500 LOC、QuotePolicy ≤350、InventoryGovernor ≤400、session analyzer ≤500、Phase 1 feasibility ≤500；函式盡量 ≤60 LOC。只保留所需 port、標準庫與公開契約測試。
 

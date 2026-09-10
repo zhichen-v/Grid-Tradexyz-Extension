@@ -6,6 +6,8 @@ import asyncio
 from dataclasses import replace
 from decimal import Decimal, localcontext
 from typing import TYPE_CHECKING, Protocol
+from .api_budget import ApiBudgetUnavailable
+from .lighter_runtime import AccountReadRace
 
 from .domain import (
     AccountSnapshot,
@@ -28,7 +30,7 @@ from .domain import (
 )
 
 if TYPE_CHECKING:
-    from .order_manager import MarketMakerOrderManager, ReconcileResult
+    from .order_manager import MarketMakerOrderManager
 
 
 class MarketDataPort(Protocol):
@@ -60,113 +62,9 @@ class ExecutionPort(Protocol):
 class ExecutionUnavailable(RuntimeError):
     """Execution is unavailable; backend details are intentionally not exposed."""
 
-
-class DrySafetyExecutionPort:
-    """Exercise the V2 order manager without enabling trading.
-
-    Supports empty quote plans and simulated cancellation only. Normal quoting
-    and bounded flatten use the dedicated volume and bounded execution ports.
-    A simulated result is not authenticated account or terminal-flat evidence.
-    """
-
-    def __init__(self, manager: MarketMakerOrderManager):
-        self.manager = manager
-        self._require_dry()
-
-    def _require_dry(self) -> str:
-        try:
-            dry = self.manager.config.dry_run is True
-            symbol = self.manager.config.symbol
-        except Exception:
-            raise ExecutionUnavailable("dry execution unavailable") from None
-        if not dry:
-            raise ExecutionUnavailable("dry execution unavailable")
-        return symbol
-
-    def snapshot(self) -> ExecutionSnapshot:
-        self._require_dry()
-        try:
-            from .execution_models import RuntimeState
-
-            managed = self.manager.snapshot()
-            simulated = all(order.simulated is True for order in managed)
-            if not simulated or self.manager.has_uncertain_state or self.manager.has_unknown_order_state:
-                health = ExecutionHealth.PAUSED_ORDER_STATE
-            elif self.manager.runtime_state in {
-                RuntimeState.SYNCING, RuntimeState.ACTIVE, RuntimeState.RISK_REDUCTION,
-            }:
-                health = ExecutionHealth.HEALTHY
-            elif self.manager.runtime_state in {
-                RuntimeState.PAUSED_DATA, RuntimeState.PAUSED_MARKET,
-                RuntimeState.PAUSED_POSITION, RuntimeState.PAUSED_EXCHANGE,
-            }:
-                health = ExecutionHealth.PAUSED_DATA
-            elif self.manager.runtime_state is RuntimeState.PAUSED_ORDER_STATE:
-                health = ExecutionHealth.PAUSED_ORDER_STATE
-            else:
-                health = ExecutionHealth.HALTED
-            return ExecutionSnapshot(health, len(managed), simulated=simulated)
-        except Exception:
-            raise ExecutionUnavailable("dry execution snapshot unavailable") from None
-
-    async def reconcile_quotes(self, plan: QuotePlan) -> ExecutionResult:
-        symbol = self._require_dry()
-        if not isinstance(plan, QuotePlan) or plan.symbol != symbol:
-            raise ExecutionUnavailable("quote symbol does not match execution")
-        if plan.quotes:
-            raise ExecutionUnavailable("Phase 2 supports empty dry plans only")
-        snapshot = self.snapshot()
-        if snapshot.health is not ExecutionHealth.HEALTHY:
-            return ExecutionResult(ExecutionStatus.BLOCKED, snapshot)
-        from .execution_models import DesiredQuotes, RuntimeState
-        from .execution_models import RiskDecision
-
-        zero = Decimal("0")
-        desired = DesiredQuotes(
-            bid=None, ask=None, reference_price=zero, reservation_price=zero,
-            half_spread=zero, inventory_ratio=zero, runtime_state=RuntimeState.ACTIVE,
-            reason="v2 empty quote plan",
-        )
-        risk = RiskDecision(
-            buy_amount=None, sell_amount=None, buy_reduce_only=False,
-            sell_reduce_only=False, buy_capacity=zero, sell_capacity=zero,
-            worst_long=zero, worst_short=zero, inventory_ratio=zero,
-            runtime_state=RuntimeState.ACTIVE, reason="v2 no new orders", safe=True,
-        )
-        try:
-            result = await self.manager.reconcile(desired, risk)
-            return self._result(result)
-        except Exception:
-            raise ExecutionUnavailable("dry quote reconciliation unavailable") from None
-
-    async def cancel_all_managed(self) -> ExecutionResult:
-        self._require_dry()
-        snapshot = self.snapshot()
-        if snapshot.health is not ExecutionHealth.HEALTHY or not snapshot.simulated:
-            return ExecutionResult(ExecutionStatus.BLOCKED, snapshot)
-        try:
-            result = await self.manager.cancel_managed_orders("v2 dry cancellation")
-            return self._result(result)
-        except Exception:
-            raise ExecutionUnavailable("dry cancellation unavailable") from None
-
-    async def flatten_ioc(self, intent: FlattenIntent) -> ExecutionResult:
-        symbol = self._require_dry()
-        if not isinstance(intent, FlattenIntent) or intent.symbol != symbol:
-            raise ExecutionUnavailable("flatten symbol does not match execution")
-        raise ExecutionUnavailable("Bounded flatten is not implemented")
-
-    def _result(self, result: ReconcileResult) -> ExecutionResult:
-        snapshot = self.snapshot()
-        status = (
-            ExecutionStatus.BLOCKED
-            if result.errors or snapshot.health is not ExecutionHealth.HEALTHY
-            else ExecutionStatus.SIMULATED
-        )
-        return ExecutionResult(
-            status, snapshot, submitted_count=0,
-            cancelled_count=sum(action.operation == "would_cancel" for action in result.actions),
-        )
+    def __init__(self, message, *, values=None):
+        super().__init__(message)
+        self.diagnostic_values = values or {}
 
 
 class BoundedExecutionPort:
@@ -179,10 +77,11 @@ class BoundedExecutionPort:
 
     def __init__(self, manager: MarketMakerOrderManager, account: AccountPort,
                  market: MarketDataPort, clock: Clock, *,
-                 authorize_bounded_flatten: bool = False):
+                 authorize_bounded_flatten: bool = False, on_failure=None):
         if authorize_bounded_flatten is not True:
             raise ExecutionUnavailable("per-run bounded flatten authorization required")
         self.manager, self.account, self.market, self.clock = manager, account, market, clock
+        self._on_failure = on_failure
         try:
             self._symbol = manager.config.symbol
         except Exception:
@@ -190,6 +89,13 @@ class BoundedExecutionPort:
         self._failed = False
         self._lock = asyncio.Lock()
         self._require_authorized_mode()
+
+    def _diagnose(self, stage, error):
+        if self._on_failure is not None:
+            try:
+                self._on_failure(stage, error)
+            except Exception:
+                pass
 
     def _require_authorized_mode(self):
         try:
@@ -284,6 +190,7 @@ class BoundedExecutionPort:
             before = self.snapshot()
             if before.health is not ExecutionHealth.HEALTHY:
                 return ExecutionResult(ExecutionStatus.BLOCKED, before)
+            terminal = False
             try:
                 deadline = self.clock.monotonic() + 10
                 result = await self._bounded(
@@ -291,13 +198,18 @@ class BoundedExecutionPort:
                 if (result.errors or not {o.order_id for o in before.orders}
                         <= self.manager.terminal_order_ids):
                     raise ExecutionUnavailable("managed cancellation not confirmed")
+                terminal = True
                 account = await self._account_after(self.clock.monotonic(), deadline)
                 return self._confirmed(account, cancelled=before.managed_order_count)
             except asyncio.CancelledError:
                 self._failed = True
                 raise
-            except Exception:
-                self._failed = True
+            except ApiBudgetUnavailable:
+                self._failed = not terminal
+                raise
+            except Exception as error:
+                self._diagnose("cancel_managed_orders", error)
+                self._failed = not terminal or isinstance(error, TimeoutError)
                 return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot())
 
     async def flatten_ioc(self, intent: FlattenIntent) -> ExecutionResult:
@@ -314,7 +226,8 @@ class BoundedExecutionPort:
             except asyncio.CancelledError:
                 self._failed = True
                 raise
-            except Exception:
+            except Exception as error:
+                self._diagnose("flatten_ioc", error)
                 self._failed = True
                 return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot(),
                                        submitted_count=len(self.manager.active_unwind_order_ids - previous_ids))
@@ -342,13 +255,21 @@ class BoundedExecutionPort:
         market = self.market.snapshot()
         now = self.clock.monotonic()
         if (type(market) is not MarketStateSnapshot or market.symbol != self._symbol
-                or not market.trusted or not prepared_at <= market.observed_monotonic <= now
-                or now - market.observed_monotonic > 3
+                or not market.trusted
                 or market.tick_size != self.manager.metadata.price_tick
-                or market.size_step != self.manager.metadata.quantity_step
-                or (intent.side is Side.BUY and market.external_ask > intent.limit_price)
+                or market.size_step != self.manager.metadata.quantity_step):
+            raise ExecutionUnavailable("trusted exit market metadata required")
+        if (not prepared_at <= market.observed_monotonic <= now
+                or now - market.observed_monotonic > 3):
+            raise ExecutionUnavailable("post-preparation exit book required", values={
+                "exit_book_age_ms": (Decimal(str(now)) - Decimal(str(market.observed_monotonic))) * 1000,
+                "exit_book_after_prepare_ms": (Decimal(str(market.observed_monotonic))
+                                              - Decimal(str(prepared_at))) * 1000})
+        if ((intent.side is Side.BUY and market.external_ask > intent.limit_price)
                 or (intent.side is Side.SELL and market.external_bid < intent.limit_price)):
-            raise ExecutionUnavailable("fresh bounded executable market required")
+            raise ExecutionUnavailable("exit market outside fixed price bound", values={
+                "exit_bid": market.external_bid, "exit_ask": market.external_ask,
+                "exit_limit": intent.limit_price})
         desired = replace(desired, amount=self._ioc_chunk(account.position.copy_abs()))
         previous_ids = self.manager.active_unwind_order_ids
         result = await self._bounded(
@@ -438,7 +359,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
 
     def __init__(self, manager, account, market, clock, *, refresh_quote,
                  reprice_threshold_ticks: int, max_quote_age_ms: int,
-                 authorize_bounded_flatten: bool = False):
+                 authorize_bounded_flatten: bool = False, before_mutation=None, on_failure=None):
         for value in (reprice_threshold_ticks, max_quote_age_ms):
             _count(value)
             if value == 0:
@@ -446,10 +367,11 @@ class VolumeExecutionPort(BoundedExecutionPort):
         if not callable(refresh_quote):
             raise ValueError("quote refresh callback required")
         super().__init__(manager, account, market, clock,
-                         authorize_bounded_flatten=authorize_bounded_flatten)
+                         authorize_bounded_flatten=authorize_bounded_flatten, on_failure=on_failure)
         if manager.config.post_only is not True:
             raise ExecutionUnavailable("normal volume quotes require POST_ONLY")
         self.refresh_quote = refresh_quote
+        self.before_mutation = before_mutation
         self.reprice_threshold_ticks, self.max_quote_age_ms = reprice_threshold_ticks, max_quote_age_ms
         self._maker_fee = None
         self._post_only_refresh = (0, 0.0)
@@ -458,7 +380,16 @@ class VolumeExecutionPort(BoundedExecutionPort):
         value = await self._bounded(lambda: self.refresh_quote(execution), deadline)
         current = self.snapshot()
         if current.orders != execution.orders:
-            raise ExecutionUnavailable("working orders changed during quote refresh")
+            previous = {row.order_id: row for row in execution.orders or ()}
+            reduced = current.orders is not None and all(
+                row.order_id in previous and row.side == previous[row.order_id].side
+                and row.price == previous[row.order_id].price
+                and row.reduce_only == previous[row.order_id].reduce_only
+                and row.remaining_size <= previous[row.order_id].remaining_size
+                for row in current.orders)
+            removed = previous.keys() - {row.order_id for row in current.orders or ()}
+            if not reduced or not removed <= self.manager.terminal_order_ids:
+                raise ExecutionUnavailable("working orders changed during quote refresh")
         value = _validate_quote_authorization(value, current, self._symbol,
                                               self.clock.monotonic(), after=after)
         if (value.market.tick_size != self.manager.metadata.price_tick
@@ -473,6 +404,8 @@ class VolumeExecutionPort(BoundedExecutionPort):
         if self.manager.config.post_only is not True:
             raise ExecutionUnavailable("normal volume quotes require POST_ONLY")
         if not plan.quotes:
+            if self.before_mutation is not None:
+                self.before_mutation()
             return await self.cancel_all_managed()
         async with self._lock:
             before = self.snapshot()
@@ -497,7 +430,12 @@ class VolumeExecutionPort(BoundedExecutionPort):
                 # The manager latches uncertainty if cancellation interrupted a mutation.
                 # Cancelling a read must not disable known-order cleanup.
                 raise
-            except Exception:
+            except (ApiBudgetUnavailable, AccountReadRace):
+                # The session distinguishes activity lag from fatal cash gaps;
+                # neither can authorize another order without a complete audit.
+                raise
+            except Exception as error:
+                self._diagnose("reconciling_quotes", error)
                 # A pre-mutation data refusal must still permit known-safe cleanup.
                 return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot(), submitted, cancelled)
 
@@ -510,9 +448,18 @@ class VolumeExecutionPort(BoundedExecutionPort):
         await self._bounded(self.manager.sync_open_orders, deadline)
         self._capture_post_only_rejection()
         execution = self.snapshot()
+        if (execution.health is ExecutionHealth.PAUSED_ORDER_STATE
+                and self.manager.can_reconcile_known_orders):
+            # A known order may disappear before its terminal history arrives.
+            # One additional read uses the same quote deadline and normal API
+            # admission; only exact proof can restore a healthy execution state.
+            await self._bounded(self.manager.sync_open_orders, deadline)
+            self._capture_post_only_rejection()
+            execution = self.snapshot()
         if execution.health is not ExecutionHealth.HEALTHY:
             return ExecutionResult(ExecutionStatus.BLOCKED, execution)
         authorization = await self._fresh_quote(execution, deadline, after)
+        execution = self.snapshot()  # Refresh may have proven a concurrent fill.
         generation, rejected_at = self._post_only_refresh
         if generation and authorization.market.observed_monotonic > rejected_at:
             self.manager.acknowledge_post_only_book_refresh(generation)
@@ -523,6 +470,8 @@ class VolumeExecutionPort(BoundedExecutionPort):
         revision |= bool(managed and authorization.account.maker_fee_rate != self._maker_fee)
         cancelled = 0
         if managed and revision:
+            if self.before_mutation is not None:
+                self.before_mutation()
             result = await self._bounded(
                 lambda: self.manager.cancel_managed_orders("v2 quote revision"), deadline)
             if (result.errors or not set(created) <= self.manager.terminal_order_ids
@@ -532,6 +481,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
             cancelled = len(managed)
             execution = self.snapshot()
             authorization = await self._fresh_quote(execution, deadline, self.clock.monotonic())
+            execution = self.snapshot()
         self._maker_fee = authorization.account.maker_fee_rate
         # Keep proven working prices below the revision threshold. Passing a new
         # target to the manager here could cause hidden cancellation without our fresh audit.
@@ -541,6 +491,8 @@ class VolumeExecutionPort(BoundedExecutionPort):
                         retained[quote.side].remaining_size, quote.reduce_only)
             if quote.side in retained else quote for quote in authorization.plan.quotes))
         execution_plan, execution_risk = self._execution_quotes(effective, authorization)
+        if self.before_mutation is not None and any(q.side not in retained for q in effective.quotes):
+            self.before_mutation()
         result = await self._bounded(lambda: self.manager.reconcile(execution_plan, execution_risk), deadline)
         self._capture_post_only_rejection()
         snapshot = self.snapshot()

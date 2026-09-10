@@ -20,6 +20,7 @@ from core.services.market_maker_v2.domain import (
 from core.services.market_maker_v2.execution_port import (
     ExecutionUnavailable, BoundedExecutionPort,
 )
+from core.services.market_maker_v2.telemetry import failure_diagnostic
 
 
 D = Decimal
@@ -215,12 +216,25 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
         for name, snapshot in cases:
             with self.subTest(name=name, snapshot=snapshot):
                 self.setUp()
+                diagnostics = []
+                self.port._on_failure = lambda stage, error: diagnostics.append(
+                    failure_diagnostic("BTC", stage, error))
                 port = self.account if name == "account" else self.market
                 port.snapshot.side_effect = None
                 port.snapshot.return_value = snapshot
                 result = await self.port.flatten_ioc(self.intent)
                 self.assertIs(result.status, ExecutionStatus.BLOCKED)
                 self.adapter.create_order.assert_not_called()
+                values = {row.name: row.value for row in diagnostics[0].values}
+                if name == "market" and snapshot.trusted:
+                    if snapshot.observed_monotonic == 99:
+                        self.assertEqual(values, {"exit_book_age_ms": D("1000"),
+                                                  "exit_book_after_prepare_ms": D("-1000")})
+                    else:
+                        self.assertEqual(values, {"exit_bid": D("100.9"),
+                                                  "exit_ask": D("102"), "exit_limit": D("101.2")})
+                else:
+                    self.assertEqual(values, {})
 
     async def test_missing_post_ioc_audit_cannot_claim_terminal_flat(self):
         initial = await self.account_snapshot()

@@ -27,10 +27,11 @@ class InventoryGovernorTests(unittest.TestCase):
         report = ledger.snapshot(now=100)
         self.assertEqual((report.realized_net_pnl, report.max_drawdown), (D("1"), D("99")))
         governor = self.governor(max_session_loss_usdg=D("100"))
-        decision = self.evaluate(governor, report=report)
-        self.assertEqual((decision.buy_capacity, decision.sell_capacity), (D("0"), D("0")))
-        # Existing inventory can earn back current headroom; historical maximum DD remains 99.
         ledger.ingest_fill(fill("recover-buy", Side.BUY, "1", "100", 101.0, fee="0"))
+        decision = self.evaluate(governor, position="1", now=101, report=ledger.snapshot(now=101))
+        self.assertEqual(decision.state, StrategyState.REDUCE_ONLY)
+        self.assertEqual((decision.buy_capacity, decision.sell_capacity), (D("0"), D("1")))
+        # Existing inventory can earn back current headroom; historical maximum DD remains 99.
         ledger.ingest_fill(fill("recover-sell", Side.SELL, "1", "199", 102.0, fee="0"))
         recovered = self.evaluate(governor, now=103, report=ledger.snapshot(now=103))
         self.assertEqual((recovered.buy_capacity, recovered.sell_capacity), (D("1"), D("1")))
@@ -235,14 +236,61 @@ class InventoryGovernorTests(unittest.TestCase):
         larger = self.evaluate(self.governor(max_session_loss_usdg=D("14.040000001")), account=account)
         self.assertEqual((larger.buy_capacity, larger.sell_capacity), (1, 1))
 
-    def test_working_quantities_are_counted_with_new_quotes_before_terminal_cancel(self):
+    def test_working_quantities_bound_total_targets_before_terminal_cancel(self):
         order = WorkingOrder("old-buy", Side.BUY, D("0.8"), D("99"))
         risk = self.evaluate(position="1.5", account=self.account("1.5", open_order_count=1),
                              execution=self.execution(orders=(order,)))
-        self.assertEqual(risk.buy_capacity, D("0.7"))
-        self.assertLessEqual(D("1.5") + order.remaining_size + risk.buy_capacity, D("3"))
+        self.assertEqual(risk.buy_capacity, D("1"))
+        self.assertLessEqual(D("1.5") + max(order.remaining_size, risk.buy_capacity), D("3"))
         cleared = self.evaluate(position="1.5")
-        self.assertEqual(cleared.buy_capacity, D("1"))
+        self.assertEqual(cleared.buy_capacity, risk.buy_capacity)
+
+    def test_retaining_one_side_can_add_the_other_without_double_reserving(self):
+        account = self.account(maker_fee_rate=D("0.01"), taker_fee_rate=D("0.01"))
+        policy = VolumeQuotePolicy(order_size=D("1"), target_net_edge_bps=D("0"),
+            volatility_multiplier=D("0"), hard_inventory_limit=D("3"), skew_bps_at_hard=D("0"))
+        for side, price in ((Side.BUY, "99"), (Side.SELL, "101")):
+            with self.subTest(side=side):
+                old = WorkingOrder("old", side, D("1"), D(price))
+                # Joint reserve is 14.04 for either empty slots, one retained
+                # side plus the missing side, or two retained sides.
+                for orders in ((), (old,), (old, WorkingOrder("other",
+                        Side.SELL if side is Side.BUY else Side.BUY, D("1"),
+                        D("101") if side is Side.BUY else D("99")))):
+                    current = replace(account, open_order_count=len(orders))
+                    risk = self.evaluate(self.governor(max_session_loss_usdg=D("14.040000001")),
+                        account=current, execution=self.execution(orders=orders))
+                    self.assertEqual((risk.buy_capacity, risk.sell_capacity), (D("1"), D("1")))
+                    quotes = policy.propose(self.market(), current, risk, now=100).quotes
+                    self.assertEqual({q.side: q.size for q in quotes},
+                                     {Side.BUY: D("1"), Side.SELL: D("1")})
+
+    def test_retained_targets_still_shrink_for_loss_and_inventory_limits(self):
+        old = WorkingOrder("old-buy", Side.BUY, D("1"), D("99"))
+        account = self.account(open_order_count=1, maker_fee_rate=D("0.01"),
+                               taker_fee_rate=D("0.01"))
+        risk = self.evaluate(self.governor(max_session_loss_usdg=D("14.04")),
+            account=account, execution=self.execution(orders=(old,)))
+        self.assertEqual((risk.buy_capacity, risk.sell_capacity), (D("0.9"), D("0.9")))
+        # The old full BUY is reserved until cancellation even though the target
+        # shrank: stop 10 + taker/slip 2.02 + maker (1 + .9) * 101 * .01.
+        self.assertLess(D("10") + D("2.02") + D("1.9") * D("101") * D("0.01"), D("14.04"))
+        for sign in (1, -1):
+            with self.subTest(sign=sign):
+                side, price = (Side.BUY, "99") if sign > 0 else (Side.SELL, "101")
+                old = WorkingOrder("old", side, D("0.8"), D(price))
+                risk = self.evaluate(position=str(sign * 2),
+                    account=self.account(str(sign * 2), open_order_count=1),
+                    execution=self.execution(orders=(old,)))
+                target = risk.buy_capacity if sign > 0 else risk.sell_capacity
+                self.assertEqual(target, D("0.5"))
+                self.assertLessEqual(D("2") + max(old.remaining_size, target), D("3"))
+                # Existing unsafe exposure cannot be erased by a smaller target.
+                breached = self.evaluate(position=str(sign * D("2.5")),
+                    account=self.account(str(sign * D("2.5")), open_order_count=1),
+                    execution=self.execution(orders=(old,)))
+                self.assertEqual(breached.state, StrategyState.REDUCE_ONLY)
+                self.assertEqual(breached.buy_capacity if sign > 0 else breached.sell_capacity, D("0"))
 
     def test_working_gap_loss_and_risky_reduce_only_orders_do_not_grant_new_risk(self):
         for order in (WorkingOrder("old", Side.BUY, D("1"), D("200")),
@@ -257,6 +305,46 @@ class InventoryGovernorTests(unittest.TestCase):
         self.assertEqual(risk.state, StrategyState.REDUCE_ONLY)
         self.assertEqual((risk.buy_capacity, risk.sell_capacity), (0, D("0.5")))
 
+    def test_flat_minimum_quote_reserve_exhaustion_requires_terminal_exit_proof(self):
+        governor = self.governor(order_size=D("0.00040"), soft_limit=D("0.00040"),
+            hard_limit=D("0.00080"), stop_loss_usdg=D("0.15"),
+            max_session_loss_usdg=D("0.5"), ioc_slippage_ticks=200)
+        market = self.market(external_bid=D("79625.8"), external_ask=D("79625.9"),
+            tick_size=D("0.1"), size_step=D("0.00001"), min_order_size=D("0.00020"))
+        account = self.account(maker_fee_rate=D("0.00012"), taker_fee_rate=D("0.00035"))
+        report = self.report(realized_net_pnl=D("-0.34698980775"),
+            marked_net_pnl=D("-0.34698980775"), current_drawdown=D("0.34698980775"),
+            max_drawdown=D("0.34698980775"))
+        # More than one lot remains affordable, but not the venue's minimum.
+        risk = self.evaluate(governor, market=market, account=account, report=report)
+        self.assertEqual(risk.state, StrategyState.FLATTENING)
+        self.assertEqual(governor.stop_reason, "risk_capacity_exhausted")
+        self.assertIsNone(risk.flatten)
+        self.assertEqual((risk.buy_capacity, risk.sell_capacity), (D("0"), D("0")))
+        self.assertEqual(governor.exit_deadline, 130)
+        # A later flat account or a recovered market does not complete/restart it.
+        self.assertEqual(self.evaluate(governor, now=101).state, StrategyState.FLATTENING)
+        with self.assertRaises(GovernorUnavailable):
+            governor.confirm_exit(self.confirmed(100), now=101)
+        terminal = governor.confirm_exit(self.confirmed(102), now=102)
+        self.assertEqual(terminal.state, StrategyState.SESSION_COMPLETE)
+        self.assertEqual(governor.stop_reason, "risk_capacity_exhausted")
+
+    def test_unaffordable_working_orders_cancel_before_flat_reserve_is_rechecked(self):
+        governor = self.governor(max_session_loss_usdg=D("100"))
+        order = WorkingOrder("adverse-old-buy", Side.BUY, D("1"), D("200"))
+        risk = self.evaluate(governor, account=self.account(open_order_count=1),
+                             execution=self.execution(orders=(order,)))
+        self.assertEqual(risk.state, StrategyState.REDUCE_ONLY)
+        self.assertEqual((risk.buy_capacity, risk.sell_capacity), (D("0"), D("0")))
+        self.assertIsNone(governor.exit_deadline)
+        self.assertIsNone(governor.stop_reason)
+        # Zero capacity was caused by the working order's gap, not a terminal
+        # session loss. Only its fresh cancellation proof releases that reserve.
+        cleared = self.evaluate(governor, now=101)
+        self.assertEqual(cleared.state, StrategyState.QUOTING)
+        self.assertEqual((cleared.buy_capacity, cleared.sell_capacity), (D("1"), D("1")))
+
     def test_high_precision_capacity_never_rounds_over_hard_limit(self):
         position = "1.999999999999999999999999999999999999999"
         risk = self.evaluate(position=position)
@@ -268,7 +356,8 @@ class InventoryGovernorTests(unittest.TestCase):
         risk = self.evaluate(position="1", account=self.account("1", open_order_count=1),
             execution=self.execution(orders=(order,)),
             governor=self.governor(order_size=D("2")))
-        self.assertEqual(risk.buy_capacity, D("1.9"))
+        self.assertEqual(risk.buy_capacity, D("2"))
+        self.assertLessEqual(D("1") + max(order.remaining_size, risk.buy_capacity), D("3"))
 
     def test_stale_untrusted_mismatched_and_failed_truth_fail_closed(self):
         invalid = [dict(market=self.market(trusted=False)),

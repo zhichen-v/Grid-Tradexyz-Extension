@@ -111,6 +111,10 @@ class MarketState:
                 alpha = 1 - Decimal("0.5") ** (elapsed / _HALF_LIFE_SECONDS)
                 move_bps = abs(mid / sample_mid - 1) * _BPS
                 ewma += alpha * (move_bps - ewma)
+                # Decimal zero otherwise accumulates alpha's exponent at every
+                # quiet sample and eventually exhausts downstream precision.
+                if ewma == ZERO:
+                    ewma = ZERO
                 sample_time, sample_mid = now, mid
             snapshot = MarketStateSnapshot(
                 self._symbol, observed_monotonic, bid, ask, self._tick,

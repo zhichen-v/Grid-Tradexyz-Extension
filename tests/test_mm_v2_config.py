@@ -138,14 +138,19 @@ class ConfigTests(unittest.TestCase):
         dry = load_config(EXAMPLE)
         live = replace(dry, dry_run=False)
         require_authorization(dry)
+        require_authorization(dry, allow_delayed_dry_book=True)
         with self.assertRaisesRegex(ConfigError, "authorize-bounded-flatten"):
             require_authorization(live)
         require_authorization(live, True)
+        with self.assertRaises(ConfigError):
+            require_authorization(live, True, allow_delayed_dry_book=True)
         with self.assertRaises(ConfigError):
             require_authorization(live)
         for value in (1, "true", None):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 require_authorization(live, value)
+            with self.subTest(delayed=value), self.assertRaises(ConfigError):
+                require_authorization(dry, allow_delayed_dry_book=value)
 
     def test_runtime_safety_profile_is_fixed_and_not_a_config_extension(self):
         profile = LIGHTER_VOLUME_RUNTIME_PROFILE

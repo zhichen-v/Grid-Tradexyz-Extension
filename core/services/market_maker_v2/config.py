@@ -234,9 +234,13 @@ def load_config(path: str | Path) -> MarketMakerV2Config:
     return MarketMakerV2Config.from_mapping(root["market_maker_v2"])
 
 
-def require_authorization(config: MarketMakerV2Config, authorized: bool = False) -> None:
+def require_authorization(config: MarketMakerV2Config, authorized: bool = False, *,
+                          allow_delayed_dry_book: bool = False) -> None:
     """Call before constructing an adapter or connecting; authorization is per run."""
-    if type(config) is not MarketMakerV2Config or type(authorized) is not bool:
+    if (type(config) is not MarketMakerV2Config or type(authorized) is not bool
+            or type(allow_delayed_dry_book) is not bool):
         raise ConfigError("typed config and literal per-run authorization required")
+    if allow_delayed_dry_book and not config.dry_run:
+        raise ConfigError("delayed book testing requires dry_run: true")
     if not config.dry_run and not authorized:
         raise ConfigError("live startup requires --authorize-bounded-flatten")

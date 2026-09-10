@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
-from decimal import Decimal
+from decimal import Decimal, Inexact, ROUND_DOWN, localcontext
 import yaml
 import os
 
@@ -518,8 +518,94 @@ class LighterAdapter(ExchangeAdapter):
         normalized_symbol = self._normalize_symbol(symbol)
         return await self._rest.get_account_trades(normalized_symbol, limit)
 
+    def enable_market_maker_exact_funding(self) -> None:
+        """Opt in to precise funding discovery; existing adapter callers are unchanged."""
+        if not hasattr(self, "_mm_exact_funding"):
+            self._mm_exact_funding = {}
+
+    async def _exact_market_maker_fundings(self, rows, market_id, *, allow_unsettled=False):
+        rest = self._rest
+        if rest.network not in {"robinhood", "robinhood_testnet"}:
+            raise ValueError("unsupported exact funding network")
+        key = (rest.network, rest.account_index, market_id)
+        cache = self._mm_exact_funding.get(key)
+        def number(value):
+            if type(value) not in (str, int, Decimal):
+                raise ValueError("invalid funding number")
+            result = Decimal(value)
+            if not result.is_finite():
+                raise ValueError("invalid funding number")
+            return result
+        records = {}
+        for row in rows:
+            identifier, timestamp = row.funding_id, row.timestamp
+            change, rate, size, discount = map(number,
+                (row.change, row.rate, row.position_size, row.discount))
+            if (type(identifier) is not int or identifier < 0 or identifier in records
+                    or type(timestamp) is not int or not 0 <= timestamp < 100000000000
+                    or type(row.market_id) is not int or row.market_id != market_id
+                    or size <= 0 or discount < 0 or abs(rate) >= 1
+                    or row.position_side not in {"long", "short"}):
+                raise ValueError("invalid exact funding event")
+            raw = (timestamp, market_id, change, rate, size, row.position_side, discount)
+            if cache is not None and identifier in cache and cache[identifier][0] != raw:
+                raise ValueError("conflicting funding identity")
+            records[identifier] = raw
+        new = {identifier: raw for identifier, raw in records.items()
+               if cache is not None and identifier not in cache}
+        rounds = {}
+        if new and not allow_unsettled:
+            timestamps = {raw[0] for raw in new.values()}
+            if max(timestamps) - min(timestamps) >= 100 * 3600:
+                raise ValueError("funding round window exhausted")
+            response = await rest._call_api("exact funding rounds query",
+                lambda: rest.candlestick_api.fundings(market_id=market_id,
+                    resolution="1h", start_timestamp=min(timestamps),
+                    end_timestamp=max(timestamps) + 1, count_back=100))
+            rest._require_success_response(response, "exact funding rounds query")
+            if response.resolution != "1h" or type(response.fundings) is not list or len(response.fundings) > 100:
+                raise ValueError("invalid funding rounds")
+            for row in response.fundings:
+                timestamp = row.timestamp
+                if type(timestamp) is not int or timestamp in rounds:
+                    raise ValueError("invalid funding round identity")
+                rounds[timestamp] = row
+        updated = dict(cache or {})
+        result = []
+        for identifier, raw in records.items():
+            timestamp, _, amount, rate, size, side, discount = raw
+            if allow_unsettled and identifier in new:
+                continue  # Exit may defer new economics, never mark it accounted.
+            if identifier in new:
+                row = rounds.get(timestamp)
+                if row is None or row.direction not in {"long", "short"}:
+                    raise ValueError("funding round unavailable")
+                unit_value, public_rate = number(row.value), number(row.rate)
+                direction = Decimal(1 if row.direction == "long" else -1)
+                with localcontext() as context:
+                    context.traps[Inexact] = True
+                    if (unit_value < 0 or public_rate < 0
+                            or public_rate * direction / 100 != rate):
+                        raise ValueError("funding round rate mismatch")
+                    # Engineering inference: the round's value is cash per base
+                    # unit. Authenticate size/side and verify its display amount;
+                    # the V2 ledger independently requires an exact cash bridge.
+                    amount = unit_value * size * (-1 if side == row.direction else 1)
+                    context.traps[Inexact] = False
+                    if amount.quantize(Decimal("0.000001"), rounding=ROUND_DOWN) != raw[2]:
+                        raise ValueError("funding round amount mismatch")
+                if discount > abs(amount):
+                    raise ValueError("invalid deferred funding discount")
+            elif cache is not None:
+                amount = cache[identifier][1]
+            updated[identifier] = (raw, amount)
+            # REST funding timestamps are seconds; trade timestamps are millis.
+            result.append({"id": str(identifier), "timestamp": timestamp * 1000, "change": amount})
+        self._mm_exact_funding[key] = updated
+        return tuple(result)
+
     async def get_account_fee_and_funding(
-        self, symbol: str, limit: int = 100
+        self, symbol: str, limit: int = 100, *, allow_unsettled_funding: bool = False
     ) -> Dict[str, Any]:
         """Read current authenticated fee ticks and realized funding, without mutation.
 
@@ -547,6 +633,9 @@ class LighterAdapter(ExchangeAdapter):
                 ),
             )
             rest._require_success_response(limits, "current account fees query")
+            if (getattr(rest, "_mm_budget_admission", False)
+                    and getattr(limits, "user_tier", None) != "premium"):
+                raise ValueError("MM API budget requires current authenticated premium tier")
             rates = []
             for field in ("current_maker_fee_tick", "current_taker_fee_tick"):
                 tick = getattr(limits, field, None)
@@ -564,6 +653,10 @@ class LighterAdapter(ExchangeAdapter):
             rows = getattr(response, "position_fundings", None)
             if not isinstance(rows, list):
                 raise ValueError("funding rows unavailable")
+            if hasattr(self, "_mm_exact_funding"):
+                fundings = await self._exact_market_maker_fundings(rows, market_id,
+                    allow_unsettled=allow_unsettled_funding is True)
+                return {"maker_fee_rate": rates[0], "taker_fee_rate": rates[1], "fundings": fundings}
             fundings = []
             for row in rows:
                 identifier, timestamp = row.funding_id, row.timestamp
@@ -1026,17 +1119,52 @@ class LighterAdapter(ExchangeAdapter):
 
     async def close_read_stream(self):
         """Close the opt-in read route before explicit failure-cleanup REST reads."""
+        rest = getattr(self, "_rest", None)
+        if rest is not None:
+            rest._mm_confirmation_reader = None
         stream = getattr(self, "_read_stream", None)
         if stream is not None:
             await stream.close()
             self._read_stream = None
 
-    async def open_read_stream(self, symbol: str, *, clock=time.monotonic):
+    def set_market_maker_confirmation_reader(self, reader):
+        """Share MM submission lookup evidence with its account/OM read boundary."""
+        if (not callable(reader) or getattr(self, "_read_stream", None) is None
+                or getattr(self._rest, "_capture_terminal_cancellation_outcomes", False) is not True):
+            raise ValueError("MM confirmation reader prerequisites unavailable")
+        self._rest._mm_confirmation_reader = reader
+
+    def set_market_maker_request_observer(self, observer, *, enforce_admission=False):
+        """Observe only this adapter's SDK clients; never patch a global transport."""
+        if (not callable(observer) or type(enforce_admission) is not bool or getattr(self, "_connected", False)
+                or getattr(self, "_mm_request_observer", None) is not None):
+            raise ValueError("request observer requires a disconnected adapter")
+        self._mm_request_observer = observer
+        self._rest._mm_budget_admission = enforce_admission
+
+        def attach(client):
+            transport = client.rest_client
+            request = transport.request
+            async def observed(method, url, *args, **kwargs):
+                observer("rest", url)
+                return await request(method, url, *args, **kwargs)
+            transport.request = observed
+
+        self._rest._mm_observe_client = attach
+        signer = self._rest.signer_client
+        if signer is not None:
+            attach(signer.api_client)
+
+    async def open_read_stream(self, symbol: str, *, clock=time.monotonic,
+                               allow_delayed_dry_book=False):
         """Open an opt-in read-only stream using this adapter's existing signer."""
         from .lighter_read_stream import LighterReadStream
 
         try:
             rest = self._rest
+            if (type(allow_delayed_dry_book) is not bool
+                    or allow_delayed_dry_book and getattr(rest, "_mm_budget_admission", False)):
+                raise ValueError("invalid dry book profile")
             expected_url = {
                 "robinhood": "wss://api.rh.lighter.xyz/stream",
                 "robinhood_testnet": "wss://api.rh-testnet.lighter.xyz/stream",
@@ -1060,7 +1188,8 @@ class LighterAdapter(ExchangeAdapter):
                 return token
 
             stream = LighterReadStream(self.ws_url, rest.account_index, market_id, auth_factory,
-                                       clock=clock)
+                clock=clock, request_observer=getattr(self, "_mm_request_observer", None),
+                allow_delayed_dry_book=allow_delayed_dry_book)
             self._read_stream = stream
             await stream.start()
             return stream

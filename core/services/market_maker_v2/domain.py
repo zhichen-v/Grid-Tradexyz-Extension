@@ -168,6 +168,9 @@ class SessionRunResult:
     report: "SessionReport | None"
     final_account: AccountSnapshot | None
     failure: str | None
+    delayed_dry_book: bool = False
+    cleanup_account: AccountSnapshot | None = None
+    stop_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +463,7 @@ class FillEvent:
     observed_monotonic: float
     reference_price: Decimal | None = None
     flatten_id: str | None = None
+    source_timestamp_ms: int | None = None
 
     def __post_init__(self):
         _identifier(self.fill_id)
@@ -477,6 +481,8 @@ class FillEvent:
             _decimal(self.reference_price, positive=True)
         if self.flatten_id is not None:
             _identifier(self.flatten_id)
+        if self.source_timestamp_ms is not None:
+            _count(self.source_timestamp_ms)
         if self.liquidity == LiquidityRole.TAKER and self.flatten_id is None:
             raise ValueError("taker fills must belong to bounded flatten")
 
@@ -538,4 +544,45 @@ class FillAccounting:
                 _decimal(value)
 
 
-TelemetryEvent = AccountSnapshot | QuotePlan | ExecutionResult | FillAccounting | MarkEvent | CashflowEvent | SessionReport | BoundedExitReport | InventoryDecision
+@dataclass(frozen=True, slots=True)
+class DiagnosticValue:
+    name: str
+    value: Decimal
+
+    def __post_init__(self):
+        _identifier(self.name)
+        _decimal(self.value)
+
+
+@dataclass(frozen=True, slots=True)
+class FailureDiagnostic:
+    """Local failure evidence; no exception messages, account payloads or secrets."""
+    symbol: str
+    stage: str
+    error_type: str
+    source: tuple[str, ...] = ()
+    execution_health: ExecutionHealth | None = None
+    order_states: tuple[str, ...] = ()
+    uncertain: bool | None = None
+    unknown_orders: bool | None = None
+    values: tuple[DiagnosticValue, ...] = ()
+
+    def __post_init__(self):
+        _symbol(self.symbol)
+        _identifier(self.stage)
+        _identifier(self.error_type)
+        for values in (self.source, self.order_states):
+            if type(values) is not tuple:
+                raise ValueError("immutable diagnostic fields required")
+            for value in values:
+                _identifier(value)
+        if self.execution_health is not None and not isinstance(self.execution_health, ExecutionHealth):
+            raise ValueError("typed diagnostic health required")
+        for value in (self.uncertain, self.unknown_orders):
+            if value is not None:
+                _boolean(value)
+        if type(self.values) is not tuple or any(type(value) is not DiagnosticValue for value in self.values):
+            raise ValueError("typed diagnostic values required")
+
+
+TelemetryEvent = AccountSnapshot | QuotePlan | ExecutionResult | FillAccounting | MarkEvent | CashflowEvent | SessionReport | BoundedExitReport | InventoryDecision | FailureDiagnostic

@@ -30,7 +30,8 @@ Lighter交易所适配器 - REST API模块
 """
 
 from typing import Dict, Any, Optional, List, Callable
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, Inexact, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, localcontext
+from dataclasses import replace
 from datetime import datetime
 import asyncio
 import logging
@@ -216,7 +217,9 @@ class LighterRest(LighterBase):
             self._request_interval = 0.05
             self._max_rate_limit_delay = 30.0
 
-        max_attempts = 2 if retry_on_429 else 1
+        # Live MM admits a bounded healthy proof path. A 429 invalidates that
+        # assumption; do not silently multiply its remaining exit read costs.
+        max_attempts = 2 if retry_on_429 and not getattr(self, "_mm_budget_admission", False) else 1
         for attempt in range(max_attempts):
             rate_limited = False
             async with self._request_lock:
@@ -637,24 +640,32 @@ class LighterRest(LighterBase):
         """Resolve cancellation only from an exact active or terminal-history match."""
         target = str(order_id)
         active_seen = False
+        terminal_only = (getattr(self, "_capture_terminal_cancellation_outcomes", False) is True
+                         and (callable(getattr(self, "_mm_confirmation_reader", None))
+                              or getattr(self, "_mm_budget_admission", False)))
 
         def matches(order: OrderData) -> bool:
+            if terminal_only:
+                return str(getattr(order, "id", "") or "") == target and order.symbol == symbol
             return target in {
                 str(getattr(order, "id", "") or ""),
                 str(getattr(order, "client_id", "") or ""),
             }
 
         for attempt in range(self.CANCELLATION_RECONCILIATION_ATTEMPTS):
-            try:
-                active_orders = await self.get_open_orders(symbol)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to reconcile ambiguous cancellation: "
-                    f"order_id={order_id}, source=open, error={exc}"
-                )
-            else:
-                if any(matches(order) for order in active_orders):
-                    active_seen = True
+            # MM consumes positive terminal proof only. Absence remains uncertain;
+            # an active-list read cannot establish a terminal outcome.
+            if not terminal_only:
+                try:
+                    active_orders = await self.get_open_orders(symbol)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to reconcile ambiguous cancellation: "
+                        f"order_id={order_id}, source=open, error={exc}"
+                    )
+                else:
+                    if any(matches(order) for order in active_orders):
+                        active_seen = True
 
             try:
                 history = await self.get_order_history(symbol)
@@ -753,6 +764,9 @@ class LighterRest(LighterBase):
             # 创建API客户端
             configuration = Configuration(host=self.base_url)
             self.api_client = ApiClient(configuration=configuration)
+            observer = getattr(self, "_mm_observe_client", None)
+            if observer is not None:
+                observer(self.api_client)
 
             # 创建各种API实例
             self.account_api = AccountApi(self.api_client)
@@ -2285,7 +2299,15 @@ class LighterRest(LighterBase):
             raise RuntimeError("order submission lost its client_order_id")
 
         unresolved_reason: Optional[str] = None
-        if batch_mode:
+        if (not batch_mode and not skip_order_index_query
+                and callable(getattr(self, "_mm_confirmation_reader", None))
+                and kwargs.get("time_in_force") == "IOC" and kwargs.get("reduce_only") is True):
+            terminal = await self._query_mm_ioc_terminal(symbol, side, price, quantity, client_order_id)
+            if terminal is not None:
+                return replace(terminal, params=dict(terminal.params or {}) | kwargs)
+            order_id = None
+            unresolved_reason = "IOC submission acknowledged without exact terminal proof"
+        elif batch_mode:
             # Batch mode deliberately skips the exchange order-index lookup.
             order_id = None
             unresolved_reason = "batch submission acknowledged without exchange order index"
@@ -2304,15 +2326,25 @@ class LighterRest(LighterBase):
         else:
             # 单个模式：立即查询 order_index（网格程序）
             logger.info(f"🔍 单个模式：立即查询 order_index...")
-
+            mm_maker = (callable(getattr(self, "_mm_confirmation_reader", None))
+                        and kwargs.get("time_in_force") == "POST_ONLY")
             order_index = await self._query_order_index(
                 symbol=symbol,
                 side=side,
                 price=price,
                 amount=quantity,
                 client_order_id=client_order_id,
-                max_retries=3
+                max_retries=3,
+                **({"return_order": True} if mm_maker else {}),
             )
+
+            if mm_maker:
+                # The exact observed row is the proof. An artificial PENDING
+                # receipt loses fills/status and prevents V2's next safe action.
+                if self._valid_mm_maker_confirmation(order_index, symbol, side, price,
+                                                     quantity, kwargs.get("reduce_only")):
+                    return replace(order_index, params=dict(order_index.params or {}) | kwargs)
+                order_index = None
 
             if order_index:
                 # ✅ 成功获取 order_index
@@ -2373,6 +2405,72 @@ class LighterRest(LighterBase):
             raw_data={'tx': tx, 'response': response, 'tx_hash_str': tx_hash_str}
         )
 
+    async def _query_mm_ioc_terminal(self, symbol, side, price, amount, client_order_id):
+        """MM IOC history is the confirmation; never search an active-only channel."""
+        try:
+            async with asyncio.timeout(5):
+                for attempt in range(10):
+                    history = await self.get_order_history(symbol, limit=100)
+                    matches = [order for order in history
+                               if self._order_matches_client_id(order, client_order_id)]
+                    if matches:
+                        if len(matches) != 1:
+                            return None
+                        order = matches[0]
+                        source = (order.raw_data or {}).get("order_info")
+                        values = (order.amount, order.price, order.filled, order.remaining)
+                        if (any(not isinstance(value, Decimal) or not value.is_finite() for value in values)
+                                or order.symbol != symbol or order.side.value != side
+                                or order.type is not OrderType.LIMIT
+                                or not str(order.id).isdigit() or not 1 <= int(order.id) < (1 << 60)
+                                or order.amount != amount or order.price != price
+                                or not 0 <= order.filled <= amount or not 0 <= order.remaining <= amount
+                                or order.status not in {OrderStatus.FILLED, OrderStatus.CANCELED,
+                                                       OrderStatus.EXPIRED, OrderStatus.REJECTED}
+                                or getattr(source, "reduce_only", None) is not True
+                                or getattr(source, "time_in_force", None) != "immediate-or-cancel"
+                                or getattr(source, "owner_account_index", None) != self.account_index
+                                or getattr(source, "market_index", None) != self.get_market_index(symbol)):
+                            return None
+                        with localcontext() as context:
+                            context.traps[Inexact] = True
+                            if order.filled + order.remaining > amount:
+                                return None
+                        if order.status is OrderStatus.FILLED and (order.filled != amount or order.remaining):
+                            return None
+                        return order
+                    if attempt < 9:
+                        await asyncio.sleep(0.5)
+        except Exception:
+            pass  # A failed post-send read remains uncertain; it never permits a resend.
+        return None
+
+    def _valid_mm_maker_confirmation(self, order, symbol, side, price, amount, reduce_only):
+        """Confirm the submitted intent without promoting an ID or ack to OPEN."""
+        if not isinstance(order, OrderData):
+            return False
+        source = (order.raw_data or {}).get("order_info")
+        values = (order.amount, order.price, order.filled, order.remaining)
+        if (any(not isinstance(value, Decimal) or not value.is_finite() for value in values)
+                or order.symbol != symbol or order.side.value != side or order.type is not OrderType.LIMIT
+                or not str(order.id).isdigit() or not 1 <= int(order.id) < (1 << 60)
+                or order.amount != amount or order.price != price
+                or not 0 <= order.filled <= amount or not 0 <= order.remaining <= amount
+                or order.status not in {OrderStatus.OPEN,
+                    OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
+                or type(reduce_only) is not bool or getattr(source, "reduce_only", None) is not reduce_only
+                or getattr(source, "time_in_force", None) != "post-only"
+                or getattr(source, "owner_account_index", None) != self.account_index
+                or getattr(source, "market_index", None) != self.get_market_index(symbol)):
+            return False
+        with localcontext() as context:
+            context.traps[Inexact] = True
+            accounted = order.filled + order.remaining
+        if accounted > amount or (order.status is OrderStatus.OPEN
+                                  and accounted != amount):
+            return False
+        return order.status is not OrderStatus.FILLED or (order.filled == amount and not order.remaining)
+
     async def _query_order_index(
         self,
         symbol: str,
@@ -2381,8 +2479,9 @@ class LighterRest(LighterBase):
         amount: Decimal,
         client_order_id: Optional[int] = None,
         max_retries: int = 3,
-        retry_delay: float = 0.5
-    ) -> Optional[str]:
+        retry_delay: float = 0.5,
+        return_order: bool = False,
+    ) -> Optional[str | OrderData]:
         """
         通过价格和数量匹配查询 order_index
 
@@ -2400,9 +2499,10 @@ class LighterRest(LighterBase):
             amount: 订单数量
             max_retries: 最大重试次数（默认3次）
             retry_delay: 重试延迟（秒，默认0.5秒）
+            return_order: MM-only caller retains the exact matched observation.
 
         Returns:
-            order_index (字符串) 或 None（查询失败）
+            order_index, the matched OrderData when requested, or None.
         """
         for attempt in range(max_retries):
             try:
@@ -2413,7 +2513,8 @@ class LighterRest(LighterBase):
                     await asyncio.sleep(retry_delay * attempt)  # 递增延迟
 
                 # 查询挂单列表
-                open_orders = await self.get_open_orders(symbol)
+                reader = getattr(self, "_mm_confirmation_reader", None) or self.get_open_orders
+                open_orders = await reader(symbol)
 
                 if not open_orders:
                     logger.debug(
@@ -2423,6 +2524,12 @@ class LighterRest(LighterBase):
                     continue
 
                 if client_order_id is not None:
+                    if return_order:
+                        matches = [order for order in open_orders
+                                   if self._order_matches_client_id(order, client_order_id)]
+                        if matches:
+                            return matches[0] if len(matches) == 1 else None
+                        continue
                     for order in open_orders:
                         if self._order_matches_client_id(order, client_order_id):
                             logger.info(
@@ -2466,6 +2573,10 @@ class LighterRest(LighterBase):
         if client_order_id is not None:
             try:
                 history_orders = await self.get_order_history(symbol, limit=100)
+                if return_order:
+                    matches = [order for order in history_orders
+                               if self._order_matches_client_id(order, client_order_id)]
+                    return matches[0] if len(matches) == 1 else None
                 for order in history_orders:
                     if self._order_matches_client_id(order, client_order_id):
                         logger.info(

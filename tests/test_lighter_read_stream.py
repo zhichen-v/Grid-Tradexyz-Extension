@@ -327,6 +327,93 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             stream.book_snapshot()
 
+    async def test_delayed_dry_profile_preserves_packets_and_counts_only_applied_updates(self):
+        for delayed in (False, True):
+            for age_ms in (4000, -50):
+                with self.subTest(delayed=delayed, age_ms=age_ms):
+                    wall, monotonic = [1], [42.5]
+                    stream, socket, _ = await self.make_stream(
+                        wall_clock=lambda: wall[0], clock=lambda: monotonic[0],
+                        allow_delayed_dry_book=delayed)
+                    wall[0] += max(age_ms, 0) / 1000
+                    monotonic[0] += max(age_ms, 0) / 1000
+                    update = book_message(initial=False, nonce=11, offset=21)
+                    update["timestamp"] = int(wall[0] * 1000) - age_ms
+                    await socket.push(update)
+                    await self.flush()
+                    if not delayed:
+                        with self.assertRaises(RuntimeError):
+                            stream.book_snapshot()
+                        self.assertEqual(stream.source_time_diagnostics()["accepted_book_packets"], 1)
+                        self.assertEqual(stream.source_time_diagnostics()["profile"], "strict")
+                        self.assertTrue(stream.transport_healthy)
+                        continue
+                    initial_checks = stream.source_time_diagnostics()["outside_strict_source_checks"]
+                    self.assertEqual(initial_checks, 1)
+                    result = stream.book_snapshot()
+                    self.assertEqual(result["timestamp"], update["timestamp"])
+                    self.assertEqual(result["received_monotonic"], monotonic[0])
+                    stream.check_book_source(result["timestamp"])
+                    evidence = stream.source_time_diagnostics()
+                    self.assertEqual(evidence["profile"], "delayed_dry")
+                    self.assertEqual((evidence["source_min_age_ms"], evidence["source_max_age_ms"]),
+                                     (-100, 10000))
+                    self.assertEqual(evidence["accepted_book_packets"], 2)
+                    self.assertEqual(evidence["outside_strict_source_packets"], 1)
+                    self.assertEqual(evidence["outside_strict_source_checks"], initial_checks + 4)
+                    self.assertEqual(Decimal(evidence["min_accepted_age_ms"]), min(0, age_ms))
+                    self.assertEqual(Decimal(evidence["max_accepted_age_ms"]), max(0, age_ms))
+                    wall[0] += 0.1
+                    monotonic[0] += 0.1
+                    fresh = book_message(initial=False, nonce=12, offset=22)
+                    fresh["timestamp"] = round(wall[0] * 1000)
+                    await socket.push(fresh)
+                    await self.flush()
+                    self.assertEqual(stream.book_snapshot()["timestamp"], fresh["timestamp"])
+                    self.assertEqual(stream.source_time_diagnostics()["accepted_book_packets"], 3)
+                    self.assertEqual(stream.source_time_diagnostics()["outside_strict_source_packets"], 1)
+                    final_evidence = stream.source_time_diagnostics()
+                    await stream.close()
+                    self.assertEqual(stream.source_time_diagnostics(), final_evidence)
+
+    async def test_delayed_dry_source_boundaries_do_not_relax_sequence_or_clock_continuity(self):
+        for age_ms, fault in ((10000, None), (-100, None), (10001, "source_time_out_of_bounds"),
+                              (-101, "source_time_out_of_bounds"),
+                              (0, "discontinuous_book"), (100, "clock_discontinuity")):
+            with self.subTest(age_ms=age_ms, fault=fault):
+                wall, monotonic = [1], [42.5]
+                stream, socket, _ = await self.make_stream(
+                    wall_clock=lambda: wall[0], clock=lambda: monotonic[0],
+                    allow_delayed_dry_book=True)
+                wall[0] += max(age_ms, 0) / 1000
+                if fault != "clock_discontinuity":
+                    monotonic[0] += max(age_ms, 0) / 1000
+                update = book_message(initial=False, nonce=11, offset=21)
+                update["timestamp"] = round(wall[0] * 1000) - age_ms
+                if fault == "discontinuous_book":
+                    update["order_book"]["nonce"] = 9
+                await socket.push(update)
+                await self.flush()
+                if fault is None:
+                    self.assertEqual(stream.book_snapshot()["timestamp"], update["timestamp"])
+                    self.assertEqual(stream.source_time_diagnostics()["accepted_book_packets"], 2)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        stream.book_snapshot()
+                    self.assertEqual(stream.last_book_failure, ("receive_book", fault))
+                    self.assertEqual(stream.source_time_diagnostics()["accepted_book_packets"], 1)
+                    self.assertEqual(stream.source_time_diagnostics()["outside_strict_source_packets"], 0)
+                    self.assertTrue(stream.transport_healthy)
+                    self.assertEqual((await stream.request_snapshot("account_all_orders"))["orders"], {})
+
+    async def test_delayed_dry_profile_requires_exact_boolean_before_connection(self):
+        for value in (None, 0, 1, "true"):
+            connection = AsyncMock()
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "invalid dry book profile"):
+                LighterReadStream("wss://api.rh.lighter.xyz/stream", 7, 0, lambda: "test-auth",
+                                  connect_factory=connection, allow_delayed_dry_book=value)
+            connection.assert_not_called()
+
     async def test_source_failure_reports_age_and_wall_elapsed_error_without_relaxing_guard(self):
         for wall_value, kind, age in ((0.98, "future", "-20.00"), (4.001, "stale", "3001.000")):
             wall = [1]
@@ -352,8 +439,8 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
             stream.check_book_source(old["timestamp"])
         self.assertEqual(stream.last_source_time_failure[0], "stale")
         self.assertTrue(stream.transport_healthy)
-        with self.assertRaises(RuntimeError):
-            stream.check_book_source(3900)
+        stream.check_book_source(3900)
+        self.assertEqual(stream.book_snapshot()["nonce"], 11)
 
     async def test_host_clock_jump_fails_book_but_keeps_account_cleanup_on_either_platform(self):
         for quantum in (0.015625, 0.000000001):
@@ -554,6 +641,29 @@ class LighterReadStreamOwnershipTests(unittest.IsolatedAsyncioTestCase):
             with patch("core.adapters.exchanges.adapters.lighter_read_stream.LighterReadStream") as factory:
                 with self.assertRaisesRegex(RuntimeError, "read stream unavailable"):
                     await adapter.open_read_stream("ETH")
+                factory.assert_not_called()
+
+    async def test_delayed_dry_profile_is_forwarded_but_rejected_with_live_admission(self):
+        for delayed, admission in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(delayed=delayed, admission=admission):
+                adapter = self.make_adapter()
+                adapter._rest._mm_budget_admission = admission
+                with patch("core.adapters.exchanges.adapters.lighter_read_stream.LighterReadStream") as factory:
+                    factory.return_value.start = AsyncMock()
+                    if delayed and admission:
+                        with self.assertRaisesRegex(RuntimeError, "read stream unavailable"):
+                            await adapter.open_read_stream("ETH", allow_delayed_dry_book=delayed)
+                        factory.assert_not_called()
+                        adapter._rest.signer_client.create_auth_token_with_expiry.assert_not_called()
+                    else:
+                        await adapter.open_read_stream("ETH", allow_delayed_dry_book=delayed)
+                        self.assertIs(factory.call_args.kwargs["allow_delayed_dry_book"], delayed)
+                        factory.return_value.start.assert_awaited_once()
+        for value in (None, 0, 1, "true"):
+            adapter = self.make_adapter()
+            with patch("core.adapters.exchanges.adapters.lighter_read_stream.LighterReadStream") as factory:
+                with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "read stream unavailable"):
+                    await adapter.open_read_stream("ETH", allow_delayed_dry_book=value)
                 factory.assert_not_called()
 
     async def test_opt_in_order_snapshot_uses_existing_parser_without_rest_query(self):

@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import signal
 import sys
+import time
 
 from core.services.market_maker_v2 import orchestrator
 from core.services.market_maker_v2.config import load_config, require_authorization
@@ -30,6 +31,10 @@ def parse_cli(argv=None):
     parser.add_argument("--output", type=Path, required=True, help="new, exclusive JSONL output path")
     parser.add_argument("--authorize-bounded-flatten", action="store_true",
                         help="authorize this live run's bounded reduce-only exit")
+    parser.add_argument("--allow-delayed-dry-book", action="store_true",
+                        help="dry testing only: allow book source age -100..10000ms; records the relaxed profile")
+    parser.add_argument("--progress", action="store_true",
+                        help="show local phase and elapsed time every 10 seconds; no extra API reads")
     return parser.parse_args(argv)
 
 
@@ -62,23 +67,47 @@ def _stop_signals(event):
             signal.signal(sig, previous)
 
 
-async def run_session(config, settings, *, output, authorized=False, stop_event=None):
+async def _show_progress(session):
+    started = time.monotonic()
+    while True:
+        print(f"MM V2: phase={session.phase} elapsed={time.monotonic() - started:.0f}s",
+              file=sys.stderr, flush=True)
+        await asyncio.sleep(10)
+
+
+async def run_session(config, settings, *, output, authorized=False, stop_event=None,
+                      allow_delayed_dry_book=False, progress=False):
     """No settings contents are recorded; the coordinator owns connection cleanup."""
-    require_authorization(config, authorized)
+    require_authorization(config, authorized, allow_delayed_dry_book=allow_delayed_dry_book)
     _validate_identity(settings)
     event = stop_event if stop_event is not None else asyncio.Event()
     previous_logging = logging.root.manager.disable
     # Shared SDK logs can contain raw responses; typed V2 JSONL is the diagnostic path.
     logging.disable(logging.CRITICAL)
     try:
-        with JsonlTelemetrySink(output) as sink, _stop_signals(event):
+        with (JsonlTelemetrySink(output) as sink, _stop_signals(event),
+              Path(str(output) + ".budget.json").open("x", encoding="utf-8") as budget_output):
             adapter = build_adapter(settings)
             session = orchestrator.VolumeSession(
                 config, adapter, account_index=settings["account_index"],
                 expected_l1_address=settings["expected_l1_address"],
                 authorize_bounded_flatten=authorized, telemetry=sink,
+                allow_delayed_dry_book=allow_delayed_dry_book,
             )
-            return await session.run(event)
+            progress_task = asyncio.create_task(_show_progress(session)) if progress else None
+            try:
+                return await session.run(event)
+            finally:
+                if progress_task is not None:
+                    progress_task.cancel()
+                    await asyncio.gather(progress_task, return_exceptions=True)
+                budget = session.api_budget.snapshot()
+                diagnostics = getattr(session.market.stream, "source_time_diagnostics", lambda: None)
+                budget["source_time"] = {
+                    "profile": "delayed_dry" if allow_delayed_dry_book else "strict",
+                    "observations": diagnostics(),
+                }
+                json.dump(budget, budget_output, allow_nan=False, sort_keys=True)
     finally:
         logging.disable(previous_logging)
 
@@ -88,11 +117,25 @@ def _summary(config, result):
             or type(result.completed) is not bool):
         raise ValueError("invalid session result")
     report = result.report
-    economics = (not config.dry_run and type(report) is SessionReport and report.complete)
+    delayed = getattr(result, "delayed_dry_book", False)
+    if type(delayed) is not bool or delayed and not config.dry_run:
+        raise ValueError("invalid delayed dry result")
+    economics = (not config.dry_run and result.completed and result.failure is None
+                 and type(report) is SessionReport and report.complete)
     summary = {"mode": "dry_run" if config.dry_run else "live",
                "completed": result.completed, "failed": result.failure is not None,
-               "economics_evaluated": economics}
+               "economics_evaluated": economics,
+               "source_time_profile": "delayed_dry" if delayed else "strict"}
+    stop_reason = getattr(result, "stop_reason", None)
+    if stop_reason is not None:
+        if stop_reason != "risk_capacity_exhausted":
+            raise ValueError("invalid session stop reason")
+        summary["stop_reason"] = stop_reason
     account = result.final_account
+    cleanup = getattr(result, "cleanup_account", None)
+    if type(cleanup) is AccountSnapshot:
+        summary.update(cleanup_authenticated=cleanup.authenticated,
+                       cleanup_position=str(cleanup.position), cleanup_open_orders=cleanup.open_order_count)
     if type(account) is AccountSnapshot:
         summary.update(final_position=str(account.position),
                        final_open_orders=account.open_order_count,
@@ -112,10 +155,13 @@ def main(argv=None):
     try:
         config = load_config(args.config)
         # This must precede even secret-bearing settings reads, not just connect.
-        require_authorization(config, args.authorize_bounded_flatten)
+        require_authorization(config, args.authorize_bounded_flatten,
+                              allow_delayed_dry_book=args.allow_delayed_dry_book)
         settings = load_settings(args.exchange_config, env_path=args.env_file)
         result = asyncio.run(run_session(config, settings, output=args.output,
-                                        authorized=args.authorize_bounded_flatten))
+                                        authorized=args.authorize_bounded_flatten,
+                                        allow_delayed_dry_book=args.allow_delayed_dry_book,
+                                        progress=args.progress))
         print(json.dumps(_summary(config, result), allow_nan=False, sort_keys=True))
         return 0 if result.completed and result.failure is None else 1
     except KeyboardInterrupt:

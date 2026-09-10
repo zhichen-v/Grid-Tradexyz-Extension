@@ -6,13 +6,16 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace as NS
 
 from core.services.market_maker_v2.domain import (
     AccountSnapshot, FillAccounting, FillEvent, FlattenIntent, InventoryDecision,
     LiquidityRole, MarkEvent, QuotePlan, Side, StrategyState,
 )
 from core.services.market_maker_v2.session_ledger import SessionLedger
-from core.services.market_maker_v2.telemetry import JsonlTelemetrySink, TelemetryError
+from core.services.market_maker_v2.telemetry import JsonlTelemetrySink, TelemetryError, failure_diagnostic
+from core.services.market_maker_v2.lighter_runtime import LighterReadError
+from core.services.market_maker_v2.execution_port import ExecutionUnavailable
 
 
 class JsonlTelemetryTests(unittest.TestCase):
@@ -20,6 +23,56 @@ class JsonlTelemetryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "events.jsonl"
+
+    def test_failure_records_code_locations_and_states_without_exception_payloads(self):
+        manager = NS(known_order_ids=frozenset(), has_uncertain_state=True,
+                     has_unknown_order_state=False,
+                     snapshot=lambda: [NS(side=NS(value="buy"), state=NS(value="uncertain_submission"),
+                                          order_id="DO_NOT_EXPOSE_SECRET")])
+        try:
+            try:
+                raise RuntimeError("DO_NOT_EXPOSE_SECRET")
+            except RuntimeError:
+                QuotePlan("BTC", ({"credential": "DO_NOT_EXPOSE_SECRET"},))
+        except ValueError as error:
+            diagnostic = failure_diagnostic("BTC", "authorizing_quotes", error, manager=manager)
+        with JsonlTelemetrySink(self.path) as sink:
+            sink.emit(diagnostic)
+        encoded = self.path.read_text()
+        self.assertNotIn("DO_NOT_EXPOSE_SECRET", encoded)
+        self.assertNotIn("Traceback", encoded)
+        self.assertNotIn("credential", encoded)
+        row = json.loads(encoded)
+        self.assertEqual(row["event"], "failure_diagnostic")
+        self.assertEqual(row["data"]["error_type"], "ValueError")
+        self.assertTrue(any(source.startswith("domain:") for source in row["data"]["source"]))
+        self.assertEqual(row["data"]["order_states"], ["buy:uncertain_submission:unconfirmed"])
+
+    def test_read_failure_values_use_decimal_strings_and_exclude_identity_or_payloads(self):
+        error = LighterReadError("private-provider-detail", values={
+            "cash": D("298.79515983036"), "account_position": D("0.00040"),
+            "account_index": D("123456"), "token": "private-token"})
+        with JsonlTelemetrySink(self.path) as sink:
+            sink.emit(failure_diagnostic("BTC", "final_account", error))
+        encoded = self.path.read_text()
+        self.assertNotIn("private-", encoded)
+        self.assertNotIn("123456", encoded)
+        self.assertEqual(json.loads(encoded)["data"]["values"], [
+            {"name": "cash", "value": "298.79515983036"},
+            {"name": "account_position", "value": "0.00040"}])
+
+    def test_exit_diagnostic_excludes_unapproved_fields_and_nonfinancial_payloads(self):
+        error = ExecutionUnavailable("private-provider-detail", values={
+            "exit_limit": D("79874.2"), "exit_bid": D("79872.6"),
+            "exit_book_age_ms": "private-token", "account_index": D("123456")})
+        with JsonlTelemetrySink(self.path) as sink:
+            sink.emit(failure_diagnostic("BTC", "flatten_ioc", error))
+        encoded = self.path.read_text()
+        self.assertNotIn("private-", encoded)
+        self.assertNotIn("123456", encoded)
+        self.assertEqual(json.loads(encoded)["data"]["values"], [
+            {"name": "exit_limit", "value": "79874.2"},
+            {"name": "exit_bid", "value": "79872.6"}])
 
     def test_one_stream_appends_typed_events_with_decimal_strings(self):
         fill = FillEvent("f1", "o1", "BTC", Side.BUY, D("0.0002"), D("100"),

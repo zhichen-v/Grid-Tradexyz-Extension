@@ -127,6 +127,26 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
             params={"cancel_terminal": True},
         )
 
+    async def test_active_ioc_minimum_exemption_keeps_positive_lot_price_and_position_bounds(self):
+        valid = DesiredOrder(OrderSide.SELL, Decimal("100.1"), Decimal("0.1"), True, "bounded exit")
+        invalid = (replace(valid, amount=Decimal("0")),
+                   replace(valid, amount=Decimal("-0.1")),
+                   replace(valid, amount=Decimal("NaN")),
+                   replace(valid, amount=Decimal("1.1")),
+                   replace(valid, amount=Decimal("0.15")),
+                   replace(valid, price=Decimal("0")),
+                   replace(valid, price=Decimal("NaN")),
+                   replace(valid, price=Decimal("100.05")),
+                   replace(valid, reduce_only=False))
+        for desired in invalid:
+            with self.subTest(desired=desired):
+                manager = self.make_manager(self.active_unwind_config())
+                result = await manager.execute_active_unwind(desired)
+                self.assertTrue(result.errors)
+                self.assertIsNone(manager.active_unwind_prepared_generation)
+                self.adapter.get_open_orders.assert_not_awaited()
+                self.adapter.create_order.assert_not_awaited()
+
     async def test_active_unwind_cancels_before_single_bounded_ioc(self) -> None:
         events = []
 

@@ -13,13 +13,23 @@ class LighterReadStream:
 
     def __init__(self, url, account_index, market_id, auth_factory, *,
                  connect_factory=websockets.connect, clock=time.monotonic,
-                 wall_clock=time.time, sleep=asyncio.sleep, timeout=5):
+                 wall_clock=time.time, sleep=asyncio.sleep, timeout=5, request_observer=None,
+                 allow_delayed_dry_book=False):
+        if type(allow_delayed_dry_book) is not bool:
+            raise ValueError("invalid dry book profile")
+        self._source_profile = "delayed_dry" if allow_delayed_dry_book else "strict"
+        self._source_min_age_ms = -100 if allow_delayed_dry_book else 0
+        self._source_max_age_ms = 10000 if allow_delayed_dry_book else 3000
+        self._accepted_book_packets = self._outside_strict_source_packets = 0
+        self._outside_strict_source_checks = 0
+        self._min_accepted_age_ms = self._max_accepted_age_ms = None
         self._url, self._account, self._market = url, account_index, market_id
         self._auth, self._connect, self._clock = auth_factory, connect_factory, clock
         self._wall_clock = wall_clock
         self._wall_quantum = max(0, min(time.get_clock_info("time").resolution, 0.02))
         self._sleep = sleep
         self._timeout = timeout
+        self._request_observer = request_observer
         self._socket = self._reader = self._pending = self._book_ready = None
         self._lock = asyncio.Lock()
         self._invalid = False
@@ -56,6 +66,19 @@ class LighterReadStream:
     def last_source_time_failure(self):
         return self._last_source_time_failure
 
+    def source_time_diagnostics(self):
+        """Sanitized acceptance evidence remains available after stream cleanup."""
+        return {"profile": self._source_profile,
+                "source_min_age_ms": self._source_min_age_ms,
+                "source_max_age_ms": self._source_max_age_ms,
+                "accepted_book_packets": self._accepted_book_packets,
+                "outside_strict_source_packets": self._outside_strict_source_packets,
+                "outside_strict_source_checks": self._outside_strict_source_checks,
+                "min_accepted_age_ms": (str(self._min_accepted_age_ms)
+                                        if self._min_accepted_age_ms is not None else None),
+                "max_accepted_age_ms": (str(self._max_accepted_age_ms)
+                                        if self._max_accepted_age_ms is not None else None)}
+
     def _fail_book(self, stage, error):
         reasons = {"invalid book sequence": "invalid_sequence",
                    "stale or future source book timestamp": "source_time_out_of_bounds",
@@ -78,6 +101,14 @@ class LighterReadStream:
                 self._url, ping_interval=30, ping_timeout=10, close_timeout=1,
                 max_size=8 * 1024 * 1024,
             ), self._timeout)
+            if self._request_observer is not None:
+                # Includes library keepalives and server-triggered control pongs.
+                protocol = self._socket.protocol
+                send_frame = protocol.send_frame
+                def observed(frame):
+                    self._request_observer("ws", int(frame.opcode))
+                    return send_frame(frame)
+                protocol.send_frame = observed
             self._book_ready = asyncio.get_running_loop().create_future()
             self._reader = asyncio.create_task(self._receive())
             await asyncio.wait_for(self._send_wait(
@@ -235,23 +266,26 @@ class LighterReadStream:
         return Decimal(str(self._wall_clock())) * 1000 - timestamp
 
     def _check_source_time(self, timestamp):
-        # No inferred clock correction: a lagging/jumping host clock fails closed.
+        # No inferred clock correction; the default profile remains strict.
         age_ms = self._source_age_ms(timestamp)
         wall, now = age_ms + timestamp, Decimal(str(self._clock())) * 1000
         previous = self._wall_observation
         self._wall_observation = wall, now
         elapsed_error = wall - previous[0] - (now - previous[1]) if previous else None
-        if not age_ms.is_finite() or not 0 <= age_ms <= 3000:
+        if not age_ms.is_finite() or not self._source_min_age_ms <= age_ms <= self._source_max_age_ms:
             kind = "unusable" if not age_ms.is_finite() else "future" if age_ms < 0 else "stale"
             # Diagnostic only: no inferred offset or change to acceptance bounds.
             self._last_source_time_failure = (kind, str(age_ms),
                 str(elapsed_error) if elapsed_error is not None else None)
             raise ValueError("stale or future source book timestamp")
-        # This is a continuity bound, NOT an allowance for future source data.
+        # Clock continuity is independent of the source-age profile.
         # 50 ms exceeds two capped wall-clock quanta on either supported host.
         if elapsed_error is not None and abs(elapsed_error) > 50:
             self._last_source_time_failure = ("clock_jump", str(age_ms), str(elapsed_error))
             raise ValueError("host clock discontinuity")
+        # Includes repeat validation of aligned/cached books; not a packet count.
+        self._outside_strict_source_checks += int(not 0 <= age_ms <= 3000)
+        return age_ms
 
     def _update_book(self, message):
         if message.get("channel") != f"order_book:{self._market}":
@@ -263,7 +297,7 @@ class LighterReadStream:
             raise ValueError("unexpected book snapshot")
         nonce, offset = self._integer(book["nonce"]), self._integer(book["offset"])
         timestamp = self._integer(message["timestamp"])
-        self._check_source_time(timestamp)
+        age_ms = self._check_source_time(timestamp)
         if "offset" in message and self._integer(message["offset"]) != offset:
             raise ValueError("conflicting book offset")
         if not initial and (self._integer(book["begin_nonce"]) != self._book["nonce"]
@@ -291,6 +325,12 @@ class LighterReadStream:
         self._book = {"nonce": nonce, "offset": offset, "timestamp": timestamp,
                       "received_monotonic": self._clock(),
                       "last_updated_at": book.get("last_updated_at")}
+        self._accepted_book_packets += 1
+        self._outside_strict_source_packets += int(not 0 <= age_ms <= 3000)
+        self._min_accepted_age_ms = (age_ms if self._min_accepted_age_ms is None
+                                     else min(self._min_accepted_age_ms, age_ms))
+        self._max_accepted_age_ms = (age_ms if self._max_accepted_age_ms is None
+                                     else max(self._max_accepted_age_ms, age_ms))
 
     def check_book_source(self, timestamp):
         """Revalidate even a previously aligned packet against current stream health."""
@@ -298,10 +338,16 @@ class LighterReadStream:
         if self._book_invalid or self._book is None:
             raise RuntimeError("read book unavailable")
         try:
-            self._check_source_time(self._integer(timestamp))
+            self._check_source_time(self._book["timestamp"])
         except Exception as error:
             self._fail_book("book_snapshot", error)
             raise RuntimeError("read book source timestamp unavailable") from None
+        # An old aligned packet expires independently of the current live book.
+        # Reject it without destroying fresh evidence needed for bounded exit.
+        try:
+            self._check_source_time(self._integer(timestamp))
+        except Exception:
+            raise RuntimeError("aligned book source timestamp unavailable") from None
 
     def book_snapshot(self):
         self.check_book_source(self._book["timestamp"] if self._book else None)

@@ -116,11 +116,95 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         creates = [i for i, kind in enumerate(kinds) if kind == "create"]
         self.assertIn("authorize", kinds[creates[0] + 1:creates[1]])
         self.assertIn("account", kinds[creates[0] + 1:creates[1]])
+
+    async def test_recorded_fee_loss_keeps_both_quotes_until_actual_expiry(self):
+        # The real hour lost .163683... before entering its endless BUY replacement loop.
+        self.bid, self.ask, self.maker_fee = D("79900"), D("79901"), D("0.00012")
+        self.manager.config = ExecutionSettings("BTC", D("0.0004"), D("0.0008"), 500, False)
+        self.manager.metadata = MarketMetadata("BTC", 1, 5, D("0.1"),
+            D("0.00001"), D("0.00001"), D("10"))
+        self.governor = InventoryGovernor(order_size=D("0.0004"), soft_limit=D("0.0004"),
+            hard_limit=D("0.0008"), stop_loss_usdg=D("0.15"), max_hold_seconds=180,
+            cooldown_seconds=30, max_session_loss_usdg=D("0.5"),
+            session_started_monotonic=0, session_deadline_monotonic=3600, ioc_slippage_ticks=200)
+        self.policy = VolumeQuotePolicy(order_size=D("0.0004"), target_net_edge_bps=D("0.20"),
+            volatility_multiplier=D("0"), hard_inventory_limit=D("0.0008"), skew_bps_at_hard=D("0"))
+        self.market.snapshot.side_effect = lambda: MarketStateSnapshot("BTC", self.time(),
+            self.bid, self.ask, D("0.1"), D("0.00001"), D("0.00001"), True)
+        report = SessionReport("BTC", False, D("0"), None, ledger_position=D("0"),
+            realized_net_pnl=D("-0.16368336318"), marked_net_pnl=D("-0.16368336318"),
+            current_drawdown=D("0.164885484780"), max_drawdown=D("0.164885484780"))
+
+        async def authorize(execution):
+            account = replace(await self.account_snapshot(), equity=D("298.472771115322"),
+                              taker_fee_rate=D("0.00035"))
+            market = self.market.snapshot()
+            current = replace(report, duration_seconds=D(str(self.time())))
+            risk = self.governor.evaluate(market, account, current, execution, now=self.time())
+            plan = self.policy.propose(market, account, risk, now=self.time())
+            return QuoteAuthorization(account, market, risk, plan)
+
+        self.refresh.side_effect = authorize
+        self.port = self.make_port(reprice_threshold_ticks=500, max_quote_age_ms=60000)
+        first = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(first.status, ExecutionStatus.CONFIRMED)
+        self.assertEqual({row.side for row in first.snapshot.orders}, {Side.BUY, Side.SELL})
+        self.assertEqual((first.submitted_count, first.cancelled_count), (2, 0))
+        original_ids = set(self.open)
+        for _ in range(11):
+            self.time.value += 5
+            result = await self.port.reconcile_quotes(first.actual_plan)
+            self.assertEqual((result.submitted_count, result.cancelled_count), (0, 0))
+            self.assertEqual(set(self.open), original_ids)
+        self.adapter.cancel_order.assert_not_called()
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.time.value += 5
+        expired = await self.port.reconcile_quotes(first.actual_plan)
+        self.assertEqual((expired.submitted_count, expired.cancelled_count), (2, 2))
+        self.assertEqual({row.side for row in expired.snapshot.orders}, {Side.BUY, Side.SELL})
+        self.assertTrue(original_ids <= self.manager.terminal_order_ids)
         second = await self.port.reconcile_quotes(self.proposal)
         self.assertEqual(second.submitted_count, 0)
         self.assertEqual({o.side for o in second.snapshot.orders}, {Side.BUY, Side.SELL})
         self.assertEqual(second.actual_plan.symbol, "BTC")
         self.assertFalse(second.snapshot.simulated)
+
+    async def test_delayed_known_terminal_is_proven_before_new_quote(self):
+        await self.quote_both()
+        sold = next(row for row in self.open.values() if row.side is OrderSide.SELL)
+        self.open.pop(sold.id)
+        self.position = -sold.amount
+        terminal = replace(sold, status=OrderStatus.FILLED,
+                           filled=sold.amount, remaining=D("0"))
+        reads = 0
+
+        async def history(symbol):
+            nonlocal reads
+            reads += 1
+            return [] if reads == 1 else [terminal]
+
+        self.adapter.get_order_history.side_effect = history
+        self.refresh.reset_mock()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+        self.assertGreaterEqual(reads, 2)
+        self.assertIn(sold.id, self.manager.terminal_order_ids)
+        self.assertIs(self.refresh.call_args_list[0].args[0].health, ExecutionHealth.HEALTHY)
+        self.assertEqual({o.side for o in result.snapshot.orders}, {Side.BUY, Side.SELL})
+        self.adapter.cancel_order.assert_not_called()
+
+    async def test_local_wire_ambiguity_with_empty_registry_cannot_recover(self):
+        await self.quote_both()
+        self.manager._mark_submission_uncertain(OrderSide.BUY, "unproven receipt")
+        self.assertFalse(self.manager.get_unresolved_submissions())
+        self.assertFalse(self.manager.can_reconcile_known_orders)
+        self.adapter.create_order.reset_mock()
+        self.adapter.cancel_order.reset_mock()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.BLOCKED)
+        self.assertTrue(self.manager.has_uncertain_state)
+        self.adapter.create_order.assert_not_called()
+        self.adapter.cancel_order.assert_not_called()
 
     async def test_under_threshold_quotes_are_kept_without_cancelling_or_repricing(self):
         await self.quote_both()

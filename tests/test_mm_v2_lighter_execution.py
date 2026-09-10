@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from core.adapters.exchanges.exceptions import OrderSubmissionRejectedError
 from core.adapters.exchanges.models import OrderData, OrderSide, OrderStatus, OrderType
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
+from core.adapters.exchanges.adapters.lighter import LighterAdapter
 from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
 
 
@@ -44,7 +45,474 @@ def _order(
     )
 
 
+class LighterExactFundingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.rows = []
+        self.rounds = []
+        rest = object.__new__(LighterRest)
+        rest.network, rest.account_index, rest.api_key_index = "robinhood", 7, 0
+        rest.get_market_index = Mock(return_value=1)
+        rest.signer_client = SimpleNamespace(create_auth_token_with_expiry=Mock(
+            return_value=("test-auth", None)))
+        rest.account_api = SimpleNamespace(
+            account_limits=AsyncMock(return_value=SimpleNamespace(code=200,
+                current_maker_fee_tick=120, current_taker_fee_tick=350)),
+            position_funding=AsyncMock(side_effect=lambda **kw:
+                SimpleNamespace(code=200, position_fundings=self.rows)))
+        rest.candlestick_api = SimpleNamespace(fundings=AsyncMock(side_effect=lambda **kw:
+            SimpleNamespace(code=200, resolution="1h", fundings=self.rounds)))
+        async def call_api(operation, factory):
+            return await factory()
+        rest._call_api = call_api
+        self.adapter = object.__new__(LighterAdapter)
+        self.adapter._rest = self.rest = rest
+        self.adapter._normalize_symbol = Mock(return_value="BTC")
+
+    @staticmethod
+    def funding(**changes):
+        data = dict(funding_id=67904, timestamp=1788692400, market_id=1,
+            change="-0.000384", rate="0.000012", position_size="0.00040",
+            position_side="long", discount="0.000000")
+        data.update(changes)
+        return SimpleNamespace(**data)
+
+    @staticmethod
+    def funding_round(**changes):
+        data = dict(timestamp=1788692400, value="0.96002280", rate="0.0012", direction="long")
+        data.update(changes)
+        return SimpleNamespace(**data)
+
+    async def start(self):
+        self.adapter.enable_market_maker_exact_funding()
+        return await self.adapter.get_account_fee_and_funding("BTC")
+
+    async def test_default_funding_preserves_seconds_and_reported_amount(self):
+        self.rows = [self.funding()]
+        result = await self.adapter.get_account_fee_and_funding("BTC")
+        self.assertEqual(result["fundings"], ({"id": "67904", "timestamp": 1788692400,
+            "change": Decimal("-0.000384")},))
+        self.rest.candlestick_api.fundings.assert_not_awaited()
+
+    async def test_baseline_only_normalizes_time_and_never_fetches_public_history(self):
+        self.rows = [self.funding()]
+        result = await self.start()
+        self.assertEqual(result["fundings"], ({"id": "67904", "timestamp": 1788692400000,
+            "change": Decimal("-0.000384")},))
+        self.adapter.enable_market_maker_exact_funding()
+        self.assertEqual(await self.adapter.get_account_fee_and_funding("BTC"), result)
+        self.rest.candlestick_api.fundings.assert_not_awaited()
+
+    async def test_new_funding_uses_independent_precise_round_and_caches_only_proven_event(self):
+        await self.start()
+        self.rows, self.rounds = [self.funding()], [self.funding_round()]
+        result = await self.adapter.get_account_fee_and_funding("BTC")
+        self.assertEqual(result["fundings"], ({"id": "67904", "timestamp": 1788692400000,
+            "change": Decimal("-0.0003840091200")},))
+        self.assertEqual(await self.adapter.get_account_fee_and_funding("BTC"), result)
+        self.rest.candlestick_api.fundings.assert_awaited_once_with(market_id=1,
+            resolution="1h", start_timestamp=1788692400, end_timestamp=1788692401, count_back=100)
+
+    async def test_public_payer_direction_and_authenticated_side_set_signed_amount(self):
+        for side, direction, rate, change, expected in (
+                ("long", "long", "0.000012", "-0.000384", "-0.00038400912"),
+                ("short", "long", "0.000012", "0.000384", "0.00038400912"),
+                ("long", "short", "-0.000012", "0.000384", "0.00038400912"),
+                ("short", "short", "-0.000012", "-0.000384", "-0.00038400912")):
+            with self.subTest(side=side, direction=direction):
+                self.setUp()
+                await self.start()
+                self.rows = [self.funding(position_side=side, rate=rate, change=change)]
+                self.rounds = [self.funding_round(direction=direction)]
+                result = await self.adapter.get_account_fee_and_funding("BTC")
+                self.assertEqual(result["fundings"][0]["change"], Decimal(expected))
+
+    async def test_invalid_or_missing_round_fails_without_committing_new_id(self):
+        mutations = [[], [self.funding_round(timestamp=1788692401)],
+            [self.funding_round(rate="0.0013")], [self.funding_round(value="0.97002280")],
+            [self.funding_round(direction="short")], [self.funding_round(value="NaN")],
+            [self.funding_round(), self.funding_round()]]
+        for rounds in mutations:
+            with self.subTest(rounds=rounds):
+                self.setUp()
+                await self.start()
+                self.rows, self.rounds = [self.funding()], rounds
+                with self.assertRaisesRegex(RuntimeError, "^authenticated fee/funding read unavailable$"):
+                    await self.adapter.get_account_fee_and_funding("BTC")
+                self.rounds = [self.funding_round()]
+                result = await self.adapter.get_account_fee_and_funding("BTC")
+                self.assertEqual(result["fundings"][0]["change"], Decimal("-0.00038400912"))
+                self.assertEqual(self.rest.candlestick_api.fundings.await_count, 2)
+
+    async def test_public_endpoint_failure_does_not_use_rounded_amount(self):
+        await self.start()
+        self.rows = [self.funding()]
+        self.rest.candlestick_api.fundings.side_effect = RuntimeError("test-public-unavailable")
+        with self.assertRaisesRegex(RuntimeError, "^authenticated fee/funding read unavailable$"):
+            await self.adapter.get_account_fee_and_funding("BTC")
+        self.assertEqual(self.adapter._mm_exact_funding[("robinhood", 7, 1)], {})
+
+    async def test_invalid_authenticated_fields_reject_before_public_discovery(self):
+        for changes in (dict(position_size="0"), dict(position_side="unknown"),
+                        dict(discount="-0.000001"), dict(rate="NaN"),
+                        dict(timestamp=1788692400000), dict(market_id=2)):
+            with self.subTest(changes=changes):
+                self.setUp()
+                await self.start()
+                self.rows = [self.funding(**changes)]
+                with self.assertRaises(RuntimeError):
+                    await self.adapter.get_account_fee_and_funding("BTC")
+                self.rest.candlestick_api.fundings.assert_not_awaited()
+
+    async def test_immutable_raw_conflict_is_not_hidden_by_precise_cache(self):
+        await self.start()
+        self.rows, self.rounds = [self.funding()], [self.funding_round()]
+        await self.adapter.get_account_fee_and_funding("BTC")
+        for changes in (dict(change="-0.000385"), dict(rate="0.000013"),
+                        dict(position_size="0.00041"), dict(discount="0.000001")):
+            with self.subTest(changes=changes):
+                self.rows = [self.funding(**changes)]
+                with self.assertRaises(RuntimeError):
+                    await self.adapter.get_account_fee_and_funding("BTC")
+        self.rest.candlestick_api.fundings.assert_awaited_once()
+
+    async def test_multiple_new_rounds_use_one_bounded_read_and_atomic_cache_commit(self):
+        await self.start()
+        self.rows = [self.funding(), self.funding(funding_id=67905, timestamp=1788696000)]
+        self.rounds = [self.funding_round()]
+        with self.assertRaises(RuntimeError):
+            await self.adapter.get_account_fee_and_funding("BTC")
+        self.assertEqual(self.adapter._mm_exact_funding[("robinhood", 7, 1)], {})
+        self.rounds.append(self.funding_round(timestamp=1788696000))
+        result = await self.adapter.get_account_fee_and_funding("BTC")
+        self.assertEqual(len(result["fundings"]), 2)
+        self.assertEqual(self.rest.candlestick_api.fundings.await_count, 2)
+
+    async def test_deferred_discount_is_validated_without_crediting_cash(self):
+        await self.start()
+        self.rows, self.rounds = [self.funding(discount="0.000020")], [self.funding_round()]
+        result = await self.adapter.get_account_fee_and_funding("BTC")
+        self.assertEqual(result["fundings"][0]["change"], Decimal("-0.00038400912"))
+        self.rows = [self.funding(funding_id=67905, discount="0.000385")]
+        with self.assertRaises(RuntimeError):
+            await self.adapter.get_account_fee_and_funding("BTC")
+
+    async def test_exit_read_defers_new_precision_without_consuming_its_identity(self):
+        self.rows = [self.funding(funding_id=67903, timestamp=1788688800)]
+        baseline = await self.start()
+        self.rows.append(self.funding())
+        result = await self.adapter.get_account_fee_and_funding("BTC", allow_unsettled_funding=True)
+        self.assertEqual(result, baseline)
+        self.assertNotIn(67904, self.adapter._mm_exact_funding[("robinhood", 7, 1)])
+        self.rest.candlestick_api.fundings.assert_not_awaited()
+        self.rounds = [self.funding_round()]
+        result = await self.adapter.get_account_fee_and_funding("BTC")
+        self.assertEqual(result["fundings"][-1]["change"], Decimal("-0.00038400912"))
+        self.rest.candlestick_api.fundings.assert_awaited_once()
+
+
 class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_premium_tier_gate_is_live_mm_only_and_fails_before_funding_read(self):
+        for admission, tier, allowed in ((True, "premium", True), (True, "standard", False),
+                                        (True, "Premium", False), (True, None, False),
+                                        (False, "standard", True), (None, None, True)):
+            with self.subTest(admission=admission, tier=tier):
+                limits = SimpleNamespace(code=200, current_maker_fee_tick=120,
+                                         current_taker_fee_tick=350)
+                if tier is not None:
+                    limits.user_tier = tier
+                rest = object.__new__(LighterRest)
+                if admission is not None:
+                    rest._mm_budget_admission = admission
+                rest.account_index, rest.api_key_index = 7, 0
+                rest.get_market_index = Mock(return_value=1)
+                rest.signer_client = SimpleNamespace(create_auth_token_with_expiry=Mock(
+                    return_value=("test-auth", None)))
+                rest.account_api = SimpleNamespace(account_limits=AsyncMock(return_value=limits),
+                    position_funding=AsyncMock(return_value=SimpleNamespace(code=200, position_fundings=[])))
+                async def call_api(operation, factory):
+                    return await factory()
+                rest._call_api = call_api
+                adapter = object.__new__(LighterAdapter)
+                adapter._rest = rest
+                adapter._normalize_symbol = Mock(return_value="BTC")
+                if allowed:
+                    result = await adapter.get_account_fee_and_funding("BTC")
+                    self.assertEqual(result, {"maker_fee_rate": Decimal("0.00012"),
+                        "taker_fee_rate": Decimal("0.00035"), "fundings": ()})
+                    rest.account_api.position_funding.assert_awaited_once()
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "^authenticated fee/funding read unavailable$"):
+                        await adapter.get_account_fee_and_funding("BTC")
+                    rest.account_api.position_funding.assert_not_awaited()
+                rest.account_api.account_limits.assert_awaited_once()
+
+    @staticmethod
+    def _ioc_rest(rows):
+        rest = LighterRateLimitBoundaryTests._submission_rest(
+            (object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+        rest.account_index = 7
+        rest.get_market_index = Mock(return_value=1)
+        rest._mm_confirmation_reader = AsyncMock(return_value=[])
+        rest.get_order_history = AsyncMock(return_value=rows)
+        rest.get_open_orders = AsyncMock(return_value=[])
+        rest.signer_client.create_order = AsyncMock(
+            return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+        async def call_api(operation, factory, **kwargs):
+            return await factory()
+        rest._call_api = call_api
+        return rest
+
+    @staticmethod
+    def _ioc_terminal():
+        return replace(_order("987", OrderSide.SELL, Decimal("100.0"), Decimal("0.2"),
+                              OrderStatus.FILLED), client_id="1", filled=Decimal("0.2"),
+                       remaining=Decimal("0"), raw_data={"order_info": SimpleNamespace(
+                           reduce_only=True, time_in_force="immediate-or-cancel",
+                           owner_account_index=7, market_index=1)})
+
+    async def test_mm_ioc_returns_exact_terminal_to_order_manager_without_active_or_duplicate_reads(self):
+        from core.services.market_maker_v2.config import ExecutionSettings
+        from core.services.market_maker_v2.execution_models import DesiredOrder, MarketMetadata
+        from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
+
+        terminal = self._ioc_terminal()
+        for row in (terminal, replace(terminal, status=OrderStatus.CANCELED, filled=Decimal("0.1")),
+                    replace(terminal, status=OrderStatus.CANCELED, filled=Decimal("0"))):
+            with self.subTest(status=row.status, filled=row.filled):
+                rest = self._ioc_rest([row])
+                async def create(symbol, side, kind, amount, price, params):
+                    return await rest.place_order(symbol, side.value, kind.value, amount, price, **params)
+                adapter = SimpleNamespace(create_order=AsyncMock(side_effect=create),
+                    get_open_orders=AsyncMock(return_value=[]), get_order_history=AsyncMock(return_value=[]))
+                manager = MarketMakerOrderManager(adapter,
+                    ExecutionSettings("BTC", Decimal("0.2"), Decimal("1"), 1, False),
+                    MarketMetadata("BTC", 1, 1, Decimal("0.1"), Decimal("0.1"), Decimal("0.1"), Decimal("0")))
+                desired = DesiredOrder(OrderSide.SELL, Decimal("100.0"), Decimal("0.2"), True, "exit")
+                await manager.execute_active_unwind(desired)
+                result = await manager.execute_active_unwind(desired,
+                    prepared_generation=manager.active_unwind_prepared_generation)
+                self.assertFalse(result.errors)
+                self.assertIn("987", manager.terminal_order_ids)
+                self.assertFalse(manager.active_unwind_pending)
+                rest.signer_client.create_order.assert_awaited_once()
+                rest.get_order_history.assert_awaited_once_with("BTC", limit=100)
+                rest.get_open_orders.assert_not_awaited()
+                rest._mm_confirmation_reader.assert_not_awaited()
+                adapter.get_order_history.assert_not_awaited()
+
+    async def test_mm_ioc_missing_or_conflicting_terminal_remains_uncertain_without_resending(self):
+        terminal = self._ioc_terminal()
+        invalid = [replace(terminal, **changes) for changes in (
+            {"client_id": "other"}, {"symbol": "ETH"}, {"side": OrderSide.BUY},
+            {"type": OrderType.MARKET}, {"id": "0"}, {"id": str(1 << 60)},
+            {"amount": Decimal("0.3")}, {"price": Decimal("100.1")},
+            {"filled": Decimal("0.1")}, {"filled": Decimal("NaN")},
+            {"remaining": Decimal("0.1")}, {"status": OrderStatus.OPEN},
+        )]
+        for field, value in (("reduce_only", False), ("time_in_force", "post-only"),
+                             ("owner_account_index", 8), ("market_index", 0)):
+            source = vars(terminal.raw_data["order_info"]) | {field: value}
+            invalid.append(replace(terminal, raw_data={"order_info": SimpleNamespace(**source)}))
+        for rows in ([], [terminal, terminal], *([row] for row in invalid)):
+            with self.subTest(rows=[(row.id, row.status) for row in rows]):
+                rest = self._ioc_rest(rows)
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+                    result = await rest.place_order("BTC", "sell", "limit", Decimal("0.2"),
+                        Decimal("100.0"), time_in_force="IOC", reduce_only=True)
+                self.assertIsNone(result.id)
+                self.assertTrue(rest.get_unresolved_submissions())
+                rest.signer_client.create_order.assert_awaited_once()
+                self.assertLessEqual(rest.get_order_history.await_count, 10)
+                rest.get_open_orders.assert_not_awaited()
+                rest._mm_confirmation_reader.assert_not_awaited()
+
+    async def test_ioc_terminal_lookup_is_mm_only_and_read_failure_is_not_retry_safe(self):
+        for mm, tif, reducing in ((False, "IOC", True), (True, "POST_ONLY", True), (True, "IOC", False)):
+            rest = self._ioc_rest([self._ioc_terminal()])
+            if not mm:
+                rest._mm_confirmation_reader = None
+            rest._query_order_index = AsyncMock(return_value="987")
+            result = await rest.place_order("BTC", "sell", "limit", Decimal("0.2"), Decimal("100.0"),
+                time_in_force=tif, reduce_only=reducing)
+            self.assertIs(result.status, OrderStatus.PENDING)
+            rest._query_order_index.assert_awaited_once()
+            rest.get_order_history.assert_not_awaited()
+        for error in (TimeoutError(), RuntimeError("read unavailable")):
+            rest = self._ioc_rest([])
+            rest.get_order_history.side_effect = error
+            result = await rest.place_order("BTC", "sell", "limit", Decimal("0.2"), Decimal("100.0"),
+                time_in_force="IOC", reduce_only=True)
+            self.assertIsNone(result.id)
+            rest.signer_client.create_order.assert_awaited_once()
+            rest.get_order_history.assert_awaited_once()
+
+    async def test_mm_submission_confirmation_uses_owned_reader_and_close_detaches_it(self):
+        rest = object.__new__(LighterRest)
+        rest.enable_terminal_cancellation_outcomes()
+        confirmed = replace(_order("987", OrderSide.BUY, Decimal("100"), Decimal("1"), OrderStatus.OPEN),
+                            client_id="42")
+        reader = AsyncMock(return_value=[confirmed])
+        rest.get_open_orders = AsyncMock(return_value=[])
+        rest.get_order_history = AsyncMock(return_value=[])
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+        adapter._read_stream = SimpleNamespace(close=AsyncMock())
+        adapter.set_market_maker_confirmation_reader(reader)
+        with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+            identifier = await rest._query_order_index("BTC", "buy", Decimal("100"), Decimal("1"),
+                                                      client_order_id=42)
+        self.assertEqual(identifier, "987")
+        reader.assert_awaited_once_with("BTC")
+        rest.get_open_orders.assert_not_awaited()
+        rest.get_order_history.assert_not_awaited()
+        await adapter.close_read_stream()
+        self.assertIsNone(rest._mm_confirmation_reader)
+        with self.assertRaises(ValueError):
+            adapter.set_market_maker_confirmation_reader(reader)
+
+    async def test_mm_maker_confirmation_reaches_both_live_slots_without_another_read(self):
+        from test_mm_v2_quote_execution import QuoteExecutionTests
+        from core.services.market_maker_v2.domain import ExecutionHealth, ExecutionStatus
+
+        fixture = QuoteExecutionTests()
+        fixture.setUp()
+        rest = object.__new__(LighterRest)
+        rest.account_index = 7
+        rest.get_market_index = Mock(return_value=1)
+        rest._mm_confirmation_reader = AsyncMock(side_effect=lambda symbol: list(fixture.open.values()))
+        rest.get_order_history = AsyncMock(return_value=[])
+
+        async def create(symbol, side, kind, amount, price, params):
+            row = await fixture.create(symbol, side, kind, amount, price, params)
+            row.client_id = row.id
+            row.raw_data = {"order_info": SimpleNamespace(owner_account_index=7, market_index=1,
+                reduce_only=params["reduce_only"], time_in_force="post-only")}
+            return await rest._handle_order_result(object(), SimpleNamespace(code=200, tx_hash="test-tx"),
+                None, symbol, side.value, kind.value, amount, price, client_order_id=int(row.id), **params)
+
+        fixture.adapter.create_order.side_effect = create
+        with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+            result = await fixture.port.reconcile_quotes(fixture.proposal)
+        self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+        self.assertIs(result.snapshot.health, ExecutionHealth.HEALTHY)
+        self.assertEqual(result.submitted_count, 2)
+        self.assertEqual(len(result.snapshot.orders), 2)
+        self.assertEqual(fixture.adapter.create_order.await_count, 2)
+        self.assertEqual(rest._mm_confirmation_reader.await_count, 2)
+        rest.get_order_history.assert_not_awaited()
+
+    async def test_mm_maker_preserves_partial_and_terminal_exchange_observations(self):
+        initial = self._ioc_terminal()
+        source = SimpleNamespace(owner_account_index=7, market_index=1, reduce_only=False,
+                                 time_in_force="post-only")
+        initial = replace(initial, status=OrderStatus.OPEN, filled=Decimal("0"), remaining=Decimal("0.2"),
+                          raw_data={"order_info": source})
+        for status, filled, remaining in ((OrderStatus.OPEN, "0", "0.2"),
+                (OrderStatus.OPEN, "0.1", "0.1"), (OrderStatus.FILLED, "0.2", "0"),
+                (OrderStatus.CANCELED, "0.1", "0")):
+            with self.subTest(status=status, filled=filled):
+                row = replace(initial, status=status, filled=Decimal(filled), remaining=Decimal(remaining))
+                rest = self._ioc_rest([row])
+                if status is OrderStatus.OPEN:
+                    rest._mm_confirmation_reader.return_value = [row]
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+                    result = await rest.place_order("BTC", "sell", "limit", Decimal("0.2"), Decimal("100.0"),
+                                                    time_in_force="POST_ONLY", reduce_only=False)
+                self.assertEqual((result.id, result.status, result.filled, result.remaining),
+                                 (row.id, row.status, row.filled, row.remaining))
+                self.assertIs(result.raw_data["order_info"], source)
+                self.assertEqual(result.params["time_in_force"], "POST_ONLY")
+                self.assertIs(result.params["reduce_only"], False)
+                rest.signer_client.create_order.assert_awaited_once()
+                self.assertEqual(rest._mm_confirmation_reader.await_count, 1 if status is OrderStatus.OPEN else 3)
+                self.assertEqual(rest.get_order_history.await_count, 0 if status is OrderStatus.OPEN else 1)
+
+    async def test_mm_maker_conflicting_or_missing_confirmation_never_resends(self):
+        row = replace(self._ioc_terminal(), status=OrderStatus.OPEN, filled=Decimal("0"),
+            remaining=Decimal("0.2"), raw_data={"order_info": SimpleNamespace(owner_account_index=7,
+                market_index=1, reduce_only=False, time_in_force="post-only")})
+        invalid = [replace(row, **changes) for changes in (
+            {"client_id": "other"}, {"symbol": "ETH"}, {"side": OrderSide.BUY},
+            {"amount": Decimal("0.3")}, {"price": Decimal("100.1")},
+            {"filled": Decimal("NaN")}, {"remaining": Decimal("0.1")},
+            {"status": OrderStatus.PENDING}, {"id": "0"}, {"type": OrderType.MARKET})]
+        for field, value in (("reduce_only", True), ("time_in_force", "good-till-time"),
+                             ("owner_account_index", 8), ("market_index", 0)):
+            invalid.append(replace(row, raw_data={"order_info": SimpleNamespace(
+                **(vars(row.raw_data["order_info"]) | {field: value}))}))
+        for rows in ([], [row, row], *([value] for value in invalid)):
+            with self.subTest(rows=[(value.id, value.status) for value in rows]):
+                rest = self._ioc_rest(rows)
+                rest._mm_confirmation_reader.return_value = rows
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+                    result = await rest.place_order("BTC", "sell", "limit", Decimal("0.2"), Decimal("100.0"),
+                                                    time_in_force="POST_ONLY", reduce_only=False)
+                self.assertIsNone(result.id)
+                self.assertTrue(rest.get_unresolved_submissions())
+                rest.signer_client.create_order.assert_awaited_once()
+
+    async def test_default_lighter_maker_receipt_and_index_lookup_remain_unchanged(self):
+        row = self._ioc_terminal()
+        rest = self._ioc_rest([])
+        rest._mm_confirmation_reader = None
+        rest.get_open_orders.return_value = [row]
+        with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+            result = await rest.place_order("BTC", "sell", "limit", Decimal("0.2"), Decimal("100.0"),
+                                            time_in_force="POST_ONLY", reduce_only=False)
+        self.assertEqual(result.id, row.id)
+        self.assertIs(result.status, OrderStatus.PENDING)
+        rest.get_open_orders.assert_awaited_once_with("BTC")
+        rest.get_order_history.assert_not_awaited()
+        rest.signer_client.create_order.assert_awaited_once()
+
+    async def test_mm_cancel_uses_positive_exact_history_without_redundant_active_reads(self):
+        canceled = _order("987", OrderSide.BUY, Decimal("100"), Decimal("1"), OrderStatus.CANCELED)
+        filled = replace(canceled, status=OrderStatus.FILLED, filled=Decimal("1"))
+        impostor = replace(canceled, id="other", client_id="987")
+        for rows, confirmed in (([canceled], True), ([filled], False), ([], False),
+                                ([impostor], False), ([replace(canceled, symbol="ETH")], False)):
+            with self.subTest(rows=[row.id for row in rows], confirmed=confirmed):
+                rest = object.__new__(LighterRest)
+                rest.enable_terminal_cancellation_outcomes()
+                rest._mm_confirmation_reader = AsyncMock(return_value=[])
+                rest.get_market_index = Mock(return_value=1)
+                rest.signer_client = SimpleNamespace(cancel_order=AsyncMock(
+                    return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None)))
+                async def call_api(operation, factory, **kwargs):
+                    return await factory()
+                rest._call_api = call_api
+                rest.get_open_orders = AsyncMock(return_value=[])
+                rest.get_order_history = AsyncMock(return_value=rows)
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+                    self.assertIs(await rest.cancel_order("BTC", "987"), confirmed)
+                    calls = rest.signer_client.cancel_order.await_count
+                    if not confirmed:
+                        self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+                        self.assertFalse(await rest.cancel_order("BTC", "987"))
+                        self.assertEqual(rest.signer_client.cancel_order.await_count, calls)
+                rest.get_open_orders.assert_not_awaited()
+                if confirmed:
+                    rest.get_order_history.assert_awaited_once()
+                if rows == [filled]:
+                    self.assertIs(rest.get_terminal_cancellation_outcome("BTC", "987"), filled)
+
+    async def test_mm_exit_cancellation_stays_history_only_after_read_stream_closes(self):
+        canceled = _order("987", OrderSide.BUY, Decimal("100"), Decimal("1"), OrderStatus.CANCELED)
+        rest = self._ioc_rest([canceled])
+        rest.enable_terminal_cancellation_outcomes()
+        rest._mm_budget_admission = True
+        rest.signer_client.cancel_order = AsyncMock(
+            return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+        adapter._read_stream = SimpleNamespace(close=AsyncMock())
+        await adapter.close_read_stream()
+        self.assertIsNone(rest._mm_confirmation_reader)
+        self.assertTrue(await rest.cancel_order("BTC", "987"))
+        rest.get_open_orders.assert_not_awaited()
+        rest.get_order_history.assert_awaited_once_with("BTC")
+        rest.signer_client.cancel_order.assert_awaited_once()
+
     @staticmethod
     def _submission_rest(result) -> LighterRest:
         rest = object.__new__(LighterRest)

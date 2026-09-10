@@ -18,7 +18,8 @@ from core.services.market_maker_v2.domain import (
     AccountSnapshot, ExecutionHealth, ExecutionResult, ExecutionSnapshot,
     ExecutionStatus, ExitStatus, FillEvent, LiquidityRole, Side,
 )
-from core.services.market_maker_v2.orchestrator import bounded_exit, DryCycleUnavailable
+from core.services.market_maker_v2.orchestrator import bounded_exit
+from core.services.market_maker_v2.execution_port import ExecutionUnavailable
 from core.services.market_maker_v2.session_ledger import SessionLedger
 from core.services.market_maker_v2.telemetry import JsonlTelemetrySink
 
@@ -67,6 +68,39 @@ class BoundedExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({intent.limit_price for intent in intents}, {D("101.2")})
         self.assertEqual({intent.deadline_monotonic for intent in intents}, {130.0})
         self.assertEqual(fixture.adapter.create_order.await_count, 3)
+
+    async def test_ioc_below_maker_minimums_reduces_exact_residual_on_each_side(self):
+        for position in (D("-0.2"), D("0.2")):
+            with self.subTest(position=position):
+                self.setUp()
+                fixture = self.fixture
+                fixture.position, fixture.fill_size = position, D("0.1")
+                fixture.manager.metadata = replace(fixture.manager.metadata,
+                    min_base_amount=D("0.3"), min_quote_amount=D("1000"))
+                market = fixture.market_snapshot
+                fixture.market.snapshot.side_effect = lambda: replace(market(), min_order_size=D("0.3"))
+                fixture.port.flatten_ioc = AsyncMock(wraps=fixture.port.flatten_ioc)
+                report = await self.exit()
+                self.assertIs(report.status, ExitStatus.FLAT)
+                self.assertEqual(report.attempts, 2)
+                self.assertEqual(report.final_result.account_snapshot.position, D("0"))
+                self.assertTrue(report.final_result.account_snapshot.authenticated)
+                calls = fixture.adapter.create_order.await_args_list
+                self.assertEqual([row.args[3] for row in calls], [D("0.2"), D("0.1")])
+                self.assertTrue(all(row.kwargs["params"] == {"time_in_force": "IOC", "reduce_only": True}
+                                    for row in calls))
+                intents = [row.args[0] for row in fixture.port.flatten_ioc.call_args_list]
+                self.assertEqual(len({intent.limit_price for intent in intents}), 1)
+                self.assertEqual({intent.deadline_monotonic for intent in intents}, {105.0})
+
+    async def test_subminimum_off_step_inventory_is_not_rounded_into_ioc(self):
+        fixture = self.fixture
+        fixture.position = D("-0.15")  # Quantity step remains 0.1.
+        fixture.manager.metadata = replace(fixture.manager.metadata, min_base_amount=D("0.3"))
+        report = await self.exit()
+        self.assertIs(report.status, ExitStatus.BLOCKED)
+        self.assertEqual(report.attempts, 0)
+        fixture.adapter.create_order.assert_not_awaited()
 
     async def test_initial_cancel_race_uses_new_full_residual_before_authorizing_ioc(self):
         fixture = self.fixture
@@ -146,7 +180,7 @@ class BoundedExitTests(unittest.IsolatedAsyncioTestCase):
         fixture = self.fixture
         fixture.clock.monotonic = Mock(side_effect=AssertionError("clock read forbidden"))
         fixture.port.snapshot = Mock(side_effect=AssertionError("port read forbidden"))
-        with self.assertRaises(DryCycleUnavailable):
+        with self.assertRaises(ExecutionUnavailable):
             await self.exit(authorize_bounded_flatten=False)
         fixture.clock.monotonic.assert_not_called()
         fixture.port.snapshot.assert_not_called()

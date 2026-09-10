@@ -248,6 +248,15 @@ class MarketMakerOrderManager:
         return frozenset(self._known_order_ids)
 
     @property
+    def can_reconcile_known_orders(self) -> bool:
+        """Permit reads for delayed evidence, never ambiguous wire mutations."""
+        return (not self._submission_ambiguity_latched
+                and not self.has_unknown_order_state
+                and not self.get_unresolved_submissions()
+                and not self.get_unresolved_cancellations()
+                and all(slot.order_id in self._known_order_ids for slot in self.snapshot()))
+
+    @property
     def terminal_order_ids(self) -> frozenset[str]:
         """Order IDs backed by exact terminal exchange evidence."""
         return frozenset(
@@ -1897,6 +1906,7 @@ class MarketMakerOrderManager:
     def _validate_active_unwind(self, desired: DesiredOrder) -> str | None:
         if not desired.reduce_only:
             return "active unwind must be reduce-only"
+        # IOC has no maker base/notional minimum: https://apidocs.lighter.xyz/docs/trading
         if (
             not isinstance(desired.amount, Decimal)
             or not isinstance(desired.price, Decimal)
@@ -1909,8 +1919,6 @@ class MarketMakerOrderManager:
                 desired.amount, self.metadata.quantity_step
             )
             or not is_step_aligned(desired.price, self.metadata.price_tick)
-            or desired.amount < self.metadata.min_base_amount
-            or desired.amount * desired.price < self.metadata.min_quote_amount
         ):
             return "active unwind desired price/amount is invalid"
         return None
