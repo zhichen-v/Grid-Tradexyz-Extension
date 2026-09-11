@@ -362,7 +362,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
     def __init__(self, manager, account, market, clock, *, refresh_quote,
                  reprice_threshold_ticks: int, max_quote_age_ms: int,
                  authorize_bounded_flatten: bool = False, before_mutation=None, before_cancel=None,
-                 on_failure=None):
+                 on_failure=None, before_optional_revision=None, on_optional_refusal=None):
         for value in (reprice_threshold_ticks, max_quote_age_ms):
             _count(value)
             if value == 0:
@@ -376,6 +376,8 @@ class VolumeExecutionPort(BoundedExecutionPort):
         self.refresh_quote = refresh_quote
         self.before_mutation = before_mutation
         self.before_cancel = before_cancel
+        self.before_optional_revision = before_optional_revision
+        self.on_optional_refusal = on_optional_refusal
         self.reprice_threshold_ticks, self.max_quote_age_ms = reprice_threshold_ticks, max_quote_age_ms
         self._maker_fee = None
         self._post_only_refresh = (0, 0.0)
@@ -454,6 +456,48 @@ class VolumeExecutionPort(BoundedExecutionPort):
         if count:
             self._post_only_refresh = (generation, self.clock.monotonic())
 
+    def _retained_orders_safe(self, authorization, *, sides=None):
+        """Existing orders need current risk permission, not a new-order minimum."""
+        execution, now = self.snapshot(), self.clock.monotonic()
+        try:
+            _validate_quote_authorization(authorization, execution, self._symbol, now)
+        except ExecutionUnavailable:
+            return False
+        risk, market, account = authorization.decision, authorization.market, authorization.account
+        if risk.state not in {StrategyState.QUOTING, StrategyState.SKEWED, StrategyState.REDUCE_ONLY}:
+            return False
+        if execution.orders and account.maker_fee_rate != self._maker_fee:
+            return False
+        targets = {quote.side: quote for quote in authorization.plan.quotes}
+        created = {str(order.order_id): order.created_monotonic for order in self.manager.snapshot()}
+        for order in execution.orders:
+            if sides is not None and order.side not in sides:
+                continue
+            target = targets.get(order.side)
+            capacity = risk.buy_capacity if order.side is Side.BUY else risk.sell_capacity
+            reducing = account.position < 0 if order.side is Side.BUY else account.position > 0
+            passive = order.price < market.external_ask if order.side is Side.BUY else order.price > market.external_bid
+            age = now - created[order.order_id]
+            if (target is None or target.reduce_only != order.reduce_only or not passive
+                    or not 0 <= age * 1000 < self.max_quote_age_ms
+                    or order.remaining_size > capacity
+                    or (order.reduce_only and (not reducing or order.remaining_size > abs(account.position)))
+                    or (risk.state is StrategyState.REDUCE_ONLY and not order.reduce_only)):
+                return False
+        return True
+
+    def _defer_optional(self, authorization, cancelled):
+        if self.on_optional_refusal is None or not self._retained_orders_safe(authorization):
+            return None
+        # The session checks stop/deadline and the next monitor plus exit budget.
+        # This is not permission to skip a future account/market/risk audit.
+        self.on_optional_refusal(authorization)
+        snapshot = self.snapshot()
+        actual = QuotePlan(self._symbol, tuple(QuoteIntent(order.side, order.price,
+            order.remaining_size, order.reduce_only) for order in snapshot.orders))
+        return ExecutionResult(ExecutionStatus.DEFERRED, snapshot, cancelled_count=cancelled,
+                               account_snapshot=authorization.account, actual_plan=actual)
+
     async def _reconcile_volume(self, deadline, *, after=0):
         await self._bounded(self.manager.sync_open_orders, deadline)
         self._capture_post_only_rejection()
@@ -486,8 +530,36 @@ class VolumeExecutionPort(BoundedExecutionPort):
                 revision.update(order.side for order in execution.orders)
             if not revision:
                 break
+            # Revoke unsafe sides first. A required cancellation must not turn
+            # a safe opposite-side reprice into mandatory work and bypass its
+            # budget preflight. The next iteration reauthorizes that side after
+            # exact cancellation proof, within this same quote deadline.
+            mandatory = {side for side in revision
+                         if not self._retained_orders_safe(authorization, sides={side})}
+            if mandatory:
+                revision = mandatory
+            elif len(execution.orders) == 1:
+                # Restore a missing side before optional work on a safe quote.
+                # Repricing would pay cancellation and another account audit
+                # before the create gate can even consider the missing side.
+                # Its fresh intent must also remain compatible with the actual
+                # retained price; the normal create admission below still runs.
+                retained = execution.orders[0]
+                missing = next((quote for quote in authorization.plan.quotes
+                                if quote.side is not retained.side), None)
+                if missing is not None and (retained.price < missing.price
+                        if retained.side is Side.BUY else missing.price < retained.price):
+                    break
             from ...adapters.exchanges.models import OrderSide
             selected = {order.order_id for order in execution.orders if order.side in revision}
+            if self.before_optional_revision is not None and self._retained_orders_safe(authorization):
+                try:
+                    self.before_optional_revision(len(selected))
+                except ApiBudgetUnavailable:
+                    deferred = self._defer_optional(authorization, cancelled)
+                    if deferred is None:
+                        raise
+                    return deferred
             self._admit_cancel(len(selected))
             result = await self._bounded(
                 lambda: self.manager.cancel_managed_orders("v2 quote revision",
@@ -502,8 +574,9 @@ class VolumeExecutionPort(BoundedExecutionPort):
             authorization = await self._fresh_quote(execution, deadline, self.clock.monotonic())
             execution = self.snapshot()
         self._maker_fee = authorization.account.maker_fee_rate
-        # Keep proven working prices below the revision threshold. Passing a new
-        # target to the manager here could cause hidden cancellation without our fresh audit.
+        # Keep the exact retained price and remaining amount, including when
+        # restoring a missing side takes priority over an optional revision.
+        # A changed target here could cause hidden cancellation without audit.
         retained = {order.side: order for order in execution.orders}
         effective = QuotePlan(self._symbol, tuple(
             QuoteIntent(quote.side, retained[quote.side].price,
@@ -511,7 +584,13 @@ class VolumeExecutionPort(BoundedExecutionPort):
             if quote.side in retained else quote for quote in authorization.plan.quotes))
         execution_plan, execution_risk = self._execution_quotes(effective, authorization)
         if self.before_mutation is not None and any(q.side not in retained for q in effective.quotes):
-            self.before_mutation()
+            try:
+                self.before_mutation()
+            except ApiBudgetUnavailable:
+                deferred = self._defer_optional(authorization, cancelled)
+                if deferred is None:
+                    raise
+                return deferred
         result = await self._bounded(lambda: self.manager.reconcile(execution_plan, execution_risk), deadline)
         self._capture_post_only_rejection()
         snapshot = self.snapshot()

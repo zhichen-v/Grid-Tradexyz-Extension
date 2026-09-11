@@ -1,7 +1,7 @@
 """Count attempted wire requests, including failed reads and protocol frames."""
 
 from collections import Counter, deque
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from fractions import Fraction
 from math import isfinite
 from urllib.parse import urlsplit
@@ -10,9 +10,26 @@ from urllib.parse import urlsplit
 class ApiBudgetUnavailable(RuntimeError):
     """The next ordinary action would spend capacity reserved for bounded exit."""
 
-    def __init__(self, message, *, values=None):
+    def __init__(self, message, *, values=None, operation="normal", blocker=None):
         super().__init__(message)
         self.diagnostic_values = values or {}
+        self.operation = operation
+        self.blocking_bucket = self.blocking_offset_seconds = None
+        self.projected_usage = self.limit = None
+        if blocker is not None:
+            self.blocking_bucket, offset, self.projected_usage, self.limit = blocker
+            # Checkpoints are half seconds or differences of binary clock values;
+            # their rational offsets have finite, exactly representable decimals.
+            with localcontext() as context:
+                context.prec = len(str(offset.numerator)) + offset.denominator.bit_length() + 2
+                self.blocking_offset_seconds = Decimal(offset.numerator) / Decimal(offset.denominator)
+
+    @property
+    def budget_diagnostic(self):
+        return {"operation": self.operation, "blocking_bucket": self.blocking_bucket,
+                "blocking_offset_seconds": (None if self.blocking_offset_seconds is None
+                                            else str(self.blocking_offset_seconds)),
+                "projected_usage": self.projected_usage, "limit": self.limit}
 
 
 class ApiBudget:
@@ -33,9 +50,12 @@ class ApiBudget:
         self.peaks = Counter()
         self.counts = Counter()
         self.deferrals = 0
+        self.optional_waits = 0
         self.account_read_deferrals = 0
         self.account_profile = None
         self._backpressure_exits = deque(maxlen=64)
+        self._account_read_exits = deque(maxlen=64)
+        self._admission_denials = deque(maxlen=64)
         self._last = 0
 
     def _expire(self):
@@ -92,8 +112,15 @@ class ApiBudget:
         three IOC sends. This is not a repeated-race/429 or network-success
         guarantee; other IP/L1 consumers are outside this meter's scope.
         """
-        if not self.available(normal=normal, reserve={"rest": 8806, "ws": 67, "tx": 5}):
-            return False
+        return self._scheduled_live_blocker(normal) is None
+
+    def _scheduled_live_blocker(self, normal):
+        reserve = {"rest": 8806, "ws": 67, "tx": 5}
+        if not self.available(normal=normal, reserve=reserve):
+            for bucket, limit in self.LIMITS.items():
+                projected = self._used[bucket] + normal[bucket] + reserve[bucket]
+                if projected > limit:
+                    return bucket, Fraction(0), projected, limit
         now = Fraction(self._last)
         expiries = deque((Fraction(at) + 60 - now, weight)
                          for at, bucket, weight in self._events if bucket == "rest")
@@ -105,21 +132,29 @@ class ApiBudget:
             # Before this boundary the preceding prefix still applies. Expiry
             # happens before a coincident history/metadata step takes effect.
             if used + normal["rest"] + prefix > self.LIMITS["rest"]:
-                return False
+                return "rest", elapsed, used + normal["rest"] + prefix, self.LIMITS["rest"]
             while expiries and expiries[0][0] <= elapsed:
                 used -= expiries.popleft()[1]
             prefix = (6006 + 100 * min(33, int(2 * elapsed))
                       + 900 * min(5, 1 + int(elapsed / 8)) + 900 + 1000)
             if used + normal["rest"] + prefix > self.LIMITS["rest"]:
-                return False
-        return True
+                return "rest", elapsed, used + normal["rest"] + prefix, self.LIMITS["rest"]
+        return None
 
-    def require_normal(self, normal):
+    def require_normal(self, normal, *, operation="normal"):
         """Call before an ordinary action, never as a post-send confirmation gate."""
-        if not self.scheduled_live_available(normal):
-            raise ApiBudgetUnavailable("API capacity reserved for bounded exit", values={
+        if (type(operation) is not str or not operation or len(operation) > 64
+                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in operation)):
+            raise ValueError("API operation must be a bounded local code label")
+        blocker = self._scheduled_live_blocker(normal)
+        if blocker is not None:
+            error = ApiBudgetUnavailable("API capacity reserved for bounded exit", values={
                 **{f"api_used_{key}": Decimal(self._used[key]) for key in self.LIMITS},
-                **{f"api_next_{key}": Decimal(normal[key]) for key in self.LIMITS}})
+                **{f"api_next_{key}": Decimal(normal[key]) for key in self.LIMITS}},
+                operation=operation, blocker=blocker)
+            self._admission_denials.append({"observed_monotonic": self._last,
+                                           **error.budget_diagnostic})
+            raise error
 
     def record_backpressure_exit(self, *, phase, exit_id, error):
         """Keep bounded, sanitized attribution; account-read races are separate."""
@@ -128,11 +163,72 @@ class ApiBudget:
         self._backpressure_exits.append({
             "number": self.deferrals, "observed_monotonic": now,
             "reason": "local_api_budget", "phase": phase, "exit_id": exit_id,
+            **error.budget_diagnostic,
             "used": {key: int(error.diagnostic_values.get(f"api_used_{key}", self._used[key]))
                      for key in self.LIMITS},
             "next": {key: int(error.diagnostic_values[f"api_next_{key}"])
                      for key in self.LIMITS if f"api_next_{key}" in error.diagnostic_values}})
         return sum(row["observed_monotonic"] >= now - 600 for row in self._backpressure_exits)
+
+    def require_flat_read(self, normal, *, operation="flat_read"):
+        """Admit read-only recovery after proven cleanup, preserving a final audit.
+
+        A fresh cash audit has at most two attempts: each cash300 + fees900
+        (including one public funding round) + settlement300 + trades600 +
+        terminal history100. Each attempt has five WS frames; keep five more
+        for control traffic. Caller must prove flat/empty and forbid mutations.
+        """
+        if (type(operation) is not str or not operation or len(operation) > 64
+                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in operation)):
+            raise ValueError("API operation must be a bounded local code label")
+        reserve = {"rest": 4400, "ws": 15, "tx": 0}
+        allowed = self.available(normal=normal, reserve=reserve)
+        if normal["tx"] != 0:
+            raise ValueError("flat proof admission cannot include mutations")
+        if not allowed:
+            blocker = next((key, Fraction(0), self._used[key] + normal[key] + reserve[key], limit)
+                           for key, limit in self.LIMITS.items()
+                           if self._used[key] + normal[key] + reserve[key] > limit)
+            error = ApiBudgetUnavailable("API capacity reserved for final flat proof", values={
+                **{f"api_used_{key}": Decimal(self._used[key]) for key in self.LIMITS},
+                **{f"api_next_{key}": Decimal(normal[key]) for key in self.LIMITS}},
+                operation=operation, blocker=blocker)
+            self._admission_denials.append({"observed_monotonic": self._last,
+                                           **error.budget_diagnostic})
+            raise error
+
+    def record_account_read_exit(self, *, phase, exit_id, error):
+        """Attribute exhausted account proofs without retaining exception payloads."""
+        from .lighter_runtime import AccountReadRace, _AccountCashRace, UnattributedCashflow
+
+        if type(error) not in {AccountReadRace, _AccountCashRace, UnattributedCashflow}:
+            raise ValueError("account read race required")
+        if (phase not in {"syncing_orders", "authorizing_quotes", "reconciling_quotes"}
+                or type(exit_id) is not str or not exit_id.startswith("exit-")
+                or not 1 <= len(exit_id[5:]) <= 20
+                or any(character not in "0123456789" for character in exit_id[5:])):
+            raise ValueError("bounded account read exit labels required")
+        # These exact messages belong to our account-proof implementation.
+        # Unknown messages remain useful as a class without becoming log text.
+        reasons = {
+            "exact terminal order proof unavailable": "terminal_order_history",
+            "terminal fills not reflected in account ledger": "terminal_fill_history",
+            "account changed during stream/REST bracket": "stream_rest_bracket",
+            "account trade count and history disagree": "trade_counter_history",
+            "account history exceeds activity counter": "history_ahead_of_counter",
+            "active order fills not reflected in account history": "active_fill_history",
+            "account fills and position disagree": "fill_position",
+            "new fill exceeds observed fee terms": "fill_fee_terms",
+            "unattributed account cashflow or equity mismatch": "cash_equity",
+        }
+        message = error.args[0] if error.args and type(error.args[0]) is str else None
+        self.account_read_deferrals += 1
+        self._account_read_exits.append({
+            "number": self.account_read_deferrals, "observed_monotonic": self._expire(),
+            "reason": "account_cash_conflict" if isinstance(error, _AccountCashRace) else "account_read_race",
+            "subreason": reasons.get(message, "unclassified_account_read_race"),
+            "phase": phase, "exit_id": exit_id,
+        })
 
     def snapshot(self):
         self._expire()
@@ -140,6 +236,9 @@ class ApiBudget:
                 "rest_weight_by_phase": dict(self.rest_weight_by_phase),
                 "account_profile": self.account_profile,
                 "attempts": dict(self.counts), "scope": "owned_python_transports",
-                "deferrals": self.deferrals, "account_read_deferrals": self.account_read_deferrals,
+                "deferrals": self.deferrals, "optional_waits": self.optional_waits,
+                "account_read_deferrals": self.account_read_deferrals,
                 "backpressure_window_seconds": 600,
+                "recent_admission_denials": list(self._admission_denials),
+                "recent_account_read_exits": list(self._account_read_exits),
                 "recent_backpressure_exits": list(self._backpressure_exits)}

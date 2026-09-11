@@ -129,8 +129,9 @@ class _ConsoleProgress:
 
     def status(self, phase):
         # These are steps of one quote cycle, not operator-visible state changes.
-        if phase in {"running", "syncing_orders", "authorizing_quotes",
-                     "reconciling_quotes", "waiting"}:
+        if phase in {"running", "syncing_orders", "authorizing_quotes", "reconciling_quotes"}:
+            phase = "api_wait" if self.phase == "api_wait" else "quoting"
+        elif phase == "waiting":
             phase = "quoting"
         now = time.monotonic()
         if phase == self.phase and now - self.last_status < 60:

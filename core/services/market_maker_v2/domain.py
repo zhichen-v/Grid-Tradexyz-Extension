@@ -35,6 +35,7 @@ class ExecutionStatus(str, Enum):
     SIMULATED = "simulated"
     BLOCKED = "blocked"
     CONFIRMED = "confirmed"
+    DEFERRED = "deferred"
 
 
 class ExitStatus(str, Enum):

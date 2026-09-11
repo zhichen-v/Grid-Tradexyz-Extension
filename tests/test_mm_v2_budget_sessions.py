@@ -1,9 +1,9 @@
 """Offline admission checks with endpoint-derived minimum costs, not wire evidence.
 
 The real session/ledger/order manager run against RuntimeAdapter. This proxy
-charges known public calls only; SDK retries and native startup are absent.
-Selected scenarios add protocol pings explicitly. Actual wire amplification and
-source latency still require the production observer.
+charges known endpoint minimums, including cold metadata/nonce reads. Selected
+scenarios add protocol pings and bounded confirmation delays explicitly. Other
+SDK retries, native startup and actual source latency still require wire evidence.
 """
 
 import asyncio
@@ -28,6 +28,8 @@ class MinimumCostAdapter(RuntimeAdapter):
         self.observer = None
         self.transactions = []
         self.ioc_parts = []
+        self._market_info_at = float("-inf")
+        self._nonce_initialized = False
         paths = {
             "get_exchange_info": ("orderBooks",),
             "get_balances": ("account",),
@@ -65,6 +67,16 @@ class MinimumCostAdapter(RuntimeAdapter):
 
     async def create_order(self, *args, **kwargs):
         tif = kwargs.get("params", {}).get("time_in_force")
+        # LighterRest.place_order reads _get_market_info on every create, with
+        # a separate 300s cache from the runtime's exchange-info refresh.
+        if self.clock.now - self._market_info_at >= 300:
+            self.charge("orderBookDetails")
+            self._market_info_at = self.clock.now
+        # The configured SDK optimistic nonce manager fetches only on first
+        # successful use. Invalid-nonce refreshes need an explicit fault case.
+        if not self._nonce_initialized:
+            self.charge("nextNonce")
+            self._nonce_initialized = True
         self.charge("sendTx")
         self.transactions.append((self.clock.now, "create", tif))
         if tif != "IOC":
@@ -79,6 +91,9 @@ class MinimumCostAdapter(RuntimeAdapter):
             self.confirmation_reader = reader
 
     async def cancel_order(self, *args, **kwargs):
+        if not self._nonce_initialized:
+            self.charge("nextNonce")
+            self._nonce_initialized = True
         self.charge("sendTx")
         self.transactions.append((self.clock.now, "cancel", None))
         result = await super().cancel_order(*args, **kwargs)
@@ -110,7 +125,64 @@ class MinimumCostAdapter(RuntimeAdapter):
 
 
 class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
-    async def run_bursty_tape(self, *, whole_pair):
+    async def test_delayed_funding_recovery_pays_actual_endpoint_weights(self):
+        adapter, clock, stop = MinimumCostAdapter(), RuntimeClock(), asyncio.Event()
+        adapter.clock = clock
+        adapter.unified("299.00000056076")
+        amount, events, posted, reads, metering = D("0.000361530936"), [], [], [], []
+        original_fees = adapter.get_account_fee_and_funding
+
+        async def advance(seconds):
+            if (not posted and session.phase == "waiting" and len(adapter.orders) == 2
+                    and session.ledger.snapshot(now=clock.now).duration_seconds >= D("55")):
+                adapter.fill(next(order for order in adapter.orders if order.side is OrderSide.SELL))
+                adapter.unified_cash(D(adapter.account.assets[0].margin_balance) + amount)
+                posted.append(clock.now)
+            clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        async def fees(*args, **kwargs):
+            if session.phase == "funding_recovery":
+                reads.append(clock.now)
+                self.assertEqual((D(adapter.position.position), adapter.orders), (D("0"), []))
+                if len(reads) == 3:
+                    adapter.fees["fundings"] = ({"id": "67905", "timestamp": 2000, "change": amount},)
+                    adapter.charge("fundings")
+            return await original_fees(*args, **kwargs)
+
+        adapter.get_account_fee_and_funding = fees
+        configured = config(dry=False, duration=180)
+        configured = replace(configured, quote=replace(configured.quote, max_quote_age_ms=60000))
+        session = VolumeSession(configured, adapter, account_index=7,
+            expected_l1_address=ADDRESS, authorize_bounded_flatten=True,
+            telemetry=NS(emit=events.append), clock=clock, sleep=advance)
+        observe = adapter.observer
+        def observed(transport, target):
+            if session.phase == "funding_recovery":
+                self.assertFalse(session._budget_exiting)
+                metering.append((transport, target))
+            observe(transport, target)
+        adapter.observer = observed
+        result = await session.run(stop)
+        self.assertTrue(result.completed, (result.failure,
+            [event for event in events if isinstance(event, FailureDiagnostic)],
+            session.api_budget.snapshot()["recent_admission_denials"]))
+        self.assertTrue(result.report.complete)
+        self.assertEqual(result.report.funding, amount)
+        self.assertGreaterEqual(result.report.duration_seconds, D("180"))
+        self.assertEqual(result.report.equity_reconciliation_difference, D("0"))
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertEqual(len(reads), 3)
+        self.assertGreaterEqual(reads[2] - reads[0], 1)
+        self.assertEqual(metering.count(("rest", "fundings")), 1)
+        self.assertEqual(metering.count(("rest", "positionFunding")), 3)
+        self.assertEqual([event.amount for event in events if isinstance(event, CashflowEvent)], [amount])
+        self.assertTrue(any(at > reads[-1] and tif == "POST_ONLY" for at, _, tif in adapter.transactions))
+        for bucket, peak in session.api_budget.peaks.items():
+            self.assertLessEqual(peak, session.api_budget.LIMITS[bucket])
+
+    async def run_bursty_tape(self, *, whole_pair, optional_wait=True, duration=600,
+                             wire_amplification=False):
         """Fixed 10-minute synthetic order flow; missed opportunities never wait.
 
         This tests operational cost and cleanup, not venue fills or profitability.
@@ -121,14 +193,15 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
         adapter, clock, stop = MinimumCostAdapter(), RuntimeClock(), asyncio.Event()
         adapter.clock = clock
         adapter.unified("299.00000056076")
-        configured = config(dry=False, duration=600)
+        configured = config(dry=False, duration=duration)
         configured = replace(configured, quote=replace(configured.quote,
             order_size=D("0.2"), max_quote_age_ms=60000))
-        schedule = [(wave * 120 + offset, side) for wave in range(5)
+        schedule = [(wave * 120 + offset, side) for wave in range(duration // 120)
             for offset, side in zip((10, 25, 45),
                 (OrderSide.SELL, OrderSide.SELL, OrderSide.BUY) if wave % 2 == 0
                 else (OrderSide.BUY, OrderSide.BUY, OrderSide.SELL))]
         fills, missed, events, callback_errors = [], [], [], []
+        fast_confirmations, delayed_cancellations = [], []
         started, last_ping = None, 0
         original_fill = adapter.fill
 
@@ -163,7 +236,7 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
                     if schedule and elapsed >= schedule[0][0]:
                         due, side = schedule.pop(0)
                         candidates = [order for order in adapter.orders if order.side is side]
-                        if session.phase == "waiting" and candidates:
+                        if session.phase in {"waiting", "api_wait"} and candidates:
                             order = candidates[0]
                             quantity = min(D("0.1"), order.remaining)
                             adapter.fill(replace(order, amount=quantity, remaining=quantity))
@@ -192,6 +265,69 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
         session = VolumeSession(configured, adapter, account_index=7,
             expected_l1_address=ADDRESS, authorize_bounded_flatten=True,
             telemetry=NS(emit=events.append), clock=clock, sleep=advance)
+        if wire_amplification:
+            original_set_reader = adapter.set_market_maker_confirmation_reader
+            def set_reader(reader):
+                async def confirm(symbol):
+                    if fast_confirmations:
+                        return await reader(symbol)
+                    # A maker fills before its first active lookup. Production
+                    # _query_order_index reads three times at .3/.5/1s, then
+                    # requires exact terminal history instead of an active row.
+                    order = adapter.orders[-1]
+                    adapter.fill(order)
+                    observed = {"order_reads": 0}
+                    fast_confirmations.append(observed)
+                    before = session.api_budget.counts.copy()
+                    began = clock.now
+                    for delay in (0.3, 0.5, 1):
+                        await advance(delay)
+                        rows = await reader(symbol)
+                        observed["order_reads"] += 1
+                        self.assertFalse(any(row.id == order.id for row in rows))
+                    history = await adapter.get_order_history(symbol, limit=100)
+                    self.assertEqual(next(row for row in history if row.id == order.id).status,
+                                     OrderStatus.FILLED)
+                    observed.update(seconds=clock.now - began,
+                        ws_frames=session.api_budget.counts["ws:1"] - before["ws:1"],
+                        history_reads=session.api_budget.counts["rest:accountInactiveOrders"]
+                            - before["rest:accountInactiveOrders"])
+                    return rows
+                original_set_reader(confirm)
+            adapter.set_market_maker_confirmation_reader = set_reader
+            original_cancel = adapter.cancel_order
+            async def delayed_cancel(identifier, symbol):
+                if delayed_cancellations:
+                    return await original_cancel(identifier, symbol)
+                # Simulate accepted cancellation whose positive terminal row
+                # appears only on poll four. The first three empty results do
+                # not grant terminal ownership or a replacement create.
+                self.assertTrue(adapter._nonce_initialized)
+                adapter.charge("sendTx")
+                adapter.transactions.append((clock.now, "cancel", None))
+                terminal = await RuntimeAdapter.cancel_order(adapter, identifier, symbol)
+                adapter.history.pop(identifier)
+                observed = {"history_reads": 0}
+                delayed_cancellations.append(observed)
+                began = clock.now
+                try:
+                    for attempt in range(4):
+                        if attempt:
+                            await advance(0.5)
+                        if attempt == 3:
+                            adapter.history[identifier] = terminal
+                        history = await adapter.get_order_history(symbol)
+                        observed["history_reads"] += 1
+                        self.assertEqual(any(row.id == identifier for row in history), attempt == 3)
+                    observed["seconds"] = clock.now - began
+                    return terminal
+                finally:
+                    adapter.history[identifier] = terminal
+            adapter.cancel_order = delayed_cancel
+        if not optional_wait:
+            # Preserve the original mandatory-exit safety scenario separately
+            # from the complete-duration operational acceptance case.
+            session._admit_optional_revision = session._on_optional_refusal = None
         revision = execution_port._quote_revision
         def all_sides(orders, *args):
             return {order.side for order in orders} if revision(orders, *args) else set()
@@ -203,26 +339,80 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(isinstance(event, FailureDiagnostic) for event in events))
         self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
         self.assertEqual(result.report.equity_reconciliation_difference, D("0"))
-        self.assertEqual(len(fills) + len(missed) + len(schedule), 15)
-        if result.report.duration_seconds < 600:
+        opportunity_count = duration // 120 * 3
+        self.assertEqual(len(fills) + len(missed) + len(schedule), opportunity_count)
+        if result.report.duration_seconds < duration:
             self.assertEqual(result.stop_reason, "api_backpressure_repeated")
             self.assertEqual(session.api_budget.deferrals, 3)
         for bucket, peak in session.api_budget.peaks.items():
             self.assertLessEqual(peak, ApiBudget.LIMITS[bucket])
         budget = session.api_budget.snapshot()
         return {"duration": str(result.report.duration_seconds), "stop": result.stop_reason,
-            "maker_opportunities_filled": len(fills), "maker_opportunities_total": 15,
-            "deferrals": budget["deferrals"], "rest": sum(budget["rest_weight_by_phase"].values()),
-            "tx": budget["attempts"].get("rest:sendTx", 0), "ioc": result.report.taker_fill_count}
+            "maker_opportunities_filled": len(fills), "maker_opportunities_total": opportunity_count,
+            "maker_opportunities_missed": len(missed), "maker_opportunities_remaining": len(schedule),
+            "deferrals": budget["deferrals"], "optional_waits": budget["optional_waits"],
+            "rest": sum(budget["rest_weight_by_phase"].values()),
+            "tx": budget["attempts"].get("rest:sendTx", 0), "ioc": result.report.taker_fill_count,
+            "cold_market_reads": budget["attempts"].get("rest:orderBookDetails", 0),
+            "nonce_reads": budget["attempts"].get("rest:nextNonce", 0),
+            "fast_confirmations": fast_confirmations, "delayed_cancellations": delayed_cancellations}
 
     async def test_bursty_partial_fills_measure_churn_and_keep_exact_cleanup(self):
-        selected = await self.run_bursty_tape(whole_pair=False)
-        whole = await self.run_bursty_tape(whole_pair=True)
+        selected = await self.run_bursty_tape(whole_pair=False, optional_wait=False)
+        whole = await self.run_bursty_tape(whole_pair=True, optional_wait=False)
+        for safety_case in (selected, whole):
+            self.assertLess(D(safety_case["duration"]), D("600"))
+            self.assertEqual(safety_case["stop"], "api_backpressure_repeated")
+            self.assertEqual(safety_case["deferrals"], 3)
         self.assertGreaterEqual(selected["maker_opportunities_filled"], whole["maker_opportunities_filled"])
         self.assertLess(selected["tx"] * whole["maker_opportunities_filled"],
                         whole["tx"] * selected["maker_opportunities_filled"])
         print("BURSTY_SIMULATED_SESSION_METRICS " + json.dumps(
             {"selected_sides": selected, "whole_pair": whole}, sort_keys=True))
+
+    async def test_fixed_bursty_tape_completes_full_ten_minutes(self):
+        measured = await self.run_bursty_tape(whole_pair=False)
+        print("FULL_BURSTY_SESSION_METRICS " + json.dumps(measured, sort_keys=True))
+        self.assertGreaterEqual(D(measured["duration"]), D("600"))
+        self.assertLess(D(measured["duration"]), D("630"))
+        self.assertNotEqual(measured["stop"], "api_backpressure_repeated")
+        self.assertGreaterEqual(measured["maker_opportunities_filled"], 14)
+        self.assertGreater(measured["optional_waits"], 0)
+
+    async def test_repeated_bursts_continue_past_the_reported_early_stop_window(self):
+        measured = await self.run_bursty_tape(whole_pair=False, duration=1800)
+        print("LONG_BURSTY_SESSION_METRICS " + json.dumps(measured, sort_keys=True))
+        self.assertGreaterEqual(D(measured["duration"]), D("1800"))
+        self.assertLess(D(measured["duration"]), D("1830"))
+        self.assertIsNone(measured["stop"])
+        self.assertEqual(measured["maker_opportunities_total"], 45)
+        self.assertGreaterEqual(measured["maker_opportunities_filled"], 44)
+
+    async def test_fixed_bursty_tape_with_terminal_confirmation_amplification_completes(self):
+        measured = await self.run_bursty_tape(whole_pair=False, wire_amplification=True)
+        print("AMPLIFIED_BURSTY_SESSION_METRICS " + json.dumps(measured, sort_keys=True))
+        self.assertGreaterEqual(D(measured["duration"]), D("600"))
+        self.assertLess(D(measured["duration"]), D("630"))
+        self.assertIsNone(measured["stop"])
+        self.assertEqual(measured["maker_opportunities_total"], 15)
+        self.assertEqual(measured["maker_opportunities_remaining"], 0)
+        self.assertEqual(measured["maker_opportunities_filled"]
+                         + measured["maker_opportunities_missed"], 15)
+        self.assertGreaterEqual(measured["maker_opportunities_filled"], 14)
+        self.assertGreaterEqual(measured["cold_market_reads"], 2)
+        self.assertEqual(measured["nonce_reads"], 1)
+        self.assertEqual(len(measured["fast_confirmations"]), 1)
+        fast = measured["fast_confirmations"][0]
+        self.assertEqual((fast["order_reads"], fast["ws_frames"], fast["history_reads"]), (3, 6, 1))
+        # RuntimeClock also advances 1ms per observation. Preserve the full
+        # SDK wait schedule while allowing those independently counted reads.
+        self.assertGreaterEqual(fast["seconds"], 1.8)
+        self.assertLess(fast["seconds"], 2)
+        self.assertEqual(len(measured["delayed_cancellations"]), 1)
+        delayed = measured["delayed_cancellations"][0]
+        self.assertEqual(delayed["history_reads"], 4)
+        self.assertGreaterEqual(delayed["seconds"], 1.5)
+        self.assertLess(delayed["seconds"], 1.7)
 
     def test_backpressure_diagnostics_are_bounded_and_window_is_inclusive(self):
         now = [0.0]
@@ -339,7 +529,8 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(session.api_budget.deferrals, 3)
                 self.assertFalse(any(tif == "POST_ONLY" for _, _, tif in adapter.transactions[injected[-1][1]:]))
 
-    async def run_session(self, *, calm=False, partial_exit=False, moving_inventory=False, cooldown_end=None):
+    async def run_session(self, *, calm=False, partial_exit=False, moving_inventory=False,
+                          cooldown_end=None, optional_wait=True):
         adapter, clock, stop = MinimumCostAdapter(), RuntimeClock(), asyncio.Event()
         adapter.clock = clock
         configured = config(dry=False, duration=600 if moving_inventory else 90)
@@ -391,9 +582,11 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
                 authorizations.append((clock.now, value.account))
             return value
         session._authorize = authorize
+        if not optional_wait:
+            session._admit_optional_revision = session._on_optional_refusal = None
         original = session.api_budget.require_normal
         burst_injected = False
-        def admit(cost):
+        def admit(cost, **kwargs):
             nonlocal burst_injected
             if cooldown_end and filled and not burst_injected and not session._budget_exiting:
                 # Explicit external-load fault for stop/deadline-in-cooldown;
@@ -402,10 +595,14 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
                 while session.api_budget.snapshot()["used"].get("rest", 0) < 12000:
                     adapter.charge("account")
             try:
-                original(cost)
+                original(cost, **kwargs)
             except ApiBudgetUnavailable:
-                denials.append((clock.now, len(adapter.transactions), tuple(row.id for row in adapter.orders),
-                                D(adapter.position.position) * adapter.position.sign))
+                # Only mandatory-read/cancel denials promise an immediate exit.
+                # Optional create/reprice refusal is covered by DEFERRED tests;
+                # a failed subsequent monitor gate is mandatory and lands here.
+                if not optional_wait or kwargs.get("operation") not in {"create", "optional_reprice"}:
+                    denials.append((clock.now, len(adapter.transactions), tuple(row.id for row in adapter.orders),
+                                    D(adapter.position.position) * adapter.position.sign))
                 raise
         session.api_budget.require_normal = admit
         result = await session.run(stop)
@@ -446,7 +643,9 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(adapter.creates, 0)
 
     async def test_reprice_pressure_cleans_waits_and_resumes_before_same_deadline(self):
-        session, adapter, result, denials = await self.run_session()
+        # Exercise the original fallback (no optional-work deferral) as an
+        # explicit safety case; full-duration acceptance uses the new path.
+        session, adapter, result, denials = await self.run_session(optional_wait=False)
         self.assertTrue(denials, "frequent replacement must reach the reserved-capacity boundary")
         self.assertTrue(result.completed, result.failure)
         self.assertTrue(result.report.complete)
@@ -538,7 +737,7 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(adapter.orders)
                 self.assertEqual(D(adapter.position.position), D("0"))
                 waits.append((clock.now, len(adapter.transactions)))
-            if session.phase == "waiting" and adapter.orders:
+            if session.phase in {"waiting", "api_wait"} and adapter.orders:
                 if started is None:
                     started = clock.now
                     original_deadline = session.governor.session_deadline_monotonic
@@ -581,9 +780,9 @@ class BudgetSessionTests(unittest.IsolatedAsyncioTestCase):
             original_observe(transport, target)
         adapter.observer = observe
         original_admit = session.api_budget.require_normal
-        def admit(cost):
+        def admit(cost, **kwargs):
             try:
-                original_admit(cost)
+                original_admit(cost, **kwargs)
             except ApiBudgetUnavailable:
                 denials.append((clock.now, len(adapter.transactions)))
                 raise

@@ -137,6 +137,25 @@ class CliTests(unittest.TestCase):
         self.assertIn("elapsed=60s phase=quoting", lines[1])
         self.assertIn("phase=api_cooldown", lines[2])
 
+    def test_optional_wait_does_not_print_each_monitor_step(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), patch.object(cli.time, "monotonic", return_value=0) as clock:
+            console = cli._ConsoleProgress(None)
+            console.status("api_wait")
+            for second in range(1, 60):
+                clock.return_value = second
+                console.status(("syncing_orders", "authorizing_quotes", "reconciling_quotes")[second % 3])
+                console.status("api_wait")
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            clock.return_value = 60
+            console.status("api_wait")
+            clock.return_value = 61
+            console.status("waiting")
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("elapsed=60s phase=api_wait", lines[1])
+        self.assertIn("phase=quoting", lines[2])
+
     def test_console_keeps_every_journal_event_and_exact_fill_totals(self):
         d = Decimal
         fill = FillEvent("f1", "o1", "BTC", Side.BUY, d("0.00017"), d("79594.1"),

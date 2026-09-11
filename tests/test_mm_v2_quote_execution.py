@@ -22,6 +22,7 @@ from core.services.market_maker_v2.execution_port import (
 from core.services.market_maker_v2.config import ExecutionSettings, execution_settings
 from core.services.market_maker_v2.inventory_governor import InventoryGovernor
 from core.services.market_maker_v2.quote_policy import VolumeQuotePolicy
+from core.services.market_maker_v2.api_budget import ApiBudgetUnavailable
 
 
 class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -116,6 +117,297 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         creates = [i for i, kind in enumerate(kinds) if kind == "create"]
         self.assertIn("authorize", kinds[creates[0] + 1:creates[1]])
         self.assertIn("account", kinds[creates[0] + 1:creates[1]])
+
+    async def test_optional_revision_denial_retains_safe_prices_and_actual_orders(self):
+        await self.quote_both()
+        previous = tuple(self.port.snapshot().orders)
+        self.bid, self.ask = D("99"), D("103")
+        self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("optional revision"))
+        self.port.on_optional_refusal = Mock()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.DEFERRED)
+        self.assertEqual(result.snapshot.orders, previous)
+        self.assertEqual((result.submitted_count, result.cancelled_count), (0, 0))
+        self.assertEqual({(q.side, q.price, q.size) for q in result.actual_plan.quotes},
+                         {(o.side, o.price, o.remaining_size) for o in previous})
+        self.assertTrue(result.account_snapshot.authenticated)
+        self.port.on_optional_refusal.assert_called_once()
+        self.adapter.cancel_order.assert_not_called()
+
+    async def test_flat_create_denial_waits_without_inventing_quotes(self):
+        self.port.before_mutation = Mock(side_effect=ApiBudgetUnavailable("create"))
+        self.port.on_optional_refusal = Mock()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.DEFERRED)
+        self.assertEqual(result.actual_plan.quotes, ())
+        self.assertEqual(result.snapshot.orders, ())
+        self.assertEqual(result.account_snapshot.position, D("0"))
+        self.adapter.create_order.assert_not_called()
+        self.adapter.cancel_order.assert_not_called()
+
+    async def test_second_create_denial_preserves_first_submission_count(self):
+        self.port.before_mutation = Mock(side_effect=[None, ApiBudgetUnavailable("second create")])
+        self.port.on_optional_refusal = Mock()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.DEFERRED)
+        self.assertEqual((result.submitted_count, result.cancelled_count), (1, 0))
+        self.assertEqual(len(result.actual_plan.quotes), 1)
+        self.assertEqual(len(result.snapshot.orders), 1)
+        self.assertEqual(self.adapter.create_order.await_count, 1)
+
+    async def test_missing_side_precedes_optional_reprice_without_losing_retained_queue(self):
+        for retained_side in (Side.BUY, Side.SELL):
+            for create_available in (True, False):
+                with self.subTest(side=retained_side, create_available=create_available):
+                    self.setUp()
+                    async def one_side(execution):
+                        value = await self.refresh_quote(execution)
+                        return replace(value, plan=QuotePlan("BTC", tuple(
+                            quote for quote in value.plan.quotes if quote.side is retained_side)))
+                    self.refresh.side_effect = one_side
+                    await self.port.reconcile_quotes(self.proposal)
+                    previous = self.port.snapshot().orders[0]
+                    created = self.manager.snapshot()[0].created_monotonic
+                    async def both_sides(execution):
+                        value = await self.refresh_quote(execution)
+                        return replace(value, plan=QuotePlan("BTC", tuple(
+                            replace(quote, price=quote.price
+                                + (D("-1") if retained_side is Side.BUY else D("1")))
+                            if quote.side is retained_side else quote for quote in value.plan.quotes)))
+                    self.refresh.side_effect = both_sides
+                    self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("reprice"))
+                    self.port.before_mutation = Mock(side_effect=None if create_available
+                                                    else ApiBudgetUnavailable("create"))
+                    self.port.on_optional_refusal = Mock()
+                    self.adapter.create_order.reset_mock()
+                    result = await self.port.reconcile_quotes(self.proposal)
+                    self.assertEqual(result.status,
+                        ExecutionStatus.CONFIRMED if create_available else ExecutionStatus.DEFERRED)
+                    self.assertEqual((result.cancelled_count, result.submitted_count),
+                                     (0, 1 if create_available else 0))
+                    self.assertIn(previous, result.snapshot.orders)
+                    self.assertEqual(next(order.created_monotonic for order in self.manager.snapshot()
+                                          if str(order.order_id) == previous.order_id), created)
+                    self.assertEqual({quote.side for quote in result.actual_plan.quotes},
+                        {Side.BUY, Side.SELL} if create_available else {retained_side})
+                    self.port.before_optional_revision.assert_not_called()
+                    self.port.before_mutation.assert_called_once()
+                    self.assertEqual(self.adapter.create_order.await_count, int(create_available))
+                    self.adapter.cancel_order.assert_not_called()
+
+    async def test_missing_side_priority_cannot_cross_or_lock_retained_price(self):
+        for retained_side in (Side.BUY, Side.SELL):
+            for overlap in (D("0"), D("0.1")):
+                with self.subTest(side=retained_side, overlap=overlap):
+                    self.setUp()
+                    async def one_side(execution):
+                        value = await self.refresh_quote(execution)
+                        return replace(value, plan=QuotePlan("BTC", tuple(
+                            quote for quote in value.plan.quotes if quote.side is retained_side)))
+                    self.refresh.side_effect = one_side
+                    await self.port.reconcile_quotes(self.proposal)
+                    previous = self.port.snapshot().orders[0]
+                    self.bid, self.ask = D("99"), D("101")
+                    async def incompatible(execution):
+                        value = await self.refresh_quote(execution)
+                        if retained_side is Side.BUY:
+                            prices = {Side.BUY: previous.price - 1, Side.SELL: previous.price - overlap}
+                        else:
+                            prices = {Side.BUY: previous.price + overlap, Side.SELL: previous.price + 1}
+                        return replace(value, plan=QuotePlan("BTC", tuple(
+                            replace(quote, price=prices[quote.side]) for quote in value.plan.quotes)))
+                    self.refresh.side_effect = incompatible
+                    self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("reprice"))
+                    self.port.before_mutation = Mock()
+                    self.port.on_optional_refusal = Mock()
+                    self.adapter.create_order.reset_mock()
+                    result = await self.port.reconcile_quotes(self.proposal)
+                    self.assertIs(result.status, ExecutionStatus.DEFERRED)
+                    self.assertEqual(result.snapshot.orders, (previous,))
+                    self.assertEqual((result.cancelled_count, result.submitted_count), (0, 0))
+                    self.port.before_optional_revision.assert_called_once_with(1)
+                    self.port.before_mutation.assert_not_called()
+                    self.adapter.create_order.assert_not_called()
+
+    async def test_missing_side_priority_keeps_subminimum_partial_and_original_deadline(self):
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                self.setUp()
+                async def buy_only(execution):
+                    value = await self.refresh_quote(execution)
+                    return replace(value, plan=QuotePlan("BTC", value.plan.quotes[:1]))
+                self.refresh.side_effect = buy_only
+                await self.port.reconcile_quotes(self.proposal)
+                previous = next(iter(self.open.values()))
+                self.open[previous.id] = replace(previous, filled=D("0.1"), remaining=D("0.1"))
+                self.position = D("0.1")
+                self.market.snapshot.side_effect = lambda: replace(self.market_snapshot(), min_order_size=D("0.2"))
+                self.refresh.side_effect = self.refresh_quote
+                def admit():
+                    if delayed:
+                        self.time.value += 11
+                self.port.before_mutation = Mock(side_effect=admit)
+                self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("replenish"))
+                self.adapter.create_order.reset_mock()
+                result = await self.port.reconcile_quotes(self.proposal)
+                self.assertEqual(result.status, ExecutionStatus.BLOCKED if delayed else ExecutionStatus.CONFIRMED)
+                self.assertEqual(result.submitted_count, 0 if delayed else 1)
+                self.assertEqual(next(row.remaining_size for row in result.snapshot.orders
+                                      if row.order_id == previous.id), D("0.1"))
+                self.assertEqual(self.adapter.create_order.await_count, 0 if delayed else 1)
+                self.port.before_mutation.assert_called_once()
+                self.port.before_optional_revision.assert_not_called()
+                self.adapter.cancel_order.assert_not_called()
+
+    async def test_required_expiry_cancellation_finishes_before_missing_create_is_deferred(self):
+        await self.quote_both()
+        old_ids = set(self.open)
+        self.time.value += 5
+        self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("optional"))
+        self.port.before_mutation = Mock(side_effect=ApiBudgetUnavailable("create"))
+        self.port.before_cancel = Mock()
+        self.port.on_optional_refusal = Mock()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.DEFERRED)
+        self.assertEqual((result.submitted_count, result.cancelled_count), (0, 2))
+        self.assertEqual(result.actual_plan.quotes, ())
+        self.assertTrue(old_ids <= self.manager.terminal_order_ids)
+        self.port.before_optional_revision.assert_not_called()
+        self.port.before_cancel.assert_called_once_with(2)
+
+    async def test_required_cancel_budget_refusal_never_enters_optional_wait(self):
+        await self.quote_both()
+        self.time.value += 5
+        self.port.before_cancel = Mock(side_effect=ApiBudgetUnavailable("required cancel"))
+        self.port.on_optional_refusal = Mock()
+        with self.assertRaises(ApiBudgetUnavailable):
+            await self.port.reconcile_quotes(self.proposal)
+        self.port.on_optional_refusal.assert_not_called()
+        self.adapter.cancel_order.assert_not_called()
+
+    async def test_required_side_cancel_preserves_safe_opposite_when_optional_revision_is_refused(self):
+        for required_side in (Side.BUY, Side.SELL):
+            for required_cause in ("capacity", "age", "reduce_only", "nonpassive"):
+                with self.subTest(side=required_side, cause=required_cause):
+                    self.setUp()
+                    await self.quote_both()
+                    previous = {order.side: order for order in self.port.snapshot().orders}
+                    optional_side = Side.SELL if required_side is Side.BUY else Side.BUY
+                    optional_id = previous[optional_side].order_id
+                    optional_age = next(order.created_monotonic for order in self.manager.snapshot()
+                                        if str(order.order_id) == optional_id)
+                    if required_cause == "age":
+                        # Only the required side reaches its original lifetime.
+                        self.time.value += 4
+                        slot = self.manager._slots[OrderSide(required_side.value)]
+                        slot.created_monotonic -= 1
+                    elif required_cause == "nonpassive":
+                        self.bid, self.ask = ((D("99.7"), D("99.9")) if required_side is Side.BUY
+                                              else (D("100.2"), D("100.4")))
+                    elif required_cause == "reduce_only":
+                        self.position = D("-0.2") if required_side is Side.BUY else D("0.2")
+                    async def fresh(execution):
+                        value = await self.refresh_quote(execution)
+                        if required_cause == "capacity":
+                            key = "buy_capacity" if required_side is Side.BUY else "sell_capacity"
+                            value = replace(value, decision=replace(value.decision, **{key: D("0.1")}))
+                        quotes = []
+                        for quote in value.plan.quotes:
+                            if quote.side is optional_side:
+                                quote = replace(quote, price=quote.price
+                                    + (D("-1") if quote.side is Side.BUY else D("1")))
+                            elif required_cause == "capacity":
+                                quote = replace(quote, size=D("0.1"))
+                            elif required_cause == "reduce_only":
+                                quote = replace(quote, reduce_only=True)
+                            quotes.append(quote)
+                        return replace(value, plan=QuotePlan("BTC", tuple(quotes)))
+                    self.refresh.side_effect = fresh
+                    self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("optional"))
+                    self.port.before_cancel = Mock()
+                    self.port.before_mutation = Mock(side_effect=ApiBudgetUnavailable("missing create"))
+                    self.port.on_optional_refusal = Mock()
+                    self.adapter.create_order.reset_mock()
+                    result = await self.port.reconcile_quotes(self.proposal)
+                    self.assertIs(result.status, ExecutionStatus.DEFERRED)
+                    self.assertEqual((result.cancelled_count, result.submitted_count), (1, 0))
+                    self.assertEqual(result.snapshot.orders, (previous[optional_side],))
+                    self.assertEqual(next(order.created_monotonic for order in self.manager.snapshot()
+                                          if str(order.order_id) == optional_id), optional_age)
+                    self.assertIn(previous[required_side].order_id, self.manager.terminal_order_ids)
+                    self.port.before_cancel.assert_called_once_with(1)
+                    self.port.before_optional_revision.assert_not_called()
+                    self.port.before_mutation.assert_called_once()
+                    self.port.on_optional_refusal.assert_called_once()
+                    self.adapter.create_order.assert_not_called()
+
+    async def test_optional_deferral_requires_monitor_headroom_and_explicit_callback(self):
+        for monitor in (None, Mock(side_effect=ApiBudgetUnavailable("monitor"))):
+            with self.subTest(monitor=monitor):
+                self.setUp()
+                self.port.before_mutation = Mock(side_effect=ApiBudgetUnavailable("create"))
+                self.port.on_optional_refusal = monitor
+                with self.assertRaises(ApiBudgetUnavailable):
+                    await self.port.reconcile_quotes(self.proposal)
+                self.adapter.create_order.assert_not_called()
+
+    async def test_expired_fee_changed_or_overcapacity_orders_are_not_optionally_retained(self):
+        for invalid in ("expired", "fees", "capacity"):
+            with self.subTest(invalid=invalid):
+                self.setUp()
+                await self.quote_both()
+                self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("optional"))
+                self.port.on_optional_refusal = Mock()
+                if invalid == "expired":
+                    self.time.value += 5
+                elif invalid == "fees":
+                    self.maker_fee = D("0.0001")
+                else:
+                    original = self.refresh_quote
+                    async def smaller(execution):
+                        value = await original(execution)
+                        risk = replace(value.decision, buy_capacity=D("0.1"), sell_capacity=D("0.1"))
+                        return replace(value, decision=risk, plan=replace(value.plan,
+                            quotes=tuple(replace(q, size=D("0.1")) for q in value.plan.quotes)))
+                    self.refresh.side_effect = smaller
+                result = await self.port.reconcile_quotes(self.proposal)
+                self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+                self.assertGreater(result.cancelled_count, 0)
+                self.port.before_optional_revision.assert_not_called()
+                self.port.on_optional_refusal.assert_not_called()
+
+    async def test_stale_or_unknown_order_truth_cannot_use_optional_deferral(self):
+        for invalid in ("stale", "unknown"):
+            with self.subTest(invalid=invalid):
+                self.setUp()
+                await self.quote_both()
+                self.bid, self.ask = D("99"), D("101")
+                self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("optional"))
+                self.port.on_optional_refusal = Mock()
+                if invalid == "unknown":
+                    self.open["foreign"] = fixtures.exchange_order("foreign", OrderSide.BUY)
+                else:
+                    original = self.refresh_quote
+                    async def stale(execution):
+                        value = await original(execution)
+                        return replace(value, account=replace(value.account, observed_monotonic=89))
+                    self.refresh.side_effect = stale
+                result = await self.port.reconcile_quotes(self.proposal)
+                self.assertIs(result.status, ExecutionStatus.BLOCKED)
+                self.port.on_optional_refusal.assert_not_called()
+
+    async def test_partial_remaining_below_new_order_minimum_can_be_retained(self):
+        await self.quote_both()
+        buy = next(row for row in self.open.values() if row.side is OrderSide.BUY)
+        self.open[buy.id] = replace(buy, filled=D("0.1"), remaining=D("0.1"))
+        self.position = D("0.1")
+        self.market.snapshot.side_effect = lambda: replace(self.market_snapshot(), min_order_size=D("0.2"))
+        self.port.before_optional_revision = Mock(side_effect=ApiBudgetUnavailable("replenish"))
+        self.port.on_optional_refusal = Mock()
+        result = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(result.status, ExecutionStatus.DEFERRED)
+        self.assertEqual(next(q.size for q in result.actual_plan.quotes if q.side is Side.BUY), D("0.1"))
+        self.adapter.cancel_order.assert_not_called()
 
     async def test_recorded_fee_loss_keeps_both_quotes_until_actual_expiry(self):
         # The real hour lost .163683... before entering its endless BUY replacement loop.
@@ -248,12 +540,12 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.create_order.await_count, 1)
         self.assertIs(result.snapshot.health, ExecutionHealth.HEALTHY)
 
-    async def test_quote_age_and_reprice_threshold_force_cancel_proof_then_new_authority(self):
+    async def test_required_quote_revisions_need_cancel_proof_then_new_authority(self):
         for cause in ("age", "price"):
             with self.subTest(cause=cause):
                 self.setUp()
                 await self.quote_both()
-                old_ids = set(self.open)
+                previous = {order.side: order for order in self.port.snapshot().orders}
                 if cause == "age":
                     self.time.value += 5
                 else:
@@ -261,8 +553,14 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.events.clear()
                 result = await self.port.reconcile_quotes(self.proposal)
                 self.assertIs(result.status, ExecutionStatus.CONFIRMED)
-                self.assertEqual(result.cancelled_count, 2)
-                self.assertTrue(old_ids <= self.manager.terminal_order_ids)
+                self.assertEqual(result.cancelled_count, 2 if cause == "age" else 1)
+                required = (tuple(previous.values()) if cause == "age"
+                            else (previous[Side.SELL],))
+                self.assertTrue({order.order_id for order in required} <= self.manager.terminal_order_ids)
+                if cause == "price":
+                    # Sell became nonpassive; preserve the safe old buy while
+                    # restoring the missing sell before its optional reprice.
+                    self.assertIn(previous[Side.BUY], result.snapshot.orders)
                 kinds = [event[0] for event in self.events]
                 self.assertLess(max(i for i, kind in enumerate(kinds) if kind == "cancel"),
                                 max(i for i, kind in enumerate(kinds) if kind == "authorize"))

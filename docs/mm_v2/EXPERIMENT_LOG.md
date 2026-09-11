@@ -1,5 +1,126 @@
 # Market Maker V2 — Experiment log
 
+## 2026-09-11 場次 231145 後：資金費有界恢復、空委託監控成本與缺側補單
+
+依使用者「ok請就這幾點先優化」完成 V2 本地修復。下面231145的歷史失敗、現金差額、實際54.98%雙邊覆蓋及未完成60分鐘的結論保留；本批沒有新live、私人帳戶連線、Grid／shared adapter／risk或quote配置修改、VPS、commit/push。公開funding等額吻合仍只是上輪歸因證據，未補造或回填私人funding ID。
+
+**資金費時序與收尾。** 正常audit仍只有原2次／10s；僅精確cash bridge的 `UnattributedCashflow` 可進新流程，費率不符、身份錯誤、unknown mutation等不混入。先在原期限完成known-order撤單與bounded exit，取得fresh authenticated0/0，再最多2份strict snapshot，中間1s等待，同一10s且不超過原cleanup剩餘期限。Funding checkpoint取於失敗audit之前，覆蓋「cash先到」及「私人ID先到」兩種時序。需新authenticated ID及逐位exactcash一致才能恢復同一ledger、loss limits與session deadline；沒有ID而cash自行回正、錯金額、長期缺紀錄均停止。Stop/deadline後只完成帳務，不重報價。失敗不在finally重新啟動取證窗口。
+
+Final-account才發現缺funding也可於原final10s內取證。新funding入帳時間晚於該次opening cash，故成功後另取一次fresh confirmation；同期限、同逐讀成本檢查，不重蓋舊cash時間、不遞迴延長。這修正了「funding已精確入帳／final0/0，但ledger最後證明仍早於事件」的實際離線重現。
+
+**只在已清理0/0後調整讀取預留。** 真端點權重fixture先證明：已清理0/0、REST用量9800時，額外audit300仍被普通「再預留完整3IOC」公式在未來24s以24306>24000拒絕。新 `require_flat_read` 只用於上述同健康stream、固定mutation generation、禁止mutation的取證範圍；每個read仍由實際observer計費，額外保留最後一次strict proof的4400 REST／15 WS／0 TX。單份proof最多2attempt，每attempt cash300＋fees/public funding900＋settlement300＋trades600＋terminal100=2200 REST、5 WS，另留5控制幀。4400是最後查核預留，**不是整段recovery總成本上限**；額外probes會累計並可能被拒絕。普通quote/create/cancel預留、24000／200／40限額均未改；重入先經原cooldown及完整風控／admission。stream遺失或更換、generation改變、未知委託會在下一read前中止，禁止REST fallback使用此較窄成本契約。
+
+**監控與雙邊。** 上輪兩個API monitor退出之前皆已authenticated無單、只剩±0.00060持倉。只有completed fresh audit、同generation、所有known terminal fills已證明、account／manager／healthy execution都空時，下一monitor才從1200降為cash300，再加原due terms；有單或證據不全仍原1200，所有實際conditional read gates不變。同6100 REST burst合成契約中，monitor2400以24206拒絕，monitor1500通過；不能把此合成成本檢查當成缺失逐請求時序的完整實盤重播。
+
+執行層若只剩一張安全委託，且它的真實價格可與最新缺側intent共存，先補缺側，再考慮可選改價。原ID、價格、剩餘量與排隊時間保留；必要撤单、每筆create的fresh風控／API gate、POST_ONLY、自成交交叉／鎖價拒絕、原10s deadline均不變。回歸覆蓋多空對稱、create被拒、低於新單minimum的合法既有partial、過期或不再被風控允許的委託。
+
+**完整V2 suite：561 tests PASS，86.360s。** 使用repository `.venv` 與 `unittest discover -s tests -p "test_mm_v2_*.py"`，包含本次及以往cash cache、terminal／unknown mutation、partial IOC、固定價格／風控、stop／deadline等回歸。未改shared production／Grid，未額外重跑無關全專案基線。180s真端點權重離線fixture證明晚到funding只入帳一次、精確cash差0、final0/0、原窗口運行完畢，保留普通報價cooldown後重入。
+
+| 相同離線工作量，本批結果 | 完整ledger秒 | Maker機會／fills | IOC／taker fills | API退出 | REST權重／TX |
+|---|---:|---:|---:|---:|---:|
+| 固定10min | 600.106 | 15/15機會 | 5 | 0 | 69106／59 |
+| 確認延遲／REST放大10min | 600.106 | 14/15，保留1次錯過 | 4 | 0 | 70106／62 |
+| 固定30min | 1800.106 | 45/45機會 | 15 | 0 | 202406／177 |
+| 連續60min | 3600.106 | 42 maker fills | 8 | 0 | 351406／320 |
+
+連續60min actual quote3376.653s／two-sided3282.337s，雙邊占ledger **91.17%**；上一批同fixture為3247.132s／90.20%。Funding−0.00038400912只入帳一次／public round只讀一次，cash差0、final0/0、六個10min窗口皆有報價；REST/WS/TX峰值10000／118／13，原限額24000／200／40。30min固定機會從上一批44/45變45/45；API退出均0，IOC15不變，REST200906→202406、TX169→177。60min REST351306→351406、TX316→320，不能宣稱總请求量或費用因此降低。舊disabled-optional對照仍在約259s第三次背壓早停，未藉調整fixture移除失敗證據。
+
+這些是本地執行／會計證據，不是修後實盤60分鐘、雙邊覆蓋或fee-cover驗收。沒有用網路flat dry冒充funding／partial-fill驗證；新live仍需該次明確授權，未自動啟動。
+
+## 2026-09-11 場次 231145：跨整點資金費高度吻合現金差額，一小時實盤仍未完成（分析）
+
+最新使用者場次 `logs/mm_v2_economics_20260910_231145_705.jsonl`，window為planned3600s、wall2901.2834956s（48分21秒）、exit code1；ledger2838.4683620s（47分18秒）。不是完整60分鐘。現有analyzer獨立重播沒有 `recorded_events_do_not_reconcile_to_report`，但明確為 `incomplete_final_accounting` 與 `runtime_failure_diagnostic`、economics_evaluated=false；同stem `.jsonl.analysis.json` 保存結果。帳本 `failed=false` 欄位不可取代程序code1與兩筆failure diagnostic。
+
+**最後失敗為 cash bridge，不是第三次API背壓早停。** `authorizing_quotes`及`final_account`皆為 `_AccountCashRace`：expected equity297.260512415252、account equity297.260873946188，交易所現金多出 **0.000361530936 USDG**；execution healthy、managed states空、uncertain/unknown皆false。Exit-5在ledger t2837.0618712s取得fresh authenticated position/orders0/0、attempts0，當時本已flat，沒有多送IOC。其後最後嚴格財務查核仍失敗；不能把清理0/0、帳本position0或report.failed=false當作整輪成功。此為歷史最後清理快照，本次分析未重新連接帳戶。
+
+**公開資金費與差額精確相符，私人歷史發布延遲尚未證實。** 最後SELL0.00039@77210發生於2026-09-10 23:59:49.494 +08，BUY0.00039@77210.5於2026-09-11 00:00:01.480 +08；依整輪signed fills，整點持有short0.00039。公開[Robinhood BTC funding round](https://api.rh.lighter.xyz/api/v1/fundings?market_id=1&resolution=1h&start_timestamp=1789052400&end_timestamp=1789056001&count_back=3)的timestamp1789056000、unit value0.92700240、rate0.0012%、direction long。按現有exact-funding公式，short應收 `0.92700240 × 0.00039 = 0.000361530936`，恰等於現金差額。這強烈支持資金費已進現金而尚未進本場ledger；不能由金額相同就補造authenticated funding ID。
+
+本場ledger funding0、positionFunding/accountLimits各96次，而owned observer沒有任何 `rest:fundings` request。程式只有在私人positionFunding返回新ID後才查public round；正常cash mismatch的一次forced refresh及final讀取仍未使該筆入帳。故優先查核的是整點cash／private funding history的可見時序，尚不能斷言是交易所延遲、資料窗口、還是程式對新row的發現缺口。公開round、boundary持倉與等額差異保存於同stem `.funding_evidence.json`；只有公開無認證查詢，未查私人funding紀錄。未放寬精確比較、回填原journal或修改runtime。
+
+| 本場觀測 | 數值 |
+|---|---:|
+| Maker turnover／fills／不同委託 | 2324.147061 USDG／85／80 |
+| Maker買／賣額 | 1199.852661／1124.294400 USDG |
+| Taker turnover／fills | 168.323040 USDG／5 |
+| 已記錄交易gross | +0.010539 USDG |
+| Maker fee／taker fee／總費用 | 0.27889764732／0.05891306400／0.33781071132 USDG |
+| 成交ledger net（funding未入帳） | −0.32727171132 USDG |
+| 清理快照相對起始現金變動 | −0.326910180384 USDG |
+| 實際有單／雙邊秒 | 2354.0084185／1560.4745028 |
+| 有單／雙邊占ledger窗口 | 82.93%／54.98% |
+
+交易gross只覆蓋總費用3.12%，尚未fee-cover；本場不是靠較大的maker總額就達標。按原3600s窗口，maker額2324.147061 USDG；按實際含startup的wall折算約2883.87 USDG/h，兩種分母須分開。成交ledger cost約1.40814bps（未含缺失funding），不是原run已驗證all-in。清理快照現金變動與候選funding調整後net相等，仍不覆寫失敗的最後會計結果。
+
+| Ledger分鐘 | Maker USDG／fills | Taker fills | 交易gross減fee USDG | 有單／雙邊秒 |
+|---|---:|---:|---:|---:|
+| 0–10 | 415.593864／17 | 1 | −0.05222291568 | 548.592／372.586 |
+| 10–20 | 585.987540／23 | 0 | −0.06444850480 | 575.386／377.315 |
+| 20–30 | 478.615400／17 | 3 | −0.09106091400 | 509.138／282.960 |
+| 30–40 | 478.244940／16 | 1 | −0.08729773880 | 411.854／279.318 |
+| 40–47:18 | 365.705317／12 | 0 | −0.03224163804 | 309.038／248.295 |
+| 47:18–60 | 未運行 | 0 | 不外推 | 0／0 |
+
+**運作中斷减少，但API與雙邊持續性仍未完成實盤驗收。** 可恢復account read deferrals0、optional_waits128；兩次正常風控退出、兩次API monitor退出，最後一次cash failure後的flat清理，共5次。API兩次在t約1529.381及1834.529s，均REST monitor2400，未來24／32s預計24806／24206>24000，仍為本地完整退出預留拒絕，不是已證實429；每次清理後恢復，未達第三次API早停條件。近期denial只保留最後64筆，不拿該長度當整場拒絕總數。34467筆strict行情、最大age334.3102ms、無source例外；不能將本場現金故障歸因於行情延遲。
+
+與上輪221113比較相同前862.8702873s：退出6→1（舊3API＋3account、新1風控），API3→0、可恢復account race3→0；有單612.998→804.692s，雙邊519.164→521.875s，maker額859.357890→646.968044（−24.71%）、fills33→25，taker fills5→1，交易net−0.26045506055→−0.09046681728。不同真實市場/成交条件，不是控制實驗；可以說中斷與taker負擔減少，不能說相同時間量能或雙邊覆蓋已提升。完整本場雙邊54.98%，也未重現離線一小時90.20%。
+
+本次只完成歷史分析、公開funding核對與既有文件狀態更新；沒有新live、私人帳戶連線、策略／risk／Grid／VPS修改、commit/push，也不為分析文件重跑產品測試。上一批542 V2 PASS仍是既有本地證據。後續優先範圍為跨整點資金費可見時序與有界恢復／最終對帳，其次是剩餘monitor背壓與單側報價；實盤完整60分鐘及fee-cover皆未通過。
+
+## 2026-09-10 場次 221113：實盤早停歸因與持續運行缺口修復（本地完成）
+
+使用者提供的 `logs/mm_v2_economics_20260910_221113_386.jsonl` 原定 3600s，實際 ledger **862.8702873s**／完整 wall **925.7702803s**，以 `api_backpressure_repeated`、code 0 提早停止。`complete=true`／`failed=false` 只證明本場帳務及收尾完整，不能當成完成一小時。33 maker fills／859.357890 USDG、5 taker fills／88.620325 USDG；gross −0.126315、maker fee 0.10312294680、taker fee 0.03101711375、funding 0、all-in net **−0.26045506055 USDG**、cost 3.03081014 bps。Final authenticated position/orders 為 **0/0**、exact cash bridge 差額 0；這是該場最後觀測，沒有本批重新連接帳戶查核。實際有单 612.9975186s、雙邊 519.1636819s；早停仍保留原 3600s 比較分母。
+
+**六次收尾分屬三次 API 背壓與三次 account read race，不是六次 API 拒絕。** Sidecar 另有 8 次成功可選延後，與退出分開計數。API 三次均在 `reconciling_quotes`，可選 create/reprice 已被拒絕，接著必要下一輪 `monitor` 亦無完整退出預留：
+
+| 退出 | 當前 REST 用量 | 下一監控 REST | 首個未來阻擋點 | 預計 REST／上限 |
+|---|---:|---:|---:|---:|
+| exit-1 | 9600 | 2400 | 24s | 24106／24000 |
+| exit-4 | 10600 | 1200 | 16s | 24206／24000 |
+| exit-6 | 10700 | 1200 | 16.5s | 24006／24000 |
+
+三次均為本地 `rest` 預留拒絕，沒有證據顯示交易所 429。不能只以當前 REST 或峰值低於 24000 就判定監控一定能繼續。REST／WS／TX 峰值為 13300／122／11；startup／normal／exit REST 為 2700／97606／18000。13370 筆行情封包皆在 strict 範圍，最大 accepted age 386.9598000ms、零 source 例外，沒有證據將本輪早停歸因於行情延遲。126 個 quote execution results 中 84 個為零送零撤 confirmed、8 個為零送零撤 deferred，其餘為單側補單或必要撤換；不能說所有循環都在整對撤建。
+
+Account read race 對應 exit-2／3／5：各次最後完成結果之後都有新的 `quote_plan`，但沒有新 `execution_result` 就進入收尾；結合 runner 的唯一 plan emit 路徑，可定位同為 `reconciling_quotes` 內的重新查核。附近確有 maker 成交，包括同單 0.00028＋0.00012 的 partial fills，但舊 sidecar 沒有記錄這三次的錯誤子項，**不能唯一認定是 cache、bracket、counter、history 或 position 哪一項失配**。六次退出皆有新 authenticated 0/0，五次需 IOC、exit-5 原已 flat；本輪沒有復發以 maker minimum 阻擋小殘量 IOC、固定 limit 零成交鎖停或循環小數阻斷 cash/exit 的舊症狀。
+
+本批從同一路徑的成本／證據生命週期修復：create 預檢納入後續監控，為 REST 2600＋15s 內到期 terms／WS13／TX2；可選 selected-side reprice 為 REST `412 × sides + 3800`＋15s 內到期 terms／WS18／TX `sides + 2`。原各階段 admission、下一輪 monitor gate 與完整 scheduled exit reserve 仍保留，並非先檢查後跳過真實 read／mutation 邊界。只有一側必須撤除時，安全另一側的可選改價仍須先預檢，拒絕不得把它夾帶到必要取消中。延後 wake 使用 ledger age 與既有 cash 觀測保守持倉年齡的較大值，不以延後重置 max hold。
+
+Unified cash cache 若因新成交、counter 或 exact state 不再可重用，於原 10s audit deadline 內走重新 admission 的 fresh REST／完整 bracket；cache miss 不直接當作兩次真實查核失敗。Fresh proof 仍不一致、cash conflict、unknown execution、stale book／account 或必要 API 拒絕仍 fail closed，不增加 retry／TTL 或放寬精確帳務。新增 bounded `recent_account_read_exits`，保留最多 64 筆 allowlisted phase／exit ID／時間／subreason，與 API exit attribution 分開；不保存 exception payload 或帳戶身份。Cache 失效的可重現本地缺陷與歷史未分類 race 保持區分。
+
+Flat/empty 的無 REST 等候恢復目標同步改為 REST5000／WS18／TX2，涵蓋重新查核、到期 terms、第一筆 create 及後續 monitor，避免只達舊門檻就反覆進場查帳。這是恢復目標而非持有 reservation，所有實際 gates 仍執行。Cash cache fallback 丟棄舊 opening/closing handoff，重新取得完整邊界；最壞正常路徑為三段查核、15 WS frames、最多兩次 fresh REST balances，各段開始前有 audit admission。它仍受同一10s deadline及一次真正 fresh race retry限制，exit/final從不走 cash reuse，退出 reserve不變。Closing之後、account_all回來前若 mutation generation改變，立即拒絕，不得藉fallback掩蓋。
+
+**最終 542 項 V2 tests PASS（90.506s）**，使用 repository `.venv`／`unittest discover -s tests -p "test_mm_v2_*.py"`；`git diff --check`及獨立契約檢視通過。新增重現涵蓋 create不能花掉下一次監控、雙方向混合必要／可選撤單、cache失效再遇真正race、persistent mismatch、額外讀取預算拒絕、原10s／generation限制，以及延遲58s才發現成交時仍依保守hold期限喚醒。既有部分成交精確realized cash、小殘量與固定限價IOC、funding、未知mutation／known-order清理與stop/deadline回歸皆包含於此套件。
+
+| 最終離線場景 | 完整時長 | 固定 maker 機會 | API 強制退出 | REST 權重／TX | IOC |
+|---|---:|---:|---:|---:|---:|
+| 集中成交 | 600.106s | 15／15 | 0 | 68206／57 | 5 |
+| 確認延遲放大 | 600.105s | 14／15，錯過1次 | 0 | 69506／59 | 4 |
+| 連續集中成交 | 1800.105s | 44／45，錯過1次 | 0 | 200906／169 | 15 |
+
+三個固定機會場景沒有補排錯過事件，皆到原deadline、exact cash差0及final authenticated0/0。成本fixture補上首次nonce6、首次及每300s market details300；放大情境真實執行三次orders確認（6 WS frames）及一次terminal history，耗時1.811s；另一次撤單在第四次history讀取才取得terminal，耗時1.505s。未計入的其他SDK retries、外部API消費與真實來源延遲仍是限制。早先未補cold costs的1800s／45of45只屬中途結果，最終以表中44of45為準。
+
+既有一小時混合fixture修正為 `api_wait` 期間保留單仍可成交及接收行情，沒有調低原90%雙邊門檻：3600.105s、42 maker／8 taker，六個10min窗口皆報價，quote uptime3376.336s、雙邊3247.132s（90.20%），API退出0，REST351306／TX316，REST／WS／TX峰10000／118／12，funding −0.00038400912僅一次且final0/0與精確帳務通過。無可選延後的負例仍會在第三次API退出安全早停；安全收尾不冒充完整運行。模擬仍有風控IOC與錯過機會，不能推算真實量能或fee-cover。
+
+本批保留進場時已有的未提交修改，沒有啟動 live、查詢交易帳戶、調整 quota／reserve／策略／風險／local live config、操作 Grid／VPS 或 commit／push。沒有shared production變更，不重跑無關Grid suite；沒有用flat network dry充作nonflat成本驗證。實盤持續一小時與 volume／fee cover 仍未通過，歷史失敗與成本不回填成功。
+
+## 2026-09-10 Pro review：可選報價延後與完整固定負載驗收
+
+沿用 `13174b1`，本批只修正常 API admission 與可選 create/reprice 的分流，沒有調整策略、spread、size、max hold、stop loss、配額、退出預留或 IOC 邊界。前述實盤故障與安全早停仍是歷史失敗證據。本批沒有連接交易帳戶、啟動 live 或操作 VPS。
+
+`VolumeExecutionPort` 只在兩處產生 `DEFERRED`：建立缺少側之前，以及仍安全的既有報價撤換之前。延後需完整 fresh authenticated account／exact orders、健康 execution、原有效期內、仍 passive 且符合最新 governor capacity／reduce-only；部分成交剩餘量低於補單目標或新單 minimum 不會自行變成必須撤單。真正到期、風險／費率失效、未知訂單、stale account/book、必要 read/cancel 拒絕仍走原清理／退出，沒有全域 catch-and-continue。
+
+可選撤換先按實際 selected sides 預檢：每側取消 REST412／TX1、撤後 coherent audit REST1200／WS5、建立 REST1400／WS8／TX2，加原10s quote deadline內會到期的 terms。所有原階段 admission 與撤後 fresh risk authorization 仍執行。延後保留真實 order ID／age／remaining，`actual_plan` 僅包含實際保留單；第二側建單延後也保留第一側已成功動作計數，不宣稱雙邊目標完成。
+
+非 flat/empty 延後需另能支付下一監控輪 REST1200／WS5／TX0（兩側 terminal slot200、cash300、trades600、terminal fill100），以及5s內到期的 fee900／settlement300，外加不變的 scheduled exit reserve。額度檢查不是持有 reservation，arrival race／forced refresh仍經原 gates，失敗即退出。完整已查核 flat/empty 才可無新增 REST 等待；恢復仍須重新同步、查帳與風險授權。`api_wait` 不重置持倉年齡、損失、quote age或session deadline，stop可喚醒，睡眠裁切到原 quote expiry／hold／session deadline。
+
+Sidecar 新增 `optional_waits`，與真正啟動退出的 `deferrals` 分開；只有後者套用原600s內第三次API退出後停止重入規則。最近64個 admission denials 保存 `operation`、`blocking_bucket`、精確字串 `blocking_offset_seconds`、`projected_usage`、`limit`；真正 backpressure exits 也保留相同欄位。Console 顯示 `api_wait`，其中正常監控步驟合併為60s heartbeat，完整 JSONL不抽樣。
+
+**固定600s驗收已通過，而非以安全早停充作成功。** 原15個固定機會、每15s單側BBO移動、每波集中部分成交、原quota/reserve/risk完全相同；missed機會不延後重送。既有委託在 `api_wait` 仍可按原時點成交，並未以狀態名稱假設交易所暫停。新的獨立斷言要求完整600s、至少14/15，及final authenticated0/0、exactcash差額0。實測 **600.108s、15/15、REST76200、TX89、IOC5、可選延後23次、真正API退出1次**；不以不同時長的REST總量宣稱降幅。仍有正常風控／必要API退出與taker成本，離線成交不是venue fill或fee-cover證據。
+
+原安全案例另保留，僅在測試中禁用可選延後 callbacks：selected sides **531.546s／14/15**、whole pair **264.025s／5/15**，兩者明確斷言第三次API退出早停及exact0/0/cash；不能滿足新完整窗口測試。新增 execution／session 反例檢查必要取消、未知／stale證據、預算不足、延後時新成交觸及停損，以及stop／原期限，成功收尾場次皆精確對帳。
+
+最終 **530 V2 tests PASS，62.907s**（repository `.venv`／`unittest discover -s tests -p "test_mm_v2_*.py"`）。包含原60min離線fixture：3600.105s、maker42／taker8、REST375400、TX446、雙邊3338.561s、API退出1，funding僅一次且精確對帳。另已測flat/empty建單拒絕等候時stop／原deadline，以及延後後stale book的明確失敗＋已知單清理。`git diff --check`通過；沒有shared/Grid production變更，未重跑無關Grid suite。未commit/push，未進行新的network/live驗證。
+
+
 **2026-09-10 20:46 場次204643：完整追查API觸發、撤換放大與IOC語義（本地）：** `logs/mm_v2_economics_20260910_204643_627.jsonl` 原定3600s，ledger385.6028150s／wall約448s後code1；12 maker fills／276.994580 USDG、2 taker fills／76.944880 USDG，gross−0.041240、maker fee0.03323934960／taker fee0.02693070800、funding0、realized net−0.10141005760。Final authenticated仍long0.00020／orders0，uPnL−0.010580；report的同額equity difference是尚未實現PnL，不是現金結算差額。前輪realized-gross修正已處理本輪多筆部分成交與兩次實際IOC，沒有再出現循環小數帳務錯誤；本輪all-in／fee cover仍不可用。
 
 API sidecar為同stem `.jsonl.budget.json`：3次local deferral均在reconciling_quotes，REST used8106／7800／11000、next1400；1次account activity race。REST peak12100、WS111、TX9皆低於本地總上限，但admission還保留未來40s的IOC／final proof，近期burst的可用normal額度較低，不能直接拿24k−當前用量當可花額度。Startup／normal／exit REST2700／44006／7000；75次account、60次history、20次trades。50個confirmed quote results中36個no-op、5個單create、4個雙create、3個雙撤雙建、2個單撤雙建；正常no-op並未普遍收create admission。整對revision有額外讀寫，但不是所有成本的唯一原因。保持現有quota、reserve、source checks與風險參數，不以提前停止縮短量能分母。

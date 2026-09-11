@@ -601,6 +601,93 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
     test_terminal_fill_proof = LighterAccountTests.test_terminal_fill_proof_blocks_fully_lagging_flat_rest
     test_unknown_orders_and_fills = LighterAccountTests.test_unknown_order_and_fill_rejected_before_ledger
 
+    async def test_empty_order_monitor_proof_requires_current_complete_terminal_audit(self):
+        for invalid in (None, "pending_terminal", "known_unproved", "generation", "stale_cash",
+                        "new_stream", "transport", "working_orders", "missing_cache"):
+            with self.subTest(invalid=invalid):
+                await self.asyncSetUp()
+                known = set()
+                self.port._known = lambda: known
+                self.assertFalse(self.port.has_complete_empty_order_proof)
+                await self.start()
+                known.add("10")
+                self.terminal.add("10")
+                self.adapter.trades = [trade()]
+                self.adapter.position.position = "1"
+                self.adapter.account.collateral = "99.99"
+                self.adapter.get_order_history = AsyncMock(return_value=[
+                    NS(id="10", symbol="BTC", status="filled", amount=D("1"), filled=D("1"))])
+                current = await self.port.snapshot(allow_metadata_cache=True)
+                self.assertEqual((current.position, current.open_order_ids), (D("1"), ()))
+                self.assertTrue(self.port.has_complete_empty_order_proof)
+                if invalid == "pending_terminal":
+                    self.port._terminal_proofs.clear()
+                elif invalid == "known_unproved":
+                    known.add("11")
+                elif invalid == "generation":
+                    self.generation += 1
+                elif invalid == "stale_cash":
+                    self.clock.now += 10.001
+                elif invalid == "new_stream":
+                    self.port.stream = ReadStream(self.adapter, self.clock)
+                elif invalid == "transport":
+                    self.port.stream.transport_healthy = False
+                elif invalid == "working_orders":
+                    self.port.latest_orders = (WorkingOrder("10", Side.BUY, D("1"), D("100"), False),)
+                elif invalid == "missing_cache":
+                    self.port._cash_cache = None
+                self.assertEqual(self.port.has_complete_empty_order_proof, invalid is None)
+
+    async def test_empty_order_monitor_refreshes_due_terms_and_keeps_unexpected_trade_gate(self):
+        known = set()
+        self.port._known = lambda: known
+        self.adapter.unified("100")
+        await self.start()
+        known.add("10")
+        self.terminal.add("10")
+        self.adapter.trades = [trade()]
+        self.adapter.position.position = "1"
+        self.adapter.unified_cash("99.99")
+        self.adapter.get_order_history = AsyncMock(return_value=[
+            NS(id="10", symbol="BTC", status="filled", amount=D("1"), filled=D("1"))])
+        await self.port.snapshot(allow_metadata_cache=True)
+        self.clock.now = 25
+        await self.port.snapshot(allow_metadata_cache=True)
+        self.assertTrue(self.port.has_complete_empty_order_proof)
+        self.assertEqual(self.port.normal_terms_refresh_cost(5), 1200)
+        methods = ("get_balances", "get_account_fee_and_funding", "get_settlement_asset", "get_account_trades")
+        for method in methods:
+            setattr(self.adapter, method, AsyncMock(wraps=getattr(self.adapter, method)))
+        self.adapter.get_order_history.reset_mock()
+        self.port.before_read = Mock()
+        self.clock.now = 30
+        current = await self.port.snapshot(allow_cash_reuse=True, allow_metadata_cache=True)
+        self.assertEqual((current.position, current.open_order_ids), (D("1"), ()))
+        self.assertEqual(self.adapter.get_balances.await_count, 1)
+        self.assertEqual(self.adapter.get_account_fee_and_funding.await_count, 1)
+        self.assertEqual(self.adapter.get_settlement_asset.await_count, 1)
+        self.adapter.get_account_trades.assert_not_awaited()
+        self.adapter.get_order_history.assert_not_awaited()
+        self.assertEqual([c.args[0] for c in self.port.before_read.call_args_list
+                          if c.args[0] in {"fees", "settlement", "trades", "terminal_history"}],
+                         ["fees", "settlement"])
+        # A new activity indication never inherits permission to read trades
+        # from the cheaper no-order forecast. Its real gate can still refuse.
+        self.adapter.trades.append(trade("2", side="sell", order="11"))
+        known.add("11")
+        self.adapter.position.position = "0"
+        self.adapter.unified_cash("99.98")
+        self.clock.now = 31
+        def admit(kind):
+            if kind == "trades":
+                raise ApiBudgetUnavailable("unexpected activity requires new admission")
+        self.port.before_read = Mock(side_effect=admit)
+        with self.assertRaises(ApiBudgetUnavailable):
+            await self.port.snapshot(allow_cash_reuse=True, allow_metadata_cache=True)
+        self.adapter.get_account_trades.assert_not_awaited()
+        self.assertEqual(self.ledger.snapshot(now=31).maker_fill_count, 1)
+        self.assertFalse(self.port.has_complete_empty_order_proof)
+
     async def test_conditional_read_refusal_precedes_query_and_preserves_cache_age(self):
         methods = {"fees": "get_account_fee_and_funding", "settlement": "get_settlement_asset",
                    "trades": "get_account_trades", "terminal_history": "get_order_history"}
@@ -819,6 +906,133 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.observed_monotonic, 4)
         self.assertEqual(self.adapter.get_balances.await_count, before + 1)
 
+    async def test_obsolete_cash_cache_preserves_one_fresh_bracket_retry(self):
+        cases = [(source, consistent) for source in ("activity_count", "financial_state")
+                 for consistent in (True, False)]
+        for source, consistent in cases:
+            with self.subTest(source=source, consistent=consistent):
+                await self.asyncSetUp()
+                if source == "financial_state":
+                    self.adapter.unified("100")
+                await self.start()
+                activity = self.port.stream.request_snapshot
+                stale = await activity("account_all")
+                if source == "activity_count":
+                    self.adapter.trades = [trade(), trade("2", side="sell", order="11")]
+                    self.adapter.account.collateral = "99.98"
+                    stale["positions"]["1"]["position"] = "1"
+                    stale["total_trades_count"] = 1  # WS still has the intermediate buy.
+                else:
+                    self.adapter.trades = [trade()]
+                    self.adapter.position.position = "1"
+                    self.adapter.unified_cash("99.99")
+                reads = 0
+
+                async def delayed(channel):
+                    nonlocal reads
+                    reads += 1
+                    current = await activity(channel)
+                    if source == "financial_state":
+                        current["total_trades_count"] = 0  # Exact fills may precede stats.
+                    return deepcopy(stale) if reads == 2 or reads > 2 and not consistent else current
+
+                self.port.stream.request_snapshot = AsyncMock(side_effect=delayed)
+                self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
+                self.adapter.get_open_orders = AsyncMock(wraps=self.adapter.get_open_orders)
+                self.port.before_read = Mock()
+
+                if consistent:
+                    current = await self.port.snapshot(allow_cash_reuse=True)
+                    self.assertEqual(current.position, D("1") if source == "financial_state" else D("0"))
+                    self.assertEqual(current.equity, D("99.99") if source == "financial_state" else D("99.98"))
+                else:
+                    with self.assertRaisesRegex(LighterReadError, "account changed during stream/REST bracket"):
+                        await self.port.snapshot(allow_cash_reuse=True)
+                    self.assertEqual(self.port._stream_count, 0)
+                    self.assertIsNone(self.port._cash_cache)
+                self.assertEqual(self.adapter.get_balances.await_count, 2)
+                self.assertEqual(self.adapter.get_open_orders.await_count, 6)
+                self.assertEqual(self.port.stream.request_snapshot.await_count, 3)
+                self.assertEqual(self.port.before_read.call_args_list.count(call("audit")), 3)
+                self.assertEqual(self.port.before_read.call_args_list.count(call("retry")), 1)
+                self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count,
+                                 (1 if source == "financial_state" else 2) if consistent else 0)
+
+    async def test_obsolete_cache_fresh_fallback_is_admitted_before_any_extra_read(self):
+        await self.start()
+        self.adapter.trades = [trade()]
+        self.adapter.position.position = "1"
+        self.adapter.account.collateral = "99.99"
+        self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
+        self.adapter.get_open_orders = AsyncMock(wraps=self.adapter.get_open_orders)
+        self.port.stream.request_snapshot = AsyncMock(wraps=self.port.stream.request_snapshot)
+        audits = 0
+
+        def admit(kind):
+            nonlocal audits
+            if kind == "audit":
+                audits += 1
+                if audits == 2:
+                    raise ApiBudgetUnavailable("fixture fresh fallback denied")
+
+        self.port.before_read = Mock(side_effect=admit)
+        with self.assertRaises(ApiBudgetUnavailable):
+            await self.port.snapshot(allow_cash_reuse=True)
+        self.adapter.get_balances.assert_not_awaited()
+        self.assertEqual(self.adapter.get_open_orders.await_count, 2)
+        self.port.stream.request_snapshot.assert_awaited_once()
+        self.assertNotIn(call("retry"), self.port.before_read.call_args_list)
+        self.assertIsNone(self.port._cash_cache)
+        self.assertIsNone(self.port._opening_orders)
+        self.assertEqual(self.port._stream_count, 0)
+        self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count, 0)
+
+    async def test_obsolete_cache_fresh_fallback_keeps_original_audit_deadline(self):
+        await self.start()
+        self.adapter.trades = [trade()]
+        self.adapter.position.position = "1"
+        self.adapter.account.collateral = "99.99"
+        activity = self.port.stream.request_snapshot
+
+        async def slow(channel):
+            self.clock.now += 5.1
+            return await activity(channel)
+
+        self.port.stream.request_snapshot = AsyncMock(side_effect=slow)
+        self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
+        self.port.before_read = Mock()
+        with self.assertRaisesRegex(LighterReadError, "account changed during consistent read"):
+            await self.port.snapshot(allow_cash_reuse=True)
+        self.assertEqual(self.port.stream.request_snapshot.await_count, 2)
+        self.adapter.get_balances.assert_awaited_once()
+        self.assertEqual(self.port.before_read.call_args_list.count(call("audit")), 2)
+        self.assertNotIn(call("retry"), self.port.before_read.call_args_list)
+        self.assertIsNone(self.port._cash_cache)
+        self.assertEqual(self.port._stream_count, 0)
+        self.assertEqual(self.ledger.snapshot(now=self.clock.now).maker_fill_count, 0)
+
+    async def test_obsolete_cache_cannot_restart_proof_after_generation_changes(self):
+        await self.start()
+        self.adapter.trades = [trade()]
+        self.adapter.position.position = "1"
+        self.adapter.account.collateral = "99.99"
+        activity = self.port.stream.request_snapshot
+
+        async def changed(channel):
+            self.generation += 1  # Mutation lands after closing, before account_all.
+            return await activity(channel)
+
+        self.port.stream.request_snapshot = AsyncMock(side_effect=changed)
+        self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
+        self.port.before_read = Mock()
+        with self.assertRaisesRegex(LighterReadError, "execution changed during account audit"):
+            await self.port.snapshot(allow_cash_reuse=True)
+        self.port.stream.request_snapshot.assert_awaited_once()
+        self.adapter.get_balances.assert_not_awaited()
+        self.assertEqual(self.port.before_read.call_args_list.count(call("audit")), 1)
+        self.assertIsNone(self.port._cash_cache)
+        self.assertEqual(self.ledger.snapshot(now=2).maker_fill_count, 0)
+
     async def test_unified_nonflat_reuses_cash_not_valuation_time_and_keeps_fresh_price_stop(self):
         from core.services.market_maker_v2.domain import ExecutionHealth, ExecutionSnapshot, MarketStateSnapshot, StrategyState
         from core.services.market_maker_v2.inventory_governor import InventoryGovernor
@@ -886,7 +1100,7 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     with self.assertRaises(LighterReadError):
                         await self.port.snapshot(allow_cash_reuse=True)
-                self.adapter.get_balances.assert_awaited_once()
+                self.assertEqual(self.adapter.get_balances.await_count, 2 if change in {"cash", "sign"} else 1)
                 self.assertEqual(self.ledger.snapshot(now=3).external_transfers, D("0"))
 
     async def test_generation_error_and_missing_generation_prevent_cash_reuse(self):

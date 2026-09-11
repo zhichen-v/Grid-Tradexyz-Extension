@@ -179,6 +179,152 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
             account_index=7, expected_l1_address=ADDRESS, authorize_bounded_flatten=authorized,
             telemetry=NS(emit=self.events.append), clock=self.clock, sleep=sleep or advance)
 
+    async def run_optional_wait_fault(self, fault):
+        # Import here: the endpoint-cost proxy itself imports this fixture.
+        from test_mm_v2_budget_sessions import MinimumCostAdapter
+        adapter, clock, stop = MinimumCostAdapter(), RuntimeClock(), asyncio.Event()
+        adapter.clock = clock
+        adapter.unified("299.00000056076")
+        configured = config(dry=False, duration=18 if fault.endswith("deadline") else 30)
+        configured = replace(configured, quote=replace(configured.quote, max_quote_age_ms=60000),
+                             flatten=replace(configured.flatten, stop_loss_usdg=D("0.05")))
+        events, waits, refused_reads = [], [], []
+        moved = injected = False
+        stopped_at = None
+        pending_read = False
+
+        def emit(event):
+            nonlocal stopped_at
+            events.append(event)
+            if isinstance(event, BoundedExitReport) and injected and fault in {"loss", "read"}:
+                stopped_at = clock.now
+                stop.set()
+
+        async def advance(seconds):
+            nonlocal moved, injected, stopped_at, pending_read
+            if session.phase == "waiting" and adapter.orders and not moved:
+                # Shift the desired midpoint while keeping both original orders
+                # passive and in their original lifetime: revision is optional.
+                adapter.book.asks[0].price = D("105")
+                moved = True
+            if session.phase == "api_wait":
+                waits.append(clock.now)
+                if not injected:
+                    injected = True
+                    if fault.endswith("stop"):
+                        stopped_at = clock.now
+                        stop.set()
+                    elif fault == "stale":
+                        stopped_at = clock.now  # No new risk after evidence expires.
+                        adapter.book_age = 4
+                    elif fault in {"loss", "read"}:
+                        buy = next(row for row in adapter.orders if row.side is OrderSide.BUY)
+                        adapter.fill(buy)
+                        if fault == "loss":
+                            adapter.book.bids[0].price = D("98")
+                            adapter.book.asks[0].price = D("100")
+                            adapter.position.unrealized_pnl = "-0.1"
+                            adapter.unified_cash(D(adapter.account.assets[0].margin_balance))
+                        else:
+                            pending_read = True
+            clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        session = orchestrator.VolumeSession(configured, adapter, account_index=7,
+            expected_l1_address=ADDRESS, authorize_bounded_flatten=True,
+            telemetry=NS(emit=emit), clock=clock, sleep=advance)
+        original_admit = session.api_budget.require_normal
+
+        def admit(cost, *, operation="normal"):
+            nonlocal pending_read
+            if operation == "optional_reprice" or fault.startswith("flat_") and operation == "create":
+                raise ApiBudgetUnavailable("injected optional work refusal", values={"operation": operation})
+            if pending_read and operation == "sync_read" and not session._budget_exiting:
+                pending_read = False
+                refused_reads.append(clock.now)
+                raise ApiBudgetUnavailable("injected required monitor refusal", values={"operation": operation})
+            return original_admit(cost, operation=operation)
+
+        session.api_budget.require_normal = admit
+        original_available = session.api_budget.scheduled_live_available
+        def available(normal):
+            if fault.startswith("flat_") and injected and normal == {"rest": 5000, "ws": 18, "tx": 2}:
+                return False  # Preserve the flat recovery wait until stop/deadline.
+            return original_available(normal)
+        session.api_budget.scheduled_live_available = available
+        result = await session.run(stop)
+        self.assertTrue(waits, "fault must happen after a safe optional deferral")
+        self.assertEqual(result.completed, fault != "stale", result.failure)
+        self.assertTrue(result.report.complete)
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertEqual(result.report.equity_reconciliation_difference, D("0"))
+        diagnostics = [event for event in events if isinstance(event, FailureDiagnostic)]
+        if fault == "stale":
+            self.assertTrue(diagnostics, "stale market must remain a visible failed-closed run")
+        else:
+            self.assertFalse(diagnostics)
+        exits = [event for event in events if isinstance(event, BoundedExitReport)]
+        self.assertTrue(exits)
+        self.assertTrue(all(event.complete for event in exits))
+        self.assertEqual(adapter.disconnections, 1)
+        if stopped_at is not None:
+            self.assertFalse(any(at >= stopped_at and tif == "POST_ONLY"
+                                 for at, _, _, tif, _ in adapter.created_records))
+        return session, adapter, result, waits, exits, refused_reads
+
+    async def test_optional_wait_operator_stop_preserves_bounded_exit(self):
+        session, adapter, result, waits, exits, _ = await self.run_optional_wait_fault("stop")
+        self.assertLess(exits[0].observed_monotonic - waits[0], 30)
+        self.assertEqual(result.report.taker_fill_count, 0)
+        self.assertEqual(session.api_budget.deferrals, 0)
+
+    async def test_optional_wait_uses_original_session_deadline(self):
+        session, adapter, result, waits, exits, _ = await self.run_optional_wait_fault("deadline")
+        deadline = session.governor.session_deadline_monotonic
+        self.assertLessEqual(exits[-1].observed_monotonic, deadline + 30)
+        self.assertGreaterEqual(result.report.duration_seconds, D("18"))
+        self.assertLess(result.report.duration_seconds, D("19"))
+        self.assertFalse(any(at >= deadline and tif == "POST_ONLY"
+                             for at, _, _, tif, _ in adapter.created_records))
+        self.assertEqual(session.api_budget.deferrals, 0)
+
+    async def test_fill_and_stop_loss_during_optional_wait_trigger_risk_exit(self):
+        session, adapter, result, waits, exits, _ = await self.run_optional_wait_fault("loss")
+        self.assertEqual(result.report.maker_fill_count, 1)
+        self.assertEqual(result.report.taker_fill_count, 1)
+        self.assertLess(exits[0].observed_monotonic - waits[0], 10)
+        self.assertEqual(session.api_budget.deferrals, 0)
+
+    async def test_required_read_refusal_after_optional_wait_exits_instead_of_waiting(self):
+        session, adapter, result, waits, exits, refused = await self.run_optional_wait_fault("read")
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(session.api_budget.deferrals, 1)
+        self.assertEqual(result.report.maker_fill_count, 1)
+        self.assertEqual(result.report.taker_fill_count, 1)
+        self.assertLess(exits[0].observed_monotonic - refused[0], 30)
+
+    async def test_flat_create_wait_honors_stop_and_original_deadline_without_orders(self):
+        for fault in ("flat_stop", "flat_deadline"):
+            with self.subTest(fault=fault):
+                session, adapter, result, waits, exits, _ = await self.run_optional_wait_fault(fault)
+                self.assertEqual(adapter.creates, 0)
+                self.assertEqual(adapter.cancels, 0)
+                self.assertTrue(all(event.attempts == 0 for event in exits))
+                self.assertEqual(session.api_budget.deferrals, 0)
+                if fault == "flat_deadline":
+                    self.assertGreaterEqual(result.report.duration_seconds, D("18"))
+                    self.assertLess(result.report.duration_seconds, D("19"))
+                else:
+                    self.assertLess(exits[0].observed_monotonic - waits[0], 30)
+
+    async def test_market_expiring_during_optional_wait_cancels_known_orders_and_fails_closed(self):
+        session, adapter, result, waits, exits, _ = await self.run_optional_wait_fault("stale")
+        self.assertFalse(result.completed)
+        self.assertEqual(result.failure, "session_failed_closed")
+        self.assertEqual(adapter.cancels, 2)
+        self.assertNotIn("IOC", adapter.created_tifs)
+        self.assertLess(exits[0].observed_monotonic - waits[0], 30)
+
     async def test_delayed_immutable_book_is_bracketed_by_order_watermarks(self):
         class Buffered(ReadStream):
             engine_nonce = 1
@@ -561,6 +707,205 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_cash_first_seen_during_budget_exit_cannot_authorize_reentry(self):
         await self._unattributed_cash_cleanup(in_budget_exit=True)
 
+    async def test_private_funding_arrives_after_flat_cleanup_and_resumes_same_session(self):
+        await self._late_funding_recovery("recover")
+
+    async def test_private_funding_identity_before_cash_recovers_after_exact_flat_proof(self):
+        await self._late_funding_recovery("id_first")
+
+    async def test_cash_recovery_needs_private_identity_and_exact_amount(self):
+        for outcome in ("cash_reverts_without_id", "wrong_amount"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                await self._late_funding_recovery(outcome)
+
+    async def test_funding_recovery_cannot_bypass_read_admission(self):
+        await self._late_funding_recovery("budget_denied")
+
+    async def test_stop_during_funding_recovery_finishes_accounting_without_reentry(self):
+        await self._late_funding_recovery("stop")
+
+    async def test_permanent_cash_gap_cannot_restart_funding_recovery_in_finally(self):
+        await self._late_funding_recovery("permanent")
+
+    async def test_funding_recovery_cannot_resume_unknown_execution_state(self):
+        await self._late_funding_recovery("unknown")
+
+    async def test_funding_recovery_rechecks_stream_and_generation_before_following_reads(self):
+        for outcome in ("generation_changed", "stream_replaced"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                await self._late_funding_recovery(outcome)
+
+    async def _late_funding_recovery(self, outcome):
+        self.adapter.set_market_maker_request_observer = lambda observer, *, enforce_admission: None
+        session = self.session(dry=False, duration=40, authorized=True)
+        stop, gap = asyncio.Event(), D("0.00039")
+        changed, funded, recovery_reads, blocked, altered = [], [], [], [], []
+        original_fees = self.adapter.get_account_fee_and_funding
+        original_balances = self.adapter.get_balances
+        original_admit = session.api_budget.require_flat_read
+        preserved = None
+
+        async def advance(seconds):
+            nonlocal preserved
+            if not changed and session.phase == "waiting" and self.adapter.creates == 2:
+                self.adapter.fill(next(row for row in self.adapter.orders if row.side is OrderSide.BUY))
+                if outcome == "id_first":
+                    self.adapter.fees["fundings"] = ({"id": "7001", "timestamp": 2000, "change": -gap},)
+                else:
+                    self.adapter.account.collateral = str(D(self.adapter.account.collateral) - gap)
+                changed.append(self.clock.now)
+                preserved = (session.ledger, session.governor.session_deadline_monotonic,
+                             session.governor.max_session_loss_usdg)
+            if outcome == "stop" and session.phase == "funding_recovery":
+                stop.set()
+            self.clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        async def fees(*args, **kwargs):
+            if session.phase == "funding_recovery":
+                recovery_reads.append(self.clock.now)
+                self.assertEqual((D(self.adapter.position.position), self.adapter.orders), (D("0"), []))
+                self.assertTrue(session.cleanup_account.authenticated)
+                self.assertEqual((session.cleanup_account.position, session.cleanup_account.open_order_ids),
+                                 (D("0"), ()))
+            ready = (session.phase == "funding_recovery" and len(recovery_reads) >= 3
+                     or outcome == "stop" and stop.is_set())
+            if ready and not funded and outcome != "permanent":
+                funded.append(self.clock.now)
+                if outcome == "cash_reverts_without_id":
+                    self.adapter.account.collateral = str(D(self.adapter.account.collateral) + gap)
+                elif outcome != "budget_denied":
+                    amount = -gap if outcome != "wrong_amount" else -gap + D("0.00001")
+                    self.adapter.fees["fundings"] = ({"id": "7001", "timestamp": 2000, "change": amount},)
+            return await original_fees(*args, **kwargs)
+
+        async def balances():
+            if outcome == "id_first" and session.phase == "funding_recovery" and not funded:
+                self.assertEqual((D(self.adapter.position.position), self.adapter.orders), (D("0"), []))
+                self.assertIn("7001", session.account.accepted_funding_ids)
+                funded.append(self.clock.now)
+                self.adapter.account.collateral = str(D(self.adapter.account.collateral) - gap)
+            result = await original_balances()
+            if (outcome in {"generation_changed", "stream_replaced"}
+                    and session.phase == "funding_recovery" and not altered):
+                altered.append(self.clock.now)
+                if outcome == "generation_changed":
+                    session.manager._mutation_generation += 1
+                else:
+                    session.account.stream = ReadStream(self.adapter, self.clock)
+            return result
+
+        def admit(cost, *, operation="normal"):
+            if outcome == "budget_denied" and session.phase == "funding_recovery" and operation == "fees_read":
+                blocked.append(self.clock.now)
+                raise ApiBudgetUnavailable("fixture recovery read denied", operation=operation)
+            return original_admit(cost, operation=operation)
+
+        def emit(event):
+            self.events.append(event)
+            if outcome == "unknown" and type(event) is BoundedExitReport:
+                session.manager._mark_submission_uncertain(OrderSide.BUY, "fixture late wire ambiguity")
+                self.adapter.get_unresolved_submissions = lambda: [{"symbol": "BTC"}]
+
+        session.sleep = advance
+        self.adapter.get_account_fee_and_funding = fees
+        self.adapter.get_balances = balances
+        session.api_budget.require_flat_read = admit
+        session.telemetry = NS(emit=emit)
+        result = await session.run(stop)
+        self.assertEqual(len(changed), 1)
+        self.assertIs(session.ledger, preserved[0])
+        self.assertEqual(session.governor.session_deadline_monotonic, preserved[1])
+        self.assertEqual(session.governor.max_session_loss_usdg, preserved[2])
+        self.assertEqual(self.adapter.disconnections, 1)
+        self.assertEqual((D(self.adapter.position.position), self.adapter.orders), (D("0"), []))
+        exits = [event for event in self.events if type(event) is BoundedExitReport]
+        self.assertTrue(exits and all(event.complete for event in exits))
+        self.assertLess(exits[0].observed_monotonic - changed[0], 30)
+        if outcome == "budget_denied":
+            self.assertTrue(blocked, "additional funding reads must use normal admission")
+            self.assertFalse(recovery_reads, "denial must precede the funding request")
+        elif outcome == "unknown":
+            self.assertTrue(session.manager.has_uncertain_state)
+            self.assertFalse(recovery_reads, "unknown execution must block even funding recovery")
+        elif outcome == "id_first":
+            self.assertTrue(funded, "cash must catch up only after flat cleanup")
+        elif outcome in {"generation_changed", "stream_replaced"}:
+            self.assertEqual(len(altered), 1)
+            self.assertFalse(recovery_reads, "changed proof identity must block the following fee request")
+        else:
+            self.assertTrue(recovery_reads, "private funding proof must wait until after cleanup")
+            self.assertLessEqual(len(recovery_reads), 4, "finally must not restart an exhausted recovery")
+        if outcome in {"recover", "stop", "id_first"}:
+            self.assertTrue(result.completed, result.failure)
+            self.assertTrue(result.report.complete)
+            self.assertEqual(result.report.funding, -gap)
+            self.assertEqual(result.report.external_transfers, D("0"))
+            self.assertEqual(result.report.equity_reconciliation_difference, D("0"))
+            self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+            if outcome in {"recover", "id_first"}:
+                if outcome == "recover":
+                    self.assertGreaterEqual(recovery_reads[2] - recovery_reads[0], 1)
+                self.assertTrue(any(at > funded[0] and tif == "POST_ONLY"
+                                    for at, _, _, tif, _ in self.adapter.created_records))
+            else:
+                self.assertEqual(self.adapter.created_tifs, ["POST_ONLY", "POST_ONLY", "IOC"])
+            self.assertFalse(any(changed[0] < at < funded[0] and tif == "POST_ONLY"
+                                 for at, _, _, tif, _ in self.adapter.created_records))
+        else:
+            self.assertFalse(result.completed)
+            self.assertEqual(self.adapter.created_tifs, ["POST_ONLY", "POST_ONLY", "IOC"])
+            self.assertLess(self.clock.now - exits[0].observed_monotonic, 25,
+                            "failed recovery cannot restart its bounded proof window")
+
+    async def test_funding_first_missing_in_final_account_recovers_within_its_original_ten_seconds(self):
+        self.adapter.set_market_maker_request_observer = lambda observer, *, enforce_admission: None
+        session = self.session(dry=False, duration=2, authorized=True)
+        original_balances = self.adapter.get_balances
+        original_fees = self.adapter.get_account_fee_and_funding
+        filled, changed, reads = [], [], []
+        gap = D("0.00039")
+
+        async def advance(seconds):
+            if not filled and self.adapter.orders:
+                self.adapter.fill(next(row for row in self.adapter.orders if row.side is OrderSide.BUY))
+                filled.append(self.clock.now)
+            self.clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        async def balances():
+            if session.phase == "final_account" and not changed:
+                self.assertEqual((D(self.adapter.position.position), self.adapter.orders), (D("0"), []))
+                changed.append((self.clock.now, self.adapter.creates))
+                self.adapter.account.collateral = str(D(self.adapter.account.collateral) - gap)
+            return await original_balances()
+
+        async def fees(*args, **kwargs):
+            if session.phase == "funding_recovery":
+                reads.append(self.clock.now)
+                if len(reads) == 3:
+                    self.adapter.fees["fundings"] = ({"id": "7001", "timestamp": 2000, "change": -gap},)
+            return await original_fees(*args, **kwargs)
+
+        session.sleep = advance
+        self.adapter.get_balances, self.adapter.get_account_fee_and_funding = balances, fees
+        result = await session.run(asyncio.Event())
+        self.assertTrue(result.completed, (result.failure, reads, [event for event in self.events
+                                                                 if type(event) is FailureDiagnostic]))
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(len(reads), 4)  # Fresh confirmation also sees the newly published WS funding source.
+        self.assertGreaterEqual(reads[2] - reads[0], 1)
+        self.assertLess(self.clock.now - changed[0][0], 10)
+        self.assertEqual(self.adapter.creates, changed[0][1], "final accounting cannot reenter trading")
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertEqual(result.report.funding, -gap)
+        self.assertEqual(result.report.external_transfers, D("0"))
+        self.assertEqual(result.report.equity_reconciliation_difference, D("0"))
+        self.assertEqual((result.report.maker_fill_count, result.report.taker_fill_count), (1, 1))
+        self.assertEqual(self.adapter.disconnections, 1)
+
     async def _unattributed_cash_cleanup(self, *, in_budget_exit):
         self.adapter.set_market_maker_request_observer = lambda observer, *, enforce_admission: None
         session = self.session(dry=False, duration=90, authorized=True)
@@ -605,7 +950,7 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(changed), 1)
         self.assertEqual(changed[0][1], in_budget_exit)
         self.assertEqual(session.api_budget.deferrals, int(in_budget_exit))
-        self.assertEqual(session.api_budget.account_read_deferrals, 0)
+        self.assertEqual(session.api_budget.account_read_deferrals, 1)
         self.assertFalse(result.completed)
         self.assertIsNone(result.final_account, "the final economic proof must remain strict")
         self.assertFalse(result.report.complete)
@@ -624,8 +969,10 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
                          (2 if in_budget_exit else 1, 1))
         self.assertEqual((D(self.adapter.position.position), self.adapter.orders), (D("0"), []))
         exits = [event for event in self.events if type(event) is BoundedExitReport]
-        self.assertEqual(len(exits), 1)
-        self.assertTrue(exits[0].complete)
+        self.assertEqual(len(exits), 2 if in_budget_exit else 1)
+        self.assertTrue(all(event.complete for event in exits))
+        if in_budget_exit:
+            self.assertEqual(exits[1].attempts, 0)  # Fresh flat proof after cooldown adds no IOC.
         self.assertTrue(any(type(event) is FailureDiagnostic and event.stage == "final_account"
                             for event in self.events))
 
@@ -647,15 +994,21 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.setUp()
                 await self._account_bracket_recovery(stage=stage)
 
+    async def test_obsolete_cash_cache_then_one_fresh_race_resumes_without_cleanup(self):
+        await self._account_bracket_recovery(stage="authorizing_quotes", cache_miss=True)
+
     async def test_bracket_race_cannot_resume_unknown_wire_or_incomplete_cleanup(self):
         for outcome in ("unknown_wire", "persistent"):
             with self.subTest(outcome=outcome):
                 self.setUp()
                 await self._account_bracket_recovery(stage="authorizing_quotes", outcome=outcome)
 
-    async def _account_bracket_recovery(self, *, stage, outcome="recover"):
+    async def _account_bracket_recovery(self, *, stage, outcome="recover", cache_miss=False):
         self.adapter.set_market_maker_request_observer = lambda observer, *, enforce_admission: None
         session = self.session(dry=False, duration=25, authorized=True)
+        if cache_miss:
+            session.config = replace(session.config,
+                quote=replace(session.config.quote, max_quote_age_ms=60000))
         original_stream, original_admit = self.adapter.open_read_stream, session.account.before_read
         injections, retries, preserved = [], [], []
         stale = None
@@ -668,8 +1021,11 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
                 nonlocal stale
                 row = await original_activity(channel)
                 creates = 2 if stage == "authorizing_quotes" else 1
+                cached = session.account._cash_cache
+                cache_ready = (cached is not None and cached[0] == session.manager.mutation_generation)
                 if (not injections and self.adapter.creates == creates
-                        and session.phase == stage and not session._budget_exiting):
+                        and session.phase == stage and not session._budget_exiting
+                        and (not cache_miss or cache_ready)):
                     stale = deepcopy(row)
                     preserved.append((session.ledger, session.governor.session_deadline_monotonic,
                                       session.governor.max_session_loss_usdg, self.clock.now,
@@ -696,6 +1052,11 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
             return result
 
         def admit(kind):
+            if (kind == "audit" and not cache_miss and not injections
+                    and session.phase == stage and not session._budget_exiting):
+                # This fixture promises two genuinely fresh REST races. Cache
+                # invalidation alone now falls back before using that retry.
+                session.account._cash_cache = None
             if kind == "retry" and injections and not session._budget_exiting:
                 retries.append(self.clock.now)
             return original_admit(kind)
@@ -720,15 +1081,18 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.api_budget.account_read_deferrals, int(outcome == "persistent"))
             return
         self.assertTrue(result.completed, result.failure)
-        self.assertEqual(session.api_budget.snapshot()["account_read_deferrals"], 1)
+        self.assertEqual(session.api_budget.snapshot()["account_read_deferrals"], int(not cache_miss))
         self.assertTrue(all(event.complete for event in exits))
-        self.assertEqual(len(exits), 2)
-        self.assertLess(exits[0].observed_monotonic - injections[0], 30)
-        self.assertFalse([record for record in self.adapter.created_records
-                          if injections[0] <= record[0] < exits[0].observed_monotonic
-                          and record[3] == "POST_ONLY"])
-        self.assertTrue([record for record in self.adapter.created_records
-                         if record[0] > exits[0].observed_monotonic and record[3] == "POST_ONLY"])
+        self.assertEqual(len(exits), 1 if cache_miss else 2)
+        if cache_miss:
+            self.assertGreaterEqual(exits[0].observed_monotonic, preserved[0][1])
+        else:
+            self.assertLess(exits[0].observed_monotonic - injections[0], 30)
+            self.assertFalse([record for record in self.adapter.created_records
+                              if injections[0] <= record[0] < exits[0].observed_monotonic
+                              and record[3] == "POST_ONLY"])
+            self.assertTrue([record for record in self.adapter.created_records
+                             if record[0] > exits[0].observed_monotonic and record[3] == "POST_ONLY"])
         self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
         self.assertEqual((result.report.maker_fill_count, result.report.taker_fill_count), (1, 1))
         self.assertEqual(result.report.all_in_net_pnl, -result.report.maker_fee - result.report.taker_fee)
@@ -943,6 +1307,62 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(ioc[0][0] - filled_at, 66)
         self.assertEqual(result.report.forced_flatten_count, 1)
         self.assertEqual(result.final_account.position, D("0"))
+
+    async def test_optional_wait_wakes_at_conservative_hold_deadline_after_late_fill(self):
+        from core.services.market_maker_v2.domain import ExecutionStatus
+
+        self.adapter.set_market_maker_request_observer = lambda observer, *, enforce_admission: None
+        session = self.session(dry=False, duration=90, authorized=True)
+        session.config = replace(session.config,
+            quote=replace(session.config.quote, max_quote_age_ms=120000))
+        stop, filled_at, deferred_at = asyncio.Event(), None, None
+        observed_ages = []
+        original_start = session._start
+
+        async def start():
+            await original_start()
+            original_reconcile = session.execution.reconcile_quotes
+
+            async def defer(plan):
+                nonlocal deferred_at
+                result = await original_reconcile(plan)
+                if session.final_account.position and deferred_at is None:
+                    deferred_at = self.clock.now
+                    observed_ages.append((session.ledger.snapshot(now=self.clock.now).inventory_age,
+                                          session.account.inventory_age_bound(self.clock.now)))
+                    return replace(result, status=ExecutionStatus.DEFERRED, account_snapshot=session.final_account)
+                return result
+
+            session.execution.reconcile_quotes = defer
+
+        async def advance(seconds):
+            nonlocal filled_at
+            buys = [row for row in self.adapter.orders if row.side is OrderSide.BUY]
+            if session.phase == "waiting" and filled_at is None and buys:
+                self.adapter.fill(buys[0])
+                filled_at = self.clock.now
+                self.clock.now += 58  # Discovery leaves two seconds of conservative hold time.
+            else:
+                self.clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        def emit(event):
+            self.events.append(event)
+            if type(event) is BoundedExitReport:
+                stop.set()
+
+        session._start, session.sleep, session.telemetry = start, advance, NS(emit=emit)
+        result = await session.run(stop)
+        self.assertTrue(result.completed, [event for event in self.events if type(event) is FailureDiagnostic])
+        self.assertIsNotNone(deferred_at)
+        self.assertEqual(len(observed_ages), 1)
+        self.assertLess(observed_ages[0][0], D("0.1"))
+        self.assertGreaterEqual(observed_ages[0][1], D("58"))
+        ioc = [row for row in self.adapter.created_records if row[3] == "IOC"]
+        self.assertEqual(len(ioc), 1)
+        self.assertLessEqual(ioc[0][0] - filled_at, 60.5)
+        self.assertLess(ioc[0][0] - deferred_at, 2.5)
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
 
     async def test_market_failure_stops_and_disconnects_without_false_completion(self):
         async def break_then_advance(seconds):

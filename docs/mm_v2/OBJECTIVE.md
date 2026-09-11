@@ -1,6 +1,8 @@
 # Market Maker V2 — Volume-first objective
 
-> 狀態：2026-09-10，204643實盤在第三次API背壓退出時，將行情移出固定IOC限價誤判為HALTED，殘留long0.00020；21:06:28獨立唯讀已0/0，不能回填原場成功。本地完成IOC零成交語義、單側撤換、Unified非零現金證據8s重用與分段admission修正。固定600s集中成交壓力仍531.546s／14of15後第三次API保護早停，未達完整窗口，不能稱穩定／fee-cover成功；保留本地重現，未啟動新live、Grid/VPS不動。實際腳本仍60分鐘。詳細證據見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+> 狀態：2026-09-11，依使用者授權完成V2本地資金費有界恢復、最後入帳後fresh cash確認、完整空委託證據下的監控成本精算，以及安全既有单優先補缺側。只讀取證在清理0/0後、原期限內、逐read計費並保留最後完整proof；normal quota／exit reserve／risk／quote配置不變。最新實盤仍為231145：planned3600s，wall2901.283s後code1，歷史清理0/0但cash差+0.000361530936 USDG；maker2324.147061、交易net−0.32727171132（funding未入帳）、雙邊54.98%。修後沒有新live或私人帳戶連線，實盘完整60分鐘、最終帳務、雙邊持續性與fee-cover仍待驗證。完整本地測試與歷史證據見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+
+本批完整V2 **561 tests PASS（86.360s）**，含固定10／30／60min離線負載與晚到funding真端點成本測試；同一小時fixture雙邊由90.20%至91.17%、API退出0、cash差0／final0/0。這不是修後實盤或經濟達標證據。
 
 ## 目標與判定
 

@@ -30,6 +30,10 @@ class _AccountCashRace(AccountReadRace):
     """Cash may settle before its independently identified funding evidence."""
 
 
+class UnattributedCashflow(_AccountCashRace):
+    """Exact equity bridge failed; only identified cashflows can explain it."""
+
+
 def _number(value):
     if type(value) not in (str, int, Decimal):
         raise LighterReadError("invalid financial data")
@@ -150,6 +154,10 @@ class LighterAccountPort:
         if report.ledger_position != ZERO or report.duration_seconds != ZERO:
             raise LighterReadError("ledger must start at the account baseline")
         self._ledger = ledger
+
+    @property
+    def accepted_funding_ids(self):
+        return frozenset(self._fundings)
 
     def begin_quote_cycle(self):
         """Order observations are single-use handoffs, never a cross-cycle cache."""
@@ -373,6 +381,26 @@ class LighterAccountPort:
                 raise AccountReadRace("terminal fills not reflected in account ledger")
             self._terminal_proofs[identifier] = (status, filled, amount)
 
+    @property
+    def has_complete_empty_order_proof(self):
+        """Only a completed, current audit can rule out further owned fills."""
+        cached = self._cash_cache
+        return bool(self.stream is not None and self.stream is self._metadata_stream
+            and self.stream.transport_healthy and cached is not None
+            and cached[0] is not None and cached[0] == self._generation()
+            and 0 <= self.clock.monotonic() - cached[1] <= 10
+            and cached[4] == () and self.latest_orders == ()
+            and set(self._known()) <= self._terminal_proofs.keys()
+            and set(self._terminal()) <= self._terminal_proofs.keys())
+
+    def normal_terms_refresh_cost(self, horizon_seconds=0):
+        """Read-only cost forecast; never extends the actual metadata TTL."""
+        now = self.clock.monotonic() + horizon_seconds
+        if self.stream is not self._metadata_stream:
+            return 1200
+        return (900 if not 0 <= now - self._fees_at < 28 else 0) + (
+            300 if not 0 <= now - self._settlement_at < 28 else 0)
+
     async def _read_fees(self, *, allow_unreconciled_cash=False):
         if self.before_read is not None:
             self.before_read("fees")
@@ -454,12 +482,28 @@ class LighterAccountPort:
         if len(balances) != 1:
             raise LighterReadError("exclusive collateral account required")
         raw = balances[0].raw_data["account"]
-        if opening[0] != closing[0]:
+        if opening[0] != closing[0] or closing[0] != self._generation():
             raise LighterReadError("execution changed during account audit")
-        if (orders != confirmed or reuse and count != cached[3]
+        if orders != confirmed:
+            raise AccountReadRace("account changed during stream/REST bracket")
+        if (reuse and count != cached[3]
                 or state(account) != _account_state(raw.assets, raw.positions, raw.shares,
                                                    include_valuation=include_valuation)):
-            raise AccountReadRace("account changed during stream/REST bracket")
+            if not reuse:
+                raise AccountReadRace("account changed during stream/REST bracket")
+            # Equal current order bookends can invalidate an older cash cache
+            # without proving a concurrent fresh-read race. Start fresh cash
+            # inside new order bookends and retain the one real race retry.
+            # Even closing may predate the activity now visible in account_all.
+            # This remains inside snapshot's original 10s wait; admit every
+            # additional proof before its reads (normal only; exit uses fresh).
+            self.begin_quote_cycle()
+            self._cash_cache = None
+            if self.before_read is not None:
+                self.before_read("audit")
+            return await self._stream_read(allow_metadata_cache=allow_metadata_cache,
+                force_trades=force_trades, force_funding=force_funding,
+                allow_unreconciled_cash=allow_unreconciled_cash)
         now = self.clock.monotonic()
         if (self.before_read is not None and 0 <= now - self._fees_at < terms_age
                 and (force_funding or funding_source != self._fees_source)):
@@ -652,7 +696,7 @@ class LighterAccountPort:
                         expected_equity = (self._baseline.equity + report.realized_net_pnl
                                            + report.external_transfers + account.unrealized_pnl)
                     if expected_equity != account.equity:
-                        raise _AccountCashRace("unattributed account cashflow or equity mismatch", values={
+                        raise UnattributedCashflow("unattributed account cashflow or equity mismatch", values={
                             "expected_equity": expected_equity, "account_equity": account.equity})
             self._trades.update(trades)
             self._fundings.update(funding)

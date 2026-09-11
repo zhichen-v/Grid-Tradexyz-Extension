@@ -1,6 +1,8 @@
 """Offline request-boundary tests; these are not live wire-traffic measurements."""
 
 import unittest
+from decimal import Decimal
+from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -18,6 +20,116 @@ ZERO = {"rest": 0, "ws": 0, "tx": 0}
 
 
 class ApiBudgetTests(unittest.TestCase):
+    def test_flat_read_preserves_exact_final_proof_rest_and_ws_boundaries(self):
+        for boundary, bucket, projected, limit in (
+            ({"rest": 19600, "ws": 0, "tx": 0}, "rest", 24001, 24000),
+            ({"rest": 0, "ws": 185, "tx": 0}, "ws", 201, 200),
+        ):
+            with self.subTest(bucket=bucket):
+                budget = ApiBudget(lambda: 100.0)
+                budget.require_flat_read(boundary, operation="funding_proof_read")
+                with self.assertRaises(ApiBudgetUnavailable) as caught:
+                    budget.require_flat_read(boundary | {bucket: boundary[bucket] + 1},
+                                             operation="funding_proof_read")
+                error = caught.exception
+                self.assertEqual(error.budget_diagnostic, {
+                    "operation": "funding_proof_read", "blocking_bucket": bucket,
+                    "blocking_offset_seconds": "0", "projected_usage": projected, "limit": limit})
+                self.assertEqual(error.diagnostic_values["api_next_" + bucket], Decimal(boundary[bucket] + 1))
+                self.assertEqual(budget.snapshot()["recent_admission_denials"], [
+                    {"observed_monotonic": 100.0, **error.budget_diagnostic}])
+                self.assertEqual(budget.snapshot()["deferrals"], 0)
+
+    def test_flat_read_counts_observed_requests_and_cannot_spend_final_audit(self):
+        budget = ApiBudget(lambda: 100.0)
+        for _ in range(98):
+            budget.observe("rest", "accountInactiveOrders")
+        # The prior exit has already proven flat. Ordinary admission would
+        # reserve another full IOC exit and refuse this read at a future step.
+        with self.assertRaises(ApiBudgetUnavailable):
+            budget.require_normal({"rest": 300, "ws": 5, "tx": 0})
+        budget.require_flat_read({"rest": 300, "ws": 5, "tx": 0})
+        while budget.snapshot()["used"]["rest"] < 19400:
+            budget.require_flat_read({"rest": 300, "ws": 0, "tx": 0})
+            budget.observe("rest", "account")
+        self.assertEqual(budget.snapshot()["used"]["rest"], 19400)
+        with self.assertRaises(ApiBudgetUnavailable):
+            budget.require_flat_read({"rest": 300, "ws": 0, "tx": 0})
+        self.assertEqual(budget.snapshot()["used"]["rest"] + 4400, 23800)
+        for _ in range(185):
+            budget.observe("ws", 1)
+        with self.assertRaises(ApiBudgetUnavailable) as caught:
+            budget.require_flat_read({"rest": 0, "ws": 1, "tx": 0})
+        self.assertEqual(caught.exception.blocking_bucket, "ws")
+
+    def test_flat_read_rejects_mutations_incomplete_costs_and_unbounded_labels(self):
+        budget = ApiBudget(lambda: 1.0)
+        for cost in (ZERO | {"tx": 1}, {"rest": 0}, ZERO | {"other": 0},
+                     ZERO | {"rest": -1}, ZERO | {"ws": False}, ZERO | {"tx": 0.0}):
+            with self.subTest(cost=cost), self.assertRaises(ValueError):
+                budget.require_flat_read(cost)
+        for operation in ("", "flat?auth=sensitive-test-value", "A" * 65, None):
+            with self.subTest(operation=operation), self.assertRaises(ValueError):
+                budget.require_flat_read(ZERO, operation=operation)
+        self.assertNotIn("sensitive-test-value", repr(budget.snapshot()))
+        self.assertEqual(budget.snapshot()["attempts"], {})
+
+    def test_account_read_exit_attribution_separates_proof_failure_classes(self):
+        from core.services.market_maker_v2.lighter_runtime import AccountReadRace, _AccountCashRace, UnattributedCashflow
+
+        budget = ApiBudget(lambda: 1.0)
+        cases = (
+            (AccountReadRace, "exact terminal order proof unavailable", "terminal_order_history"),
+            (AccountReadRace, "terminal fills not reflected in account ledger", "terminal_fill_history"),
+            (AccountReadRace, "account changed during stream/REST bracket", "stream_rest_bracket"),
+            (AccountReadRace, "account trade count and history disagree", "trade_counter_history"),
+            (AccountReadRace, "account history exceeds activity counter", "history_ahead_of_counter"),
+            (AccountReadRace, "active order fills not reflected in account history", "active_fill_history"),
+            (AccountReadRace, "account fills and position disagree", "fill_position"),
+            (_AccountCashRace, "new fill exceeds observed fee terms", "fill_fee_terms"),
+            (_AccountCashRace, "unattributed account cashflow or equity mismatch", "cash_equity"),
+            (UnattributedCashflow, "unattributed account cashflow or equity mismatch", "cash_equity"),
+        )
+        for number, (kind, message, subreason) in enumerate(cases, 1):
+            budget.record_account_read_exit(phase="authorizing_quotes", exit_id=f"exit-{number}",
+                error=kind(message, values={"provider_payload": "sensitive-test-value"}))
+            row = budget.snapshot()["recent_account_read_exits"][-1]
+            self.assertEqual(row, {
+                "number": number, "observed_monotonic": 1.0,
+                "reason": "account_cash_conflict" if issubclass(kind, _AccountCashRace) else "account_read_race",
+                "subreason": subreason, "phase": "authorizing_quotes", "exit_id": f"exit-{number}",
+            })
+        self.assertEqual(budget.snapshot()["deferrals"], 0)
+        self.assertEqual(budget.snapshot()["recent_backpressure_exits"], [])
+        self.assertNotIn("sensitive-test-value", repr(budget.snapshot()))
+
+    def test_account_read_exit_attribution_is_bounded_and_never_logs_unknown_payloads(self):
+        import json
+        from core.services.market_maker_v2.lighter_runtime import AccountReadRace
+
+        now = [1.0]
+        budget = ApiBudget(lambda: now[0])
+        for number in range(70):
+            now[0] += 1
+            budget.record_account_read_exit(phase="reconciling_quotes", exit_id=f"exit-{number + 1}",
+                error=AccountReadRace("provider auth=sensitive-test-value"))
+        result = budget.snapshot()
+        self.assertEqual(result["account_read_deferrals"], 70)
+        self.assertEqual(len(result["recent_account_read_exits"]), 64)
+        self.assertEqual(result["recent_account_read_exits"][0]["number"], 7)
+        self.assertTrue(all(row["subreason"] == "unclassified_account_read_race"
+                            for row in result["recent_account_read_exits"]))
+        self.assertNotIn("sensitive-test-value", json.dumps(result, allow_nan=False))
+        for overrides in ({"phase": "provider auth=sensitive-test-value"},
+                          {"exit_id": "exit-sensitive-test-value"},
+                          {"exit_id": "exit-"}, {"exit_id": None},
+                          {"error": ValueError("provider auth=sensitive-test-value")}):
+            arguments = {"phase": "syncing_orders", "exit_id": "exit-71",
+                         "error": AccountReadRace("account fills and position disagree")} | overrides
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                budget.record_account_read_exit(**arguments)
+        self.assertEqual(budget.snapshot()["account_read_deferrals"], 70)
+
     def test_phase_costs_count_actual_rest_attempts_and_preserve_local_limits(self):
         phase = ["startup"]
         budget = ApiBudget(lambda: 1.0, work_phase=lambda: phase[0])
@@ -107,6 +219,63 @@ class ApiBudgetTests(unittest.TestCase):
         self.assertEqual(values, {"api_used_rest": Decimal(0), "api_used_ws": Decimal(130),
             "api_used_tx": Decimal(0), "api_next_rest": Decimal(1900),
             "api_next_ws": Decimal(5), "api_next_tx": Decimal(0)})
+
+    def test_refusal_identifies_first_bucket_or_future_reserve_checkpoint(self):
+        for normal, bucket, offset, projected, limit in (
+            (ZERO | {"rest": 15195, "ws": 134}, "rest", "0", 24001, 24000),
+            (ZERO | {"ws": 134, "tx": 36}, "ws", "0", 201, 200),
+            (ZERO | {"tx": 36}, "tx", "0", 41, 40),
+            (ZERO | {"rest": 8295}, "rest", "32", 24001, 24000),
+        ):
+            with self.subTest(normal=normal):
+                budget = ApiBudget(lambda: 1.0)
+                self.assertFalse(budget.scheduled_live_available(normal))
+                with self.assertRaises(ApiBudgetUnavailable) as caught:
+                    budget.require_normal(normal, operation="create")
+                error = caught.exception
+                self.assertEqual((error.operation, error.blocking_bucket,
+                                  error.blocking_offset_seconds, error.projected_usage, error.limit),
+                                 ("create", bucket, Decimal(offset), projected, limit))
+                self.assertEqual(budget.snapshot()["recent_admission_denials"], [
+                    {"observed_monotonic": 1.0, **error.budget_diagnostic}])
+                budget.record_backpressure_exit(phase="authorizing_quotes", exit_id="exit-1", error=error)
+                row = budget.snapshot()["recent_backpressure_exits"][-1]
+                for key, value in error.budget_diagnostic.items():
+                    self.assertEqual(row[key], value)
+
+    def test_future_refusal_reports_exact_boundary_without_crediting_later_expiry(self):
+        now = [0.500000001]
+        budget = ApiBudget(lambda: now[0])
+        for _ in range(50):
+            budget.observe("rest", "account")
+        budget.observe("rest", "accountInactiveOrders")
+        now[0] = 60.0
+        with self.assertRaises(ApiBudgetUnavailable) as caught:
+            budget.require_normal(ZERO, operation="optional_reprice")
+        error = caught.exception
+        self.assertEqual(error.blocking_offset_seconds, Decimal("0.5"))
+        self.assertEqual(error.projected_usage, 24006)
+        # Formatting diagnostics cannot round a binary-clock boundary through float.
+        offset = Fraction.from_float(0.500000001)
+        exact = ApiBudgetUnavailable("diagnostic", blocker=("rest", offset, 24006, 24000))
+        self.assertEqual(Fraction(exact.blocking_offset_seconds), offset)
+
+    def test_admission_denials_are_bounded_serializable_and_separate_from_exits(self):
+        import json
+        budget = ApiBudget(lambda: 1.0)
+        for _ in range(70):
+            with self.assertRaises(ApiBudgetUnavailable):
+                budget.require_normal(ZERO | {"tx": 36}, operation="create")
+        self.assertIsNone(budget.require_normal(ZERO))
+        result = budget.snapshot()
+        self.assertEqual(len(result["recent_admission_denials"]), 64)
+        self.assertEqual(result["deferrals"], 0)
+        self.assertEqual(result["recent_backpressure_exits"], [])
+        json.dumps(result, allow_nan=False)
+        for invalid in ("", "create?auth=secret", "A" * 65, None):
+            with self.subTest(operation=invalid), self.assertRaises(ValueError):
+                budget.require_normal(ZERO, operation=invalid)
+        self.assertNotIn("secret", repr(budget.snapshot()))
 
     def test_weights_attempts_expiration_and_query_redaction(self):
         now = [1.0]
@@ -214,16 +383,18 @@ class OwnedRequestObserverTests(unittest.IsolatedAsyncioTestCase):
     def test_normal_cancel_admission_counts_selected_sides_and_skips_exit(self):
         from core.services.market_maker_v2.orchestrator import VolumeSession
         session = object.__new__(VolumeSession)
+        session._funding_proof_context = None
         session._budget_active, session._budget_exiting = True, False
         session.api_budget = SimpleNamespace(require_normal=Mock())
+        session.account = SimpleNamespace(normal_terms_refresh_cost=Mock(return_value=0))
         session._admit_cancel(0)
         session.api_budget.require_normal.assert_not_called()
         session._admit_cancel(1)
-        session.api_budget.require_normal.assert_called_once_with({"rest": 412, "ws": 0, "tx": 1})
+        session.api_budget.require_normal.assert_called_once_with({"rest": 412, "ws": 0, "tx": 1}, operation="cancel")
         session._admit_cancel(2)
-        session.api_budget.require_normal.assert_called_with({"rest": 824, "ws": 0, "tx": 2})
+        session.api_budget.require_normal.assert_called_with({"rest": 824, "ws": 0, "tx": 2}, operation="cancel")
         session._admit_mutation()
-        session.api_budget.require_normal.assert_called_with({"rest": 1400, "ws": 8, "tx": 2})
+        session.api_budget.require_normal.assert_called_with({"rest": 2600, "ws": 13, "tx": 2}, operation="create")
         session.api_budget.require_normal.reset_mock()
         session._budget_exiting = True
         session._admit_cancel(2)
@@ -231,6 +402,154 @@ class OwnedRequestObserverTests(unittest.IsolatedAsyncioTestCase):
         for count in (-1, 3, True, 1.0):
             with self.subTest(count=count), self.assertRaises(ValueError):
                 session._admit_cancel(count)
+
+    def test_optional_revision_preflight_counts_only_selected_sides_and_due_terms(self):
+        from core.services.market_maker_v2.orchestrator import VolumeSession
+        session = object.__new__(VolumeSession)
+        session._budget_active, session._budget_exiting = True, False
+        session.api_budget = SimpleNamespace(require_normal=Mock())
+        session.account = SimpleNamespace(normal_terms_refresh_cost=Mock(return_value=900))
+        for count in (1, 2):
+            with self.subTest(count=count):
+                session._admit_optional_revision(count)
+                session.api_budget.require_normal.assert_called_with(
+                    {"rest": 412 * count + 1200 + 1400 + 1200 + 900, "ws": 18, "tx": count + 2},
+                    operation="optional_reprice")
+                session.account.normal_terms_refresh_cost.assert_called_with(15)
+        session.account.normal_terms_refresh_cost.return_value = 0
+        session._admit_optional_revision(1)
+        session.api_budget.require_normal.assert_called_with(
+            {"rest": 4212, "ws": 18, "tx": 3}, operation="optional_reprice")
+        session._budget_exiting = True
+        session.api_budget.require_normal.reset_mock()
+        session.account.normal_terms_refresh_cost.reset_mock()
+        session._admit_optional_revision(2)
+        session.api_budget.require_normal.assert_not_called()
+        session.account.normal_terms_refresh_cost.assert_not_called()
+        for count in (-1, 0, 3, True, 1.0):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                session._admit_optional_revision(count)
+
+    def test_create_cannot_spend_the_following_account_monitor_headroom(self):
+        from core.services.market_maker_v2.orchestrator import VolumeSession
+        session = object.__new__(VolumeSession)
+        session._funding_proof_context = None
+        session._budget_active, session._budget_exiting = True, False
+        session.account = SimpleNamespace(normal_terms_refresh_cost=Mock(return_value=0))
+        session.api_budget = ApiBudget(lambda: 100.0)
+        for _ in range(10):
+            session.api_budget.observe("rest", "trades")
+        for _ in range(5):
+            session.api_budget.observe("rest", "accountInactiveOrders")
+        # The old create-only gate passes, but its upper-bound cost leaves
+        # insufficient room for the next complete account monitor plus exit.
+        session.api_budget.require_normal({"rest": 1400, "ws": 8, "tx": 2})
+        with self.assertRaises(ApiBudgetUnavailable):
+            session._admit_mutation()
+        # Declining an optional create still leaves monitoring and mandatory
+        # cancellation available; no risk/exit reserve is reduced to pass.
+        session.api_budget.require_normal({"rest": 1200, "ws": 5, "tx": 0})
+        session._admit_cancel(2)
+        session.account.normal_terms_refresh_cost.assert_called_with(15)
+
+    def test_optional_wait_requires_monitor_capacity_for_every_nonempty_account(self):
+        from core.services.market_maker_v2.orchestrator import VolumeSession
+        session = object.__new__(VolumeSession)
+        session._budget_active, session._budget_exiting = True, False
+        session._stop = SimpleNamespace(is_set=Mock(return_value=False))
+        session.clock = SimpleNamespace(monotonic=lambda: 10.0)
+        session.governor = SimpleNamespace(session_deadline_monotonic=100.0)
+        session.api_budget = SimpleNamespace(require_normal=Mock())
+        session.account = SimpleNamespace(stream=SimpleNamespace(transport_healthy=True),
+            normal_terms_refresh_cost=Mock(return_value=900), has_complete_empty_order_proof=False)
+        for position, orders in ((Decimal(".0002"), ()), (Decimal(0), ("known",))):
+            authorization = SimpleNamespace(account=SimpleNamespace(position=position, open_order_ids=orders))
+            with self.subTest(position=position, orders=orders):
+                session._on_optional_refusal(authorization)
+                session.api_budget.require_normal.assert_called_with(
+                    {"rest": 2100, "ws": 5, "tx": 0}, operation="monitor")
+                session.account.normal_terms_refresh_cost.assert_called_with(5)
+        session.account.normal_terms_refresh_cost.return_value = 0
+        session._on_optional_refusal(authorization)
+        session.api_budget.require_normal.assert_called_with(
+            {"rest": 1200, "ws": 5, "tx": 0}, operation="monitor")
+        refusal = ApiBudgetUnavailable("required monitor unavailable")
+        session.api_budget.require_normal.side_effect = refusal
+        with self.assertRaises(ApiBudgetUnavailable) as caught:
+            session._on_optional_refusal(authorization)
+        self.assertIs(caught.exception, refusal)
+        session.api_budget.require_normal.reset_mock()
+        authorization.account.open_order_ids = ()
+        session._on_optional_refusal(authorization)
+        self.assertTrue(session._optional_flat_wait)
+        session.api_budget.require_normal.assert_not_called()
+
+    def test_proven_empty_order_monitor_retains_cash_and_terms_without_speculative_fills(self):
+        from core.services.market_maker_v2.domain import ExecutionHealth
+        from core.services.market_maker_v2.orchestrator import VolumeSession
+        session = object.__new__(VolumeSession)
+        session._funding_proof_context = None
+        session._budget_active, session._budget_exiting = True, False
+        session._stop = SimpleNamespace(is_set=lambda: False)
+        session.clock = SimpleNamespace(monotonic=lambda: 100.0)
+        session.governor = SimpleNamespace(session_deadline_monotonic=1000.0)
+        session.account = SimpleNamespace(stream=SimpleNamespace(transport_healthy=True),
+            normal_terms_refresh_cost=Mock(return_value=1200), has_complete_empty_order_proof=True)
+        session.manager = SimpleNamespace(can_reconcile_known_orders=True, snapshot=Mock(return_value=()))
+        snapshot = SimpleNamespace(health=ExecutionHealth.HEALTHY, orders=(), managed_order_count=0)
+        session.execution = SimpleNamespace(snapshot=Mock(return_value=snapshot))
+        account = SimpleNamespace(position=Decimal(".0006"), open_order_ids=(),
+                                  authenticated=True, fresh=Mock(return_value=True))
+        authorization = SimpleNamespace(account=account)
+        session.api_budget = ApiBudget(lambda: 100.0)
+        for _ in range(61):
+            session.api_budget.observe("rest", "accountInactiveOrders")
+        # Same 32s reserve blocker as the recorded monitor class. No limits or
+        # reserve change: empty proven orders remove only impossible own fills.
+        with self.assertRaises(ApiBudgetUnavailable):
+            session.api_budget.require_normal({"rest": 2400, "ws": 5, "tx": 0}, operation="monitor")
+        session._on_optional_refusal(authorization)
+        self.assertEqual(session.api_budget.snapshot()["used"], {"rest": 6100})
+        self.assertEqual(session.api_budget.deferrals, 0)
+        session.account.normal_terms_refresh_cost.assert_called_with(5)
+        # Future creates still need the full following-monitor budget.
+        with self.assertRaises(ApiBudgetUnavailable):
+            session._admit_mutation()
+        session.account.normal_terms_refresh_cost.assert_called_with(15)
+        for condition in ("proof", "stale", "unauthenticated", "account_orders", "manager_orders",
+                          "uncertain", "execution_health", "execution_orders", "execution_count"):
+            with self.subTest(condition=condition):
+                session.account.has_complete_empty_order_proof = condition != "proof"
+                account.fresh.return_value = condition != "stale"
+                account.authenticated = condition != "unauthenticated"
+                account.open_order_ids = ("known",) if condition == "account_orders" else ()
+                session.manager.snapshot.return_value = (object(),) if condition == "manager_orders" else ()
+                session.manager.can_reconcile_known_orders = condition != "uncertain"
+                snapshot.health = ExecutionHealth.PAUSED_ORDER_STATE if condition == "execution_health" else ExecutionHealth.HEALTHY
+                snapshot.orders = (object(),) if condition == "execution_orders" else ()
+                snapshot.managed_order_count = 1 if condition == "execution_count" else 0
+                with self.assertRaises(ApiBudgetUnavailable):
+                    session._on_optional_refusal(authorization)
+
+    def test_optional_wait_cannot_bypass_stop_deadline_or_unhealthy_monitor(self):
+        from core.services.market_maker_v2.orchestrator import VolumeSession
+        from core.services.market_maker_v2.execution_port import ExecutionUnavailable
+        for condition in ("stop", "deadline", "exiting", "inactive", "unhealthy", "no_stream"):
+            with self.subTest(condition=condition):
+                session = object.__new__(VolumeSession)
+                session._budget_active = condition != "inactive"
+                session._budget_exiting = condition == "exiting"
+                session._stop = SimpleNamespace(is_set=lambda: condition == "stop")
+                session.clock = SimpleNamespace(monotonic=lambda: 10.0)
+                session.governor = SimpleNamespace(session_deadline_monotonic=(
+                    10.0 if condition == "deadline" else 100.0))
+                session.api_budget = SimpleNamespace(require_normal=Mock())
+                session.account = SimpleNamespace(stream=(None if condition == "no_stream"
+                    else SimpleNamespace(transport_healthy=condition != "unhealthy")))
+                authorization = SimpleNamespace(account=SimpleNamespace(position=Decimal(".0002"), open_order_ids=()))
+                with self.assertRaises(ExecutionUnavailable):
+                    session._on_optional_refusal(authorization)
+                session.api_budget.require_normal.assert_not_called()
 
     async def test_empty_quote_plan_only_admits_existing_cancellations(self):
         from core.services.market_maker_v2.domain import QuotePlan

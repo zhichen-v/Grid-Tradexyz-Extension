@@ -16,7 +16,7 @@ from .domain import (
 from .execution_port import Clock, ExecutionPort, MarketDataPort, ExecutionUnavailable
 from .config import require_authorization
 from .inventory_governor import InventoryGovernor
-from .lighter_runtime import AccountReadRace, LighterAccountPort, LighterMarketData
+from .lighter_runtime import AccountReadRace, LighterAccountPort, LighterMarketData, UnattributedCashflow
 from .quote_policy import VolumeQuotePolicy
 from .session_ledger import SessionLedger
 from .api_budget import ApiBudget, ApiBudgetUnavailable
@@ -184,6 +184,7 @@ class VolumeSession:
         self._budget_active = observe_requests is not None and not config.dry_run
         self._budget_exiting, self._exit_read_retries = False, 0
         self._exit_funding_refreshes = 0
+        self._optional_flat_wait = False
         if observe_requests is not None:
             observe_requests(self.api_budget.observe, enforce_admission=self._budget_active)
         self.telemetry, self.final_account = telemetry, None
@@ -198,6 +199,8 @@ class VolumeSession:
         self._passive_until = None
         self._cleanup_attempted = False
         self._session_complete = False
+        self._funding_recovery_attempted = False
+        self._funding_proof_context = None
         self._quote_account = None
         self.account = LighterAccountPort(adapter, config.symbol, self.clock,
             account_index=account_index, expected_l1_address=expected_l1_address,
@@ -210,6 +213,14 @@ class VolumeSession:
         self.account.before_read = self._admit_read
 
     def _admit_read(self, kind):
+        if self._funding_proof_context is not None:
+            generation, stream = self._funding_proof_context
+            execution = self.execution.snapshot()
+            if (self.manager.mutation_generation != generation
+                    or self.account.stream is not stream or not stream.transport_healthy
+                    or execution.health is not ExecutionHealth.HEALTHY or execution.orders != ()
+                    or execution.simulated or self.manager.snapshot()):
+                raise ExecutionUnavailable("flat funding proof state changed")
         if not self._budget_active:
             return
         if self._budget_exiting:
@@ -217,11 +228,11 @@ class VolumeSession:
                 # One normal arrival race is included in the exit envelope.
                 # Additional races need new headroom before any extra read.
                 if self._exit_read_retries:
-                    self.api_budget.require_normal({"rest": 1000, "ws": 5, "tx": 0})
+                    self.api_budget.require_normal({"rest": 1000, "ws": 5, "tx": 0}, operation="exit_retry")
                 self._exit_read_retries += 1
             elif kind == "funding_refresh":
                 if self._exit_funding_refreshes:
-                    self.api_budget.require_normal({"rest": 900, "ws": 0, "tx": 0})
+                    self.api_budget.require_normal({"rest": 900, "ws": 0, "tx": 0}, operation="exit_funding_refresh")
                 self._exit_funding_refreshes += 1
             return
         if kind not in {"retry", "funding_refresh"}:
@@ -231,22 +242,74 @@ class VolumeSession:
             # Only cash precedes the next REST gate. Trades and terminal
             # history each retain their own admission, including on retries.
             rest = {"audit": 300, "sync": 200, **conditional}.get(kind, 0)
-            self.api_budget.require_normal({"rest": rest,
-                "ws": 0 if kind in conditional else 5 if kind == "audit" else 2, "tx": 0})
+            admit = (self.api_budget.require_flat_read if self._funding_proof_context is not None
+                     else self.api_budget.require_normal)
+            admit({"rest": rest,
+                "ws": 0 if kind in conditional else 5 if kind == "audit" else 2, "tx": 0},
+                operation=kind + "_read")
 
     def _admit_mutation(self):
+        if self._funding_proof_context is not None:
+            raise ExecutionUnavailable("funding proof is read-only")
         if self._budget_active and not self._budget_exiting:
-            # One create with bounded SDK lookup/history.
-            self.api_budget.require_normal({"rest": 1400, "ws": 8, "tx": 2})
+            # A new order must leave room to observe its fills on the next
+            # cycle, not merely to send it and immediately require an exit.
+            # Include terms due during the remaining 10s quote operation and
+            # the following 5s monitor. Each actual read keeps its own gate.
+            self.api_budget.require_normal({"rest": 1400 + 1200
+                + self.account.normal_terms_refresh_cost(15), "ws": 13, "tx": 2}, operation="create")
 
     def _admit_cancel(self, count):
+        if self._funding_proof_context is not None:
+            raise ExecutionUnavailable("funding proof is read-only")
         if type(count) is not int or not 0 <= count <= 2:
             raise ValueError("normal cancellation count must be between zero and two")
         if count and self._budget_active and not self._budget_exiting:
             # MM terminal-only cancellation: at most four history reads (400),
             # initial nonce plus invalid-nonce refresh (12), and one send.
             # No active-order WS or market-metadata lookup occurs in this path.
-            self.api_budget.require_normal({"rest": 412 * count, "ws": 0, "tx": count})
+            self.api_budget.require_normal({"rest": 412 * count, "ws": 0, "tx": count}, operation="cancel")
+
+    def _admit_optional_revision(self, count):
+        if type(count) is not int or not 1 <= count <= 2:
+            raise ValueError("optional revision count must be one or two")
+        if self._budget_active and not self._budget_exiting:
+            # Selected cancellations, coherent post-cancel audit, create, and
+            # the following monitor. Optional churn cannot spend that monitor.
+            # This is a preflight, not a reservation or a substitute for the
+            # unchanged individual read/cancel/create admission gates.
+            self.api_budget.require_normal({"rest": 412 * count + 1200 + 1400 + 1200
+                + self.account.normal_terms_refresh_cost(15), "ws": 18, "tx": count + 2},
+                operation="optional_reprice")
+
+    def _on_optional_refusal(self, authorization):
+        now = self.clock.monotonic()
+        if (not self._budget_active or self._budget_exiting or self._stop.is_set()
+                or now >= self.governor.session_deadline_monotonic):
+            raise ExecutionUnavailable("optional wait cannot delay stop or deadline")
+        # Execution has already validated exact fresh account/orders and each
+        # retained quote. Flat/empty may idle without buying more account reads;
+        # resumption always traverses the full normal authorization again.
+        account = authorization.account
+        if account.position == 0 and account.open_order_ids == ():
+            self._optional_flat_wait = True
+            return
+        if self.account.stream is None or not self.account.stream.transport_healthy:
+            raise ExecutionUnavailable("optional wait requires healthy account monitoring")
+        # Proven empty slots with every prior fill settled cannot produce more
+        # owned fills while create is deferred. Keep the cash/terms monitor;
+        # unexpected activity still faces every actual read admission gate.
+        empty = (self.account.has_complete_empty_order_proof and account.authenticated
+                 and account.fresh(now) and account.open_order_ids == ()
+                 and self.manager.can_reconcile_known_orders and not self.manager.snapshot())
+        execution = self.execution.snapshot() if empty else None
+        empty = (empty and execution.health is ExecutionHealth.HEALTHY
+                 and execution.orders == () and execution.managed_order_count == 0)
+        # Otherwise retain both terminal slot lookups, cash, trades and the
+        # terminal fill check (1200). Create preflights always keep this bound.
+        self.api_budget.require_normal({"rest": (300 if empty else 1200)
+            + self.account.normal_terms_refresh_cost(5),
+            "ws": 5, "tx": 0}, operation="monitor")
 
     def _known_ids(self):
         return (self.manager.known_order_ids | self.manager.active_unwind_order_ids
@@ -270,7 +333,7 @@ class VolumeSession:
 
     def _emit(self, event):
         if (self.ledger and type(event) is ExecutionResult
-                and event.status is ExecutionStatus.CONFIRMED
+                and event.status in {ExecutionStatus.CONFIRMED, ExecutionStatus.DEFERRED}
                 and event.snapshot.health is ExecutionHealth.HEALTHY):
             try:
                 market = self.market.snapshot()
@@ -385,6 +448,8 @@ class VolumeSession:
             self.execution = VolumeExecutionPort(self.manager, exit_account, self.market, self.clock,
                 authorize_bounded_flatten=True, refresh_quote=self._authorize,
                 before_mutation=self._admit_mutation, before_cancel=self._admit_cancel,
+                before_optional_revision=self._admit_optional_revision,
+                on_optional_refusal=self._on_optional_refusal,
                 on_failure=self._diagnose,
                 reprice_threshold_ticks=cfg.quote.reprice_threshold_ticks,
                 max_quote_age_ms=cfg.quote.max_quote_age_ms)
@@ -455,6 +520,69 @@ class VolumeSession:
         await self._stop.wait()
         self._stop_at = self.clock.monotonic()
 
+    def _cleanup_deadline(self):
+        deadline = self.governor.exit_deadline
+        if deadline is None:
+            deadline = min(self.clock.monotonic(), self.governor.session_deadline_monotonic) + 30
+        if self._stop_at is not None:
+            deadline = min(deadline, self._stop_at + 30)
+        return deadline
+
+    async def _recover_funding(self, checkpoint, deadline, *, confirm_final=False):
+        """Prove delayed funding only after cleanup, with no new reserve or risk."""
+        self._funding_recovery_attempted = True
+        deadline = min(deadline, self.clock.monotonic() + 10)
+        self.phase = "funding_recovery"
+        before = self.execution.snapshot()
+        account = self.cleanup_account
+        if (account is None or not account.authenticated or account.position
+                or account.open_order_ids != () or not account.fresh(self.clock.monotonic())
+                or before.health is not ExecutionHealth.HEALTHY or before.orders != ()
+                or before.simulated or self.account.stream is None
+                or not self.account.stream.transport_healthy):
+            return None
+        was_exiting = self._budget_exiting
+        self._budget_exiting = False
+        self._funding_proof_context = (self.manager.mutation_generation, self.account.stream)
+        try:
+            for attempt in range(2):
+                if self._stop_at is not None:
+                    deadline = min(deadline, self._stop_at + 30)
+                remaining = deadline - self.clock.monotonic()
+                if remaining <= (1 if attempt else 0):
+                    return None
+                if attempt:
+                    # There is no position or working order to leave unmonitored.
+                    # Stop still permits this bounded final accounting proof.
+                    await asyncio.wait_for(self.sleep(1), remaining)
+                remaining = deadline - self.clock.monotonic()
+                if remaining <= 0:
+                    return None
+                try:
+                    account = await asyncio.wait_for(self.account.snapshot(), remaining)
+                except UnattributedCashflow:
+                    continue
+                after = self.execution.snapshot()
+                now = self.clock.monotonic()
+                if (now < deadline and account.authenticated and account.fresh(now)
+                        and account.position == ZERO and account.open_order_ids == ()
+                        and after.health is ExecutionHealth.HEALTHY and after.orders == ()
+                        and self.account.accepted_funding_ids - checkpoint):
+                    if confirm_final:
+                        # Funding ingestion is later than this proof's opening
+                        # cash read. Finalization needs a new cash observation
+                        # after that event, within the same deadline and gates.
+                        account = await asyncio.wait_for(self.account.snapshot(), deadline - now)
+                        if self.clock.monotonic() >= deadline:
+                            return None
+                    self._emit(account)
+                    return account
+                return None
+            return None
+        finally:
+            self._funding_proof_context = None
+            self._budget_exiting = was_exiting
+
     async def _exit(self, *, allow_passive=True):
         self.phase = "bounded_exit"
         self.cleanup_account = None
@@ -464,11 +592,7 @@ class VolumeSession:
             allow_passive = False  # Optional grace has no reserved API envelope.
         self.account.begin_quote_cycle()
         self._cleanup_attempted = True
-        deadline = self.governor.exit_deadline
-        if deadline is None:
-            deadline = min(self.clock.monotonic(), self.governor.session_deadline_monotonic) + 30
-        if self._stop_at is not None:
-            deadline = min(deadline, self._stop_at + 30)
+        deadline = self._cleanup_deadline()
         self._exit_sequence += 1
         self._exit_id = f"exit-{self._exit_sequence}"
         try:
@@ -541,6 +665,16 @@ class VolumeSession:
             while True:
                 self.phase = "running"
                 self._budget_exiting = False
+                if self._optional_flat_wait:
+                    self.phase = "api_wait"
+                    while (not self._stop.is_set()
+                           and self.clock.monotonic() < self.governor.session_deadline_monotonic
+                           and not self.api_budget.scheduled_live_available(
+                               {"rest": 5000, "ws": 18, "tx": 2})):
+                        await self._pause(1)
+                    self._optional_flat_wait = False
+                    if self._stop.is_set() or self.clock.monotonic() >= self.governor.session_deadline_monotonic:
+                        break
                 if cleaned and self._budget_active:
                     # A completed exit spent its reserved capacity. While
                     # authenticated flat/empty, let that rolling load expire
@@ -556,6 +690,10 @@ class VolumeSession:
                     if self._stop.is_set() or self.clock.monotonic() >= self.governor.session_deadline_monotonic:
                         break
                 try:
+                    cash_gap = None
+                    # A failed proof can already ingest a newly identified
+                    # funding row before its cash becomes visible.
+                    funding_checkpoint = self.account.accepted_funding_ids
                     cycle_started, self._quote_account = self.clock.monotonic(), None
                     self.account.begin_quote_cycle()
                     if self.manager:
@@ -584,13 +722,25 @@ class VolumeSession:
                     self._emit(result)
                     if result.status is ExecutionStatus.BLOCKED:
                         raise ValueError("execution blocked")
-                    self.phase = "waiting"
+                    self.phase = "api_wait" if result.status is ExecutionStatus.DEFERRED else "waiting"
                     interval = 5 if self._budget_active else 3
-                    await self._pause(max(0, min(cycle_started + interval, self.governor.session_deadline_monotonic) - self.clock.monotonic()))
+                    wake_at = min(cycle_started + interval, self.governor.session_deadline_monotonic)
+                    if result.status is ExecutionStatus.DEFERRED:
+                        self.api_budget.optional_waits += 1
+                        orders = self.manager.snapshot()
+                        if orders:
+                            wake_at = min(wake_at, *(row.created_monotonic
+                                + self.config.quote.max_quote_age_ms / 1000 for row in orders))
+                        now = self.clock.monotonic()
+                        inventory_age = max(self.ledger.snapshot(now=now).inventory_age,
+                                            self.account.inventory_age_bound(now))
+                        if result.account_snapshot.position:
+                            wake_at = min(wake_at, now + self.config.flatten.max_hold_seconds - float(inventory_age))
+                    await self._pause(max(0, wake_at - self.clock.monotonic()))
                 except (ApiBudgetUnavailable, AccountReadRace) as error:
                     # Activity can outlast one coherent audit's bounded retry.
-                    # Cash gaps (a subclass), invalid data, and unknown wire
-                    # outcomes never become permission to resume normal work.
+                    # Invalid data and unknown wire outcomes cannot resume.
+                    # An exact cash gap may be proved only after flat cleanup.
                     if (not self._budget_active or self._budget_exiting
                             or not self.manager.can_reconcile_known_orders):
                         raise
@@ -598,10 +748,19 @@ class VolumeSession:
                     if type(error) is AccountReadRace:
                         if self.account.stream is None or not self.account.stream.transport_healthy:
                             raise
-                        self.api_budget.account_read_deferrals += 1
+                        self.api_budget.record_account_read_exit(
+                            phase=self.phase, exit_id=f"exit-{self._exit_sequence + 1}", error=error)
                     elif isinstance(error, ApiBudgetUnavailable):
                         repeated_backpressure = self.api_budget.record_backpressure_exit(
                             phase=self.phase, exit_id=f"exit-{self._exit_sequence + 1}", error=error) >= 3
+                    elif isinstance(error, UnattributedCashflow):
+                        if (self.account.stream is None or not self.account.stream.transport_healthy
+                                or self.execution.snapshot().health is not ExecutionHealth.HEALTHY):
+                            raise
+                        cash_gap = error
+                        funding_deadline = self._cleanup_deadline()
+                        self.api_budget.record_account_read_exit(
+                            phase=self.phase, exit_id=f"exit-{self._exit_sequence + 1}", error=error)
                     else:
                         raise
                 else:
@@ -611,6 +770,14 @@ class VolumeSession:
                 cleaned = await self._exit(allow_passive=False)
                 if not cleaned:
                     raise ValueError("deferred normal work cleanup incomplete")
+                if cash_gap is not None:
+                    recovered = await self._recover_funding(funding_checkpoint, funding_deadline)
+                    if recovered is None:
+                        raise cash_gap
+                    self._funding_recovery_attempted = False
+                    if (self._stop.is_set()
+                            or self.clock.monotonic() >= self.governor.session_deadline_monotonic):
+                        break
                 if repeated_backpressure:
                     # Stop only after the existing bounded exit; finally still
                     # requires fresh authenticated 0/0 and exact accounting.
@@ -641,7 +808,17 @@ class VolumeSession:
                     # A separate authenticated read after cleanup, never an ack.
                     self.phase = "final_account"
                     self._budget_exiting = True
-                    self.final_account = await asyncio.wait_for(self.account.snapshot(), 10)
+                    final_deadline = self.clock.monotonic() + 10
+                    checkpoint = self.account.accepted_funding_ids
+                    try:
+                        self.final_account = await asyncio.wait_for(self.account.snapshot(), 10)
+                    except UnattributedCashflow:
+                        if not cleaned or self._funding_recovery_attempted:
+                            raise
+                        self.final_account = await self._recover_funding(
+                            checkpoint, final_deadline, confirm_final=True)
+                        if self.final_account is None:
+                            raise
                     cleaned = bool(cleaned and self.final_account.authenticated
                         and not self.final_account.position and self.final_account.open_order_ids == ())
                 except (Exception, asyncio.CancelledError) as error:

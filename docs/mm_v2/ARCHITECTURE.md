@@ -1,8 +1,14 @@
 # Market Maker V2 — Architecture contract
 
+2026-09-11 場次231145後更新：exact cash gap先完成原有界退出，再於同一≤10s／原cleanup剩餘期限取得新的authenticated funding ID與exactcash，才能恢復同session；checkpoint在失敗audit前保存，支援cash／ID任一先到。最多2份snapshot、中間1s，原snapshot仍2attempt；final-only還需事件之後的新cash confirmation，同原final10s，不延長。此取證只允許fresh cleanup0/0、healthy同stream、固定mutation generation，禁止mutation；逐read實際計費並保留另一份final proof的4400REST／15WS／0TX，不在已清倉後再保留新3IOC。原normal quota／exit reserve、full reentry gate與風控限額保持。缺ID／錯額／unknown／stream或generation改變仍停止；不以public等額公式代替私人證據。
+
+只有complete fresh empty-order proof、所有known terminal fills已對帳、manager／execution亦空時，optional wait的next monitor可採cash300＋原due terms；有單或證據不足保持1200＋terms，所有實際conditional reads仍admit。安全既有單與新缺側價格相容時先補缺側，保留舊ID／價格／剩餘量，再考慮optional reprice；必要撤單、POST_ONLY、fresh per-create風控、交叉／鎖價拒絕與10s期限不變。本地與實盤證據分開見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+
 > 設計契約，逐階段實作。權威來源：[rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)。產品目標／fee floor／授權／complexity budget 見 [OBJECTIVE](OBJECTIVE.md)。Phase/run 驗收只記在 [EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
 
 ## 2026-09-05 review：契約與實作落差
+
+2026-09-10 場次 221113 後本地更新（542 V2 tests PASS）：正常 create/reprice 的事前成本包含下一輪監控；selected-side revision 同時計入取消＋撤後audit＋create，原各階段admission／fresh重新授權與完整exit reserve仍保留。必要取消不得夾帶未通過預檢的另一側可選改價。`DEFERRED` 需 fresh account／exact orders且舊單仍安全，`actual_plan` 僅表示保留真實報價；非flat/empty仍需monitor能力，flat/empty等候後亦須完整再授權。Wake 使用 ledger 與 cash 觀測的保守持倉年齡，不延長 hold、quote 或 session deadline。Unified cache miss 於同一10s audit內重新admit並讀fresh REST／完整bracket，不冒充真實查核失敗；fresh mismatch／cash conflict／unknown／stale仍拒絕新增風險。Sidecar分開 optional_waits、API exits與account-read exits，後者只保存有界allowlisted子項，不能由舊日誌補猜cache分支。該場實際三次API及三次account race，原一小時未完成；上一批530 tests與固定600s驗收為歷史證據，本批結果見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
 
 下文描述設計契約及既有接線，不能視為全部已驗證。`260be69` 的離線review確認 cleanup、passive exit、POST_ONLY recovery、持續雙邊報價、own/book對齊、current drawdown reserve與final inputs freshness共七項缺口。後續授權修復已修正R1／R2與F5；R3正常arrival race、保守hold age與API admission已有離線驗收，30min T3及真實nonflat仍未通過。具體重現、驗收與進度見 [rebuild plan §19](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md#19-2026-09-05-review從目前-phase-7-接續)。
 

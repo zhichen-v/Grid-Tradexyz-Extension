@@ -1917,6 +1917,16 @@ R4最小分析工具已可使用；不等待更多工具再進下一步。短dry
 
 ### 19.8 2026-09-06 延長 volume／fee-cover 驗證
 
+本批驗證：2026-09-11完整V2 **561 tests PASS（86.360s）**；同60min離線fixture雙邊91.17%、0 API退出、cash差0／final0/0，固定30min機會45/45。實盤與經濟驗收維持下面歷史狀態。
+
+**2026-09-11 依使用者授權優化（本地）：** 已加入僅flat/empty後的資金費有界取證與final事件後fresh確認，支援cash先到／authenticated ID先到；原deadline、exact accounting及normal風控不放寬。真端點權重fixture揭露清倉後重複3IOC預留會拒絕只讀audit，新取證逐read保留最後strict proof的4400REST／15WS／0TX；normal quote/create及完整exit reserve維持。另以完整empty-order proof精算next monitor（300＋terms，其他仍1200＋terms），安全既有單優先補缺側。未啟動新live；修後實盤完整60分鐘、雙邊覆蓋與fee-cover仍待驗證。完整本批測試與歷史失敗見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+**2026-09-11 最新實盤231145分析：** planned3600s，wall2901.283s後code1；最後清理有authenticated0/0，但cash bridge差+0.000361530936 USDG令最後帳務不完整。公開整點funding×當時short0.00039恰等於差額，強烈支持漏記資金費；尚未驗證私人funding row發布時序。2次API退出、0次可恢復account race、128次可選延後；maker2324.147061／交易net−0.32727171132（未補funding）、雙邊54.98%。相同前862.870s退出6→1，但maker額降低24.71%，不得僅用更長運行的總額宣稱量能提升。本次未改runtime或啟動live；跨整點有界會計恢復、剩餘monitor背壓、實盤60分鐘與fee-cover仍待完成。見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+**2026-09-10 場次 221113 後目前狀態（本地542 V2 tests PASS）：** 原定3600s，實際ledger862.8702873s／wall925.7702803s後`api_backpressure_repeated`早停，final authenticated0/0、cash差0、net−0.26045506055 USDG。六次退出分屬三次API與三次account read race，皆在reconciling_quotes；API三次明確為下一輪monitor的future REST reserve拒絕，account race舊證據缺少子項，不宣稱已唯一追溯cache根因。本批修復create/reprice缺少下一輪監控成本、cache miss重新fresh查核、混合必要／可選撤單及保守hold wake，新增allowlisted account退出分類。原admission／source／risk／exact accounting／IOC邊界與quota／reserve不變；本批542項V2與600／1800／3600s離線負載通過，固定機會的錯過與IOC成本保留；無新live／帳戶連線／VPS。完整一小時及volume／fee cover仍未通過，所有歷史早停與成本保留。完整證據見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+**2026-09-10 前批 Pro review 驗收（歷史）：** 保留 `13174b1` 修正，新增可選 create/reprice 有界延後；可選撤換按selected sides預檢取消＋撤後audit＋create，既有委託需仍在原有效期／風險授權內，且有下一輪必要監控與原exit reserve。Flat/empty可等待後重新查核，其餘read/cancel拒絕、stale／unknown、stop／hold／loss／deadline仍退出。未調任何quota、策略或風險值。原固定600s／15機會測試完整 **600.108s／15of15**、exact0/0/cash；原第三次API安全早停案例另保留。Sidecar保存拒絕bucket與未來阻擋時點，console以api_wait＋60s摘要呈現。這是當時原碼的離線運轉驗收，非本批修後驗收或實盤fee-cover／volume成功；該批無新live／VPS。
+
 **2026-09-10 20:46最新場次與系統調查：** 204643約448s wall、final long0.00020／orders0，API背壓第三次觸發退出後，IOC因fresh BBO移出原限價在送出前被bridge HALTED。已修正為原限價IOC可零成交並沿原3次／deadline查核，仍不追价。另修單側revision不強制整對撤換、Unified非零倉位的原8s現金證據重用，以及audit／cancel／create按實際步驟分開admission；總限額、exit reserve及風險不變。集中成交固定600s負載最終仍531.546s／14of15後第3次API保護停場，明示未達完整窗口；已能本地重現，不能以unit PASS代替穩定或fee-cover成功。21:06:28新唯讀0/0不是原場自動退出證明；本次未新live。見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
 
 **2026-09-10 20:31最新實盤與修正：** 本場啟動畫面標7200s，但實際YAML仍3600s，僅約86s wall即failed；3 maker fills／77.587860 USDG後，部分減倉的模型平均成本產生循環小數，使精確cash查核及退出共用路徑失敗，IOC attempts0。本輪API deferrals0，並非配額／延遲。V2已改用交易所逐筆已實現損益、保留原JSONL與精確cash相等，exit-only直接隔離非必要cash算式；不調quote、風險或API參數。使用者確認後續是自己手動平倉，20:34:12 authenticated唯讀0/0；含該手動成交的獨立帳戶net+0.00826351180不是runner成功或長测fee-cover證据。腳本已由同一實際config讀取顯示／window時長，未改3600s交易期限；修後實盤仍未取得，詳見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
