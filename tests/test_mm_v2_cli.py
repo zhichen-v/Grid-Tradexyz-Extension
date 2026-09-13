@@ -37,6 +37,8 @@ class CliTests(unittest.TestCase):
         with (patch.object(cli, "load_config", return_value=config or self.config),
               patch.object(cli, "load_settings", return_value=self.settings) as settings,
               patch.object(cli, "build_adapter") as factory,
+              patch.object(cli, "_git_build", return_value={
+                  "status": "available", "commit": "a" * 40, "dirty": True}),
               patch.object(cli.orchestrator, "VolumeSession", create=True) as session,
               redirect_stdout(stdout), redirect_stderr(stderr)):
             session.return_value.run = AsyncMock(return_value=result or self.result)
@@ -60,6 +62,87 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result[0], 0)
         self.assertEqual(json.loads(result[1])["mode"], "dry_run")
         self.assertFalse(json.loads(result[1])["economics_evaluated"])
+
+    def test_run_provenance_records_only_effective_public_strategy_values(self):
+        configured = replace(self.config,
+            quote=replace(self.config.quote, order_size=Decimal("0.00017000"),
+                          target_net_edge_bps=Decimal("2.500")),
+            session=replace(self.config.session, duration_seconds=3600))
+        with TemporaryDirectory() as folder:
+            output = Path(folder) / "session.jsonl"
+            result = self.call_main(["--output", str(output)], config=configured)
+            self.assertEqual(result[0], 0)
+            budget = json.loads(Path(str(output) + ".budget.json").read_text(encoding="utf-8"))
+        provenance = budget["provenance"]
+        self.assertEqual(set(provenance), {"schema", "capture", "build", "effective_config"})
+        self.assertEqual(provenance["schema"], "mm_v2_run_provenance_v1")
+        self.assertEqual(provenance["capture"], "run_start")
+        self.assertEqual(provenance["build"], {"status": "available", "commit": "a" * 40, "dirty": True})
+        effective = provenance["effective_config"]
+        self.assertEqual(set(effective), {"symbol", "profile", "dry_run", "quote", "inventory", "flatten", "session"})
+        self.assertEqual(effective["quote"], {"order_size": "0.00017000", "target_net_edge_bps": "2.500",
+            "volatility_multiplier": str(configured.quote.volatility_multiplier),
+            "reprice_threshold_ticks": configured.quote.reprice_threshold_ticks,
+            "max_quote_age_ms": configured.quote.max_quote_age_ms})
+        self.assertEqual(effective["inventory"], {"soft_limit": str(configured.inventory.soft_limit),
+            "hard_limit": str(configured.inventory.hard_limit), "skew_bps_at_hard": str(configured.inventory.skew_bps_at_hard)})
+        self.assertEqual(effective["flatten"], {"max_hold_seconds": configured.flatten.max_hold_seconds,
+            "stop_loss_usdg": str(configured.flatten.stop_loss_usdg),
+            "passive_grace_seconds": configured.flatten.passive_grace_seconds,
+            "ioc_slippage_ticks": configured.flatten.ioc_slippage_ticks})
+        self.assertEqual(effective["session"], {"duration_seconds": 3600,
+            "max_loss_usdg": str(configured.session.max_loss_usdg),
+            "cooldown_seconds": configured.session.cooldown_seconds})
+        recorded = json.dumps(provenance)
+        for forbidden in ("private-sentinel", self.settings["expected_l1_address"], "account_index",
+                          "expected_l1_address", "api_key", "network", "config_path", ".env"):
+            self.assertNotIn(forbidden, recorded)
+
+    def test_git_build_is_sanitized_and_unavailable_on_failed_or_invalid_read(self):
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty), patch.object(cli.subprocess, "run", side_effect=[
+                    SimpleNamespace(stdout="b" * 40 + "\n"),
+                    SimpleNamespace(stdout="?? private-sentinel\n" if dirty else "")]) as run:
+                self.assertEqual(cli._git_build(), {"status": "available", "commit": "b" * 40, "dirty": dirty})
+                self.assertTrue(all(call.kwargs["cwd"] == cli.ROOT and call.kwargs["capture_output"]
+                                    and call.kwargs["timeout"] == 3 for call in run.call_args_list))
+        for failure in (FileNotFoundError("private-sentinel"),
+                        cli.subprocess.TimeoutExpired("private-sentinel", 3),
+                        cli.subprocess.CalledProcessError(1, "git", stderr="private-sentinel")):
+            with self.subTest(failure=type(failure).__name__), patch.object(cli.subprocess, "run", side_effect=failure):
+                self.assertEqual(cli._git_build(), {"status": "unavailable", "commit": None, "dirty": None})
+        with patch.object(cli.subprocess, "run", return_value=SimpleNamespace(stdout="private-sentinel")):
+            self.assertEqual(cli._git_build(), {"status": "unavailable", "commit": None, "dirty": None})
+
+    def test_provenance_is_flushed_before_adapter_and_start_version_survives_failure(self):
+        async def check(folder, fails):
+            output = Path(folder) / "session.jsonl"
+            sidecar = Path(str(output) + ".budget.json")
+            original = {"status": "available", "commit": "c" * 40, "dirty": False}
+
+            def construct(settings):
+                self.assertEqual(json.loads(sidecar.read_text())["provenance"]["build"], original)
+                if fails:
+                    raise RuntimeError("private-sentinel")
+                return object()
+
+            session = SimpleNamespace(run=AsyncMock(return_value=self.result),
+                                      api_budget=ApiBudget(lambda: 0), market=SimpleNamespace(stream=None))
+            with (patch.object(cli, "_git_build", side_effect=[original, {"status": "unavailable"}]) as build,
+                  patch.object(cli, "build_adapter", side_effect=construct),
+                  patch.object(cli.orchestrator, "VolumeSession", return_value=session)):
+                if fails:
+                    with self.assertRaises(RuntimeError):
+                        await cli.run_session(self.config, self.settings, output=output)
+                else:
+                    await cli.run_session(self.config, self.settings, output=output)
+                build.assert_called_once_with()
+            saved = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(saved["provenance"]["build"], original)
+            self.assertNotIn("private-sentinel", json.dumps(saved))
+        for fails in (False, True):
+            with self.subTest(fails=fails), TemporaryDirectory() as folder:
+                asyncio.run(check(folder, fails))
 
     def test_progress_prints_local_phase_without_changing_json_output(self):
         stderr = io.StringIO()
@@ -157,6 +240,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("phase=quoting", lines[2])
 
     def test_console_keeps_every_journal_event_and_exact_fill_totals(self):
+        from core.services.market_maker_v2.domain import DiagnosticValue
         d = Decimal
         fill = FillEvent("f1", "o1", "BTC", Side.BUY, d("0.00017"), d("79594.1"),
                          d("0.00162371964"), LiquidityRole.MAKER, 1.0)
@@ -167,7 +251,10 @@ class CliTests(unittest.TestCase):
                   MarkEvent("BTC", 1.0, d("79594.1"), True),
                   FillAccounting(fill, d("0"), None, None, None),
                   BoundedExitReport("exit-1", "BTC", 2.0, ExitStatus.BLOCKED, 0),
-                  FailureDiagnostic("BTC", "bounded_exit", "ValueError")]
+                  FailureDiagnostic("BTC", "bounded_exit", "ValueError", values=(
+                      DiagnosticValue("cancel_stage_send", d(1)),
+                      DiagnosticValue("cancel_error_timeout", d(1)),
+                      DiagnosticValue("cancel_error_private_token", d(1))))]
         stderr = io.StringIO()
         with (TemporaryDirectory() as folder, redirect_stderr(stderr),
               patch.object(cli.time, "monotonic", return_value=50)):
@@ -187,6 +274,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("fill=maker/buy size=0.00017 price=79594.1 fee=0.00162371964", lines[1])
         self.assertIn("exit=blocked exit_id=exit-1 attempts=0 account=unconfirmed", lines[2])
         self.assertIn("error=ValueError stage=bounded_exit", lines[3])
+        self.assertIn("stage_send=1 error_timeout=1", lines[3])
+        self.assertNotIn("private_token", stderr.getvalue())
         self.assertIn("account_age=50s", lines[4])
         self.assertNotIn("all_in_net_pnl", stderr.getvalue())
 

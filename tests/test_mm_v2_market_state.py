@@ -31,6 +31,13 @@ class MarketStateTests(unittest.TestCase):
         self.assertIs(snapshot, self.market.snapshot())
         self.assertEqual(MAX_VOLATILITY_BUFFER_BPS, D("5"))
 
+    def test_source_clock_is_preserved_separately_from_receipt_clock(self):
+        snapshot = self.update(source_timestamp_ms=1789056000123)
+        self.assertEqual(snapshot.source_timestamp_ms, 1789056000123)
+        self.assertEqual(snapshot.observed_monotonic, 0.0)
+        self.assertEqual(snapshot.external_bid, D("99"))
+        self.assertEqual(snapshot.microprice, D("100.5"))
+
     def test_own_aggregated_sizes_are_removed_before_best_and_microprice(self):
         snapshot = self.update(
             bids=levels(("99", "3"), ("98", "4")),

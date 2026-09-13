@@ -5,11 +5,11 @@ from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import mm_v2_execution_fixtures as fixtures
 from core.adapters.exchanges.models import OrderSide, OrderStatus
-from core.services.market_maker_v2.execution_models import DesiredOrder, DesiredQuotes, MarketMetadata, RuntimeState
+from core.services.market_maker_v2.execution_models import DesiredOrder, DesiredQuotes, MarketMetadata, OrderSlotState, RuntimeState
 from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
 from core.services.market_maker_v2.execution_models import RiskDecision
 from core.services.market_maker_v2.config import ExecutionSettings
@@ -135,6 +135,240 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.snapshot.managed_order_count, 0)
         self.assertEqual(self.manager.active_unwind_order_ids, {"2"})
         self.assertTrue(self.manager.active_unwind_order_ids <= self.manager.terminal_order_ids)
+
+    async def test_cancel_cleanup_reads_bounded_terminal_proof_without_resending(self):
+        for outcome in ("terminal", "still_open", "absent", "wrong_id", "same_client_known_id",
+                        "wrong_amount", "wrong_price", "generation", "new_halt", "deadline"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                await self.seed_maker()
+                order = fixtures.exchange_order("1", OrderSide.BUY, price="100", amount="0.2")
+                pending = []
+                def cancel(identifier, symbol):
+                    pending.append((symbol, identifier))
+                    return None
+                self.adapter.cancel_order.side_effect = cancel
+                self.adapter.get_unresolved_cancellations.side_effect = lambda: pending[:]
+                if outcome == "same_client_known_id":
+                    self.manager._known_order_ids.add("other")
+                proofs = [] if outcome in {"still_open", "absent"} else [
+                    replace(order, id="other" if outcome in {"wrong_id", "same_client_known_id"} else "1",
+                            client_id="unrelated" if outcome == "wrong_id" else order.client_id,
+                            amount=D("0.3") if outcome == "wrong_amount" else order.amount,
+                            remaining=D("0.3") if outcome == "wrong_amount" else order.remaining,
+                            price=D("101") if outcome == "wrong_price" else order.price,
+                            status=OrderStatus.CANCELED)]
+                self.adapter.get_order_history.return_value = proofs
+
+                def confirm(proof):
+                    pending.clear()
+                    return True
+
+                async def read(symbol):
+                    if outcome == "generation":
+                        self.manager._record_mutation()  # A concurrent mutation invalidates this read.
+                    if outcome == "new_halt":
+                        self.port._halt()  # New read-time fault must not be cleared by older recovery.
+                    if outcome == "deadline":
+                        self.time.value += 11
+                    return [order] if outcome == "still_open" else []
+
+                self.adapter.confirm_terminal_cancellation_outcome.side_effect = confirm
+                self.adapter.get_open_orders.side_effect = read
+                admitted = []
+                self.port._before_cleanup_reconcile = lambda: admitted.append(self.time())
+                self.adapter.get_open_orders.reset_mock()
+                async def advance(seconds):
+                    self.time.value += seconds
+                with patch("core.services.market_maker_v2.execution_port.asyncio.sleep", new=AsyncMock(side_effect=advance)):
+                    result = await self.port.cancel_all_managed()
+                expected_reads = 1 if outcome in {"terminal", "generation", "new_halt", "deadline"} else 2
+                self.assertEqual(len(admitted), expected_reads)
+                self.assertEqual(self.adapter.cancel_order.await_count, 1)
+                self.assertEqual(self.adapter.get_open_orders.await_count, expected_reads)
+                self.assertEqual(self.adapter.create_order.await_count, 1, "only the seeded maker")
+                self.assertFalse(self.port.can_reconcile_cancellation)
+                reads = self.adapter.get_open_orders.await_count
+                self.assertFalse(await self.port.reconcile_cancellation_for_cleanup(self.time() + 10))
+                self.assertEqual(self.adapter.get_open_orders.await_count, reads)
+                if outcome == "terminal":
+                    self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+                    self.assertIs(result.snapshot.health, ExecutionHealth.HEALTHY)
+                    self.assertEqual(result.account_snapshot.open_order_count, 0)
+                    self.assertEqual(pending, [])
+                else:
+                    self.assertIs(result.status, ExecutionStatus.BLOCKED)
+                    self.assertIs(result.snapshot.health, ExecutionHealth.HALTED)
+                    self.account.snapshot.assert_not_called()
+
+    async def test_cancel_recovery_delayed_proof_keeps_original_deadline_and_mutations(self):
+        for outcome in ("canceled", "partial_fill", "filled", "still_active", "absent"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                await self.seed_maker()
+                order = fixtures.exchange_order("1", OrderSide.BUY, price="100", amount="0.2")
+                pending = []
+                self.adapter.get_unresolved_cancellations.side_effect = lambda: pending[:]
+                def cancel(identifier, symbol):
+                    pending.append((symbol, identifier))
+                    return None
+                self.adapter.cancel_order.side_effect = cancel
+                diagnostics = []
+                self.port._on_failure = lambda stage, error: diagnostics.append((stage, error))
+                admissions = []
+                self.port._before_cleanup_reconcile = lambda: admissions.append(self.time())
+                terminal = replace(order, status=OrderStatus.FILLED if outcome == "filled" else OrderStatus.CANCELED,
+                    filled=D("0.1") if outcome == "partial_fill" else D("0.2") if outcome == "filled" else D("0"),
+                    remaining=D("0.1") if outcome == "partial_fill" else D("0") if outcome == "filled" else D("0.2"))
+
+                async def read(symbol):
+                    return [order] if self.adapter.get_open_orders.await_count == 1 or outcome == "still_active" else []
+
+                def confirm(proof):
+                    if proof is terminal:
+                        pending.clear()
+                        self.position += proof.filled
+                        return True
+                    return False
+
+                async def advance(seconds):
+                    self.assertEqual(seconds, 0.5)
+                    self.time.value += seconds
+
+                self.adapter.get_open_orders.side_effect = read
+                self.adapter.get_order_history.return_value = [] if outcome in {"absent", "still_active"} else [terminal]
+                self.adapter.confirm_terminal_cancellation_outcome.side_effect = confirm
+                with patch("core.services.market_maker_v2.execution_port.asyncio.sleep", new=AsyncMock(side_effect=advance)) as sleep:
+                    result = await self.port.cancel_all_managed()
+                self.assertEqual(admissions, [100.0, 100.5])
+                sleep.assert_awaited_once_with(0.5)
+                self.assertEqual(self.adapter.get_open_orders.await_count, 2)
+                self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
+                self.assertEqual(self.adapter.create_order.await_count, 1, "only the pre-existing maker")
+                self.assertFalse(self.port.can_reconcile_cancellation)
+                valid = outcome in {"canceled", "partial_fill", "filled"}
+                if valid:
+                    self.assertIs(result.status, ExecutionStatus.CONFIRMED)
+                    self.assertIs(result.snapshot.health, ExecutionHealth.HEALTHY)
+                    self.assertEqual(result.account_snapshot.position, D("-0.2") + terminal.filled)
+                    self.assertFalse(diagnostics)
+                else:
+                    self.assertIs(result.status, ExecutionStatus.BLOCKED)
+                    self.assertIs(result.snapshot.health, ExecutionHealth.HALTED)
+                    self.account.snapshot.assert_not_awaited()
+                    recovery = [error.diagnostic_values for stage, error in diagnostics if stage == "exit_order_sync"]
+                    self.assertEqual(recovery, [{"recovery_reads": D(2), "recovery_pending_count": D(1),
+                        "recovery_deadline_remaining_ms": D("9500.0"), "recovery_terminal_pending": D(1)}])
+
+    async def test_cancel_recovery_second_read_requires_unchanged_scope_admission_and_time(self):
+        from core.services.market_maker_v2.api_budget import ApiBudgetUnavailable
+
+        for outcome in ("new_fault", "new_unknown", "new_submission", "invalid_slot", "foreign_registry", "other_owned_cancel",
+                        "generation", "known_ids", "budget_refusal", "short_deadline", "read_timeout"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                await self.seed_maker()
+                if outcome == "other_owned_cancel":
+                    self.manager._known_order_ids.add("other-owned")
+                order = fixtures.exchange_order("1", OrderSide.BUY, price="100", amount="0.2")
+                self.adapter.cancel_order.side_effect = None
+                self.adapter.cancel_order.return_value = None
+                diagnostics, admissions = [], []
+                self.port._on_failure = lambda stage, error: diagnostics.append((stage, error))
+
+                def admit():
+                    admissions.append(self.time())
+                    if len(admissions) == 2 and outcome == "budget_refusal":
+                        raise ApiBudgetUnavailable("fixture refusal without provider payload")
+
+                async def read(symbol):
+                    if outcome == "short_deadline":
+                        self.time.value = 109.6
+                    if outcome == "read_timeout":
+                        raise TimeoutError
+                    return [order]
+
+                async def advance(seconds):
+                    self.time.value += seconds
+                    if outcome == "new_fault":
+                        self.port._halt()
+                    elif outcome == "new_unknown":
+                        self.manager._pause("unknown open order during recovery delay")
+                    elif outcome == "new_submission":
+                        self.adapter.get_unresolved_submissions.return_value = [{}]
+                    elif outcome == "invalid_slot":
+                        self.manager._slots[OrderSide.BUY].state = OrderSlotState.UNCERTAIN_SUBMISSION
+                    elif outcome == "foreign_registry":
+                        self.adapter.get_unresolved_cancellations.return_value = [("ETH", "1")]
+                    elif outcome == "other_owned_cancel":
+                        self.adapter.get_unresolved_cancellations.return_value = [("BTC", "other-owned")]
+                    elif outcome == "generation":
+                        self.manager._record_mutation()
+                    elif outcome == "known_ids":
+                        self.manager._known_order_ids.add("new-id")
+
+                self.port._before_cleanup_reconcile = admit
+                self.adapter.get_open_orders.side_effect = read
+                with patch("core.services.market_maker_v2.execution_port.asyncio.sleep", new=AsyncMock(side_effect=advance)) as sleep:
+                    result = await self.port.cancel_all_managed()
+                    self.assertIs(result.status, ExecutionStatus.BLOCKED)
+                self.assertEqual(self.adapter.get_open_orders.await_count, 1)
+                self.adapter.get_order_history.assert_not_awaited()
+                self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
+                self.assertEqual(self.adapter.create_order.await_count, 1)
+                self.account.snapshot.assert_not_awaited()
+                self.assertIs(self.port.snapshot().health, ExecutionHealth.HALTED)
+                self.assertFalse(self.port.can_reconcile_cancellation)
+                self.assertEqual(len(admissions), 2 if outcome == "budget_refusal" else 1)
+                self.assertEqual(sleep.await_count, 0 if outcome in {"short_deadline", "read_timeout"} else 1)
+                recovery = [error.diagnostic_values for stage, error in diagnostics if stage == "exit_order_sync"]
+                self.assertEqual(len(recovery), 1)
+                self.assertEqual(recovery[0]["recovery_reads"], D(1))
+                self.assertEqual(recovery[0]["recovery_pending_count"], D(1))
+                reasons = set(recovery[0]) - {"recovery_reads", "recovery_pending_count", "recovery_deadline_remaining_ms"}
+                expected = ("recovery_scope_changed" if outcome in {"new_fault", "generation", "known_ids"}
+                    else "recovery_budget_refused" if outcome == "budget_refusal"
+                    else "recovery_deadline_exhausted" if outcome in {"short_deadline", "read_timeout"}
+                    else "recovery_ineligible")
+                self.assertEqual(reasons, {expected})
+                if outcome == "budget_refusal":
+                    cleanup = [error for stage, error in diagnostics if stage == "cancel_managed_orders"]
+                    self.assertEqual(len(cleanup), 1)
+                    self.assertIs(type(cleanup[0]), ExecutionUnavailable)
+                    self.assertTrue(self.manager.last_result.errors, "original cancel failure remains available")
+
+    async def test_cancel_recovery_never_clears_a_generic_halt_or_read_refusal(self):
+        from core.services.market_maker_v2.api_budget import ApiBudgetUnavailable
+
+        for outcome in ("generic_halt", "generic_during_cancel", "read_refusal"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                await self.seed_maker()
+                self.adapter.cancel_order.side_effect = None
+                self.adapter.cancel_order.return_value = None
+                if outcome == "generic_halt":
+                    self.port._halt()
+                    self.assertFalse(await self.port.reconcile_cancellation_for_cleanup(110))
+                    self.adapter.cancel_order.assert_not_called()
+                elif outcome == "generic_during_cancel":
+                    def cancel(identifier, symbol):
+                        self.port._halt()
+                        return None
+                    self.adapter.cancel_order.side_effect = cancel
+                    result = await self.port.cancel_all_managed()
+                    self.assertIs(result.status, ExecutionStatus.BLOCKED)
+                    self.assertEqual(self.adapter.cancel_order.await_count, 1)
+                    self.assertFalse(self.port.can_reconcile_cancellation)
+                else:
+                    def refuse():
+                        raise ApiBudgetUnavailable("fixture read denial")
+                    self.port._before_cleanup_reconcile = refuse
+                    with self.assertRaises(ApiBudgetUnavailable):
+                        await self.port.cancel_all_managed()
+                    self.assertEqual(self.adapter.cancel_order.await_count, 1)
+                self.assertIs(self.port.snapshot().health, ExecutionHealth.HALTED)
+                self.adapter.get_open_orders.assert_not_called()
+                self.account.snapshot.assert_not_called()
 
     async def test_exact_partial_and_no_fill_return_fresh_residual_not_flat(self):
         for fill in (D("0"), D("0.1")):

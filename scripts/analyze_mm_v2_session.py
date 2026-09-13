@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict, fields, is_dataclass, replace
 from decimal import Decimal as D
 from enum import Enum
 import json
-from math import isfinite
+import hashlib
 from pathlib import Path
 import sys
+import re
 from typing import get_args, get_origin
 
 if __package__ in (None, ""):
@@ -31,17 +32,20 @@ from core.services.market_maker_v2.domain import (
     AccountSnapshot, BoundedExitReport, CashflowEvent, ExecutionResult,
     ExecutionHealth, ExecutionSnapshot, FillAccounting, InventoryDecision,
     MarkEvent, MarketStateSnapshot, QuotePlan, SessionReport, Side, WorkingOrder, FailureDiagnostic,
+    OrderEvidence, PublicBookObservation, GovernorDiagnostic,
 )
 from core.services.market_maker_v2.inventory_governor import InventoryGovernor
 from core.services.market_maker_v2.quote_policy import VolumeQuotePolicy
 from core.services.market_maker_v2.session_ledger import SessionLedger
+from core.services.market_maker_v2.config import MarketMakerV2Config
 
 
 EVENTS = dict(account_snapshot=AccountSnapshot, bounded_exit=BoundedExitReport,
               cashflow=CashflowEvent, execution_result=ExecutionResult,
               fill=FillAccounting, inventory_decision=InventoryDecision,
               mark=MarkEvent, quote_plan=QuotePlan, session_report=SessionReport,
-              failure_diagnostic=FailureDiagnostic)
+              failure_diagnostic=FailureDiagnostic, order_evidence=OrderEvidence,
+              public_book_observation=PublicBookObservation, governor_diagnostic=GovernorDiagnostic)
 TOTALS = (
     "maker_buy_turnover", "maker_sell_turnover", "maker_turnover_total",
     "taker_flatten_turnover", "maker_fill_count", "taker_fill_count",
@@ -98,10 +102,10 @@ def _reject_constant(_):
     raise ValueError("non-finite JSON number")
 
 
-def _events(path):
+def _events(path, *, numbered=False):
     # ponytail: one short session in memory; stream if Phase 11 files outgrow RAM.
     content = Path(path).read_text(encoding="utf-8-sig")
-    for line in content.splitlines():
+    for number, line in enumerate(content.splitlines(), 1):
         if not line.strip():
             continue
         row = json.loads(line, object_pairs_hook=_object, parse_constant=_reject_constant)
@@ -111,22 +115,185 @@ def _events(path):
             raise ValueError("unsupported V2 event")
         if row["event"] == "session_report" and set(CHECKED) - row["data"].keys():
             raise ValueError("session report lacks accounting fields")
-        yield _decode(EVENTS[row["event"]], row["data"])
+        event = _decode(EVENTS[row["event"]], row["data"])
+        yield (number, event) if numbered else event
+
+
+def _run_provenance(path):
+    """Only the startup allowlist; never infer a historical build from this checkout."""
+    sidecar = Path(str(path) + ".budget.json")
+    missing = {"status": "unavailable", "source": "startup_budget_sidecar", "record": None}
+    if not sidecar.exists():
+        return missing
+    try:
+        row = json.loads(sidecar.read_text(encoding="utf-8-sig"), object_pairs_hook=_object,
+                         parse_constant=_reject_constant)
+        value = row.get("provenance")
+        if value is None:
+            return missing
+        if (type(value) is not dict or set(value) != {"schema", "capture", "build", "effective_config"}
+                or value["schema"] != "mm_v2_run_provenance_v1" or value["capture"] != "run_start"):
+            raise ValueError("invalid startup provenance")
+        build = value["build"]
+        if type(build) is not dict or set(build) != {"status", "commit", "dirty"}:
+            raise ValueError("invalid startup build")
+        if build["status"] == "available":
+            if (type(build["commit"]) is not str
+                    or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", build["commit"]) is None
+                    or type(build["dirty"]) is not bool):
+                raise ValueError("invalid startup build")
+        elif build != {"status": "unavailable", "commit": None, "dirty": None}:
+            raise ValueError("invalid startup build")
+        effective = value["effective_config"]
+        if type(effective) is not dict or set(effective) != {item.name for item in fields(MarketMakerV2Config)}:
+            raise ValueError("complete effective configuration required")
+        config = _decode(MarketMakerV2Config, effective)
+        return {"status": "available", "source": "startup_budget_sidecar", "record": {
+            "schema": value["schema"], "capture": value["capture"],
+            "build": build, "effective_config": asdict(config)}}
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError, ArithmeticError, KeyError):
+        return {**missing, "status": "invalid"}
+
+
+_COST_KINDS = ("normal_maker", "passive_reducing_maker", "ioc_exit", "unclassified")
+
+
+def _fill_cost_kind(fill, evidence):
+    if evidence is not None:
+        if (evidence.symbol != fill.symbol or evidence.side is not fill.side
+                or evidence.submitted_monotonic > fill.observed_monotonic
+                or fill.size > evidence.size
+                or fill.side is Side.BUY and fill.price > evidence.price
+                or fill.side is Side.SELL and fill.price < evidence.price):
+            return "unclassified", False
+        if fill.liquidity.value == "maker" and evidence.time_in_force == "POST_ONLY":
+            return ("passive_reducing_maker" if evidence.reduce_only else "normal_maker"), True
+        if (fill.liquidity.value == "taker" and evidence.time_in_force == "IOC"
+                and evidence.reduce_only):
+            return "ioc_exit", True
+        return "unclassified", False
+    # Legacy V2 taker DTOs require a bounded-exit identifier; this proves exit
+    # attribution, but does not invent missing order/market evidence.
+    return ("ioc_exit" if fill.liquidity.value == "taker" else "unclassified"), False
+
+
+def _cost_totals(rows):
+    gross = sum((item[1].realized_gross_pnl for item in rows), D(0))
+    fees = sum((item[1].fill.fee for item in rows), D(0))
+    turnover = sum((item[1].fill.size * item[1].fill.price for item in rows), D(0))
+    return {"fill_count": len(rows), "turnover_usdg": turnover,
+            "realized_gross_pnl_usdg": gross, "recorded_fees_usdg": fees,
+            "trading_net_usdg": gross - fees}
+
+
+def _trading_diagnostics(rows):
+    """Journal-order actual-flat groups, not matched winners or runtime episodes.
+
+    Rows contain line, replayed FillAccounting, cost kind, and explicit evidence.
+    A fill crossing through zero remains whole until position actually equals zero.
+    """
+    costs = {kind: _cost_totals([row for row in rows if row[2] == kind]) for kind in _COST_KINDS}
+    position, current, groups = D(0), [], []
+
+    def group(items, closing_position):
+        complete = closing_position == 0
+        fills = [item[1].fill for item in items]
+        cash_gross = sum(((1 if fill.side is Side.SELL else -1) * fill.size * fill.price
+                          for fill in fills), D(0))
+        totals = _cost_totals(items)
+        times = [fill.source_timestamp_ms for fill in fills]
+        ordered = (all(when is not None for when in times)
+                   and all(a <= b for a, b in zip(times, times[1:])))
+        takers = sum(fill.liquidity.value == "taker" for fill in fills)
+        return {"index": len(groups) + 1, "complete": complete,
+                "start_line": items[0][0], "end_line": items[-1][0],
+                "category": "contains_taker" if takers else "maker_only",
+                "fill_count": len(fills), "taker_fill_count": takers,
+                "source_duration_seconds": D(times[-1] - times[0]) / 1000 if ordered else None,
+                "source_time_complete_and_ordered": ordered,
+                "closing_position": closing_position,
+                "cash_trading_gross_usdg": cash_gross if complete else None,
+                "realized_gross_pnl_usdg": totals["realized_gross_pnl_usdg"],
+                "gross_reconciles": cash_gross == totals["realized_gross_pnl_usdg"] if complete else None,
+                "recorded_fees_usdg": totals["recorded_fees_usdg"],
+                "trading_net_usdg": totals["trading_net_usdg"] if complete else None}
+
+    for row in rows:
+        fill = row[1].fill
+        current.append(row)
+        position += fill.size if fill.side is Side.BUY else -fill.size
+        if position == 0:
+            groups.append(group(current, position))
+            current = []
+    open_group = group(current, position) if current else None
+    summaries = {}
+    for kind in ("maker_only", "contains_taker"):
+        selected = [item for item in groups if item["category"] == kind]
+        summaries[kind] = {"group_count": len(selected),
+            "positive_gross_count": sum(item["realized_gross_pnl_usdg"] > 0 for item in selected),
+            "positive_net_count": sum(item["trading_net_usdg"] > 0 for item in selected),
+            "positive_gross_below_fees_count": sum(0 < item["realized_gross_pnl_usdg"] < item["recorded_fees_usdg"]
+                                                   for item in selected),
+            **{key: sum((item[key] for item in selected), D(0)) for key in
+               ("realized_gross_pnl_usdg", "recorded_fees_usdg", "trading_net_usdg")}}
+    totals = _cost_totals(rows)
+    maker_turnover = sum((item[1].fill.size * item[1].fill.price for item in rows
+                          if item[1].fill.liquidity.value == "maker"), D(0))
+    linked_fills = []
+    for line, accounting, kind, order, order_line in rows:
+        if order is None:
+            continue
+        fill, market = accounting.fill, order.market
+        ticks = ((market.external_bid - order.price) if order.side is Side.BUY
+                 else (order.price - market.external_ask)) / market.tick_size
+        linked_fills.append({"fill_line": line, "order_evidence_line": order_line,
+            "execution_class": kind,
+            "receipt_since_submit_seconds": D(str(fill.observed_monotonic)) - D(str(order.submitted_monotonic)),
+            "submitted_quote_distance_from_external_touch_ticks": ticks,
+            "quote_market_source_timestamp_ms": market.source_timestamp_ms,
+            "fill_source_timestamp_ms": fill.source_timestamp_ms})
+    return {"scope": "diagnostic_trading_only_excludes_cashflows_not_formal_economics",
+        **totals, "gross_to_recorded_fees_ratio": (totals["realized_gross_pnl_usdg"] / totals["recorded_fees_usdg"]
+                                                   if totals["recorded_fees_usdg"] else None),
+        "trading_cost_per_10000_maker_turnover_usdg": -totals["trading_net_usdg"] * 10000 / maker_turnover if maker_turnover else None,
+        "execution_costs": costs,
+        "linked_fill_observations": linked_fills,
+        "order_timing": "receipt since local submit is an observation interval, not exchange working age; quote distance uses pre-submit external BBO, never a fill reference",
+        "cost_attribution": "realized PnL at closing fills minus each class's recorded fees; not independent strategy PnL or a counterfactual",
+        "classification": "maker classes require preceding compatible confirmed order evidence; legacy taker fills retain the bounded-exit DTO contract",
+        "flat_to_flat": {"method": "journal order; start at zero, close only at exact actual zero; never split a crossing fill; no funding allocation",
+            "complete_group_count": len(groups), "open_group": open_group,
+            "complete_groups": groups, "category_totals": summaries},
+        "coverage": {"fill_count": len(rows),
+            "source_timestamp_fills": sum(item[1].fill.source_timestamp_ms is not None for item in rows),
+            "fill_reference_fills": sum(item[1].fill.reference_price is not None for item in rows),
+            "order_evidence_fills": sum(item[3] is not None for item in rows),
+            "classified_fills": sum(item[2] != "unclassified" for item in rows),
+            "spread_capture_fills": sum(item[1].spread_capture_at_fill is not None for item in rows),
+            "inventory_markout_fills": sum(item[1].inventory_markout is not None for item in rows),
+            "flatten_concession_taker_fills": sum(item[1].flatten_concession is not None for item in rows
+                                                  if item[1].fill.liquidity.value == "taker")}}
 
 
 def _session(path, mode, planned, wall, capital):
-    events = iter(_events(path))
-    initial = next(events, None)
+    events = iter(_events(path, numbered=True))
+    first = next(events, None)
+    initial = first[1] if first else None
     if type(initial) is not AccountSnapshot:
         raise ValueError("starting account snapshot required")
     ledger = SessionLedger(initial)
     final, recorded, simulated = None, None, False
+    final_line, report_line = None, None
     last_time = initial.observed_monotonic
     submissions = cancellations = plans = 0
     seen_orders, lifetimes, revisions, timing_available = {}, [], 0, True
     execution_observations, previous_execution_time = 0, None
     diagnostics = []
-    for event in events:
+    fills, order_evidence, public_books, governor = [], {}, [], []
+    order_filled_sizes = {}
+    event_count, gross_cursor, fill_accounting_matches = 1, D(0), True
+    for line, event in events:
+        event_count += 1
         if type(event) is FailureDiagnostic:
             if event.symbol != initial.symbol:
                 raise ValueError("mixed session symbols")
@@ -140,7 +307,29 @@ def _session(path, mode, planned, wall, capital):
         if type(event) is FillAccounting:
             if not ledger.ingest_fill(event.fill):
                 raise ValueError("duplicate recorded fill")
+            gross = ledger.snapshot(now=event.fill.observed_monotonic).realized_gross_pnl
+            replayed_gross = gross - gross_cursor
+            fill_accounting_matches &= replayed_gross == event.realized_gross_pnl
+            gross_cursor = gross
+            linked_line, linked = order_evidence.get(event.fill.order_id, (None, None))
+            kind, compatible = _fill_cost_kind(event.fill, linked)
+            filled_size = order_filled_sizes.get(event.fill.order_id, D(0)) + event.fill.size
+            order_filled_sizes[event.fill.order_id] = filled_size
+            if compatible and filled_size > linked.size:
+                kind, compatible = "unclassified", False
+            fills.append((line, replace(event, realized_gross_pnl=replayed_gross), kind,
+                          linked if compatible else None, linked_line if compatible else None))
             last_time = max(last_time, event.fill.observed_monotonic)
+        elif type(event) is OrderEvidence:
+            previous = order_evidence.get(event.order_id)
+            if previous is not None and previous[1] != event:
+                raise ValueError("conflicting confirmed order evidence")
+            order_evidence.setdefault(event.order_id, (line, event))
+            last_time = max(last_time, event.confirmed_monotonic)
+        elif type(event) is PublicBookObservation:
+            public_books.append(event)
+        elif type(event) is GovernorDiagnostic:
+            governor.append((line, event))
         elif type(event) is CashflowEvent:
             if not ledger.ingest_cashflow(event):
                 raise ValueError("duplicate recorded cashflow")
@@ -150,6 +339,7 @@ def _session(path, mode, planned, wall, capital):
             ledger.record_exit(event)
         elif type(event) is AccountSnapshot:
             final = event
+            final_line = line
         elif type(event) is ExecutionResult:
             if event.snapshot.symbol not in (None, initial.symbol):
                 raise ValueError("execution snapshot symbol differs from session")
@@ -175,6 +365,7 @@ def _session(path, mode, planned, wall, capital):
             plans += 1
         elif type(event) is SessionReport:
             recorded = event
+            report_line = line
     if mode == "live" and simulated:
         raise ValueError("simulated execution cannot be labeled live")
     duration = (recorded.duration_seconds if recorded else
@@ -186,6 +377,8 @@ def _session(path, mode, planned, wall, capital):
     observed = (ledger.finalize(final, now=end) if recorded and recorded.complete
                 else ledger.snapshot(now=end))
     reasons = []
+    if not fill_accounting_matches:
+        reasons.append("recorded_fill_accounting_mismatch")
     if recorded is None:
         reasons.append("missing_final_report")
     elif any(getattr(recorded, name) != getattr(observed, name) for name in CHECKED):
@@ -203,9 +396,39 @@ def _session(path, mode, planned, wall, capital):
     if mode == "dry_run" and (observed.maker_fill_count or observed.taker_fill_count):
         raise ValueError("dry run cannot contain fills")
     metrics = asdict(observed)
+    final_fields = ("final_authenticated", "final_position", "final_open_order_count")
+    report_final = ({"line": report_line, "complete": recorded.complete,
+                     **{name: getattr(recorded, name) for name in final_fields}} if recorded else None)
+    account_final = ({"line": final_line, "observed_monotonic": final.observed_monotonic,
+                      "authenticated": final.authenticated, "position": final.position,
+                      "open_order_count": final.open_order_count} if final else None)
+    # A ledger snapshot used for incomplete replay has default false/null final
+    # fields. These cannot replace recorded account facts. Keep both sources when
+    # they disagree; neither changes replay totals or the economic validity gate.
+    if recorded is not None:
+        metrics.update({name: getattr(recorded, name) for name in final_fields})
+    elif final is not None:
+        metrics.update(final_authenticated=final.authenticated, final_position=final.position,
+                       final_open_order_count=final.open_order_count)
     window = max(planned, wall)
+    trading = _trading_diagnostics(fills)
+    trading["coverage"].update(order_evidence_count=len(order_evidence),
+                               governor_diagnostic_count=len(governor),
+                               public_book_count=len(public_books))
+    reason_counts = {}
+    for _, event in governor:
+        reason_counts[event.reason] = reason_counts.get(event.reason, 0) + 1
+    trading["governor"] = {"status": "available" if governor else "unavailable",
+        "reason_counts": reason_counts,
+        "state_transitions": [{"line": line, **asdict(event)} for line, event in governor
+                              if event.previous_state is not event.state]}
+    trading["public_book_markouts"] = (_analyze_public_records(
+        public_books, len(public_books), [item[1].fill for item in fills]) if public_books else None)
     return {
         "file": Path(path).name, "symbol": initial.symbol, "mode": mode,
+        "journal_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        "event_count": event_count, "run_provenance": _run_provenance(path),
+        "diagnostic_trading": trading,
         "accounting_complete": not reasons, "incomplete_reasons": reasons,
         "failure_diagnostics": diagnostics,
         "economics_evaluated": mode == "live" and not reasons,
@@ -214,6 +437,10 @@ def _session(path, mode, planned, wall, capital):
         "planned_seconds": planned, "whole_process_wall_seconds": wall,
         "comparison_window_seconds": window,
         "recorded_metrics": metrics,
+        "recorded_final_evidence": {
+            "source": "historical_typed_events_not_reauthenticated",
+            "metrics_final_source": "session_report" if recorded else "account_snapshot" if final else None,
+            "session_report": report_final, "account_snapshot": account_final},
         "actual_maker_turnover_usdg": observed.maker_turnover_total if mode == "live" else None,
         "maker_turnover_per_wall_hour": observed.maker_turnover_total * 3600 / window,
         "turnover_over_allocated_capital": observed.maker_turnover_total / capital if capital else None,
@@ -238,10 +465,24 @@ def _aggregate(sessions):
     fees = total["maker_fee"] + total["taker_fee"]
     net = total["realized_net_pnl"] if valid else None
     capital = sessions[0]["allocated_capital_usdg"]
+    trading_net = total["realized_gross_pnl"] - fees
+    cost_fields = ("fill_count", "turnover_usdg", "realized_gross_pnl_usdg",
+                   "recorded_fees_usdg", "trading_net_usdg")
+    diagnostic = {"scope": "diagnostic_trading_only_excludes_cashflows_not_formal_economics",
+        "realized_gross_pnl_usdg": total["realized_gross_pnl"], "recorded_fees_usdg": fees,
+        "trading_net_usdg": trading_net,
+        "gross_to_recorded_fees_ratio": total["realized_gross_pnl"] / fees if fees else None,
+        "trading_cost_per_10000_maker_turnover_usdg": -trading_net * 10000 / turnover if turnover else None,
+        "execution_costs": {kind: {field: sum((s["diagnostic_trading"]["execution_costs"][kind][field]
+                                   for s in sessions), 0 if field == "fill_count" else D(0))
+                                   for field in cost_fields} for kind in _COST_KINDS},
+        "complete_flat_group_count": sum(s["diagnostic_trading"]["flat_to_flat"]["complete_group_count"] for s in sessions),
+        "unfinished_flat_group_count": sum(s["diagnostic_trading"]["flat_to_flat"]["open_group"] is not None for s in sessions)}
     return {
         "session_count": len(sessions),
         "incomplete_session_count": sum(not s["accounting_complete"] for s in sessions),
         "economics_evaluated": valid, "observed_totals": total,
+        "diagnostic_trading": diagnostic,
         "comparison_window_seconds": window,
         "maker_turnover_per_wall_hour": turnover * 3600 / window,
         "turnover_over_allocated_capital": turnover / capital if capital else None,
@@ -279,9 +520,11 @@ def build_report(paths, *, candidate, mode, planned_seconds, wall_seconds, alloc
                 "Mode, planned window, process duration and allocated capital are operator claims.",
                 "Fixed windows retain failed/early sessions; total ratios are sums divided by sums.",
                 "Replay metrics are simulated; dry quote plans are not fills or actual turnover.",
-                "Source-clock fill markouts require optional public observations and fill source timestamps; quote distance and gross-exposure coverage are unavailable.",
+                "Source-clock fill markouts require public observations and fill source timestamps; pre-submit quote distances require linked order evidence; gross-exposure coverage is unavailable.",
                 "Inventory markout is the ledger inventory-drift decomposition, not post-fill 1s/5s markout.",
                 "Cross-session chronology/drawdown and independent confirmation are unavailable; no strategy promotion.",
+                "Flat-to-flat groups and execution cost classes are offline trading diagnostics; they exclude cashflows and never restore incomplete formal economics.",
+                "Legacy missing order, governor, market or build evidence remains unavailable; quote-time markets never backfill fill reference prices.",
             ],
             "sessions": sessions, "aggregate": _aggregate(sessions),
         }
@@ -371,8 +614,8 @@ def candidate_quantity_table(config, *, external_bid, external_ask, tick_size, s
 
 
 def analyze_public_books(path, *, session_paths=()):
-    """Receipt-clock market diagnostics, without fills, own-order subtraction or interpolation."""
-    records, count = [], 0
+    """Public observations and optional source-clock fills; no interpolation."""
+    observations = []
     required = {"schema", "symbol", "observed_monotonic", "source_timestamp_ms", "nonce",
                 "bid", "ask", "bid_size", "ask_size"}
     for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
@@ -382,20 +625,23 @@ def analyze_public_books(path, *, session_paths=()):
         if (type(row) is not dict or set(row) != required
                 or row["schema"] != "mm_v2_public_book_v1" or row["symbol"] != "BTC"):
             raise ValueError("unsupported public book record")
-        when = row["observed_monotonic"]
-        if type(when) not in (int, float) or not isfinite(when) or when < 0:
-            raise ValueError("invalid book receipt time")
-        if any(type(row[key]) is not int or row[key] < 0 for key in ("source_timestamp_ms", "nonce")):
-            raise ValueError("invalid book source time/nonce")
-        prices = []
-        for key in ("bid", "ask", "bid_size", "ask_size"):
-            if type(row[key]) is not str or _number(row[key]) <= 0:
-                raise ValueError("positive decimal-string book prices/sizes required")
-            prices.append(_number(row[key]))
-        if prices[0] >= prices[1]:
-            raise ValueError("locked/crossed public book")
-        record = (D(str(when)), row["source_timestamp_ms"], row["nonce"], *prices)
-        count += 1
+        observations.append(_decode(PublicBookObservation, {key: value for key, value in row.items()
+                                                           if key != "schema"}))
+    fills = [event.fill for file in session_paths for event in _events(file)
+             if type(event) is FillAccounting]
+    output = _analyze_public_records(observations, len(observations), fills)
+    return json.loads(json.dumps(output, default=str, allow_nan=False))
+
+
+def _analyze_public_records(observations, count, all_fills):
+    records = []
+    symbols = {item.symbol for item in observations}
+    if len(symbols) != 1:
+        raise ValueError("one public book symbol required")
+    symbol = next(iter(symbols))
+    for item in observations:
+        record = (D(str(item.observed_monotonic)), item.source_timestamp_ms, item.nonce,
+                  item.bid, item.ask, item.bid_size, item.ask_size)
         if records:
             previous = records[-1]
             if any(record[index] < previous[index] for index in (0, 1, 2)):
@@ -416,9 +662,8 @@ def analyze_public_books(path, *, session_paths=()):
     times = [row[0] for row in records]
     source_times = [D(row[1]) / 1000 for row in records]
     mids = [(row[3] + row[4]) / 2 for row in records]
-    fills = [event.fill for file in session_paths for event in _events(file)
-             if type(event) is FillAccounting and event.fill.liquidity.value == "maker"]
-    if any(fill.symbol != "BTC" for fill in fills) or len({fill.fill_id for fill in fills}) != len(fills):
+    fills = [fill for fill in all_fills if fill.liquidity.value == "maker"]
+    if any(fill.symbol != symbol for fill in fills) or len({fill.fill_id for fill in fills}) != len(fills):
         raise ValueError("mixed symbol or duplicate maker fills in markout input")
     sourced = [fill for fill in fills if fill.source_timestamp_ms is not None]
     horizons = {}
@@ -448,7 +693,7 @@ def analyze_public_books(path, *, session_paths=()):
             "matched_fills": len(matched), "coverage": D(len(matched)) / len(fills) if fills else None,
             "matched_turnover_usdg": turnover,
             "turnover_weighted_bps": sum((item[0] for item in matched), D(0)) * 10000 / turnover if turnover else None}
-    output = {"schema": "mm_v2_public_book_analysis_v1", "symbol": "BTC", "record_count": count,
+    output = {"schema": "mm_v2_public_book_analysis_v1", "symbol": symbol, "record_count": count,
         "distinct_receipt_count": len(records), "duplicate_receipt_count": count - len(records),
         "observed_span_seconds": times[-1] - times[0],
         "source_span_seconds": D(records[-1][1] - records[0][1]) / 1000,
@@ -459,8 +704,8 @@ def analyze_public_books(path, *, session_paths=()):
         "pairing": "first receipt at/after horizon, maximum lateness 0.25s; no interpolation",
         "fill_pairing": "first public source timestamp at/after fill source+horizon within0.25s; favorable side-signed future mid minus fill price, before fees; historical records only",
         "source_age_verified": False,
-        "limitations": "unadjusted public BBO; receipt-clock returns separate from source-clock recorded-fill markouts; no public trades, queue fills, own-order removal, wall-clock age proof or economic promotion"}
-    return json.loads(json.dumps(output, default=str, allow_nan=False))
+        "limitations": "unadjusted public BBO includes own orders; receipt-clock returns separate from source-clock recorded-fill markouts; no public trades, queue fills, own-order removal, wall-clock age proof or economic promotion"}
+    return output
 
 
 def main(argv=None):

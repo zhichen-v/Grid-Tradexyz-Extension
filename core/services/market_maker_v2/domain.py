@@ -99,6 +99,7 @@ class MarketStateSnapshot:
     trusted: bool
     microprice: Decimal | None = None
     ewma_move_bps: Decimal = ZERO
+    source_timestamp_ms: int | None = None
 
     def __post_init__(self):
         _symbol(self.symbol)
@@ -116,6 +117,8 @@ class MarketStateSnapshot:
         _decimal(self.ewma_move_bps)
         if self.ewma_move_bps < ZERO:
             raise ValueError("volatility must be nonnegative")
+        if self.source_timestamp_ms is not None:
+            _count(self.source_timestamp_ms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +557,72 @@ class FillAccounting:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderEvidence:
+    """Confirmed order identity linked to the submitted intent, not a fill-time mark.
+
+    The monotonic interval brackets the local create operation; neither endpoint
+    claims the venue's acceptance time or a fill's actual working age.
+    """
+
+    symbol: str
+    order_id: str
+    side: Side
+    price: Decimal
+    size: Decimal
+    reduce_only: bool
+    time_in_force: str
+    submitted_monotonic: float
+    confirmed_monotonic: float
+    market: MarketStateSnapshot
+    strategy_state: StrategyState | None = None
+
+    def __post_init__(self):
+        _symbol(self.symbol)
+        _identifier(self.order_id)
+        if not isinstance(self.side, Side):
+            raise ValueError("typed order side required")
+        _decimal(self.price, positive=True)
+        _decimal(self.size, positive=True)
+        _boolean(self.reduce_only)
+        for value in (self.submitted_monotonic, self.confirmed_monotonic):
+            _time(value)
+        if (self.time_in_force not in {"POST_ONLY", "IOC"}
+                or self.time_in_force == "IOC" and not self.reduce_only
+                or self.confirmed_monotonic < self.submitted_monotonic):
+            raise ValueError("invalid order evidence boundaries")
+        if (type(self.market) is not MarketStateSnapshot or self.market.symbol != self.symbol
+                or not self.market.trusted
+                or not 0 <= self.submitted_monotonic - self.market.observed_monotonic <= 3):
+            raise ValueError("order evidence requires its fresh pre-submit market")
+        if self.strategy_state is not None and not isinstance(self.strategy_state, StrategyState):
+            raise ValueError("typed order strategy state required")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicBookObservation:
+    """Sampled validated public BBO, including own orders; diagnostics only."""
+
+    symbol: str
+    observed_monotonic: float
+    source_timestamp_ms: int
+    nonce: int
+    bid: Decimal
+    ask: Decimal
+    bid_size: Decimal
+    ask_size: Decimal
+
+    def __post_init__(self):
+        _symbol(self.symbol)
+        _time(self.observed_monotonic)
+        _count(self.source_timestamp_ms)
+        _count(self.nonce)
+        for value in (self.bid, self.ask, self.bid_size, self.ask_size):
+            _decimal(value, positive=True)
+        if self.bid >= self.ask:
+            raise ValueError("public BBO must not be locked or crossed")
+
+
+@dataclass(frozen=True, slots=True)
 class DiagnosticValue:
     name: str
     value: Decimal
@@ -561,6 +630,58 @@ class DiagnosticValue:
     def __post_init__(self):
         _identifier(self.name)
         _decimal(self.value)
+
+
+GOVERNOR_REASONS = frozenset({
+    "quoting", "soft_inventory", "hard_inventory", "insufficient_reserve",
+    "capacity_below_minimum", "risk_capacity_exhausted", "session_loss", "max_drawdown",
+    "inventory_stop_loss", "inventory_hold", "inventory_hard_limit", "operator_stop",
+    "session_deadline", "exit_in_progress", "cooldown", "cooldown_residual",
+    "session_complete", "reducing_capacity_only", "passive_exit_grace",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class GovernorDiagnostic:
+    """Evidence from the actual governor calculation; never additional risk authority."""
+
+    symbol: str
+    observed_monotonic: float
+    previous_state: StrategyState
+    state: StrategyState
+    reason: str
+    minimum_order_size: Decimal
+    buy_capacity: Decimal = ZERO
+    sell_capacity: Decimal = ZERO
+    candidate_buy: Decimal = ZERO
+    candidate_sell: Decimal = ZERO
+    realized_loss: Decimal | None = None
+    inventory_loss: Decimal | None = None
+    working_order_gap_loss: Decimal | None = None
+    drawdown_loss: Decimal | None = None
+    current_loss: Decimal | None = None
+    worst_position: Decimal | None = None
+    stop_reserve: Decimal | None = None
+    taker_fee_reserve: Decimal | None = None
+    slippage_reserve: Decimal | None = None
+    maker_fee_reserve: Decimal | None = None
+    total_reserve: Decimal | None = None
+    remaining_loss_headroom: Decimal | None = None
+
+    def __post_init__(self):
+        _symbol(self.symbol)
+        _time(self.observed_monotonic)
+        if any(not isinstance(state, StrategyState) for state in (self.previous_state, self.state)):
+            raise ValueError("typed governor states required")
+        if self.reason not in GOVERNOR_REASONS:
+            raise ValueError("bounded governor reason required")
+        _decimal(self.minimum_order_size, positive=True)
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if item.type in (Decimal, Decimal | None) and value is not None:
+                _decimal(value)
+                if item.name != "remaining_loss_headroom" and value < ZERO:
+                    raise ValueError("governor cost/capacity evidence must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,4 +715,4 @@ class FailureDiagnostic:
             raise ValueError("typed diagnostic values required")
 
 
-TelemetryEvent = AccountSnapshot | QuotePlan | ExecutionResult | FillAccounting | MarkEvent | CashflowEvent | SessionReport | BoundedExitReport | InventoryDecision | FailureDiagnostic
+TelemetryEvent = AccountSnapshot | QuotePlan | ExecutionResult | FillAccounting | MarkEvent | CashflowEvent | SessionReport | BoundedExitReport | InventoryDecision | FailureDiagnostic | OrderEvidence | PublicBookObservation | GovernorDiagnostic

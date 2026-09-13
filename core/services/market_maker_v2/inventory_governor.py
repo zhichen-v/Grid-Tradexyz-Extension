@@ -4,7 +4,7 @@ from decimal import Decimal, DecimalException, localcontext
 
 from .domain import (
     AccountSnapshot, ExecutionHealth, ExecutionResult, ExecutionSnapshot,
-    ExecutionStatus, FlattenIntent, InventoryDecision, MarketStateSnapshot,
+    ExecutionStatus, FlattenIntent, GovernorDiagnostic, InventoryDecision, MarketStateSnapshot,
     SessionReport, Side, StrategyState, ZERO, _boolean, _count, _decimal, _time,
 )
 
@@ -51,6 +51,11 @@ class InventoryGovernor:
         self.stop_reason = None
         self._exit_started = None
         self._cooldown_until = None
+        self._exit_reason = None
+        self.last_diagnostic = None
+        self._minimum_order_size = None
+        self._diagnostic_values = {}
+        self._decision_reason = None
 
     @property
     def exit_deadline(self) -> float | None:
@@ -66,9 +71,10 @@ class InventoryGovernor:
             raise GovernorUnavailable("governor clock moved backwards")
         self._last_now = now
 
-    def _begin_exit(self, now):
+    def _begin_exit(self, now, reason="exit_in_progress"):
         if self._state is not StrategyState.FLATTENING:
             self._exit_started = now
+            self._exit_reason = reason
         else:
             self._exit_started = min(self._exit_started, now)
         self._state = StrategyState.FLATTENING
@@ -81,17 +87,22 @@ class InventoryGovernor:
     def evaluate(self, market: MarketStateSnapshot, account: AccountSnapshot,
                  ledger_report: SessionReport, execution_snapshot: ExecutionSnapshot,
                  *, now: float, stop_requested: bool = False) -> InventoryDecision:
+        previous_state = self._state
+        self.last_diagnostic = None
+        self._diagnostic_values = {}
+        self._decision_reason = None
         self._clock(now)
         try:
             _boolean(stop_requested)
         except ValueError:
             raise GovernorUnavailable("typed stop request required") from None
         if self._state is StrategyState.SESSION_COMPLETE:
-            return InventoryDecision(self._state)
+            return self._diagnose(InventoryDecision(self._state), previous_state, now)
         # Stop/deadline survive stale market, failed monitor and unknown orders.
         if stop_requested or now >= self.session_deadline_monotonic:
             self._terminal_stop = True
-            self._begin_exit(min(now, self.session_deadline_monotonic))
+            self._begin_exit(min(now, self.session_deadline_monotonic),
+                "operator_stop" if stop_requested else "session_deadline")
         self._require_exit_time(now)
         if (type(market) is not MarketStateSnapshot or type(account) is not AccountSnapshot
                 or type(ledger_report) is not SessionReport
@@ -115,7 +126,9 @@ class InventoryGovernor:
             with localcontext() as context:
                 context.prec = max(context.prec, precision)
                 self._validate(market, account, ledger_report, execution_snapshot, now)
-                return self._evaluate(market, account, ledger_report, execution_snapshot, now)
+                self._minimum_order_size = market.min_order_size
+                decision = self._evaluate(market, account, ledger_report, execution_snapshot, now)
+                return self._diagnose(decision, previous_state, now)
         except DecimalException:
             raise GovernorUnavailable("unusable inventory arithmetic") from None
 
@@ -152,13 +165,16 @@ class InventoryGovernor:
         if (max(ZERO, -report.realized_net_pnl) + loss >= self.max_session_loss_usdg
                 or report.max_drawdown >= self.max_session_loss_usdg):
             self._terminal_stop = True
-            self._begin_exit(now)
+            self._begin_exit(now, "session_loss" if
+                max(ZERO, -report.realized_net_pnl) + loss >= self.max_session_loss_usdg
+                else "max_drawdown")
         if account.position:
             if report.inventory_age >= Decimal(str(self.max_hold_seconds)):
                 crossed = Decimal(str(now)) - report.inventory_age + Decimal(str(self.max_hold_seconds))
-                self._begin_exit(float(crossed))
+                self._begin_exit(float(crossed), "inventory_hold")
             if loss >= self.stop_loss_usdg or abs(account.position) > self.hard_limit:
-                self._begin_exit(now)
+                self._begin_exit(now, "inventory_stop_loss" if loss >= self.stop_loss_usdg
+                                 else "inventory_hard_limit")
 
     def _evaluate(self, market, account, report, execution, now):
         quantity = abs(account.position)
@@ -170,7 +186,7 @@ class InventoryGovernor:
         self._require_exit_time(now)
         if self._state is StrategyState.COOLDOWN:
             if quantity or account.open_order_count:
-                self._begin_exit(now)
+                self._begin_exit(now, "cooldown_residual")
             elif now < self._cooldown_until:
                 return InventoryDecision(self._state)
             else:
@@ -186,6 +202,7 @@ class InventoryGovernor:
                         quantity, price, self.exit_deadline)
             return InventoryDecision(self._state, flatten=intent)
         if quantity == self.hard_limit:
+            self._decision_reason = "hard_inventory"
             return self._reducing(account, market)
         capacities = self._capacities(market, account, report, execution.orders, loss)
         if not any(capacities):
@@ -195,7 +212,8 @@ class InventoryGovernor:
                 # Completion still requires the existing fresh exit proof.
                 self._terminal_stop = True
                 self.stop_reason = "risk_capacity_exhausted"
-                self._begin_exit(now)
+                self._begin_exit(now, "risk_capacity_exhausted")
+                self._decision_reason = "risk_capacity_exhausted"
                 return InventoryDecision(self._state)
             return self._reducing(account, market)
         self._state = StrategyState.SKEWED if quantity >= self.soft_limit else StrategyState.QUOTING
@@ -219,7 +237,8 @@ class InventoryGovernor:
         old_gap = sum((o.remaining_size * max(ZERO,
             o.price - market.external_bid if o.side is Side.BUY else market.external_ask - o.price)
             for o in orders), ZERO)
-        current_loss = max(ZERO, -report.realized_net_pnl) + inventory_loss + old_gap
+        realized_loss = max(ZERO, -report.realized_net_pnl)
+        current_loss = realized_loss + inventory_loss + old_gap
         marked = report.marked_net_pnl if report.marked_net_pnl is not None else report.realized_net_pnl
         # Reserve against the same equity peak used by the drawdown stop. Current
         # headroom can recover; historical maximum drawdown must not consume it forever.
@@ -227,6 +246,10 @@ class InventoryGovernor:
                             - report.realized_net_pnl + inventory_loss) + old_gap
         current_loss = max(current_loss, drawdown_loss)
         slip = market.tick_size * self.ioc_slippage_ticks
+        self._diagnostic_values = dict(realized_loss=realized_loss,
+            inventory_loss=inventory_loss, working_order_gap_loss=old_gap,
+            drawdown_loss=drawdown_loss, current_loss=current_loss,
+            remaining_loss_headroom=self.max_session_loss_usdg - current_loss)
 
         def allowed(buy, sell):
             # Capacities are total targets for the executor's one slot per side.
@@ -237,8 +260,14 @@ class InventoryGovernor:
             worst = max(abs(position), abs(position + buy_exposure),
                         abs(position - sell_exposure))
             stop = max(self.stop_loss_usdg, worst * self.stop_loss_usdg / self.order_size) if worst else ZERO
-            reserve = (stop + worst * ((price + slip) * account.taker_fee_rate + slip)
-                       + (buy_exposure + sell_exposure) * price * account.maker_fee_rate)
+            taker_fee = worst * (price + slip) * account.taker_fee_rate
+            slippage = worst * slip
+            maker_fee = (buy_exposure + sell_exposure) * price * account.maker_fee_rate
+            reserve = stop + taker_fee + slippage + maker_fee
+            self._diagnostic_values.update(candidate_buy=buy, candidate_sell=sell,
+                worst_position=worst, stop_reserve=stop, taker_fee_reserve=taker_fee,
+                slippage_reserve=slippage, maker_fee_reserve=maker_fee,
+                total_reserve=reserve)
             return worst <= self.hard_limit and current_loss + reserve < self.max_session_loss_usdg
 
         buy_cap = min(self.order_size, max(ZERO, self.hard_limit - position))
@@ -251,6 +280,7 @@ class InventoryGovernor:
         buy_lots, sell_lots = int(buy_cap // step), int(sell_cap // step)
         low, high = 0, max(buy_lots, sell_lots)
         if not allowed(ZERO, ZERO):
+            self._decision_reason = "insufficient_reserve"
             return ZERO, ZERO
         while low < high:
             middle = (low + high + 1) // 2
@@ -259,11 +289,56 @@ class InventoryGovernor:
             else:
                 high = middle - 1
         buy, sell = min(low, buy_lots) * step, min(low, sell_lots) * step
-        return (buy if buy >= market.min_order_size else ZERO,
-                sell if sell >= market.min_order_size else ZERO)
+        capacities = (buy if buy >= market.min_order_size else ZERO,
+                      sell if sell >= market.min_order_size else ZERO)
+        if any(capacities):
+            allowed(*capacities)
+            return capacities
+        allowed(buy, sell)
+        self._decision_reason = "capacity_below_minimum"
+        if position:
+            # A shared size search can be limited by the inventory-increasing
+            # side while an ordinary closing quote still fits the same reserve.
+            # Only recover actual reduction: no new opposite inventory, no
+            # release of old orders, and no exception to the existing budget.
+            low, high = 0, int(min(abs(position), self.order_size) // step)
+            while low < high:
+                middle = (low + high + 1) // 2
+                buy, sell = ((middle * step, ZERO) if position < ZERO
+                             else (ZERO, middle * step))
+                if allowed(buy, sell):
+                    low = middle
+                else:
+                    high = middle - 1
+            capacity = low * step
+            buy, sell = ((capacity, ZERO) if position < ZERO else (ZERO, capacity))
+            allowed(buy, sell)
+            if capacity >= market.min_order_size:
+                self._decision_reason = "reducing_capacity_only"
+                return buy, sell
+        return ZERO, ZERO
+
+    def _diagnose(self, decision, previous_state, now):
+        reason = self._decision_reason
+        if reason is None:
+            reason = ({StrategyState.QUOTING: "quoting",
+                       StrategyState.SKEWED: "soft_inventory",
+                       StrategyState.COOLDOWN: "cooldown",
+                       StrategyState.SESSION_COMPLETE: "session_complete"}
+                      .get(decision.state, self._exit_reason or "exit_in_progress"))
+        self.last_diagnostic = GovernorDiagnostic(symbol=self._symbol,
+            reason=reason, previous_state=previous_state, state=decision.state,
+            observed_monotonic=now, minimum_order_size=self._minimum_order_size,
+            buy_capacity=decision.buy_capacity, sell_capacity=decision.sell_capacity,
+            **self._diagnostic_values)
+        return decision
 
     def confirm_exit(self, result: ExecutionResult, *, now: float) -> InventoryDecision:
         """Only the safe execution bridge's exact terminal result completes cleanup."""
+        previous_state = self._state
+        self.last_diagnostic = None
+        self._diagnostic_values = {}
+        self._decision_reason = None
         self._clock(now)
         if (self._state is not StrategyState.FLATTENING or type(result) is not ExecutionResult
                 or result.status is not ExecutionStatus.CONFIRMED):
@@ -287,4 +362,4 @@ class InventoryGovernor:
         self._state = (StrategyState.SESSION_COMPLETE if self._terminal_stop
                        else StrategyState.COOLDOWN)
         self._cooldown_until = now + self.cooldown_seconds
-        return InventoryDecision(self._state)
+        return self._diagnose(InventoryDecision(self._state), previous_state, now)

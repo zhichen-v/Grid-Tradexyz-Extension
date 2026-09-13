@@ -76,7 +76,7 @@ class MarketState:
 
     def update(self, *, bids: Levels, asks: Levels, own_bids: Levels,
                own_asks: Levels, observed_monotonic: float,
-               trusted: bool) -> MarketStateSnapshot:
+               trusted: bool, source_timestamp_ms: int | None = None) -> MarketStateSnapshot:
         self._snapshot = None
         _time(observed_monotonic)
         _boolean(trusted)
@@ -118,7 +118,7 @@ class MarketState:
                 sample_time, sample_mid = now, mid
             snapshot = MarketStateSnapshot(
                 self._symbol, observed_monotonic, bid, ask, self._tick,
-                self._step, self._minimum, True, microprice, ewma,
+                self._step, self._minimum, True, microprice, ewma, source_timestamp_ms,
             )
         except DecimalException as exc:
             raise ValueError("unusable book arithmetic") from exc

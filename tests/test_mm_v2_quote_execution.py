@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import mm_v2_execution_fixtures as fixtures
 from core.adapters.exchanges.models import OrderSide, OrderStatus
+from core.adapters.exchanges.exceptions import OrderCancellationNotSentError
 from core.services.market_maker_v2.execution_models import MarketMetadata, RuntimeState
 from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
 from core.services.market_maker_v2.domain import (
@@ -117,6 +118,69 @@ class QuoteExecutionTests(unittest.IsolatedAsyncioTestCase):
         creates = [i for i, kind in enumerate(kinds) if kind == "create"]
         self.assertIn("authorize", kinds[creates[0] + 1:creates[1]])
         self.assertIn("account", kinds[creates[0] + 1:creates[1]])
+
+    async def test_cancel_no_send_latches_cleanup_only_and_audits_before_cancelling(self):
+        await self.quote_both()
+        original_ids = set(self.open)
+        self.time.value += 5
+        def not_sent(identifier, symbol):
+            raise OrderCancellationNotSentError(symbol=symbol, order_id=identifier)
+        self.adapter.cancel_order.side_effect = not_sent
+        failed = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(failed.status, ExecutionStatus.BLOCKED)
+        self.assertIs(failed.snapshot.health, ExecutionHealth.HEALTHY)
+        self.assertEqual(self.adapter.cancel_order.await_count, 1)
+        self.adapter.cancel_order.side_effect = self.cancel
+        self.events.clear()
+        self.port._before_cleanup_audit = Mock(side_effect=lambda: self.events.append(("admit_audit",)))
+        again = await self.port.reconcile_quotes(self.proposal)
+        self.assertIs(again.status, ExecutionStatus.BLOCKED)
+        self.assertEqual(self.events, [])
+        cleaned = await self.port.cancel_all_managed()
+        self.assertIs(cleaned.status, ExecutionStatus.CONFIRMED)
+        kinds = [event[0] for event in self.events]
+        self.assertLess(kinds.index("admit_audit"), kinds.index("account"))
+        self.assertLess(kinds.index("account"), kinds.index("cancel"))
+        self.assertEqual({event[1] for event in self.events if event[0] == "cancel"}, original_ids)
+        self.assertEqual(self.adapter.create_order.await_count, 2)
+        self.assertIs((await self.port.reconcile_quotes(self.proposal)).status, ExecutionStatus.BLOCKED)
+
+    async def test_cancel_no_send_cleanup_audit_failure_never_mutates(self):
+        for failure in ("budget", "stale", "unauthenticated", "wrong_orders", "new_fault", "deadline"):
+            with self.subTest(failure=failure):
+                self.setUp()
+                await self.quote_both()
+                self.time.value += 5
+                def not_sent(identifier, symbol):
+                    raise OrderCancellationNotSentError(symbol=symbol, order_id=identifier)
+                self.adapter.cancel_order.side_effect = not_sent
+                self.assertIs((await self.port.reconcile_quotes(self.proposal)).status, ExecutionStatus.BLOCKED)
+                self.adapter.cancel_order.reset_mock()
+                self.adapter.cancel_order.side_effect = self.cancel
+                if failure == "budget":
+                    self.port._before_cleanup_audit = Mock(side_effect=ApiBudgetUnavailable("no headroom"))
+                async def audit():
+                    row = await self.account_snapshot()
+                    if failure == "stale":
+                        return replace(row, observed_monotonic=self.time() - 1)
+                    if failure == "unauthenticated":
+                        return replace(row, authenticated=False)
+                    if failure == "wrong_orders":
+                        return replace(row, open_order_ids=("other", "another"))
+                    if failure == "new_fault":
+                        self.port._halt()
+                    if failure == "deadline":
+                        self.time.value += 10
+                    return row
+                self.account.snapshot.side_effect = audit
+                if failure == "budget":
+                    with self.assertRaises(ApiBudgetUnavailable):
+                        await self.port.cancel_all_managed()
+                else:
+                    self.assertIs((await self.port.cancel_all_managed()).status, ExecutionStatus.BLOCKED)
+                self.adapter.cancel_order.assert_not_called()
+                self.assertEqual(self.adapter.create_order.await_count, 2)
+                self.assertIs(self.port.snapshot().health, ExecutionHealth.HALTED)
 
     async def test_optional_revision_denial_retains_safe_prices_and_actual_orders(self):
         await self.quote_both()

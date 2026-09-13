@@ -8,7 +8,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from core.adapters.exchanges.exceptions import OrderSubmissionRejectedError
+from core.adapters.exchanges.exceptions import OrderCancellationNotSentError, OrderSubmissionRejectedError
 from core.adapters.exchanges.models import OrderData, OrderSide, OrderStatus, OrderType
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.adapters.lighter import LighterAdapter
@@ -501,6 +501,10 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 rest.get_open_orders.assert_not_awaited()
                 if confirmed:
                     rest.get_order_history.assert_awaited_once()
+                    self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+                    self.assertIs(rest.get_terminal_cancellation_outcome("BTC", "987"), canceled)
+                    self.assertTrue(rest.confirm_terminal_cancellation_outcome("BTC", "987", canceled.status))
+                    self.assertEqual(rest.get_unresolved_cancellations(), [])
                 if rows == [filled]:
                     self.assertIs(rest.get_terminal_cancellation_outcome("BTC", "987"), filled)
 
@@ -520,6 +524,531 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
         rest.get_open_orders.assert_not_awaited()
         rest.get_order_history.assert_awaited_once_with("BTC")
         rest.signer_client.cancel_order.assert_awaited_once()
+
+    async def test_mm_adapter_preserves_full_cancel_terminal_receipt_for_order_manager(self):
+        from core.services.market_maker_v2.config import ExecutionSettings
+        from core.services.market_maker_v2.execution_models import (
+            DesiredOrder, DesiredQuotes, MarketMetadata, RiskDecision, RuntimeState,
+        )
+        from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
+
+        for side in (OrderSide.BUY, OrderSide.SELL):
+            for status, filled in ((OrderStatus.CANCELED, Decimal("0")),
+                                   (OrderStatus.CANCELED, Decimal("0.1")),
+                                   (OrderStatus.FILLED, Decimal("0.2")),
+                                   (OrderStatus.EXPIRED, Decimal("0")),
+                                   (OrderStatus.REJECTED, Decimal("0"))):
+                with self.subTest(side=side, status=status, filled=filled):
+                    live = _order("987", side, Decimal("99.9") if side is OrderSide.BUY else Decimal("100.1"),
+                                  Decimal("0.2"), OrderStatus.OPEN)
+                    terminal = replace(live, status=status, filled=filled, remaining=live.amount - filled)
+                    rest = self._ioc_rest([terminal])
+                    rest.signer_client.cancel_order = AsyncMock(
+                        return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+                    adapter = object.__new__(LighterAdapter)
+                    adapter._rest = rest
+                    adapter._normalize_symbol = Mock(return_value="BTC")
+                    adapter.enable_market_maker_cancellation_outcomes()
+                    adapter.create_order = AsyncMock(return_value=live)
+                    receipts = []
+                    original_cancel = adapter.cancel_order
+
+                    async def cancel(*args, **kwargs):
+                        receipt = await original_cancel(*args, **kwargs)
+                        receipts.append((receipt, rest.get_unresolved_cancellations(),
+                            adapter.get_market_maker_cancellation_diagnostics("987", "BTC")))
+                        return receipt
+
+                    adapter.cancel_order = cancel
+                    manager = MarketMakerOrderManager(adapter,
+                        ExecutionSettings("BTC", Decimal("0.2"), Decimal("1"), 1, False),
+                        MarketMetadata("BTC", 1, 1, Decimal("0.1"), Decimal("0.1"), Decimal("0.1"), Decimal("0")))
+                    order = DesiredOrder(side, live.price, live.amount, False, "test")
+                    desired = DesiredQuotes(order if side is OrderSide.BUY else None,
+                        order if side is OrderSide.SELL else None, Decimal("100"), Decimal("100"),
+                        Decimal("0.1"), Decimal("0"), RuntimeState.ACTIVE, "test")
+                    risk = RiskDecision(Decimal("0.2"), Decimal("0.2"), False, False,
+                        Decimal("1"), Decimal("1"), Decimal("0.2"), Decimal("-0.2"),
+                        Decimal("0"), RuntimeState.ACTIVE, "test", True)
+                    created = await manager.reconcile(desired, risk)
+                    self.assertFalse(created.errors)
+
+                    result = await manager.cancel_managed_orders("normal exact cancellation")
+
+                    self.assertFalse(result.errors)
+                    self.assertEqual(len(receipts), 1)
+                    self.assertIs(receipts[0][0], terminal, "MM must receive the full DTO directly")
+                    self.assertEqual(receipts[0][1], [("BTC", "987")], "only the consumer confirms the receipt")
+                    self.assertEqual(receipts[0][2], dict(submission="acknowledged", stage="unavailable", error_kind="none",
+                        history_attempts=1,
+                        history_read_errors=0, exact_history_matches=1, captured_terminal=1))
+                    self.assertIsNone(adapter.get_market_maker_cancellation_diagnostics("987", "BTC"))
+                    self.assertEqual(manager.snapshot(), ())
+                    self.assertEqual(manager.terminal_order_ids, frozenset({live.id}))
+                    self.assertFalse(manager.has_uncertain_state)
+                    self.assertEqual(result.fill_observed, filled > 0)
+                    self.assertEqual(result.observed_fill_orders, (terminal,) if filled else ())
+                    self.assertEqual(result.actions[0].success, status is not OrderStatus.FILLED)
+                    self.assertEqual(rest.get_unresolved_cancellations(), [])
+                    rest.signer_client.cancel_order.assert_awaited_once_with(market_index=1, order_index=987)
+                    rest.get_order_history.assert_awaited_once_with("BTC")
+                    rest.get_open_orders.assert_not_awaited()
+                    rest._mm_confirmation_reader.assert_not_awaited()
+
+    async def test_mm_adapter_delayed_cancel_terminal_keeps_identity_until_consumer_confirmation(self):
+        terminal = _order("987", OrderSide.SELL, Decimal("100.1"), Decimal("0.2"), OrderStatus.CANCELED)
+        for arrives in (True, False):
+            with self.subTest(arrives=arrives):
+                rest = self._ioc_rest([])
+                rest.signer_client.cancel_order = AsyncMock(
+                    return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+                adapter = object.__new__(LighterAdapter)
+                adapter._rest = rest
+                adapter._normalize_symbol = Mock(return_value="BTC")
+                adapter.enable_market_maker_cancellation_outcomes()
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+                    first = await adapter.cancel_order("987", "BTC")
+                    self.assertIs(first.status, OrderStatus.PENDING)
+                    self.assertFalse(first.params["cancel_terminal"])
+                    self.assertIsNone(adapter.get_terminal_cancellation_outcome("987", "BTC"))
+                    self.assertEqual(rest.get_order_history.await_count, 4)
+                    rest.get_order_history.return_value = [terminal] if arrives else []
+                    second = await adapter.cancel_order("987", "BTC")
+                rest.signer_client.cancel_order.assert_awaited_once()
+                self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+                rest.get_open_orders.assert_not_awaited()
+                if arrives:
+                    self.assertIs(second, terminal)
+                    self.assertEqual(rest.get_order_history.await_count, 5)
+                    # Re-reading a retained receipt neither resends nor repolls.
+                    self.assertIs(await adapter.cancel_order("987", "BTC"), terminal)
+                    self.assertEqual(rest.get_order_history.await_count, 5)
+                    self.assertTrue(adapter.confirm_terminal_cancellation_outcome(terminal))
+                    self.assertEqual(rest.get_unresolved_cancellations(), [])
+                    self.assertIsNone(adapter.get_terminal_cancellation_outcome("987", "BTC"))
+                else:
+                    self.assertIs(second.status, OrderStatus.PENDING)
+                    self.assertFalse(second.params["cancel_terminal"])
+                    self.assertIsNone(adapter.get_terminal_cancellation_outcome("987", "BTC"))
+                    self.assertEqual(rest.get_order_history.await_count, 8)
+                rest.signer_client.cancel_order.assert_awaited_once()
+
+    async def test_default_adapter_cancel_keeps_existing_boolean_receipt_contract(self):
+        terminal = _order("987", OrderSide.SELL, Decimal("100.1"), Decimal("0.2"), OrderStatus.CANCELED)
+        rest = self._ioc_rest([terminal])
+        rest.signer_client.cancel_order = AsyncMock(
+            return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+        adapter._normalize_symbol = Mock(return_value="BTC")
+        result = await adapter.cancel_order("987", "BTC")
+        self.assertIs(result.status, OrderStatus.CANCELED)
+        self.assertTrue(result.params["cancel_terminal"])
+        self.assertEqual((result.side, result.amount, result.price, result.client_id),
+                         (OrderSide.BUY, Decimal("0"), None, None))
+        self.assertEqual(rest.get_unresolved_cancellations(), [])
+        self.assertIsNone(adapter.get_terminal_cancellation_outcome("987", "BTC"))
+        self.assertIsNone(adapter.get_market_maker_cancellation_diagnostics("987", "BTC"))
+        rest.get_open_orders.assert_awaited_once_with("BTC")
+        rest.get_order_history.assert_awaited_once_with("BTC")
+        rest.signer_client.cancel_order.assert_awaited_once()
+
+    async def test_mm_cancel_diagnostics_distinguish_missing_and_conflicting_terminal_receipts(self):
+        live = _order("987", OrderSide.BUY, Decimal("99.9"), Decimal("0.2"), OrderStatus.OPEN)
+        conflicting = replace(live, status=OrderStatus.CANCELED, price=Decimal("100.1"))
+        for rows in ([], [conflicting]):
+            with self.subTest(terminal_visible=bool(rows)):
+                rest = self._ioc_rest(rows)
+                rest.signer_client.cancel_order = AsyncMock(
+                    return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+                adapter = object.__new__(LighterAdapter)
+                adapter._rest = rest
+                adapter._normalize_symbol = Mock(return_value="BTC")
+                adapter.enable_market_maker_cancellation_outcomes()
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+                    receipt = await adapter.cancel_order("987", "BTC")
+                diagnostic = adapter.get_market_maker_cancellation_diagnostics("987", "BTC")
+                self.assertEqual(diagnostic, dict(submission="acknowledged", stage="unavailable", error_kind="none",
+                    history_attempts=1 if rows else 4,
+                    history_read_errors=0, exact_history_matches=int(bool(rows)), captured_terminal=int(bool(rows))))
+                if rows:
+                    self.assertIs(receipt, conflicting)
+                    self.assertNotEqual(receipt.price, live.price)
+                else:
+                    self.assertIs(receipt.status, OrderStatus.PENDING)
+                    # Fresh active evidence is not a cancellation rejection or terminal proof.
+                    rest.get_open_orders.return_value = [live]
+                    self.assertEqual(await adapter.get_open_orders("BTC"), [live])
+                    self.assertIsNone(adapter.get_terminal_cancellation_outcome("987", "BTC"))
+                self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+                diagnostic["history_attempts"] = 999
+                self.assertEqual(adapter.get_market_maker_cancellation_diagnostics("987", "BTC")["history_attempts"],
+                                 1 if rows else 4)
+                rest.signer_client.cancel_order.assert_awaited_once()
+
+    async def test_mm_cancel_diagnostics_never_store_provider_payloads_and_unproved_errors_stay_uncertain(self):
+        secret = "fixture-private-provider-payload"
+        success = (object(), SimpleNamespace(code=200, tx_hash="test-tx"), None)
+        cases = (
+            ("signer_or_provider_error", (None, None, secret), None, True, 4, 0),
+            ("signer_or_provider_error", success, TimeoutError(secret), True, 4, 0),
+            ("missing_response_code", (object(), None, None), None, True, 4, 0),
+            ("missing_transaction_proof", (None, SimpleNamespace(code=200), None), None, True, 4, 0),
+            ("response_rejected", (object(), SimpleNamespace(code=400, message=secret), None), None, True, 4, 0),
+            ("signer_or_provider_error", success, RuntimeError("HTTP 429 " + secret), True, 4, 0),
+            ("acknowledged", success, None, True, 4, 4),
+        )
+        for category, response, error, pending, attempts, read_errors in cases:
+            with self.subTest(category=category, history_errors=read_errors):
+                rest = self._ioc_rest([])
+                rest.signer_client.cancel_order = AsyncMock(return_value=response, side_effect=error)
+                if read_errors:
+                    rest.get_order_history.side_effect = RuntimeError(secret)
+                adapter = object.__new__(LighterAdapter)
+                adapter._rest = rest
+                adapter._normalize_symbol = Mock(return_value="BTC")
+                adapter.enable_market_maker_cancellation_outcomes()
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()), \
+                        patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+                    if pending:
+                        self.assertIs((await adapter.cancel_order("987", "BTC")).status, OrderStatus.PENDING)
+                    else:
+                        with self.assertRaises(Exception):
+                            await adapter.cancel_order("987", "BTC")
+                kind = "timeout" if isinstance(error, TimeoutError) else (
+                    "unknown" if category == "signer_or_provider_error" else "none")
+                expected = dict(submission=category, stage="unavailable", error_kind=kind, history_attempts=attempts,
+                    history_read_errors=read_errors, exact_history_matches=0, captured_terminal=0)
+                self.assertEqual(adapter.get_market_maker_cancellation_diagnostics("987", "BTC"), expected)
+                self.assertNotIn(secret, repr(rest._mm_cancellation_diagnostics))
+                self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")] if pending else [])
+                self.assertEqual(rest.get_order_history.await_count, attempts)
+                rest.signer_client.cancel_order.assert_awaited_once()
+
+    @staticmethod
+    def _real_cancel_sdk(rows=()):
+        """Use the installed nonce decorator and send method; native signing and HTTP are fake."""
+        from lighter.signer_client import SignerClient
+        from lighter.nonce_manager import OptimisticNonceManager
+        rest = LighterRateLimitBoundaryTests._ioc_rest(list(rows))
+        rest.api_key_index = 0
+        rest.base_url = "https://fixture.invalid"
+        rest._call_api = LighterRest._call_api.__get__(rest, LighterRest)
+        signer = object.__new__(SignerClient)
+        signer.account_index = 7
+        signer.nonce_manager = OptimisticNonceManager(7, None, [0])
+        signer.nonce_manager.nonce[0] = 40
+        signer.signer = SimpleNamespace(SignCancelOrder=Mock(return_value=object()))
+        signer._SignerClient__decode_tx_info = Mock(return_value=(15, '{"OrderNonce":987}', "fixture-hash", None))
+        signer.tx_api = SimpleNamespace(send_tx=AsyncMock(return_value=SimpleNamespace(code=200, tx_hash="fixture-hash")))
+        rest.signer_client = signer
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+        adapter._normalize_symbol = Mock(return_value="BTC")
+        adapter.enable_market_maker_cancellation_outcomes()
+        return adapter, rest, signer
+
+    async def test_mm_sdk_local_sign_error_requires_observed_completed_nonce_rollback(self):
+        for rollback in (True, False):
+            with self.subTest(rollback=rollback):
+                adapter, rest, signer = self._real_cancel_sdk()
+                native_sign = signer.sign_cancel_order
+                signer._SignerClient__decode_tx_info.return_value = (None, None, None, "fixture-private-sign-error")
+                if not rollback:
+                    signer.nonce_manager.acknowledge_failure = Mock()
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()), \
+                        patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+                    if rollback:
+                        with self.assertRaises(OrderCancellationNotSentError) as caught:
+                            await adapter.cancel_order("987", "BTC")
+                        self.assertEqual((caught.exception.symbol, caught.exception.order_id), ("BTC", "987"))
+                        self.assertNotIn("fixture-private", str(caught.exception))
+                        self.assertIsNone(caught.exception.__cause__)
+                    else:
+                        self.assertIs((await adapter.cancel_order("987", "BTC")).status, OrderStatus.PENDING)
+                self.assertEqual(signer.nonce_manager.nonce[0], 40 if rollback else 41)
+                signer.tx_api.send_tx.assert_not_awaited()
+                self.assertEqual(rest.get_order_history.await_count, 0 if rollback else 4)
+                self.assertEqual(rest.get_unresolved_cancellations(), [] if rollback else [("BTC", "987")])
+                diagnostic = adapter.get_market_maker_cancellation_diagnostics("987", "BTC")
+                self.assertEqual((diagnostic["stage"], diagnostic["error_kind"]), ("sign", "local_sign_error"))
+                self.assertNotIn("fixture-private", repr(diagnostic))
+                self.assertEqual(signer.sign_cancel_order, native_sign)
+                self.assertNotIn("send_tx", signer.__dict__)
+
+    async def test_mm_sdk_cancel_dns_never_claims_no_send_even_for_configured_host(self):
+        from aiohttp import ClientConnectorDNSError
+        for mode in ("configured_host", "wrong_host", "multiple_keys", "redirect_after_post"):
+            with self.subTest(mode=mode):
+                adapter, rest, signer = self._real_cancel_sdk()
+                if mode == "multiple_keys":
+                    signer.nonce_manager.api_keys_list = [0, 1]
+                    signer.nonce_manager.nonce[1] = 40
+                host = "other.invalid" if mode == "wrong_host" else "fixture.invalid"
+                dns_error = ClientConnectorDNSError(
+                    SimpleNamespace(host=host, port=443, ssl=True), OSError(1, "fixture-private-dns-error"))
+                intermediate_posts = []
+                if mode == "redirect_after_post":
+                    async def redirected_send(*args, **kwargs):
+                        # aiohttp can send the initial POST before a 307/308
+                        # redirect's DNS failure, even back to the configured host.
+                        intermediate_posts.append(1)
+                        raise dns_error
+                    signer.tx_api.send_tx.side_effect = redirected_send
+                else:
+                    signer.tx_api.send_tx.side_effect = dns_error
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()), \
+                        patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+                    self.assertIs((await adapter.cancel_order("987", "BTC")).status, OrderStatus.PENDING)
+                key = 1 if mode == "multiple_keys" else 0
+                self.assertEqual(signer.nonce_manager.nonce[key], 41)
+                self.assertFalse(signer.nonce_manager.lock(key).locked())
+                signer.tx_api.send_tx.assert_awaited_once()
+                self.assertEqual(intermediate_posts, [1] if mode == "redirect_after_post" else [])
+                self.assertEqual(rest.get_order_history.await_count, 4)
+                diagnostic = adapter.get_market_maker_cancellation_diagnostics("987", "BTC")
+                self.assertEqual((diagnostic["stage"], diagnostic["error_kind"]), ("send", "dns"))
+                self.assertNotIn("fixture-private", repr(diagnostic))
+
+    async def test_mm_cancel_sign_method_override_cannot_supply_no_send_proof(self):
+        adapter, rest, signer = self._real_cancel_sdk()
+        sends = []
+        def overridden_sign(*args, **kwargs):
+            # A custom signing hook need not be pure: it can bypass send_tx.
+            sends.append(asyncio.create_task(signer.tx_api.send_tx(tx_type=15, tx_info="{}")))
+            return None, None, None, "fixture-private-sign-error"
+        signer.sign_cancel_order = overridden_sign
+        with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()), \
+                patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+            self.assertIs((await adapter.cancel_order("987", "BTC")).status, OrderStatus.PENDING)
+            await asyncio.gather(*sends)
+        self.assertEqual(signer.nonce_manager.nonce[0], 40)
+        signer.tx_api.send_tx.assert_awaited_once()
+        self.assertEqual(rest.get_order_history.await_count, 4)
+        diagnostic = adapter.get_market_maker_cancellation_diagnostics("987", "BTC")
+        self.assertEqual((diagnostic["stage"], diagnostic["error_kind"]), ("unavailable", "unknown"))
+        self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+        self.assertIs(signer.sign_cancel_order, overridden_sign)
+
+    async def test_mm_create_redirect_dns_and_unproved_429_keep_nonce_and_submission_quarantined(self):
+        from aiohttp import ClientConnectorDNSError
+        from lighter.exceptions import BadRequestException
+        for mode in ("redirect_dns", "timeout_429", "bad_request_429", "returned_error_429"):
+            with self.subTest(mode=mode):
+                _, rest, signer = self._real_cancel_sdk()
+                signer.signer.SignCreateOrder = Mock(return_value=object())
+                rest._convert_limit_order_params.return_value = dict(market_index=1, client_order_index=1,
+                    base_amount=200, price=1000, is_ask=False, order_type=0, time_in_force=2)
+                rest._handle_ambiguous_order_submission = LighterRest._handle_ambiguous_order_submission.__get__(rest, LighterRest)
+                intermediate_posts = []
+                async def send(*args, **kwargs):
+                    intermediate_posts.append(1)
+                    if mode == "redirect_dns":
+                        raise ClientConnectorDNSError(SimpleNamespace(host="fixture.invalid", port=443, ssl=True),
+                            OSError(1, "fixture-private-dns"))
+                    if mode == "timeout_429":
+                        raise TimeoutError("fixture-private HTTP 429")
+                    raise BadRequestException(status=400, reason="fixture-private HTTP 429")
+                signer.tx_api.send_tx.side_effect = send
+                if mode == "returned_error_429":
+                    async def call_api(operation, factory, **kwargs):
+                        return await factory()
+                    rest._call_api = call_api
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()), \
+                        patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+                    order = await rest.place_order("BTC", "buy", "limit", Decimal("0.2"), Decimal("100"),
+                        time_in_force="POST_ONLY", _raise_on_definitive_pre_send_failure=True)
+                    self.assertIs(order.status, OrderStatus.PENDING)
+                    self.assertTrue(order.params["submission_uncertain"])
+                    self.assertIsNone(order.id)
+                    self.assertEqual(order.client_id, "1")
+                    self.assertEqual(await rest.resolve_unresolved_submissions(), [])
+                self.assertEqual(signer.nonce_manager.nonce[0],
+                                 40 if mode in {"bad_request_429", "returned_error_429"} else 41)
+                self.assertEqual(intermediate_posts, [1])
+                signer.tx_api.send_tx.assert_awaited_once()
+                self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+                self.assertNotIn("fixture-private", repr(order.raw_data))
+                self.assertNotIn("_raise_on_definitive_pre_send_failure", rest._convert_limit_order_params.call_args.kwargs)
+
+    async def test_mm_sdk_cancel_unproved_and_after_send_failures_reconcile_without_resending(self):
+        from lighter.exceptions import BadRequestException
+        for mode, stage, kind, sends, nonce in (
+                ("before_sign", "before_sign", "unknown", 0, 40),
+                ("native_raises", "sign", "unknown", 0, 41),
+                ("timeout", "send", "timeout", 1, 41),
+                ("parse", "after_send", "response_decode", 1, 41),
+                ("bad_request", "send", "http_4xx", 1, 40),
+                ("text_429", "send", "unknown", 1, 41)):
+            with self.subTest(mode=mode):
+                adapter, rest, signer = self._real_cancel_sdk()
+                native_sign = signer.sign_cancel_order
+                if mode == "before_sign":
+                    signer.nonce_manager.async_next_nonce = AsyncMock(side_effect=ValueError("fixture-private"))
+                elif mode == "native_raises":
+                    signer.signer.SignCancelOrder.side_effect = TypeError("fixture-private HTTP 429")
+                elif mode == "timeout":
+                    signer.tx_api.send_tx.side_effect = TimeoutError("fixture-private")
+                elif mode == "parse":
+                    signer._SignerClient__decode_tx_info.return_value = (15, '{malformed-fixture-private', "fixture-hash", None)
+                elif mode == "bad_request":
+                    signer.tx_api.send_tx.side_effect = BadRequestException(status=400, reason="fixture-private")
+                elif mode == "text_429":
+                    signer.tx_api.send_tx.side_effect = ValueError("fixture-private HTTP 429")
+                with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()), \
+                        patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+                    self.assertIs((await adapter.cancel_order("987", "BTC")).status, OrderStatus.PENDING)
+                    self.assertEqual(rest.get_order_history.await_count, 4)
+                    # Another request for this same uncertain ID only reads proof.
+                    self.assertIs((await adapter.cancel_order("987", "BTC")).status, OrderStatus.PENDING)
+                self.assertEqual(rest.get_order_history.await_count, 8)
+                self.assertEqual(signer.tx_api.send_tx.await_count, sends)
+                self.assertEqual(signer.nonce_manager.nonce[0], nonce)
+                diagnostic = adapter.get_market_maker_cancellation_diagnostics("987", "BTC")
+                self.assertEqual((diagnostic["stage"], diagnostic["error_kind"]), (stage, kind))
+                self.assertNotIn("fixture-private", repr(diagnostic))
+                self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+                self.assertEqual(signer.sign_cancel_order, native_sign)
+                self.assertNotIn("send_tx", signer.__dict__)
+
+    async def test_mm_sdk_after_send_error_tuple_can_return_exact_terminal(self):
+        from lighter.exceptions import BadRequestException
+        for status, remaining in ((OrderStatus.CANCELED, Decimal("0.1")),
+                                  (OrderStatus.FILLED, Decimal("0"))):
+            with self.subTest(status=status):
+                terminal = replace(_order("987", OrderSide.SELL, Decimal("100"), Decimal("0.2"), status),
+                    remaining=remaining, filled=Decimal("0.2") - remaining)
+                adapter, rest, signer = self._real_cancel_sdk([terminal])
+                signer.tx_api.send_tx.side_effect = BadRequestException(status=400, reason="fixture-private")
+                with patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+                    self.assertIs(await adapter.cancel_order("987", "BTC"), terminal)
+                self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+                rest.get_order_history.assert_awaited_once()
+                signer.tx_api.send_tx.assert_awaited_once()
+                self.assertTrue(adapter.confirm_terminal_cancellation_outcome(terminal))
+                self.assertEqual(rest.get_unresolved_cancellations(), [])
+                self.assertIsNone(adapter.get_market_maker_cancellation_diagnostics("987", "BTC"))
+
+    async def test_mm_cancel_outer_proof_failure_preserves_uncertainty_without_another_loop(self):
+        adapter, rest, signer = self._real_cancel_sdk()
+        rest._reconcile_cancellation = AsyncMock(side_effect=ValueError("fixture-private HTTP 429"))
+        with patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()) as log:
+            self.assertIs((await adapter.cancel_order("987", "BTC")).status, OrderStatus.PENDING)
+        self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
+        rest._reconcile_cancellation.assert_awaited_once()
+        signer.tx_api.send_tx.assert_awaited_once()
+        self.assertNotIn("fixture-private", repr(log.mock_calls))
+
+    async def test_mm_sdk_cancel_wrappers_restore_on_task_cancellation_and_pass_other_tasks(self):
+        from lighter.signer_client import SignerClient
+        adapter, rest, signer = self._real_cancel_sdk()
+        native_sign = signer.sign_cancel_order
+        class_send = SignerClient.send_tx
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def send(*args, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+            return SimpleNamespace(code=200, tx_hash="fixture-hash")
+        signer.tx_api.send_tx.side_effect = send
+        pending = asyncio.create_task(adapter.cancel_order("987", "BTC"))
+        await asyncio.wait_for(entered.wait(), 1)
+        # An unrelated task on the same instance is passed through, not attributed.
+        response = await signer.send_tx(15, "{}")
+        self.assertEqual(response.code, 200)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertEqual(signer.tx_api.send_tx.await_count, 2)
+        self.assertEqual(signer.sign_cancel_order, native_sign)
+        self.assertNotIn("send_tx", signer.__dict__)
+        self.assertIs(SignerClient.send_tx, class_send)
+        self.assertFalse(signer.nonce_manager.lock(0).locked())
+
+    async def test_mm_sdk_concurrent_cancel_observations_are_instance_scoped_and_restored(self):
+        terminals = [_order(str(i), OrderSide.BUY, Decimal("100"), Decimal("0.2"), OrderStatus.CANCELED)
+                     for i in (987, 988)]
+        adapter, rest, signer = self._real_cancel_sdk(terminals)
+        native_sign = signer.sign_cancel_order
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def send(*args, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+            return SimpleNamespace(code=200, tx_hash="fixture-hash")
+        signer.tx_api.send_tx.side_effect = send
+        first = asyncio.create_task(adapter.cancel_order("987", "BTC"))
+        await asyncio.wait_for(entered.wait(), 1)
+        second = asyncio.create_task(adapter.cancel_order("988", "BTC"))
+        await asyncio.sleep(0)
+        self.assertEqual(signer.signer.SignCancelOrder.call_count, 1)
+        release.set()
+        with patch("core.adapters.exchanges.adapters.lighter_rest.logger", new=Mock()):
+            self.assertEqual(await asyncio.gather(first, second), terminals)
+        self.assertEqual(signer.tx_api.send_tx.await_count, 2)
+        self.assertEqual(signer.nonce_manager.nonce[0], 42)
+        for identifier in ("987", "988"):
+            diagnostic = adapter.get_market_maker_cancellation_diagnostics(identifier, "BTC")
+            self.assertEqual((diagnostic["stage"], diagnostic["error_kind"]), ("complete", "none"))
+        self.assertEqual(signer.sign_cancel_order, native_sign)
+        self.assertNotIn("send_tx", signer.__dict__)
+
+    async def test_mm_cancel_diagnostic_storage_is_bounded_and_failure_is_isolated(self):
+        rest = self._ioc_rest([])
+        rest.enable_terminal_cancellation_outcomes()
+        for identifier in range(10):
+            rest._record_mm_cancellation_diagnostic("BTC", str(identifier), submission="acknowledged")
+        self.assertEqual(len(rest._mm_cancellation_diagnostics), 2)
+        self.assertIsNone(rest.get_market_maker_cancellation_diagnostics("BTC", "0"))
+        terminal = _order("987", OrderSide.SELL, Decimal("100.1"), Decimal("0.2"), OrderStatus.CANCELED)
+        rest.get_order_history.return_value = [terminal]
+        rest.signer_client.cancel_order = AsyncMock(
+            return_value=(object(), SimpleNamespace(code=200, tx_hash="test-tx"), None))
+        rest._mm_cancellation_diagnostics = object()  # A broken diagnostic sink cannot affect proof.
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+        adapter._normalize_symbol = Mock(return_value="BTC")
+        self.assertIs(await adapter.cancel_order("987", "BTC"), terminal)
+        self.assertIsNone(adapter.get_market_maker_cancellation_diagnostics("987", "BTC"))
+        self.assertTrue(adapter.confirm_terminal_cancellation_outcome(terminal))
+        self.assertEqual(rest.get_unresolved_cancellations(), [])
+        rest.signer_client.cancel_order.assert_awaited_once()
+
+    async def test_mm_cancel_confirmation_does_not_cross_exchange_and_client_namespaces(self):
+        first = replace(_order("101", OrderSide.BUY, Decimal("99.9"), Decimal("0.2"), OrderStatus.CANCELED),
+                        client_id="202")
+        second = _order("202", OrderSide.SELL, Decimal("100.1"), Decimal("0.2"), OrderStatus.CANCELED)
+        rest = self._ioc_rest([first, second])
+        rest.enable_terminal_cancellation_outcomes()
+        rest._uncertain_cancellations = {("BTC", "101"), ("BTC", "202")}
+        rest._terminal_cancellation_outcomes = {("BTC", "101"): first, ("BTC", "202"): second}
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+        adapter._normalize_symbol = Mock(return_value="BTC")
+
+        self.assertTrue(adapter.confirm_terminal_cancellation_outcome(first))
+        self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "202")])
+        self.assertIsNone(adapter.get_terminal_cancellation_outcome("101", "BTC"))
+        self.assertIs(adapter.get_terminal_cancellation_outcome("202", "BTC"), second)
+        for identifier in (None, ""):
+            self.assertFalse(adapter.confirm_terminal_cancellation_outcome(replace(first, id=identifier)))
+            self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "202")])
+            self.assertIs(adapter.get_terminal_cancellation_outcome("202", "BTC"), second)
+        self.assertTrue(adapter.confirm_terminal_cancellation_outcome(second))
+        self.assertEqual(rest.get_unresolved_cancellations(), [])
+        rest.get_order_history.assert_not_awaited()
+        rest.get_open_orders.assert_not_awaited()
+
+    async def test_default_cancel_confirmation_preserves_client_id_fallback(self):
+        terminal = replace(_order("101", OrderSide.BUY, Decimal("99.9"), Decimal("0.2"), OrderStatus.CANCELED),
+                           id=None, client_id="202")
+        rest = self._ioc_rest([])
+        rest._uncertain_cancellations = {("BTC", "202")}
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+        adapter._normalize_symbol = Mock(return_value="BTC")
+        self.assertTrue(adapter.confirm_terminal_cancellation_outcome(terminal))
+        self.assertEqual(rest.get_unresolved_cancellations(), [])
 
     @staticmethod
     def _submission_rest(result) -> LighterRest:

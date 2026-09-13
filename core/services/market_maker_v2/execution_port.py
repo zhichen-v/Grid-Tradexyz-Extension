@@ -24,6 +24,7 @@ from .domain import (
     StrategyState,
     TelemetryEvent,
     WorkingOrder,
+    OrderEvidence,
     _count,
     _symbol,
     _time,
@@ -77,16 +78,24 @@ class BoundedExecutionPort:
 
     def __init__(self, manager: MarketMakerOrderManager, account: AccountPort,
                  market: MarketDataPort, clock: Clock, *,
-                 authorize_bounded_flatten: bool = False, on_failure=None):
+                 authorize_bounded_flatten: bool = False, on_failure=None, on_order_evidence=None,
+                 before_cleanup_reconcile=None, before_cleanup_audit=None, pre_cleanup_account=None):
         if authorize_bounded_flatten is not True:
             raise ExecutionUnavailable("per-run bounded flatten authorization required")
         self.manager, self.account, self.market, self.clock = manager, account, market, clock
         self._on_failure = on_failure
+        self._on_order_evidence = on_order_evidence
+        self._before_cleanup_reconcile = before_cleanup_reconcile
+        self._before_cleanup_audit = before_cleanup_audit
+        self._pre_cleanup_account = pre_cleanup_account or account.snapshot
         try:
             self._symbol = manager.config.symbol
         except Exception:
             raise ExecutionUnavailable("authorized bounded execution unavailable") from None
         self._failed = False
+        self._cleanup_only = False
+        self._fault_generation = 0
+        self._cancel_recovery_ids = frozenset()
         self._lock = asyncio.Lock()
         self._require_authorized_mode()
 
@@ -95,6 +104,128 @@ class BoundedExecutionPort:
             try:
                 self._on_failure(stage, error)
             except Exception:
+                pass
+
+    def _halt(self, cancellation_ids=()):
+        # Only this exact known-cancel failure may be cleared by terminal proof.
+        # A generic snapshot, IOC or interrupted operation remains latched.
+        recoverable = not self._failed or bool(self._cancel_recovery_ids)
+        self._failed = True
+        self._fault_generation += 1
+        self._cancel_recovery_ids = frozenset()
+        if cancellation_ids and recoverable:
+            try:
+                self._cancel_recovery_ids = frozenset(
+                    slot.order_id for slot in self.manager.snapshot()
+                    if slot.order_id in cancellation_ids and slot.cancellation_uncertain)
+            except Exception:
+                pass  # An unavailable manager cannot authorize recovery.
+
+    @property
+    def can_reconcile_cancellation(self):
+        return bool(self._failed and self._cancel_recovery_ids
+                    and self._cancel_recovery_ids <= self.manager.known_order_ids
+                    and self.manager.can_reconcile_known_cancellations)
+
+    async def reconcile_cancellation_for_cleanup(self, deadline):
+        """One bounded proof operation; an active order never proves cancel failure."""
+        self._require_authorized_mode()
+        _time(deadline)
+        deadline = min(deadline, self.clock.monotonic() + 10)
+        async with self._lock:
+            return await self._reconcile_cancellation_for_cleanup(deadline)
+
+    async def _reconcile_cancellation_for_cleanup(self, deadline):
+        pending = self._cancel_recovery_ids
+        reads, pending_count = 0, len(pending)
+
+        def failed(reason):
+            try:
+                values = {"recovery_reads": Decimal(reads),
+                          "recovery_pending_count": Decimal(len(pending - self.manager.terminal_order_ids)),
+                          "recovery_deadline_remaining_ms": Decimal(str(max(
+                              0, deadline - self.clock.monotonic()))) * 1000,
+                          reason: Decimal(1)}
+                self._diagnose("exit_order_sync", ExecutionUnavailable(
+                    "bounded cancellation proof unavailable", values=values))
+            except Exception:
+                pass  # Diagnostic availability cannot authorize or delay cleanup.
+            return False
+
+        try:
+            eligible = self.can_reconcile_cancellation
+            self._cancel_recovery_ids = frozenset()  # Consume this failure's one operation.
+            if not eligible:
+                return failed("recovery_ineligible")
+            fault_generation = self._fault_generation
+            generation, known = self.manager.mutation_generation, self.manager.known_order_ids
+
+            def invalid_scope():
+                if (self._fault_generation != fault_generation
+                        or self.manager.mutation_generation != generation
+                        or self.manager.known_order_ids != known):
+                    return "recovery_scope_changed"
+                if (not self.manager.can_reconcile_known_cancellations
+                        or self.manager.has_unknown_order_state
+                        or any(identifier not in pending for _, identifier
+                               in self.manager.get_unresolved_cancellations())):
+                    return "recovery_ineligible"
+                return None
+
+            for attempt in range(2):
+                if reason := invalid_scope():
+                    return failed(reason)
+                if attempt:
+                    if deadline - self.clock.monotonic() <= 0.5:
+                        return failed("recovery_deadline_exhausted")
+                    await self._bounded(lambda: asyncio.sleep(0.5), deadline)
+                    if reason := invalid_scope():
+                        return failed(reason)
+                if self.clock.monotonic() >= deadline:
+                    return failed("recovery_deadline_exhausted")
+                if self._before_cleanup_reconcile is not None:
+                    self._before_cleanup_reconcile()
+                if reason := invalid_scope():
+                    return failed(reason)
+                reads += 1
+                await self._bounded(self.manager.sync_open_orders, deadline)
+                if reason := invalid_scope():
+                    return failed(reason)
+                pending_count = len(pending - self.manager.terminal_order_ids)
+                if pending_count:
+                    if attempt:
+                        return failed("recovery_terminal_pending")
+                    continue  # Only missing proof permits the one delayed read.
+                if self.manager.has_uncertain_state or self.manager.get_unresolved_cancellations():
+                    return failed("recovery_registry_pending")
+                self._failed = False
+                if self.snapshot().health is not ExecutionHealth.HEALTHY:
+                    self._halt()
+                    return failed("recovery_unhealthy")
+                return True
+        except ApiBudgetUnavailable:
+            failed("recovery_budget_refused")
+            if reads:
+                # Extra proof is optional. Preserve the original cancellation
+                # failure when its additional read cannot be admitted.
+                return False
+            raise
+        except asyncio.CancelledError:
+            failed("recovery_read_failed")
+            raise
+        except TimeoutError:
+            return failed("recovery_deadline_exhausted")
+        except Exception:
+            return failed("recovery_read_failed")
+
+    def _record_order(self, order_id, side, price, size, reduce_only, tif, started, market, state):
+        if self._on_order_evidence is not None:
+            try:
+                self._on_order_evidence(OrderEvidence(self._symbol, order_id, side, price, size,
+                    reduce_only, tif, started, self.clock.monotonic(), market, state))
+            except Exception:
+                # Missing diagnostic coverage cannot interrupt known-order cleanup.
+                # The analyzer leaves unlinked fills unclassified.
                 pass
 
     def _require_authorized_mode(self):
@@ -140,7 +271,7 @@ class BoundedExecutionPort:
             return ExecutionSnapshot(health, len(managed), False, symbol=self._symbol,
                                      observed_monotonic=self.clock.monotonic(), orders=orders)
         except Exception:
-            self._failed = True
+            self._halt()
             raise ExecutionUnavailable("bounded execution snapshot unavailable") from None
 
     async def reconcile_quotes(self, plan: QuotePlan) -> ExecutionResult:
@@ -193,23 +324,55 @@ class BoundedExecutionPort:
             terminal = False
             try:
                 deadline = self.clock.monotonic() + 10
-                result = await self._bounded(
-                    lambda: self.manager.cancel_managed_orders("v2 bounded cancellation"), deadline)
-                if (result.errors or not {o.order_id for o in before.orders}
-                        <= self.manager.terminal_order_ids):
-                    raise ExecutionUnavailable("managed cancellation not confirmed")
+                if self._cleanup_only:
+                    # A definite no-send keeps ownership, never permission to
+                    # reuse old account truth. Pay for this extra audit before
+                    # using the exit's existing cancellation allowance.
+                    if self._before_cleanup_audit is not None:
+                        self._before_cleanup_audit()
+                    started = self.clock.monotonic()
+                    generation, fault = self.manager.mutation_generation, self._fault_generation
+                    known = self.manager.known_order_ids
+                    await self._bounded(self.manager.sync_open_orders, deadline)
+                    account = await self._bounded(self._pre_cleanup_account, deadline)
+                    current = self.snapshot()
+                    if (self._fault_generation != fault or self.manager.mutation_generation != generation
+                            or self.manager.known_order_ids != known
+                            or current.health is not ExecutionHealth.HEALTHY
+                            or type(account) is not AccountSnapshot or account.symbol != self._symbol
+                            or not account.authenticated or not account.fresh(self.clock.monotonic())
+                            or not started <= account.observed_monotonic <= self.clock.monotonic()
+                            or account.open_order_ids is None or current.orders is None
+                            or set(account.open_order_ids) != {o.order_id for o in current.orders}):
+                        raise ExecutionUnavailable("fresh owned-order account required before cleanup")
+                    before = current
+                expected = {o.order_id for o in before.orders}
+                for attempt in range(2):
+                    result = await self._bounded(
+                        lambda: self.manager.cancel_managed_orders("v2 bounded cancellation"), deadline)
+                    if not result.errors and expected <= self.manager.terminal_order_ids:
+                        break
+                    self._halt(expected)
+                    if attempt or not await self._reconcile_cancellation_for_cleanup(deadline):
+                        raise ExecutionUnavailable("managed cancellation not confirmed")
+                    # Exact terminal recovery may leave another known side to
+                    # cancel. Only that remaining side is touched, in the same 10s.
+                    if expected <= self.manager.terminal_order_ids:
+                        break
                 terminal = True
                 account = await self._account_after(self.clock.monotonic(), deadline)
                 return self._confirmed(account, cancelled=before.managed_order_count)
             except asyncio.CancelledError:
-                self._failed = True
+                self._halt()
                 raise
             except ApiBudgetUnavailable:
-                self._failed = not terminal
+                if not terminal:
+                    self._halt()
                 raise
             except Exception as error:
                 self._diagnose("cancel_managed_orders", error)
-                self._failed = not terminal or isinstance(error, TimeoutError)
+                if not terminal or isinstance(error, TimeoutError):
+                    self._halt()
                 return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot())
 
     async def flatten_ioc(self, intent: FlattenIntent) -> ExecutionResult:
@@ -224,11 +387,11 @@ class BoundedExecutionPort:
             try:
                 return await self._flatten_once(intent, before)
             except asyncio.CancelledError:
-                self._failed = True
+                self._halt()
                 raise
             except Exception as error:
                 self._diagnose("flatten_ioc", error)
-                self._failed = True
+                self._halt()
                 return ExecutionResult(ExecutionStatus.BLOCKED, self.snapshot(),
                                        submitted_count=len(self.manager.active_unwind_order_ids - previous_ids))
 
@@ -271,12 +434,15 @@ class BoundedExecutionPort:
         # proof below before the caller can attempt the remaining quantity.
         desired = replace(desired, amount=self._ioc_chunk(account.position.copy_abs()))
         previous_ids = self.manager.active_unwind_order_ids
+        submitted_at = self.clock.monotonic()
         result = await self._bounded(
             lambda: self.manager.execute_active_unwind(desired, prepared_generation=generation), deadline)
         submitted_ids = self.manager.active_unwind_order_ids - previous_ids
         if (result.errors or len(submitted_ids) != 1 or self.manager.active_unwind_pending
                 or not submitted_ids <= self.manager.terminal_order_ids):
             raise ExecutionUnavailable("exact IOC terminal evidence required")
+        self._record_order(next(iter(submitted_ids)), intent.side, desired.price, desired.amount,
+                           True, "IOC", submitted_at, market, StrategyState.FLATTENING)
         final = await self._account_after(self.clock.monotonic(), deadline)
         if (final.position.copy_abs() > account.position.copy_abs()
                 or (final.position != 0 and (final.position > 0) != (account.position > 0))):
@@ -362,7 +528,9 @@ class VolumeExecutionPort(BoundedExecutionPort):
     def __init__(self, manager, account, market, clock, *, refresh_quote,
                  reprice_threshold_ticks: int, max_quote_age_ms: int,
                  authorize_bounded_flatten: bool = False, before_mutation=None, before_cancel=None,
-                 on_failure=None, before_optional_revision=None, on_optional_refusal=None):
+                 on_failure=None, before_optional_revision=None, on_optional_refusal=None,
+                 on_order_evidence=None, before_cleanup_reconcile=None, before_cleanup_audit=None,
+                 pre_cleanup_account=None):
         for value in (reprice_threshold_ticks, max_quote_age_ms):
             _count(value)
             if value == 0:
@@ -370,7 +538,10 @@ class VolumeExecutionPort(BoundedExecutionPort):
         if not callable(refresh_quote):
             raise ValueError("quote refresh callback required")
         super().__init__(manager, account, market, clock,
-                         authorize_bounded_flatten=authorize_bounded_flatten, on_failure=on_failure)
+                         authorize_bounded_flatten=authorize_bounded_flatten, on_failure=on_failure,
+                         on_order_evidence=on_order_evidence,
+                         before_cleanup_reconcile=before_cleanup_reconcile,
+                         before_cleanup_audit=before_cleanup_audit, pre_cleanup_account=pre_cleanup_account)
         if manager.config.post_only is not True:
             raise ExecutionUnavailable("normal volume quotes require POST_ONLY")
         self.refresh_quote = refresh_quote
@@ -421,7 +592,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
             return await self.cancel_all_managed()
         async with self._lock:
             before = self.snapshot()
-            if before.health is not ExecutionHealth.HEALTHY:
+            if before.health is not ExecutionHealth.HEALTHY or self._cleanup_only:
                 return ExecutionResult(ExecutionStatus.BLOCKED, before)
             submitted = cancelled = 0
             try:
@@ -561,6 +732,7 @@ class VolumeExecutionPort(BoundedExecutionPort):
                         raise
                     return deferred
             self._admit_cancel(len(selected))
+            fault = self._fault_generation
             result = await self._bounded(
                 lambda: self.manager.cancel_managed_orders("v2 quote revision",
                     sides=frozenset(OrderSide(side.value) for side in revision)), deadline)
@@ -568,7 +740,12 @@ class VolumeExecutionPort(BoundedExecutionPort):
             if (result.errors or not selected <= self.manager.terminal_order_ids
                     or execution.orders is None
                     or any(order.side in revision for order in execution.orders)):
-                self._failed = True
+                # A typed no-send did not alter the live order. Preserve only
+                # cleanup, with a fresh audit; never restart normal quotation.
+                if self._only_cancel_not_sent(result, selected, execution, fault):
+                    self._cleanup_only = True
+                else:
+                    self._halt(selected)
                 raise ExecutionUnavailable("quote cancellation lacks exact terminal proof")
             cancelled += len(selected)
             authorization = await self._fresh_quote(execution, deadline, self.clock.monotonic())
@@ -591,7 +768,13 @@ class VolumeExecutionPort(BoundedExecutionPort):
                 if deferred is None:
                     raise
                 return deferred
+        submitted_at = self.clock.monotonic()
         result = await self._bounded(lambda: self.manager.reconcile(execution_plan, execution_risk), deadline)
+        for action in result.actions:
+            if action.operation == "place" and action.order_id in self.manager.known_order_ids:
+                self._record_order(action.order_id, Side(action.side.value), action.price, action.amount,
+                    action.reduce_only, "POST_ONLY", submitted_at, authorization.market,
+                    authorization.decision.state)
         self._capture_post_only_rejection()
         snapshot = self.snapshot()
         status = (ExecutionStatus.BLOCKED if result.errors or snapshot.health is not ExecutionHealth.HEALTHY
@@ -599,6 +782,23 @@ class VolumeExecutionPort(BoundedExecutionPort):
         return ExecutionResult(status, snapshot,
             submitted_count=sum(action.operation == "place" and action.success is True for action in result.actions),
             cancelled_count=cancelled, actual_plan=effective)
+
+    def _only_cancel_not_sent(self, result, selected, execution, fault):
+        from .order_manager import ReconcileAction, ReconcileResult
+
+        if (type(result) is not ReconcileResult or not result.errors or self._failed
+                or self._fault_generation != fault or execution.health is not ExecutionHealth.HEALTHY):
+            return False
+        failed = [action for action in result.actions if type(action) is ReconcileAction
+                  and action.cancellation_not_sent is True and action.success is False]
+        if len(failed) != len(result.errors):
+            return False
+        live = {order.order_id for order in execution.orders or ()}
+        return (all(action.order_id in selected & live for action in failed)
+                and all(type(action) is ReconcileAction and action.operation == "cancel"
+                        and action.order_id in selected
+                        and (action in failed or action.order_id in self.manager.terminal_order_ids)
+                        for action in result.actions))
 
     @staticmethod
     def _execution_quotes(plan, authorization):

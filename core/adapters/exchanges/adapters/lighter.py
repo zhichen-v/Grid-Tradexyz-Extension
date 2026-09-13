@@ -902,15 +902,27 @@ class LighterAdapter(ExchangeAdapter):
             str(order_id),
         )
 
+    def get_market_maker_cancellation_diagnostics(self, order_id: str, symbol: str):
+        """Read bounded MM-only cancel labels/counts without another request."""
+        try:
+            return self._rest.get_market_maker_cancellation_diagnostics(self._normalize_symbol(symbol), str(order_id))
+        except Exception:
+            return None
+
     def confirm_terminal_cancellation_outcome(self, order: OrderData) -> bool:
         """Clear one cancellation marker after an exact terminal update."""
-        identifiers = tuple(
-            dict.fromkeys(
-                str(identifier)
-                for identifier in (order.id, order.client_id)
-                if identifier is not None
+        if getattr(self._rest, "_capture_terminal_cancellation_outcomes", False) is True:
+            # MM markers use exchange IDs exclusively; a client ID may equal
+            # another pending order's exchange ID and must never consume it.
+            identifiers = (str(order.id),) if order.id not in (None, "") else ()
+        else:
+            identifiers = tuple(
+                dict.fromkeys(
+                    str(identifier)
+                    for identifier in (order.id, order.client_id)
+                    if identifier is not None
+                )
             )
-        )
         cleared = False
         for identifier in identifiers:
             cleared = (
@@ -1053,6 +1065,10 @@ class LighterAdapter(ExchangeAdapter):
         """
         normalized_symbol = self._normalize_symbol(symbol)
         success = await self._rest.cancel_order(normalized_symbol, order_id)
+        if getattr(self._rest, "_capture_terminal_cancellation_outcomes", False) is True:
+            terminal = self._rest.get_terminal_cancellation_outcome(normalized_symbol, str(order_id))
+            if terminal is not None:
+                return terminal  # MM confirms the complete receipt; no placeholder reconstruction.
         cancellation_uncertain = (
             normalized_symbol,
             str(order_id),

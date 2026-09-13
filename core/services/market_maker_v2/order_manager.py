@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Iterable
 
 from ...adapters.exchanges.exceptions import (
+    OrderCancellationNotSentError,
     OrderSubmissionNotSentError,
     OrderSubmissionRejectedError,
 )
@@ -39,6 +40,31 @@ _UNCERTAIN_STATES = {
 }
 _ACTIVE_TERMINAL_MAX_POLLS = 10
 _ACTIVE_TERMINAL_POLL_SECONDS = 0.5
+
+_CANCEL_SUBMISSION_CODES = frozenset({
+    "acknowledged", "missing_response_code", "missing_transaction_proof",
+    "signer_or_provider_error", "response_rejected", "rate_limited", "unavailable",
+})
+_CANCEL_RECEIPT_CODES = frozenset({
+    "receipt_none", "receipt_invalid", "receipt_pending", "receipt_nonterminal",
+    "terminal_flag_unconfirmed", "terminal_symbol_mismatch", "terminal_side_mismatch",
+    "terminal_type_mismatch", "terminal_exchange_id_mismatch", "terminal_client_id_mismatch",
+    "terminal_financials_invalid", "terminal_amount_mismatch", "terminal_price_mismatch",
+    "terminal_remaining_increased", "terminal_valid", "diagnostic_unavailable",
+})
+_CANCEL_HISTORY_COUNTS = (
+    "history_attempts", "history_read_errors", "exact_history_matches", "captured_terminal",
+)
+_CANCEL_STAGE_CODES = frozenset({"unavailable", "before_sign", "sign", "send", "after_send", "complete"})
+_CANCEL_ERROR_CODES = frozenset({
+    "none", "local_sign_error", "dns", "timeout", "connection", "http_4xx", "http_5xx",
+    "response_decode", "unknown",
+})
+CANCELLATION_DIAGNOSTIC_NAMES = frozenset(
+    {"cancel_" + name for name in (*_CANCEL_RECEIPT_CODES, *_CANCEL_HISTORY_COUNTS)}
+    | {"cancel_submission_" + name for name in _CANCEL_SUBMISSION_CODES}
+    | {"cancel_stage_" + name for name in _CANCEL_STAGE_CODES}
+    | {"cancel_error_" + name for name in _CANCEL_ERROR_CODES})
 
 
 class ReconcileActionCause(Enum):
@@ -155,6 +181,8 @@ class ReconcileAction:
     success: bool | None = None
     order_id: str | None = None
     cause: ReconcileActionCause = ReconcileActionCause.NORMAL
+    diagnostic_values: tuple[tuple[str, int], ...] = ()
+    cancellation_not_sent: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +283,30 @@ class MarketMakerOrderManager:
                 and not self.get_unresolved_submissions()
                 and not self.get_unresolved_cancellations()
                 and all(slot.order_id in self._known_order_ids for slot in self.snapshot()))
+
+    @property
+    def can_reconcile_known_cancellations(self) -> bool:
+        """Permit exit-only proof reads for owned cancels, never a mutation retry."""
+        if self._submission_ambiguity_latched or self.has_unknown_order_state:
+            return False
+        try:
+            if self.get_unresolved_submissions():
+                return False
+            if any(slot.order_id not in self._known_order_ids
+                   or slot.submission_uncertain
+                   or slot.state not in {
+                       OrderSlotState.LIVE, OrderSlotState.PARTIALLY_FILLED,
+                       OrderSlotState.CANCELING, OrderSlotState.UNCERTAIN_CANCELLATION,
+                   } for slot in self.snapshot()):
+                return False
+            # Inspect the whole registry: the public getter intentionally filters
+            # by symbol, but exit recovery must not conceal foreign cancel state.
+            getter = getattr(self.adapter, "get_unresolved_cancellations", None)
+            cancellations = getter() if callable(getter) else ()
+            return all(str(symbol) == self.config.symbol and str(order_id) in self._known_order_ids
+                       for symbol, order_id in cancellations)
+        except Exception:
+            return False  # Unavailable or malformed registries grant no read recovery.
 
     @property
     def terminal_order_ids(self) -> frozenset[str]:
@@ -510,7 +562,7 @@ class MarketMakerOrderManager:
                             cause=ReconcileActionCause.SAFETY,
                         )
                     )
-                    if self.unresolved_cancellation_count:
+                    if self.unresolved_cancellation_count or (actions and actions[-1].cancellation_not_sent):
                         break
                     continue
                 if live.state not in {
@@ -539,7 +591,7 @@ class MarketMakerOrderManager:
                         ),
                     )
                 )
-                if self.unresolved_cancellation_count:
+                if self.unresolved_cancellation_count or (actions and actions[-1].cancellation_not_sent):
                     break
 
             blocking = self._blocking_reason()
@@ -988,6 +1040,15 @@ class MarketMakerOrderManager:
                             self._record_terminal_order(proof, order)
                         return fill_observed
                     self._pause(f"unknown open order update: {order.id}")
+                return False
+            if (
+                (slot.cancellation_uncertain or slot.state in {
+                    OrderSlotState.CANCELING, OrderSlotState.UNCERTAIN_CANCELLATION,
+                })
+                and order.status in _TERMINAL_STATUSES
+                and not self._valid_cancellation_terminal(slot, order)
+            ):
+                self._mark_cancellation_uncertain(slot)
                 return False
             if (
                 self._active_unwind_side is side
@@ -1526,9 +1587,14 @@ class MarketMakerOrderManager:
         actions.append(action)
         action_index = len(actions) - 1
         previous_state = slot.state
+        initially_known = (previous_state in {OrderSlotState.LIVE, OrderSlotState.PARTIALLY_FILLED}
+                           and slot.order_id in self.known_order_ids
+                           and slot.order_id not in self.terminal_order_ids
+                           and not self.has_uncertain_state and not self.has_unknown_order_state)
         slot.state = OrderSlotState.CANCELING
         slot.updated_monotonic = self._monotonic()
         self._record_mutation()
+        cancellation_generation = self.mutation_generation
         try:
             result = await self.adapter.cancel_order(
                 slot.order_id, self.config.symbol
@@ -1538,11 +1604,18 @@ class MarketMakerOrderManager:
             raise
         except Exception as exc:
             category = _error_category(exc)
-            if category == "http_429":
-                actions[action_index] = replace(action, success=False)
+            action = replace(action, diagnostic_values=self._cancel_diagnostics(slot, None))
+            actions[action_index] = action
+            # Only a scoped adapter contract proves no transaction was sent and
+            # its nonce is reusable. Provider text (including "429") proves neither.
+            if (type(exc) is OrderCancellationNotSentError and initially_known
+                    and exc.symbol == self.config.symbol and exc.order_id == slot.order_id
+                    and self.mutation_generation == cancellation_generation
+                    and not self.has_uncertain_state and not self.has_unknown_order_state):
+                actions[action_index] = replace(action, success=False, cancellation_not_sent=True)
                 slot.state = previous_state
                 slot.updated_monotonic = self._monotonic()
-                errors.append("cancel rejected: http_429")
+                errors.append("cancel definitively not sent")
                 return _OrderEffect()
             self._mark_cancellation_uncertain(slot)
             errors.append(f"cancel outcome uncertain: {category}")
@@ -1552,17 +1625,14 @@ class MarketMakerOrderManager:
             self.adapter, "get_terminal_cancellation_outcome", None
         )
         cached_terminal_used = False
-        if callable(terminal_outcome_getter) and not self._cancellation_terminal(
-            result
+        if callable(terminal_outcome_getter) and not self._valid_cancellation_terminal(
+            slot, result
         ):
             terminal_outcome = terminal_outcome_getter(
                 slot.order_id, self.config.symbol
             )
             if (
-                terminal_outcome is not None
-                and self._cancellation_terminal(terminal_outcome)
-                and self._order_matches(slot, terminal_outcome)
-                and terminal_outcome.side is side
+                self._valid_cancellation_terminal(slot, terminal_outcome)
                 and (
                     terminal_outcome.status is not OrderStatus.FILLED
                     or _has_visible_fill(
@@ -1573,10 +1643,14 @@ class MarketMakerOrderManager:
             ):
                 result = terminal_outcome
                 cached_terminal_used = True
+        action = replace(action, diagnostic_values=self._cancel_diagnostics(slot, result))
+        actions[action_index] = action
         confirmed_match = (
-            result is not None
+            isinstance(result, OrderData)
             and result.symbol == self.config.symbol
             and self._order_matches(slot, result)
+            and (not (result.status in _TERMINAL_STATUSES or self._cancellation_terminal(result))
+                 or self._valid_cancellation_terminal(slot, result))
         )
         fill_observed = confirmed_match and _has_visible_fill(
             result, previous_remaining=slot.remaining
@@ -1649,7 +1723,7 @@ class MarketMakerOrderManager:
                     side, reason, actions, errors, safety=True
                 )
             )
-            if self.unresolved_cancellation_count:
+            if self.unresolved_cancellation_count or (actions and actions[-1].cancellation_not_sent):
                 break
         return effect
 
@@ -1709,6 +1783,9 @@ class MarketMakerOrderManager:
                 if order.side is side
                 and self._order_matches(slot, order)
                 and order.status in _TERMINAL_STATUSES
+                and (not (slot.cancellation_uncertain or slot.state in {
+                    OrderSlotState.CANCELING, OrderSlotState.UNCERTAIN_CANCELLATION,
+                }) or self._valid_cancellation_terminal(slot, order))
                 and (
                     self._active_unwind_side is not side
                     or self._valid_active_resolution(slot, order)
@@ -1763,6 +1840,12 @@ class MarketMakerOrderManager:
             self._pause(f"{side.value} order status is unknown")
             return
         if order.status in _TERMINAL_STATUSES:
+            slot = self._slots[side]
+            if (slot is not None and (slot.cancellation_uncertain or slot.state in {
+                    OrderSlotState.CANCELING, OrderSlotState.UNCERTAIN_CANCELLATION,
+                }) and not self._valid_cancellation_terminal(slot, order)):
+                self._mark_cancellation_uncertain(slot)
+                return
             if not _valid_limit_order_values(order):
                 slot = self._slots[side]
                 if slot is not None:
@@ -2159,6 +2242,66 @@ class MarketMakerOrderManager:
             return "adapter cancellations remain unresolved"
         return None
 
+    def _valid_cancellation_terminal(
+        self, slot: ManagedOrder, order: OrderData | None
+    ) -> bool:
+        """A known cancel requires this exact order's complete terminal receipt."""
+        return self._cancellation_terminal_error(slot, order) is None
+
+    def _cancellation_terminal_error(self, slot, order):
+        # The validator and diagnostic use the same decision; never copy a
+        # provider value or weaken ownership checks to explain a refusal.
+        if order is None:
+            return "receipt_none"
+        if not isinstance(order, OrderData):
+            return "receipt_invalid"
+        if order.status not in _TERMINAL_STATUSES:
+            return "receipt_pending" if order.status is OrderStatus.PENDING else "receipt_nonterminal"
+        if not self._cancellation_terminal(order):
+            return "terminal_flag_unconfirmed"
+        if order.symbol != self.config.symbol:
+            return "terminal_symbol_mismatch"
+        if order.side is not slot.side:
+            return "terminal_side_mismatch"
+        if order.type is not OrderType.LIMIT:
+            return "terminal_type_mismatch"
+        if not slot.order_id or str(order.id or "") != slot.order_id:
+            return "terminal_exchange_id_mismatch"
+        if (slot.client_id and order.client_id not in (None, "")
+                and str(order.client_id) != slot.client_id):
+            return "terminal_client_id_mismatch"
+        if not _valid_limit_order_values(order):
+            return "terminal_financials_invalid"
+        if Decimal(str(order.amount)) != slot.amount:
+            return "terminal_amount_mismatch"
+        if Decimal(str(order.price)) != slot.price:
+            return "terminal_price_mismatch"
+        if Decimal(str(order.remaining)) > slot.remaining:
+            return "terminal_remaining_increased"
+        return None
+
+    def _cancel_diagnostics(self, slot, order):
+        values = {"cancel_" + (self._cancellation_terminal_error(slot, order) or "terminal_valid"): 1}
+        try:
+            getter = getattr(self.adapter, "get_market_maker_cancellation_diagnostics", None)
+            raw = getter(slot.order_id, self.config.symbol) if callable(getter) else None
+            if type(raw) is dict:
+                code = raw.get("submission")
+                if type(code) is str and code in _CANCEL_SUBMISSION_CODES:
+                    values["cancel_submission_" + code] = 1
+                for field, prefix, allowed in (("stage", "cancel_stage_", _CANCEL_STAGE_CODES),
+                                               ("error_kind", "cancel_error_", _CANCEL_ERROR_CODES)):
+                    code = raw.get(field)
+                    if type(code) is str and code in allowed:
+                        values[prefix + code] = 1
+                for name in _CANCEL_HISTORY_COUNTS:
+                    value = raw.get(name)
+                    if type(value) is int and 0 <= value <= 2147483647:
+                        values["cancel_" + name] = value
+        except (Exception, asyncio.CancelledError):
+            values["cancel_diagnostic_unavailable"] = 1
+        return tuple(values.items())
+
     def _order_matches(self, slot: ManagedOrder, order: OrderData) -> bool:
         order_id = str(order.id) if order.id is not None else None
         client_id = (
@@ -2258,7 +2401,7 @@ class MarketMakerOrderManager:
 
     @staticmethod
     def _cancellation_terminal(order: OrderData | None) -> bool:
-        if order is None:
+        if not isinstance(order, OrderData):
             return False
         params = order.params or {}
         raw_data = order.raw_data or {}

@@ -34,12 +34,13 @@ from decimal import Decimal, Inexact, InvalidOperation, ROUND_CEILING, ROUND_FLO
 from dataclasses import replace
 from datetime import datetime
 import asyncio
+import json
 import logging
 import threading
 import time
-from urllib.parse import urlparse
 
-from aiohttp import ClientConnectorDNSError
+from aiohttp import ClientConnectionError, ClientConnectorDNSError
+from pydantic import ValidationError
 
 try:
     import lighter
@@ -52,6 +53,7 @@ except ImportError:
 
 from .lighter_base import LighterBase
 from ..exceptions import (
+    OrderCancellationNotSentError,
     OrderSubmissionNotSentError,
     OrderSubmissionRejectedError,
 )
@@ -338,30 +340,6 @@ class LighterRest(LighterBase):
             )
         )
 
-    def _is_configured_api_dns_failure(self, exc: Exception) -> bool:
-        """Return whether DNS failed for this adapter's configured API host."""
-        if not isinstance(exc, ClientConnectorDNSError):
-            return False
-        expected_host = urlparse(str(getattr(self, "base_url", ""))).hostname
-        return bool(expected_host) and exc.host == expected_host
-
-    def _restore_nonce_after_pre_send_failure(self) -> bool:
-        """Undo the SDK's optimistic nonce increment for the configured key."""
-        signer = getattr(self, "signer_client", None)
-        manager = getattr(signer, "nonce_manager", None)
-        api_key_index = getattr(self, "api_key_index", None)
-        configured_keys = list(getattr(manager, "api_keys_list", ()))
-        acknowledge = getattr(manager, "acknowledge_failure", None)
-        if (
-            manager is None
-            or api_key_index is None
-            or configured_keys != [api_key_index]
-            or not callable(acknowledge)
-        ):
-            return False
-        acknowledge(api_key_index)
-        return True
-
     @staticmethod
     def _order_matches_client_id(order: OrderData, client_order_id: int) -> bool:
         target = str(client_order_id)
@@ -420,6 +398,172 @@ class LighterRest(LighterBase):
         """Enable the MM-only exact outcome side channel."""
         self._capture_terminal_cancellation_outcomes = True
 
+    def _record_mm_cancellation_diagnostic(
+        self, symbol: str, order_id: str, *, submission=None, counter=None, count=1, reset=False,
+        stage=None, error_kind=None,
+    ) -> None:
+        """Keep only fixed labels/counts for the two current MM order sides."""
+        try:
+            if getattr(self, "_capture_terminal_cancellation_outcomes", False) is not True:
+                return
+            key = (str(symbol), str(order_id))
+            records = getattr(self, "_mm_cancellation_diagnostics", None)
+            if records is None:
+                records = self._mm_cancellation_diagnostics = {}
+            if key not in records:
+                if len(records) >= 2:
+                    records.pop(next(iter(records)))
+                reset = True
+            if reset:
+                records[key] = dict(submission="unavailable", stage="unavailable", error_kind="none", history_attempts=0,
+                    history_read_errors=0, exact_history_matches=0, captured_terminal=0)
+            row = records[key]
+            if submission in {"acknowledged", "missing_response_code", "missing_transaction_proof",
+                              "signer_or_provider_error", "response_rejected", "rate_limited", "unavailable"}:
+                row["submission"] = submission
+            if counter in {"history_attempts", "history_read_errors", "exact_history_matches", "captured_terminal"}:
+                row[counter] += count
+            if stage in {"unavailable", "before_sign", "sign", "send", "after_send", "complete"}:
+                row["stage"] = stage
+            if error_kind in {"none", "local_sign_error", "dns", "timeout", "connection",
+                              "http_4xx", "http_5xx", "response_decode", "unknown"}:
+                row["error_kind"] = error_kind
+        except Exception:
+            pass  # Diagnostics can never change cancellation or cleanup outcomes.
+
+    def get_market_maker_cancellation_diagnostics(self, symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+        """A detached synchronous snapshot; no raw errors, receipts or credentials."""
+        try:
+            if getattr(self, "_capture_terminal_cancellation_outcomes", False) is not True:
+                return None
+            row = getattr(self, "_mm_cancellation_diagnostics", {}).get((str(symbol), str(order_id)))
+            return dict(row) if row is not None else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _mm_cancellation_error_kind(error: Exception) -> str:
+        """Classify types only; provider text is neither evidence nor telemetry."""
+        if isinstance(error, ClientConnectorDNSError):
+            return "dns"
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        if isinstance(error, ClientConnectionError):
+            return "connection"
+        if isinstance(error, (ValidationError, json.JSONDecodeError)):
+            return "response_decode"
+        if isinstance(error, lighter.exceptions.ApiException):
+            status = getattr(error, "status", None)
+            if type(status) is int and 400 <= status < 500:
+                return "http_4xx"
+            if type(status) is int and 500 <= status < 600:
+                return "http_5xx"
+        return "unknown"
+
+    async def _observe_mm_cancellation(self, market_index: int, order_index: int, observation: dict):
+        """Observe one real SDK call without replacing its nonce decorator or transport.
+
+        Instance wrappers pass other tasks through unchanged. Their lifetime is
+        bounded by this call, including cancellation; no signer payload is retained.
+        """
+        signer = self.signer_client
+        from lighter.signer_client import SignerClient
+        from lighter.nonce_manager import OptimisticNonceManager
+
+        if (type(signer) is not SignerClient
+                or getattr(signer.cancel_order, "__func__", None) is not SignerClient.cancel_order):
+            return await signer.cancel_order(market_index=market_index, order_index=order_index)
+        lock = getattr(self, "_mm_cancel_observation_lock", None)
+        if lock is None:
+            lock = self._mm_cancel_observation_lock = asyncio.Lock()
+        async with lock:
+            if (getattr(signer.send_tx, "__func__", None) is not SignerClient.send_tx
+                    or getattr(signer.sign_cancel_order, "__func__", None) is not SignerClient.sign_cancel_order):
+                return await signer.cancel_order(market_index=market_index, order_index=order_index)
+            task = asyncio.current_task()
+            manager = signer.nonce_manager
+            original_sign, original_send = signer.sign_cancel_order, signer.send_tx
+            missing = object()
+            own_sign = signer.__dict__.get("sign_cancel_order", missing)
+            own_send = signer.__dict__.get("send_tx", missing)
+            observation["stage"] = "before_sign"
+            reserved_key = reserved_nonce = None
+            reservation_observed = local_sign_error = False
+            send_started = False
+
+            def nonce_matches(value):
+                return (type(manager) is OptimisticNonceManager
+                        and signer.nonce_manager is manager
+                        and type(reserved_key) is int and type(reserved_nonce) is int
+                        and reserved_nonce >= 0
+                        and manager.api_keys_list == [reserved_key]
+                        and type(getattr(self, "api_key_index", None)) is int
+                        and getattr(self, "api_key_index", None) == reserved_key
+                        and type(manager.nonce) is dict
+                        and type(manager.nonce.get(reserved_key)) is int
+                        and manager.nonce[reserved_key] == value)
+
+            def observed_sign(*args, **kwargs):
+                nonlocal reserved_key, reserved_nonce, reservation_observed, local_sign_error
+                if asyncio.current_task() is not task:
+                    return original_sign(*args, **kwargs)
+                observation["stage"] = "sign"
+                # The actual SDK calls this method positionally while holding
+                # its selected key lock, after reserving exactly this nonce.
+                if len(args) == 5 and args[:2] == (market_index, order_index) and not kwargs:
+                    reserved_nonce, reserved_key = args[3], args[4]
+                    reservation_observed = (nonce_matches(reserved_nonce)
+                        and manager.lock(reserved_key).locked())
+                result = original_sign(*args, **kwargs)
+                local_sign_error = (type(result) is tuple and len(result) == 4
+                    and type(result[3]) is str and bool(result[3]))
+                if local_sign_error:
+                    observation["error_kind"] = "local_sign_error"
+                return result
+
+            async def observed_send(*args, **kwargs):
+                nonlocal send_started
+                if asyncio.current_task() is not task:
+                    return await original_send(*args, **kwargs)
+                send_started = True
+                observation["stage"] = "send"
+                try:
+                    result = await original_send(*args, **kwargs)
+                except Exception as error:
+                    observation["error_kind"] = self._mm_cancellation_error_kind(error)
+                    # Even DNS may fail after an HTTP redirect already sent the
+                    # original POST. No send-stage exception proves no-send here.
+                    raise
+                observation["stage"] = "after_send"
+                return result
+
+            signer.sign_cancel_order, signer.send_tx = observed_sign, observed_send
+            try:
+                result = await signer.cancel_order(market_index=market_index, order_index=order_index)
+                if (local_sign_error and not send_started and reservation_observed
+                        and type(result) is tuple and len(result) == 3
+                        and result[0] is None and result[1] is None
+                        and type(result[2]) is str and bool(result[2])
+                        and nonce_matches(reserved_nonce - 1)):
+                    # The SDK has returned, so its expected acknowledge_failure
+                    # completed. A fake/no-op rollback cannot authorize a retry.
+                    observation["not_sent"] = True
+                if observation["error_kind"] == "none":
+                    observation["stage"] = "complete"
+                return result
+            except Exception as error:
+                if observation["error_kind"] == "none":
+                    observation["error_kind"] = self._mm_cancellation_error_kind(error)
+                raise
+            finally:
+                for name, wrapper, previous in (("sign_cancel_order", observed_sign, own_sign),
+                                                ("send_tx", observed_send, own_send)):
+                    if signer.__dict__.get(name) is wrapper:
+                        if previous is missing:
+                            delattr(signer, name)
+                        else:
+                            setattr(signer, name, previous)
+
     def get_terminal_cancellation_outcome(
         self,
         symbol: str,
@@ -469,6 +613,10 @@ class LighterRest(LighterBase):
                 return False
         uncertain.discard(key)
         outcomes.pop(key, None)
+        try:
+            getattr(self, "_mm_cancellation_diagnostics", {}).pop(key, None)
+        except Exception:
+            pass
         return True
 
     async def resolve_unresolved_submissions(self) -> List[OrderData]:
@@ -640,17 +788,25 @@ class LighterRest(LighterBase):
         """Resolve cancellation only from an exact active or terminal-history match."""
         target = str(order_id)
         active_seen = False
-        terminal_only = (getattr(self, "_capture_terminal_cancellation_outcomes", False) is True
+        capture_terminal = getattr(self, "_capture_terminal_cancellation_outcomes", False) is True
+        terminal_only = (capture_terminal
                          and (callable(getattr(self, "_mm_confirmation_reader", None))
                               or getattr(self, "_mm_budget_admission", False)))
 
         def matches(order: OrderData) -> bool:
-            if terminal_only:
+            if capture_terminal:
                 return str(getattr(order, "id", "") or "") == target and order.symbol == symbol
             return target in {
                 str(getattr(order, "id", "") or ""),
                 str(getattr(order, "client_id", "") or ""),
             }
+
+        def retain_terminal(order: OrderData) -> None:
+            outcomes = getattr(self, "_terminal_cancellation_outcomes", None)
+            if outcomes is None:
+                outcomes = self._terminal_cancellation_outcomes = {}
+            outcomes[(str(symbol), target)] = order
+            self._record_mm_cancellation_diagnostic(symbol, target, counter="captured_terminal")
 
         for attempt in range(self.CANCELLATION_RECONCILIATION_ATTEMPTS):
             # MM consumes positive terminal proof only. Absence remains uncertain;
@@ -668,32 +824,24 @@ class LighterRest(LighterBase):
                         active_seen = True
 
             try:
+                self._record_mm_cancellation_diagnostic(symbol, target, counter="history_attempts")
                 history = await self.get_order_history(symbol)
             except Exception as exc:
+                self._record_mm_cancellation_diagnostic(symbol, target, counter="history_read_errors")
                 logger.warning(
                     "Failed to reconcile ambiguous cancellation: "
                     f"order_id={order_id}, source=history, error={exc}"
                 )
             else:
                 matching_orders = [order for order in history if matches(order)]
+                self._record_mm_cancellation_diagnostic(symbol, target,
+                    counter="exact_history_matches", count=len(matching_orders))
                 for order in matching_orders:
                     status = getattr(order, "status", None)
                     status_value = getattr(status, "value", status)
                     normalized_status = str(status_value or "").lower()
-                    if normalized_status == "filled" and bool(
-                        getattr(
-                            self,
-                            "_capture_terminal_cancellation_outcomes",
-                            False,
-                        )
-                    ):
-                        outcomes = getattr(
-                            self, "_terminal_cancellation_outcomes", None
-                        )
-                        if outcomes is None:
-                            outcomes = {}
-                            self._terminal_cancellation_outcomes = outcomes
-                        outcomes[(str(symbol), target)] = order
+                    if normalized_status == "filled" and capture_terminal:
+                        retain_terminal(order)
                         return False
                 for order in matching_orders:
                     status = getattr(order, "status", None)
@@ -705,6 +853,8 @@ class LighterRest(LighterBase):
                         "rejected",
                         "expired",
                     }:
+                        if capture_terminal:
+                            retain_terminal(order)
                         return True
 
             if attempt + 1 < self.CANCELLATION_RECONCILIATION_ATTEMPTS:
@@ -730,6 +880,15 @@ class LighterRest(LighterBase):
             reconciled = await self._reconcile_cancellation(symbol, order_id)
         finally:
             self.end_safety_requests()
+        terminal = self.get_terminal_cancellation_outcome(symbol, order_id)
+        if terminal is not None:
+            # The MM consumer validates the complete receipt before clearing
+            # this marker. A bool must not discard its side/size/price/identity.
+            logger.warning(
+                "Reconciled ambiguous cancellation with exact terminal proof: "
+                "order_id=%s status=%s", order_id, terminal.status.value
+            )
+            return reconciled is True
         if reconciled is True:
             confirmed = self.confirm_terminal_cancellation_outcome(
                 symbol, order_id, OrderStatus.CANCELED
@@ -740,13 +899,6 @@ class LighterRest(LighterBase):
                     f"order_id={order_id}, reason={reason}"
                 )
                 return True
-
-        if self.get_terminal_cancellation_outcome(symbol, order_id) is not None:
-            logger.warning(
-                "Reconciled ambiguous cancellation as an exact terminal fill; "
-                f"order_id={order_id}, reason={reason}"
-            )
-            return False
 
         logger.error(
             "Cancellation outcome remains uncertain; signer mutation will not be repeated: "
@@ -2111,9 +2263,11 @@ class LighterRest(LighterBase):
         if kwargs.get("client_order_id") is None:
             kwargs["client_order_id"] = self._next_client_order_index()
 
-        raise_on_pre_send_failure = bool(
+        # Retain the legacy opt-in argument, but DNS alone cannot establish
+        # no-send: aiohttp may already have sent a POST before following a redirect.
+        mm_submission = bool(
             kwargs.pop("_raise_on_definitive_pre_send_failure", False)
-        )
+        ) or getattr(self, "_capture_terminal_cancellation_outcomes", False) is True
         raise_on_submission_rejection = bool(
             kwargs.pop("_raise_on_definitive_submission_rejection", False)
         )
@@ -2142,17 +2296,10 @@ class LighterRest(LighterBase):
         except OrderSubmissionNotSentError:
             raise
         except Exception as exc:
-            if (
-                raise_on_pre_send_failure
-                and self._is_configured_api_dns_failure(exc)
-                and self._restore_nonce_after_pre_send_failure()
-            ):
-                logger.warning(
-                    "Lighter limit order was not submitted: DNS resolution failed"
-                )
-                raise OrderSubmissionNotSentError(
-                    "limit order was not submitted: DNS resolution failed"
-                ) from None
+            if mm_submission:
+                return await self._handle_ambiguous_order_submission(
+                    symbol, side, "limit", quantity, price_rounded,
+                    "SDK submission outcome unavailable", **kwargs)
             if self._is_definitive_mutation_exception(exc):
                 logger.error("执行限价单失败: HTTP 429 rate limited")
                 raise RuntimeError(
@@ -2176,9 +2323,11 @@ class LighterRest(LighterBase):
                 "order submission rejected: invalid nonce"
             ) from None
 
-        # Keep post-send response handling outside the pre-connect DNS catch.
-        # A later confirmation read must never make an accepted submission
-        # look retry-safe.
+        if mm_submission and err:
+            return await self._handle_ambiguous_order_submission(
+                symbol, side, "limit", quantity, price_rounded,
+                "SDK submission error without no-send proof", **kwargs)
+
         return await self._handle_order_result(
             tx, response, err, symbol, side, "limit",
             quantity, price_rounded, batch_mode=batch_mode,
@@ -2722,10 +2871,18 @@ class LighterRest(LighterBase):
             return False
 
         logical_order_id = str(mutation_order_index)
+        capture_mm = getattr(self, "_capture_terminal_cancellation_outcomes", False) is True
         uncertain = getattr(self, "_uncertain_cancellations", set())
         uncertain_key = (symbol, logical_order_id)
+        self._record_mm_cancellation_diagnostic(symbol, logical_order_id,
+                                               reset=uncertain_key not in uncertain)
         if uncertain_key in uncertain:
+            terminal = self.get_terminal_cancellation_outcome(symbol, logical_order_id)
+            if terminal is not None:
+                return terminal.status is not OrderStatus.FILLED
             reconciled = await self._reconcile_cancellation(symbol, logical_order_id)
+            if self.get_terminal_cancellation_outcome(symbol, logical_order_id) is not None:
+                return reconciled is True
             if reconciled is True:
                 if self.confirm_terminal_cancellation_outcome(
                     symbol, logical_order_id, OrderStatus.CANCELED
@@ -2737,6 +2894,7 @@ class LighterRest(LighterBase):
             )
             return False
 
+        attempt_started = False
         try:
             market_index = self.get_market_index(symbol)
             if market_index is None:
@@ -2744,30 +2902,56 @@ class LighterRest(LighterBase):
                 return False
 
             # 取消订单
+            observation = dict(stage="unavailable", error_kind="none", not_sent=False)
             try:
+                attempt_started = True
                 tx, response, err = await self._call_api(
                     "order cancellation",
-                    lambda: self.signer_client.cancel_order(
-                        market_index=market_index,
-                        order_index=mutation_order_index,
-                    ),
+                    (lambda: self._observe_mm_cancellation(market_index, mutation_order_index, observation))
+                    if capture_mm else (lambda: self.signer_client.cancel_order(
+                        market_index=market_index, order_index=mutation_order_index)),
                     retry_on_429=False,
                 )
             except Exception as exc:
+                if capture_mm:
+                    if observation["error_kind"] == "none":
+                        observation["error_kind"] = self._mm_cancellation_error_kind(exc)
+                    self._record_mm_cancellation_diagnostic(symbol, logical_order_id,
+                        submission="signer_or_provider_error", stage=observation["stage"],
+                        error_kind=observation["error_kind"])
+                    if observation["not_sent"]:
+                        raise OrderCancellationNotSentError(symbol=symbol, order_id=logical_order_id) from None
+                    return await self._handle_ambiguous_cancellation(
+                        symbol, logical_order_id, "SDK cancellation outcome unavailable")
                 if self._is_definitive_mutation_exception(exc):
+                    self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="rate_limited")
                     logger.error(
                         f"取消订单失败 {symbol}/{order_id}: HTTP 429 rate limited"
                     )
                     raise RuntimeError(
                         "order cancellation rate limited (HTTP 429)"
                     ) from None
+                self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="signer_or_provider_error")
                 return await self._handle_ambiguous_cancellation(
                     symbol,
                     logical_order_id,
                     str(exc),
                 )
 
+            if capture_mm:
+                self._record_mm_cancellation_diagnostic(symbol, logical_order_id,
+                    stage=observation["stage"], error_kind=observation["error_kind"])
+                if observation["not_sent"]:
+                    self._record_mm_cancellation_diagnostic(symbol, logical_order_id,
+                        submission="signer_or_provider_error")
+                    raise OrderCancellationNotSentError(symbol=symbol, order_id=logical_order_id) from None
             if err:
+                self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="signer_or_provider_error")
+                if capture_mm:
+                    if observation["error_kind"] == "none":
+                        self._record_mm_cancellation_diagnostic(symbol, logical_order_id, error_kind="unknown")
+                    return await self._handle_ambiguous_cancellation(
+                        symbol, logical_order_id, "SDK cancellation error without no-send proof")
                 error_msg = self.parse_error(err)
                 mutation_error = (
                     err if isinstance(err, Exception) else RuntimeError(error_msg)
@@ -2780,6 +2964,7 @@ class LighterRest(LighterBase):
                 return False
 
             if response is None or getattr(response, "code", None) is None:
+                self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="missing_response_code")
                 return await self._handle_ambiguous_cancellation(
                     symbol,
                     logical_order_id,
@@ -2789,13 +2974,20 @@ class LighterRest(LighterBase):
             try:
                 self._require_success_response(response, "order cancellation")
             except RuntimeError as exc:
+                if capture_mm:
+                    self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="response_rejected")
+                    return await self._handle_ambiguous_cancellation(
+                        symbol, logical_order_id, "cancellation response without terminal proof")
                 if self._is_definitive_mutation_exception(exc):
+                    self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="rate_limited")
                     raise RuntimeError(
                         "order cancellation rate limited (HTTP 429)"
                     ) from None
+                self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="response_rejected")
                 logger.error(f"取消订单失败: {exc}")
                 return False
             if not tx or not getattr(response, 'tx_hash', None):
+                self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="missing_transaction_proof")
                 return await self._handle_ambiguous_cancellation(
                     symbol,
                     logical_order_id,
@@ -2805,14 +2997,28 @@ class LighterRest(LighterBase):
             # A successful signer response only acknowledges transaction
             # submission. The order may still fill before the cancellation is
             # sequenced, so retain the intent until an exact terminal read.
+            self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="acknowledged")
             return await self._handle_ambiguous_cancellation(
                 symbol,
                 logical_order_id,
                 "cancellation transaction acknowledged without terminal proof",
             )
 
+        except OrderCancellationNotSentError:
+            raise
         except Exception as e:
+            if capture_mm:
+                if attempt_started:
+                    # A proof/read failure must not erase an already attempted
+                    # mutation or launch another reconciliation loop here.
+                    uncertain = getattr(self, "_uncertain_cancellations", None)
+                    if uncertain is None:
+                        uncertain = self._uncertain_cancellations = set()
+                    uncertain.add(uncertain_key)
+                logger.error("MM cancellation outcome unavailable")
+                return False
             if self._is_definitive_mutation_exception(e):
+                self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="rate_limited")
                 logger.error(
                     f"取消订单失败 {symbol}/{order_id}: HTTP 429 rate limited"
                 )

@@ -1,20 +1,25 @@
 """Offline report contracts: actual economics, failed windows and exact aggregate costs."""
 
 import contextlib
-from dataclasses import replace
+import asyncio
+from dataclasses import asdict, replace
 from decimal import Decimal as D
 import io
 import json
+import hashlib
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from core.services.market_maker_v2.domain import (
     AccountSnapshot, CashflowEvent, CashflowKind, ExecutionHealth, ExecutionResult,
     ExecutionSnapshot, ExecutionStatus, FillEvent, LiquidityRole, MarkEvent, Side, FailureDiagnostic,
+    OrderEvidence, MarketStateSnapshot, StrategyState, GovernorDiagnostic,
 )
 from core.services.market_maker_v2.session_ledger import SessionLedger
-from core.services.market_maker_v2.telemetry import JsonlTelemetrySink
+from core.services.market_maker_v2.telemetry import JsonlTelemetrySink, _encode
 from core.services.market_maker_v2.config import load_config
 from scripts.analyze_mm_v2_session import analyze_public_books, build_report, candidate_quantity_table, main
 
@@ -87,6 +92,8 @@ class SessionAnalysisTests(unittest.TestCase):
         self.assertEqual(D(totals["comparison_window_seconds"]), D(220))
         self.assertEqual(D(totals["maker_turnover_per_wall_hour"]), D(400) * 3600 / 220)
         self.assertEqual(D(totals["turnover_over_allocated_capital"]), D(8))
+        self.assertEqual(totals["diagnostic_trading"]["complete_flat_group_count"], 2)
+        self.assertEqual(D(totals["diagnostic_trading"]["trading_net_usdg"]), D("-.04"))
         self.assertIsNone(totals["objective_met"])
         self.assertIsNone(report["sessions"][0]["markout_1s"])
 
@@ -101,6 +108,7 @@ class SessionAnalysisTests(unittest.TestCase):
         self.assertEqual(D(metrics["funding"]), D(2))
         self.assertEqual(D(metrics["external_transfers"]), D(10))
         self.assertEqual(D(report["aggregate"]["all_in_net_pnl"]), D(".9603"))
+        self.assertEqual(D(report["aggregate"]["diagnostic_trading"]["trading_net_usdg"]), D("-1.0397"))
         # Positive funding cannot hide gross failing to cover the paid fees.
         self.assertFalse(report["aggregate"]["fee_neutral_observed"])
         self.assertEqual(D(metrics["forced_flatten_loss"]), D("1.0297"))
@@ -120,6 +128,67 @@ class SessionAnalysisTests(unittest.TestCase):
             self.assertEqual(D(total["observed_totals"]["maker_turnover_total"]), D(400))
             self.assertIsNone(total["all_in_net_pnl"])
             self.assertIsNone(total["fee_cover_ratio"])
+
+    def test_incomplete_authenticated_residual_keeps_recorded_final_facts_after_late_fill(self):
+        path = self.root / "residual.jsonl"
+        initial = AccountSnapshot("BTC", 0.0, D(0), D(299), D(".00012"), D(".00035"), 0, True)
+        fee = D(".00371670240")
+        with JsonlTelemetrySink(path) as sink:
+            ledger = SessionLedger(initial, telemetry=sink)
+            ledger.ingest_fill(FillEvent("fill", "sell", "BTC", Side.SELL,
+                D(".00040"), D("77431.3"), fee, LiquidityRole.MAKER, 3.0,
+                source_timestamp_ms=2000))
+            # As in the live failure, final request-start precedes late fill
+            # ingestion, while its response already contains the residual/order.
+            final = replace(initial, observed_monotonic=2.5, position=D("-.00040"),
+                entry_price=D("77431.3"), equity=initial.equity - fee,
+                open_order_count=1, open_order_ids=("remaining",))
+            recorded = ledger.finalize(final, now=4.0)
+            self.assertFalse(recorded.complete)
+            sink.emit(FailureDiagnostic("BTC", "exit_health", "blocked"))
+        report = self.analyze([path])
+        session = report["sessions"][0]
+        metrics = session["recorded_metrics"]
+        self.assertEqual((metrics["final_authenticated"], D(metrics["final_position"]),
+                          metrics["final_open_order_count"]), (True, D("-.00040"), 1))
+        self.assertFalse(metrics["complete"])
+        evidence = session["recorded_final_evidence"]
+        self.assertEqual(evidence["metrics_final_source"], "session_report")
+        self.assertEqual(evidence["session_report"], {"line": 4, "complete": False,
+            "final_authenticated": True, "final_position": "-0.00040", "final_open_order_count": 1})
+        self.assertEqual(evidence["account_snapshot"], {"line": 3, "observed_monotonic": 2.5,
+            "authenticated": True, "position": "-0.00040", "open_order_count": 1})
+        self.assertNotIn("open_order_ids", json.dumps(evidence))
+        self.assertFalse(report["aggregate"]["economics_evaluated"])
+        self.assertIsNone(report["aggregate"]["all_in_net_pnl"])
+        self.assertIsNone(report["aggregate"]["fee_cover_ratio"])
+        self.assertEqual(D(metrics["maker_fee"]), fee)
+
+    def test_recorded_final_sources_remain_distinct_and_missing_evidence_is_not_invented(self):
+        path = self.session(complete=False)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        # This fixture's snapshot report has no final proof, while the preceding
+        # standalone account event is authenticated. Preserve the disagreement.
+        session = self.analyze([path])["sessions"][0]
+        evidence = session["recorded_final_evidence"]
+        self.assertFalse(evidence["session_report"]["final_authenticated"])
+        self.assertTrue(evidence["account_snapshot"]["authenticated"])
+        self.assertFalse(session["recorded_metrics"]["final_authenticated"])
+        self.assertFalse(session["economics_evaluated"])
+        self.write_rows(path, rows[:-1])
+        session = self.analyze([path])["sessions"][0]
+        self.assertIsNone(session["recorded_final_evidence"]["session_report"])
+        self.assertEqual(session["recorded_final_evidence"]["metrics_final_source"], "account_snapshot")
+        self.assertTrue(session["recorded_metrics"]["final_authenticated"])
+        self.assertEqual(session["recorded_metrics"]["final_open_order_count"], 0)
+        self.assertIn("missing_final_report", session["incomplete_reasons"])
+        self.assertFalse(session["economics_evaluated"])
+        self.write_rows(path, rows[:-2])
+        session = self.analyze([path])["sessions"][0]
+        self.assertIsNone(session["recorded_final_evidence"]["session_report"])
+        self.assertIsNone(session["recorded_final_evidence"]["account_snapshot"])
+        self.assertIsNone(session["recorded_final_evidence"]["metrics_final_source"])
+        self.assertFalse(session["economics_evaluated"])
 
     def test_replay_and_dry_never_become_actual_fills_or_economic_pass(self):
         replay = self.analyze([self.session("replay.jsonl")], mode="replay")
@@ -331,6 +400,213 @@ class SessionAnalysisTests(unittest.TestCase):
         path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
         with self.assertRaises(ValueError):
             self.analyze([path])
+
+    def write_rows(self, path, rows):
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    def order_row(self, side, *, reducing=False, ioc=False, submitted=.8, confirmed=1.1):
+        market = MarketStateSnapshot("BTC", .5, D(99), D(101), D(1), D(".01"), D(".01"), True,
+                                     source_timestamp_ms=99500)
+        evidence = OrderEvidence("BTC", side.value, side, D(100), D(1), reducing,
+            "IOC" if ioc else "POST_ONLY", submitted, confirmed, market, StrategyState.QUOTING)
+        return {"schema": "mm_v2_event_v1", "event": "order_evidence", "data": _encode(evidence)}
+
+    def test_flat_groups_keep_legacy_costs_separate_from_unavailable_formal_economics(self):
+        path = self.session(complete=False, sell="100.01", funding="2")
+        report = self.analyze([path])
+        session = report["sessions"][0]
+        diagnostic = session["diagnostic_trading"]
+        self.assertEqual(session["journal_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(session["event_count"], len(path.read_text().splitlines()))
+        self.assertEqual(session["run_provenance"]["status"], "unavailable")
+        self.assertFalse(report["aggregate"]["economics_evaluated"])
+        self.assertIsNone(report["aggregate"]["fee_cover_ratio"])
+        self.assertIsNone(report["aggregate"]["all_in_net_pnl"])
+        self.assertEqual(D(diagnostic["realized_gross_pnl_usdg"]), D(".01"))
+        self.assertEqual(D(diagnostic["trading_net_usdg"]), D("-.010001"))
+        self.assertEqual(diagnostic["execution_costs"]["unclassified"]["fill_count"], 2)
+        self.assertEqual(diagnostic["coverage"]["order_evidence_fills"], 0)
+        self.assertEqual(diagnostic["governor"]["status"], "unavailable")
+        self.assertIsNone(diagnostic["public_book_markouts"])
+        grouped = diagnostic["flat_to_flat"]
+        self.assertEqual(grouped["complete_group_count"], 1)
+        self.assertIsNone(grouped["open_group"])
+        self.assertEqual(grouped["category_totals"]["maker_only"]["positive_gross_below_fees_count"], 1)
+        group = grouped["complete_groups"][0]
+        self.assertTrue(group["gross_reconciles"])
+        self.assertIsNone(group["source_duration_seconds"])
+
+    def test_flat_group_crossing_fill_is_unsplit_and_unfinished_position_is_retained(self):
+        path = self.root / "crossing.jsonl"
+        initial = AccountSnapshot("BTC", 0.0, D(0), D(299), D(".0001"), D(".0003"), 0, True)
+        with JsonlTelemetrySink(path) as sink:
+            ledger = SessionLedger(initial, telemetry=sink)
+            for index, (side, size, price, timestamp) in enumerate((
+                    (Side.BUY, "1", "100", 1000), (Side.SELL, "2", "101", 900),
+                    (Side.BUY, "1", "100", 3000), (Side.BUY, ".5", "100", 4000)), 1):
+                ledger.ingest_fill(FillEvent(str(index), str(index), "BTC", side, D(size), D(price),
+                    D(".01"), LiquidityRole.MAKER, float(index), source_timestamp_ms=timestamp))
+            sink.emit(ledger.snapshot(now=4.0))
+        grouped = self.analyze([path])["sessions"][0]["diagnostic_trading"]["flat_to_flat"]
+        self.assertEqual(grouped["complete_group_count"], 1)
+        group = grouped["complete_groups"][0]
+        self.assertEqual(group["fill_count"], 3)
+        self.assertEqual(D(group["cash_trading_gross_usdg"]), 2)
+        self.assertEqual(D(group["trading_net_usdg"]), D("1.97"))
+        self.assertFalse(group["source_time_complete_and_ordered"])
+        self.assertIsNone(group["source_duration_seconds"])
+        self.assertEqual(grouped["open_group"]["fill_count"], 1)
+        self.assertEqual(D(grouped["open_group"]["closing_position"]), D(".5"))
+        self.assertIsNone(grouped["open_group"]["trading_net_usdg"])
+
+    def test_order_evidence_classifies_actual_fills_and_confirmation_may_follow_receipt(self):
+        path = self.session(source_timestamps=(100000, 100500))
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        inserted = []
+        for row in rows:
+            if row["event"] == "fill":
+                side = Side(row["data"]["fill"]["side"])
+                inserted.append(self.order_row(side, reducing=side is Side.SELL))
+            inserted.append(row)
+        self.write_rows(path, inserted)
+        diagnostic = self.analyze([path])["sessions"][0]["diagnostic_trading"]
+        self.assertEqual(diagnostic["execution_costs"]["normal_maker"]["fill_count"], 1)
+        reducing = diagnostic["execution_costs"]["passive_reducing_maker"]
+        self.assertEqual(reducing["fill_count"], 1)
+        self.assertEqual(D(reducing["realized_gross_pnl_usdg"]), 1)
+        self.assertEqual(D(reducing["recorded_fees_usdg"]), D(".0101"))
+        self.assertEqual(diagnostic["coverage"]["order_evidence_fills"], 2)
+        linked = diagnostic["linked_fill_observations"][0]
+        self.assertEqual(D(linked["receipt_since_submit_seconds"]), D(".2"))
+        self.assertEqual(linked["quote_market_source_timestamp_ms"], 99500)
+        self.assertNotIn("order_id", json.dumps(diagnostic))
+        taker = self.analyze([self.session("taker_cost.jsonl", taker=True)])["sessions"][0]["diagnostic_trading"]
+        self.assertEqual(taker["execution_costs"]["ioc_exit"]["fill_count"], 1)
+        self.assertEqual(taker["coverage"]["order_evidence_fills"], 0)
+        self.assertEqual(taker["flat_to_flat"]["category_totals"]["contains_taker"]["group_count"], 1)
+
+    def test_late_incompatible_or_future_order_evidence_never_backfills_classification(self):
+        for failure in ("after_fill", "wrong_side", "future_submit", "price_outside_limit", "size_exceeds_order"):
+            path = self.session(failure + ".jsonl")
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            at = next(index for index, row in enumerate(rows) if row["event"] == "fill")
+            evidence = self.order_row(Side.BUY)
+            if failure == "wrong_side":
+                evidence["data"]["side"] = "sell"
+            if failure == "future_submit":
+                evidence["data"].update(submitted_monotonic=1.5, confirmed_monotonic=1.6)
+            if failure == "price_outside_limit":
+                evidence["data"]["price"] = "99"
+            if failure == "size_exceeds_order":
+                evidence["data"]["size"] = ".5"
+            rows.insert(at + (failure == "after_fill"), evidence)
+            self.write_rows(path, rows)
+            diagnostic = self.analyze([path])["sessions"][0]["diagnostic_trading"]
+            self.assertEqual(diagnostic["coverage"]["order_evidence_fills"], 0)
+            self.assertEqual(diagnostic["execution_costs"]["unclassified"]["fill_count"], 2)
+
+    def test_recorded_fill_gross_tampering_is_diagnosed_but_replayed_costs_are_retained(self):
+        path = self.session()
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        next(row for row in rows if row["event"] == "fill")["data"]["realized_gross_pnl"] = "999"
+        self.write_rows(path, rows)
+        report = self.analyze([path])
+        session = report["sessions"][0]
+        self.assertIn("recorded_fill_accounting_mismatch", session["incomplete_reasons"])
+        self.assertEqual(D(session["diagnostic_trading"]["realized_gross_pnl_usdg"]), 1)
+        self.assertIsNone(report["aggregate"]["all_in_net_pnl"])
+
+    def test_startup_provenance_is_allowlisted_and_never_inferred_from_current_checkout(self):
+        path = self.session()
+        config = load_config(Path(__file__).resolve().parents[1]
+                             / "config/market_maker_v2/lighter_btc_volume.example.yaml")
+        config_row = json.loads(json.dumps(asdict(config), default=str))
+        provenance = {"schema": "mm_v2_run_provenance_v1", "capture": "run_start",
+            "build": {"status": "available", "commit": "a" * 40, "dirty": True},
+            "effective_config": config_row}
+        sidecar = Path(str(path) + ".budget.json")
+        sidecar.write_text(json.dumps({"provenance": provenance, "unrelated_payload": "PRIVATE_SENTINEL"}))
+        result = self.analyze([path])["sessions"][0]["run_provenance"]
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["record"]["build"]["commit"], "a" * 40)
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+        provenance["build"]["commit"] = "PRIVATE_SENTINEL"
+        sidecar.write_text(json.dumps({"provenance": provenance}))
+        invalid = self.analyze([path])["sessions"][0]["run_provenance"]
+        self.assertEqual(invalid["status"], "invalid")
+        self.assertIsNone(invalid["record"])
+        provenance["build"] = {"status": "unavailable", "commit": None, "dirty": None}
+        del provenance["effective_config"]["dry_run"]
+        sidecar.write_text(json.dumps({"provenance": provenance}))
+        self.assertEqual(self.analyze([path])["sessions"][0]["run_provenance"]["status"], "invalid")
+        sidecar.write_text(json.dumps({"older_budget": True}))
+        self.assertEqual(self.analyze([path])["sessions"][0]["run_provenance"]["status"], "unavailable")
+
+    def test_analyzer_cli_reads_budget_sidecar_written_by_real_runner(self):
+        import run_volume_market_maker as runner
+        from core.services.market_maker_v2.api_budget import ApiBudget
+
+        path = self.root / "runner.jsonl"
+        config = load_config(runner.ROOT / "config/market_maker_v2/lighter_btc_volume.example.yaml")
+        build = {"status": "available", "commit": "b" * 40, "dirty": True}
+        settings = {"network": "robinhood_testnet", "testnet": True,
+                    "expected_l1_address": "0x" + "1" * 40, "account_index": 1,
+                    "api_key_private_key": "private-sentinel"}
+
+        def session_factory(*args, telemetry, **kwargs):
+            initial = AccountSnapshot("BTC", 0.0, D(0), D(299), D(".0001"), D(".0003"), 0, True)
+            ledger = SessionLedger(initial, telemetry=telemetry)
+            ledger.finalize(replace(initial, observed_monotonic=4.0), now=4.0)
+            return SimpleNamespace(run=AsyncMock(return_value=object()),
+                api_budget=ApiBudget(lambda: 0), market=SimpleNamespace(stream=None))
+
+        with (patch.object(runner, "build_adapter", return_value=object()),
+              patch.object(runner, "_git_build", return_value=build),
+              patch.object(runner.orchestrator, "VolumeSession", side_effect=session_factory)):
+            asyncio.run(runner.run_session(config, settings, output=path))
+        # The runner owns the filename; no test-created sidecar may mask a mismatch.
+        self.assertTrue(Path(str(path) + ".budget.json").exists())
+        self.assertFalse(path.with_suffix(".budget.json").exists())
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = main([str(path), "--candidate", "runner_contract", "--mode", "dry_run",
+                           "--planned-seconds", "100", "--wall-seconds", "4"])
+        self.assertEqual(status, 0)
+        analyzed = json.loads(stdout.getvalue())
+        provenance = analyzed["sessions"][0]["run_provenance"]
+        self.assertEqual(provenance["status"], "available")
+        self.assertEqual(provenance["record"]["build"], build)
+        self.assertEqual(provenance["record"]["effective_config"]["quote"]["order_size"],
+                         str(config.quote.order_size))
+        self.assertNotIn("private-sentinel", stdout.getvalue())
+
+    def test_embedded_public_books_reuse_source_clock_markouts_without_fill_reference_backfill(self):
+        path = self.session(source_timestamps=(100000, 100500), complete=False)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        for row in rows:
+            if row["event"] == "fill":
+                row["data"]["fill"]["reference_price"] = None
+        book = self.book_file([index / 2 for index in range(8)])
+        public_rows = [json.loads(line) for line in book.read_text().splitlines()]
+        embedded = [{"schema": "mm_v2_event_v1", "event": "public_book_observation",
+                     "data": {key: value for key, value in row.items() if key != "schema"}}
+                    for row in public_rows]
+        rows[-2:-2] = embedded
+        diagnostic = GovernorDiagnostic("BTC", 3.5, StrategyState.QUOTING, StrategyState.REDUCE_ONLY,
+            "reducing_capacity_only", D(".1"), sell_capacity=D(".1"), candidate_sell=D(".1"),
+            total_reserve=D(".02"), remaining_loss_headroom=D(".03"))
+        rows.insert(-2, {"schema": "mm_v2_event_v1", "event": "governor_diagnostic", "data": _encode(diagnostic)})
+        self.write_rows(path, rows)
+        report = self.analyze([path])
+        diagnostic = report["sessions"][0]["diagnostic_trading"]
+        self.assertEqual(diagnostic["coverage"]["fill_reference_fills"], 0)
+        self.assertEqual(diagnostic["governor"]["reason_counts"], {"reducing_capacity_only": 1})
+        self.assertEqual(len(diagnostic["governor"]["state_transitions"]), 1)
+        embedded_report = diagnostic["public_book_markouts"]
+        external_report = analyze_public_books(book, session_paths=[path])
+        self.assertEqual(embedded_report["horizons"], external_report["horizons"])
+        self.assertEqual(embedded_report["horizons"]["1s"]["recorded_maker_fill_markout"]["matched_fills"], 2)
+        self.assertIsNone(report["aggregate"]["all_in_net_pnl"])
 
 
 if __name__ == "__main__":

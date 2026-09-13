@@ -10,7 +10,6 @@ from aiohttp import ClientConnectorDNSError
 from core.adapters.exchanges.adapters.lighter import LighterAdapter
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
-from core.adapters.exchanges.exceptions import OrderSubmissionNotSentError
 from core.adapters.exchanges.models import (
     OrderData,
     OrderSide,
@@ -1709,7 +1708,7 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             OSError("Timeout while contacting DNS servers"),
         )
 
-    async def test_dns_failure_before_limit_send_is_not_quarantined(self):
+    async def test_mm_dns_opt_in_cannot_prove_limit_was_not_sent(self):
         rest = self._rest()
         rest.base_url = "https://api.rh.lighter.xyz"
         rest.api_key_index = 3
@@ -1725,11 +1724,10 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             nonce_manager=nonce_manager,
         )
 
-        with self.assertRaisesRegex(
-            OrderSubmissionNotSentError,
-            "DNS resolution",
-        ):
-            await rest.place_order(
+        # SDK transport can follow a POST redirect before this DNS failure.
+        # The MM option cannot prove no-send or authorize optimistic rollback.
+        with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()):
+            result = await rest.place_order(
                 "BTC",
                 "buy",
                 "limit",
@@ -1739,10 +1737,11 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             )
 
         rest.signer_client.create_order.assert_awaited_once()
-        nonce_manager.acknowledge_failure.assert_called_once_with(3)
-        self.assertEqual(rest.get_unresolved_submissions(), [])
-        rest.get_open_orders.assert_not_awaited()
-        rest.get_order_history.assert_not_awaited()
+        nonce_manager.acknowledge_failure.assert_not_called()
+        self.assertTrue(result.raw_data["submission_uncertain"])
+        self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+        self.assertGreater(rest.get_open_orders.await_count, 0)
+        self.assertGreater(rest.get_order_history.await_count, 0)
 
     async def test_dns_failure_without_mm_opt_in_remains_ambiguous(self):
         rest = self._rest()

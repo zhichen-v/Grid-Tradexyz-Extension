@@ -1,6 +1,7 @@
 """Offline public-contract checks: no adapter construction, signer or network."""
 
 import unittest
+import asyncio
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal as D, ROUND_DOWN
@@ -1569,6 +1570,140 @@ class LighterStreamAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current.authenticated)
         self.assertEqual(current.open_order_ids, ())
         self.assertIsNone(self.port.aligned_book)
+
+    async def test_normal_authorization_realigns_once_with_fresh_account_and_shared_admission(self):
+        for first in ({"nonce": 11}, TimeoutError()):
+            with self.subTest(first=type(first).__name__):
+                await self.asyncSetUp()
+                await self.start()
+                self.port.stream.order_nonce = 10
+                valid = {"nonce": 10, "received_monotonic": self.clock.now}
+                self.port.stream.book_at_or_after = AsyncMock(side_effect=[first, valid])
+                self.adapter.get_balances = AsyncMock(wraps=self.adapter.get_balances)
+                self.adapter.get_account_trades = AsyncMock(wraps=self.adapter.get_account_trades)
+                self.port.before_read = Mock()
+
+                account = await self.port.snapshot(require_aligned_book=True)
+
+                self.assertTrue(account.authenticated)
+                self.assertEqual(self.port.aligned_book, valid)
+                self.assertEqual(self.adapter.get_balances.await_count, 2)
+                self.assertEqual(self.adapter.get_account_trades.await_count, 1)
+                self.assertEqual(self.port.before_read.call_args_list.count(call("retry")), 1)
+                self.assertEqual(self.port.before_read.call_args_list.count(call("audit")), 2)
+                self.assertEqual(self.port.market_read_counts, {"retries": 1, "recoveries": 1})
+
+    async def test_alignment_retry_preserves_limits_and_rejects_unhealthy_or_changed_state(self):
+        for cause, reads, retries in (("persistent", 2, 1), ("invalid_book", 1, 0),
+                ("transport", 1, 0), ("deadline", 1, 0), ("generation", 1, 0), ("quota", 1, 0)):
+            with self.subTest(cause=cause):
+                await self.asyncSetUp()
+                await self.start()
+                self.port.stream.order_nonce = 10
+                self.port.stream.book_at_or_after = AsyncMock(return_value={"nonce": 11})
+                balances = self.adapter.get_balances
+
+                async def observed():
+                    if cause == "deadline":
+                        self.clock.now += 10
+                    elif cause == "generation":
+                        self.generation += 1
+                    return await balances()
+
+                def admit(kind):
+                    if cause == "quota" and kind == "retry":
+                        raise ApiBudgetUnavailable("local test admission")
+
+                self.adapter.get_balances = AsyncMock(side_effect=observed)
+                self.port.before_read = Mock(side_effect=admit)
+                if cause == "invalid_book":
+                    self.adapter.read_failure = True
+                    self.port.stream.last_book_failure = ("receive_book", "discontinuous_book")
+                elif cause == "transport":
+                    self.port.stream.transport_healthy = False
+                with self.assertRaises((LighterReadError, ApiBudgetUnavailable)) as caught:
+                    await self.port.snapshot(require_aligned_book=True)
+                self.assertEqual(self.adapter.get_balances.await_count, reads)
+                self.assertEqual(self.port.market_read_counts, {"retries": retries, "recoveries": 0})
+                self.assertIsNone(self.port.aligned_book)
+                if cause in {"persistent", "invalid_book"}:
+                    values = caught.exception.diagnostic_values
+                    self.assertEqual(values["market_outside_watermarks"], D(1))
+                    self.assertEqual(values["market_book_nonce"], D(11))
+                    self.assertEqual(values["market_closing_nonce"], D(10))
+                    self.assertEqual(values["market_book_retry_count"], D(retries))
+                    if cause == "invalid_book":
+                        self.assertEqual(values["market_book_invalid"], D(1))
+
+    async def test_alignment_retry_cannot_spend_a_second_cash_race_retry(self):
+        await self.start()
+        self.port.stream.order_nonce = 10
+        self.port.stream.book_at_or_after = AsyncMock(return_value={"nonce": 11})
+        activity = self.port.stream.request_snapshot
+
+        async def raced(channel):
+            value = await activity(channel)
+            if self.port.stream.request_snapshot.await_count == 1:
+                value["positions"]["1"]["position"] = "1"
+            return value
+
+        self.port.stream.request_snapshot = AsyncMock(side_effect=raced)
+        self.port.before_read = Mock()
+        with self.assertRaises(LighterReadError):
+            await self.port.snapshot(require_aligned_book=True)
+        self.assertEqual(self.port.stream.book_at_or_after.await_count, 2)
+        self.assertEqual(self.port.before_read.call_args_list.count(call("retry")), 1)
+        self.assertEqual(self.port.market_read_counts, {"retries": 0, "recoveries": 0})
+
+    async def test_alignment_retry_deduplicates_fills_already_accepted_by_first_account_audit(self):
+        await self.start()
+        self.adapter.trades = [trade()]
+        self.adapter.position.position = "1"
+        self.adapter.account.collateral = "99.99"
+        self.port.stream.order_nonce = 10
+        self.port.stream.book_at_or_after = AsyncMock(side_effect=[{"nonce": 11}, {"nonce": 10}])
+        self.adapter.get_account_trades = AsyncMock(wraps=self.adapter.get_account_trades)
+
+        account = await self.port.snapshot(require_aligned_book=True)
+
+        self.assertEqual(account.position, D(1))
+        self.assertEqual(account.equity, D("99.99"))
+        self.assertEqual(self.adapter.get_account_trades.await_count, 2)
+        report = self.ledger.snapshot(now=self.clock.now)
+        self.assertEqual(report.maker_fill_count, 1)
+        self.assertEqual(report.maker_fee, D(".01"))
+        self.assertEqual(report.ledger_position, D(1))
+        self.assertEqual(self.port.market_read_counts, {"retries": 1, "recoveries": 1})
+
+    async def test_cleanup_account_proof_never_requires_or_retries_alignment(self):
+        await self.start()
+        self.port.stream.order_nonce = 10
+        self.port.stream.book_at_or_after = AsyncMock(side_effect=TimeoutError)
+        self.port.before_read = Mock()
+        account = await self.port.snapshot(allow_unreconciled_cash=True)
+        self.assertEqual(account.position, D(0))
+        self.assertEqual(account.open_order_ids, ())
+        self.assertNotIn(call("retry"), self.port.before_read.call_args_list)
+        self.assertEqual(self.port.book_diagnostics["market_book_wait_timeout"], D(1))
+        self.assertEqual(self.port.market_read_counts, {"retries": 0, "recoveries": 0})
+
+    async def test_outer_timeout_preserves_market_cause_but_invalidates_account_handoffs(self):
+        await self.start()
+        self.port.stream.order_nonce = 10
+        self.port.stream.book_at_or_after = AsyncMock(side_effect=TimeoutError)
+
+        async def pending_balances():
+            await asyncio.Event().wait()
+
+        self.adapter.get_balances = pending_balances
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(self.port.snapshot(require_aligned_book=True), .02)
+        self.assertIsNone(self.port.aligned_book)
+        self.assertIsNone(self.port._cash_cache)
+        self.assertEqual(self.port.book_diagnostics["market_book_wait_timeout"], D(1))
+        self.assertEqual(self.port.book_diagnostics["market_opening_nonce"], D(10))
+        self.port.begin_quote_cycle()
+        self.assertNotIn("market_book_wait_timeout", self.port.book_diagnostics)
 
     async def test_decreasing_counter_is_rejected(self):
         self.adapter.trades = [trade()]

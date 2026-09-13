@@ -1,5 +1,247 @@
 # Market Maker V2 — Experiment log
 
+## 2026-09-13 場次193558後：行情故障診斷、單次重新對齊與完整流程反例
+
+使用者授權本地實作、驗證及完成後一次commit/push。本批保留先前未提交MM V2修復與測試，沒有改動交易數量、費率、風險限額、source freshness、Grid策略或live設定。以下為可重現的處理缺口修復，不能事後補出193558缺失的原始觸發原因。
+
+**原因證據不再合併遺失。** Shared ReadStream新增唯讀`first_stream_failure`，只保存固定stage／reason，首次失效在close後仍保留；正常close及真正CancelledError不誤記故障，後續unavailable不覆蓋初因。MM account保存book等待逾時、book不可用、超opening/closing watermark、缺watermark、generation變動，以及numeric nonce／age；market及session的`failure_diagnostic`用固定allowlist保存這些資料和stream／source分類，涵蓋錯誤先發生在`syncing_orders`的路徑，不只market.refresh。無raw payload、例外文字、URL、token或身份資料。Account逾時／外層取消仍清除可用handoff及cash cache，但保留當次診斷到記錄完成；下一個真正cycle再清，避免又留下空原因。
+
+**最小恢復契約。** 正常session要求aligned book；當完整authenticated account audit已成功，僅book等待逾時或book不在原order watermark範圍，且同一mutation generation、transport健康、原`book_snapshot()`的source／book檢查仍通過時，使用原account.snapshot的共同10s期限及至多兩次attempt重讀。第二次重新取得cash／orders／trades，逐項通過原retry／audit／條件API admission；帳戶race已用掉重試就沒有額外第三讀，已入帳fill／funding照ID去重。第二次仍不對齊則整場失敗並進原有界收尾。Invalid book、source／clock故障、transport斷線、generation變動或額度不足不以此路徑恢復；没有重連、重送mutation或放寬nonce界線。退出帳戶證明不要求book，仍先撤known orders；沒有可信行情時禁止IOC並如實回報殘量。Budget新增`market_reads.retries/recoveries`，只計實際獲准的市場重讀，保留完整場次證據。
+
+**原始完整流程驗證。** 在既有wire fixture的兩張POST_ONLY都已確認後，從raw WS注入故障，不替換session／account／market／SDK方法。三個flat故障為合法但持續落後opening的行情（真正asyncio3s等待逾時，fresh source仍有效）、不連續book nonce、真reader EOF。另在失效同期由獨立venue成交一側；以及第一次book超closing、下一次fresh bracket才一致的可恢復案例。相同場景還原舊`require_aligned_book=False`，確實再次過早失敗，不能只靠增加通過數字宣稱修復。
+
+| 完整raw場景 | 具體結果 |
+|---|---|
+| 持續book等待逾時 | 一次市場重讀、零恢復，之後停止新單；撤原兩單，authenticated及venue0/0，code1 |
+| 不連續book nonce | 不重試失效行情；原兩單精確取消，兩端0/0、code1 |
+| Transport EOF | 在syncing_orders識別transport原因；原exit-only REST查核清理至兩端0/0，code1 |
+| Book失效＋SELL成交0.00040 | 撤除另一張known單，沒有IOC；兩端short0.00040／orders0、code1，如實回報未平倉 |
+| 短暫超closing watermark | 原一次fresh read取得新opening／closing13/13，中間有fresh REST cash，retries1／recoveries1；繼續兩輪正常到期並0/0、code0 |
+| 還原舊處理的反例 | 同一暫時不同步場景code1、無後續normal create，最終0/0；同一正常驗收會拒絕它 |
+
+每場原HTTP meter與fixture的實際端點attempts一致；故障後原未成交ID各cancel一次，不借用manager或ledger生成venue答案。Focused新4個methods（含6場景）全部PASS／29.411s，當時來源指紋`07b6d51720482b4b5e63b18e6faf1706430384acaabaa7e0516b881fb3545b59`；此後修正診斷中的市場重試計數語意並新增去重回歸，交付以最終full suite的同源證據為準。Lower-level另驗證共用期限、generation、quota拒絕、不可累加account race重試、退出無book、外層取消後診斷保留、raw敏感字串不外洩與已入帳fill重讀去重。原Windows真60s quarantine／Ctrl+C與過往取消安全案例保留。
+
+提交前獨立檢查確認33個tracked變更及5個新test helpers均為程式／文件；Grid測試的既有差異只更新MM opt-in「DNS不能證明未送出」契約，default對照不變。無新增私人設定／環境檔／日誌或秘密字串。先前字面`%SystemDrive%/`快取仍排除於Git；不重試已被拒絕的刪除。沒有新live／私人API查核或VPS操作，193558經濟結論不變。
+
+**最終同源驗證：全專案949項／231.439s，657項V2全部PASS。** 完整輸出`logs/mm_v2_market_fault_full_20260913.log`；其餘8 failures＋4 errors與`logs/mm_v2_phase7_20260904/v2_only_cleanup_full_tests.log`的12個既有Grid／Lighter案例逐項相同，新增／缺少案例均0，不宣稱全專案全綠。此完整run已涵蓋shared ReadStream、新raw場景及Windows啟動器，無需另跑重複V2 suite。最後source指紋`7493caa376672aaaf0c741b6c70eacbc17387ea75a5817bc99a68a22d45b58ee`；6個raw案例manifest及兩場Windows均逐項確認與此版本相同。Raw證據為`logs/mm_v2_wire_20260913_125056_105251_book_alignment_no_retry`、`125058_144496_book_invalid_nonce_fill`、`125122_412322_book_alignment_recovers`、`125141_721441_book_wait_timeout`、`125143_668055_book_invalid_nonce`及`125146_492832_book_transport_close`（後五者同`logs/mm_v2_wire_20260913_`前綴）。Windows `logs/mm_v2_launcher_20260913_125014_503284_ctrl_c`與`125016_170289_deadline`（同前綴）皆code0、watchdog=false、整樹自然退出；Ctrl+C至整樹退出0.578s。獨立安全審查與內容／格式檢查完成，runtime及測試沒有在此驗證後再改動。Native真實撮合、完整60分鐘live及費用覆蓋仍待實盤證據；此次Git提交包含本批及本對話先前累積的MM V2修復與完整流程測試。
+
+## 2026-09-13 場次193558：行情檢查提早失敗，三次收尾成功，費用未覆蓋
+
+使用者提交最新自行執行的60分鐘live輸出。本輪只分析本機journal及budget／window，更新既有證據；沒有修改runtime／交易參數、重跑產品suite、連接帳戶或commit/push。Journal `logs/mm_v2_economics_20260913_193558_509.jsonl`共11216 events，SHA256 `8d03046522f5fe08a3ee6ef60dc58a2130f1b72b5803125d9dbea17d7ce96c08`。現有`build_report`結果保存於同stem `.jsonl.analysis.json`，包含原typed public-book觀測的markout診斷。Startup為`b4605b9`、dirty=true與公開有效參數，沒有完整source指紋，不能僅凭HEAD證明與646項測試完全同源。
+
+**完成度與終態。** Planned3600s、whole-process wall2674.2750979s（約44分34秒）、ledger2611.3621414s後code1。最後line11214 bounded exit取消兩張known orders、0次IOC，取得authenticated0/0；line11215再次取得authenticated position0／orders0，line11216 ledger final對帳差0。這是原場終點證據，沒有重新查核目前帳戶。相較000352原場0/2，本輪自動收尾有成功證據，仍未完成一小時。SessionReport的`complete=true / failed=false`只描述ledger結算；CLI保持`completed=false / failed=true / economics_evaluated=false`，analyzer因`runtime_failure_diagnostic`保留正式經濟欄位unavailable，不以ledger complete覆蓋runtime失敗。
+
+**唯一最終故障。** Console約2669s，line11213為`authorizing_quotes / LighterReadError`，source鏈`orchestrator:753 → 498 → 342 → 397 → lighter_runtime:809 → 770`。Top-cycle order sync及account audit已返回；market refresh在「沒有與委託同步的行情，或stream transport不健康」的共同分支拒絕。Execution仍healthy、兩侧live、uncertain=false／unknown=false；此次沒有取消缺證的failure。`_stream_read`可吞掉book等待RuntimeError／TimeoutError，或將不滿足opening≤book≤closing的行情設為None；原診斷未保存這些分支或最初stream關閉原因。不能確證網路斷線、協定錯誤或瞬時watermark變動，亦不能認定加重試就能安全恢复。
+
+| 本場交易診斷 | 結果（USDG，除另註） |
+|---|---:|
+| Maker fills／turnover | 45／1059.125780 |
+| Taker fills／turnover | 1／15.346060 |
+| Realized gross | +0.006600 |
+| Maker／taker fees | 0.12709509360／0.00537112100 |
+| 已記錄交易net | −0.12586621460 |
+| 毛利／總費用 | 4.9824% |
+| Max drawdown | 0.128044600200 |
+| Fill累計持倉峰值 | long+0.00060／short−0.00080 BTC |
+
+Funding及external transfers均記錄0，final cash reconciliation差0。公開有效配置每單0.00040、soft0.00040／hard0.00080 BTC、session loss0.50、target edge0.20bps；峰值觸及hard但沒有觀測到超越。正式比較窗口保持planned3600s，maker turnover/hour為1059.125780，不以提早停止的44分鐘縮短分母。有單／雙邊時間2523.7400517／2347.8791986s，占ledger96.6446%／89.9101%。
+
+**三次退出的原因不同。** 約665s因`inventory_hold`退出；取消期間maker BUY0.00040成交，使short0.00020轉成long0.00020，隨後單次reduce-only SELL IOC0.00020，約670s成功0/0並冷卻重入。約2449s因`monitor / local_api_budget`預留容量不足退出（預估24106高於24000），取消1單、0次IOC，約2451s成功0/0。約2669s才是最終行情檢查失敗，約2672s取消2單並成功0/0。第二次是本地保守容量保護，沒有證據稱為交易所429。
+
+**成本主要仍在正常成交。** 41筆normal maker診斷net−0.10408829040；4筆passive reducing maker為−0.01616680320；單次IOC為−0.00561112100，只占整場淨損約4.46%。13組完整flat-to-flat中12組maker-only，只有1組net正，另6組gross正但不足付費；maker-only合計net−0.09271489600。單純減少IOC不能解決本輪成本。1s／5s成交後public-mid變化各覆蓋31/45及36/45，費前turnover加權−0.079550／+0.118439bps；缺樣本不插值，public BBO含自身委託，不能當成完整策略淨優勢。
+
+**API、行情與測試缺口。** 可選改價等待63次、budget退出1次、account-read race退出0次；REST／WS／TX峰9900／105／9。Strict已接受20197包、最大接受age367.803ms、已接受超界0；這些統計不含被拒絕或未收到的包，不能排除末端stream故障。前批完整wire情境涵蓋取消、終態延後、回應遺失與Windows停止；現有較低層測試亦涵蓋nonce／stale／closed及超closing watermark，但尚未將這些故障接入完整session及分支診斷。
+
+下一批最小範圍是固定allowlist區分book_wait_timeout／book_invalid／outside_watermarks／transport_unhealthy及時間／nonce證據，不記raw payload；在既有wire fixture驗收有單時行情失效即停止新風險、known-order精確清理、fresh final真實回報且清理成功不抹除原失敗。同期成交的fresh residual退出、持續失效且無可信IOC行情時如實失敗，仍保留原限額／期限。此處是本輪定位出的待補範圍，尚未實作，不放寬freshness或加入盲目重連。
+
+## 2026-09-13 完整流程與啟動器測試：合成wire、真Ctrl+C及退出碼修正
+
+使用者在§19.9規劃後授權實作。新增`tests/mm_v2_wire_fixture.py`、`tests/mm_v2_wire_evidence.py`、`tests/mm_v2_windows_process.py`、`tests/test_mm_v2_wire_session.py`與`tests/test_mm_v2_launcher.py`，沿用repository `.venv`／unittest。既有未提交runtime／tests保留；本輪production只修`run_live_test.ps1`退出碼處理，未改交易參數、MM風控、Grid或共用交易adapter。
+
+**實測抓出的啟動器缺陷。** 真Windows hidden console的CTRL_C_EVENT可傳到Python，Python也完成延後finally；但PowerShell中断流程會略過原`$runCode = $LASTEXITCODE`，原window因此留下預設1，PowerShell自身卻回0。修正僅在啟動前初始化`$LASTEXITCODE=1`，finally再取得Python實際退出碼並明確`exit $runCode`。原`& Python`啟動、bounded cleanup及時間／金額界線不變。獨立child0／7、真Ctrl+C後延後清理與原session兩場均驗證，不只互比兩份可能同錯的摘要。
+
+**完整原始程式鏈。** 原CLI讀取合成設定並建立真adapter／session／manager／port／account／ledger；原SDK nonce decorator、sign/send、HTTP form／raw response反序列化及ReadStream原始JSON處理都在同一場執行。只有native signer、HTTP pool及WS傳輸替換，快測另使用原constructor的clock／sleep seam。以執行code object和其指紋證明必經原函式；fixture獨立保存接受狀態、請求、history發布、成交、持倉與cash，不以production ledger或manager slots生成答案。
+
+| 合成完整鏈情境 | 具體驗收 |
+|---|---|
+| 正常150s虛擬窗口 | 至少六張POST_ONLY，跨兩輪正常60s到期；每個ID只cancel一次，venue／fresh account0/0及exact cash；原125s可進入期限退出，改測150s，沒有改runtime截止邏輯 |
+| 終態晚到＋另一側成交 | 四次history及第一次cleanup讀都缺證；第二次cleanup讀取得exact terminal後，僅原兩張maker＋一次fresh residual reduce-only IOC，最後0/0；原場失敗碼1仍保留 |
+| 接受取消後回應遺失 | raw transport在venue接受後丟ConnectionResetError；原exact history恢復，每個cancel只送一次、nonce不回用，正常完成 |
+| 終態始終不可得 | 初始四讀＋cleanup兩讀仍缺證，無重送／新maker／IOC；原另一側委託仍在venue，client如實final0/1、exit blocked、code1，不把安全停止算清理成功 |
+| 歷史缺陷與判定器反例 | 在測試作用域還原215907 placeholder及完整terminal handoff/cache遺失，正常契約必須變紅；偽造flat的snapshot副本必被獨立venue判定拒絕，後者僅為判定器敏感度，不宣稱wire隱瞞場景 |
+
+晚到終態案例的固定合成成交為maker SELL0.00040＠77009.3（fee0.0036964464），IOC BUY0.00040＠77000.1（fee0.0107800140）；手算gross0.00368、net−0.0107964604、final cash999.9892035396，與原ledger逐項相符。每場全部HTTP端點的實際fixture attempts與原兩個SDK API client meter逐項一致；這仍不是交易所實際權重／redirect或retry的網路量測。
+
+**Windows真時間及隔離。** 使用含中文／空格的暫存工作區、原PS1／CLI及實際venv，保留真60s quarantine、Proactor／asyncio喚醒；原PS1从另一cwd啟動仍正確。程序先暫停建立、納入獨立job後才執行；stdio可繼承窗口以lock隔離。成功要在關閉job之前確認整棵樹自然清空；watchdog只在預期超時反例強制回收，不能算正常退出。缺Python／缺或無效配置在真正交易子程序前拒絕，child0／7及Ctrl+C後延後finally亦有獨立驗證。
+
+初次完整Windows focused兩場共67.206s：到期3s場次PS wall64.9237873s／active3.2063742s；Ctrl+C場次配置30s、PS wall63.2283636s／active1.4652183s，signal到整樹退出0.547s。均code0、watchdog=false、remaining processes0、fresh authenticated0/0、venue0/0／cash1000，Ctrl+C後無新正常maker，原bounded exit≤30s。證據為`logs/mm_v2_launcher_20260913_072703_363979_deadline`與`logs/mm_v2_launcher_20260913_072701_669744_ctrl_c`，來源指紋`2ee275843f3e787be96da1bd503ab23ef22eb5623ac12fdfcc1eeee7996ffa6c`。這些是最後冷啟動fixture修正前的證據；最新版同源結果另記在下方最終驗證，不混用版本。
+
+**測試自身的防誤綠。** 獨立審查補齊fixture的exact URL／method／auth／account／market／nonce、typed native modes／flags、最低名義金額、POST_ONLY不跨價及IOC限價；非法輸入須在接受及nonce變更前拒絕。一般socket／DNS／直接native loader都有拒絕反例；唯一允許的連線是原stdlib socketpair在同thread同步建立、綁定到自己的literal loopback埠，保留原Windows喚醒。沒有把假的self-pipe當Ctrl+C證據，也未更改系統網路設定。沒有可證實的OS封網，native ABI／實體HTTP／WS傳輸／真撮合仍未涵蓋。
+
+最後發現冷匯入順序缺口：若ReadStream首次在websockets.connect被替換後匯入，原default就會綁到fixture，退出patch仍殘留。新的獨立子程序先重現`cold_import_default_restored=False`；將匯入移到patch之前後，冷啟動回歸通過。原常態案例預先匯入、Windows bootstrap存續於整個子程序，因此先前正常結果未被該漏影響；仍以修正後全suite重新驗收。初輪645tests／188.810s全PASS保存在`logs/mm_v2_wire_launcher_final_tests_20260913.log`，這個數量未包含新冷啟動回歸，不能冒充最後版本。
+
+**最終同源驗證：646項V2 tests全部PASS，188.640s。** 修正後完整輸出為`logs/mm_v2_wire_launcher_verified_20260913.log`，包含新增9項wire／隔離／反例與5項Windows測試及其子案例。最後兩場Windows證據為`logs/mm_v2_launcher_20260913_073457_918664_deadline`（PS wall64.8650389s、active3.1982325s）與`logs/mm_v2_launcher_20260913_073456_154273_ctrl_c`（PS wall63.1079093s、active1.4327769s、signal至整樹退出0.485s）。兩場皆code0、自然清空job、watchdog=false、fresh authenticated0/0與獨立venue0/0／cash1000。最後來源指紋`460e29cbc5c0e63f0e5007dd4db44ec8d5360a4026086ceff42baaaea21b1af9`，冷啟動修正與完整鏈皆在此版本驗證。獨立審查與`git diff --check`通過。本次沒有新增shared production變更，不重跑無關Grid基線；不把這次V2全綠宣稱全專案既有基線已解決。
+
+Journal、budget、window（Windows）、獨立venue及synthetic manifest保存在ignored `logs/mm_v2_wire_*`／`logs/mm_v2_launcher_*`。Manifest保存Python3.12.13／SDK1.1.2、native檔案指紋（不載入）、執行code objects、前後一致的來源內容與公開設定，明示`synthetic=true`／`live_economics_evidence=false`。所有帳戶、金額及成交為合成案例；沒有新私人帳戶連線／查核、live、commit/push或VPS操作，使用者先前自行確認0/0仍不是原000352場次自動成功的證據。原provider錯誤、真60分鐘穩定度與economics仍未驗收。
+
+早期launcher精簡環境漏SystemDrive，產生repo內字面`%SystemDrive%/`下三個Windows cache檔；已補環境變數並把profile／temp／ProgramData移入隔離暫存workspace，原因已修正。兩次檢查範圍後的精確刪除均被自動審核以`blocked by policy`拒絕，未改shell或繞過；該暫存資料夾仍保留、未加入Git。
+
+## 2026-09-13 測試有效性審查：規劃完整入口驗證，尚未執行
+
+使用者指出反覆修復後，現有測試仍未有效驗證 `run_live_test`，本輪要求規劃。核對原PS1／CLI、session、SDK／read stream與測試替換邊界後，確認主要缺口是組合驗證：CLI測試替換整個session，多數session情境直接產生OrderData；真SDK與raw WS各有測試，但未在同一完整啟動與故障時序下執行。長窗口多以虛擬時鐘與成本代理執行，signal測試未實際通過Windows PowerShell子程序。這不推翻既有回歸結果，也不能由632項V2通過推論實盤穩定。
+
+具體計畫已記入[主計畫§19.9](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)：以原CLI／session／adapter／SDK搭配合成raw HTTP／WS與獨立模擬交易所紀錄，覆蓋正常到期、回應遺失、延後terminal與同時成交、API成本、殘量及會計時間差；加入真PS1／Ctrl+C、真時鐘長測與還原歷史缺陷必須變紅的反例。Native／傳輸隔離不足時明示覆蓋缺口，不宣稱零連外或完整SDK驗收。後續網路校準規劃為5分鐘strict dry，再逐場授權5／15／60分鐘live；以事件覆蓋、原期限內收尾與獨立終態證據晉級，不以測試數量或沒有成交作替代。
+
+本輪只完成來源審查、規劃與文件一致性檢查；新增測試尚未實作或執行，未重跑產品suite、啟動PS1、連接帳戶、改動交易參數、commit/push或進行VPS操作。000352初始提交錯誤仍未定因，使用者先前自行確認0/0不能改寫原場失敗。既有runtime修改與實際驗證記錄保留如下。
+
+## 2026-09-13 場次 000352：取消提交階段證據仍有歧義，原場 flat／2單退出失敗
+
+本場journal `logs/mm_v2_economics_20260913_000352_561.jsonl`，2050 events，SHA256 `525bdf651ec859494a41732425705e2eaabe2de5e039fb79da0df9c687c888d0`。Startup provenance為 `b4605b9`、dirty=true，含未提交修改，不能視為該commit的乾淨版本。Planned3600s、whole-process wall578.488854s、ledger515.4090054s後code1；分析保存在同stem `.jsonl.analysis.json`。原始line2049 account snapshot與line2050 report均為authenticated position0／open orders2，complete=false，並非完成收尾。
+
+使用者其後親自確認position／orders已為0/0。本輪沒有另外執行私人API唯讀查核；這是使用者回報，不是authenticated postflight或原run的final proof。原場0/2、歸零過程與可能的後續成本仍按原證據保留，formal economics unavailable。
+
+**故障鏈及新診斷。** 首個failure在line2039 `reconciling_quotes / ExecutionUnavailable`，其後line2041為下游ValueError；BUY uncertain_cancellation、SELL live、unknown=false。當次匹配取消action記錄 `cancel_receipt_pending=1`、`cancel_submission_signer_or_provider_error=1`、history attempts4／read errors0／exact matches0／captured terminal0及 `cancel_nonterminal_response=1`。Line2043 `exit_order_sync` 顯示recovery reads2、pending1、尚餘9203.5917ms、`recovery_terminal_pending=1`，其後exit_health blocked、IOC attempts0。這證明已讀歷史沒有取得相符終態；不能把泛化submission flag當成確定未送出。
+
+最後兩張known orders在ledger447.1096791s／447.9623935s提交；504.8361183s的healthy快照仍對應同ID／價格。509.8909584s取消前檢查時BUY／SELL已約62.7813s／61.9286s，均超過60s quote age。首個failure位於513.4488394–513.9963310s的相鄰public observations之間；514.4513458s退出blocked，514.6972094s開始的final account read仍有原兩張known orders。取消前檢查至blocked exit為4.5603874s，並非完整wire取消耗時。相同BUY取消缺證→halt→退出受阻的模式再次出現；以往場次缺少這些新增flags，不能倒推其具體原因相同。
+
+| 本場已記錄交易診斷 | 結果 |
+|---|---:|
+| Maker fills／turnover | 3／77.344280 USDG |
+| IOC fills／turnover | 1／15.465700 USDG |
+| Realized gross／maker fees／taker fees | −0.015140／0.00928131360／0.00541299500 USDG |
+| 已記錄交易net | −0.02983430860 USDG |
+| 有單／雙邊秒，占ledger時間 | 471.0499269／460.7033076，91.393%／89.386% |
+| API／account race退出，可選延後 | 0／0，3 |
+
+只有1組完整flat-to-flat，包含3筆normal maker及1筆IOC；沒有未閉合持倉不代表沒有委託風險。唯一正常退出由inventory_hold觸發，在216.4887982s以1次IOC取得authenticated0/0後重入。原planned3600s比較窗口下maker turnover/hour仍為77.344280，不縮短失敗窗口。1s／5s maker markout各覆蓋2/3，扣費前加權−0.678941／−0.377190bps；樣本過少，不能推論策略改善或以插值補齊。Strict來源2857包、最大age336.746ms、0超界；REST／WS／TX峰8600／110／8，無API拒絕退出。Budget累計sendTx31、nextNonce1、inactive-order reads47；31是整場聚合次數，沒有逐次交易類別／成功時序，不能由數量推定最後取消是否送出或已獲交易所接受。
+
+**本地SDK重現與證據界線。** 真SDK的本地隔離重現顯示：送出前／簽名失敗，以及transport／送出後解析失敗，都可能產生相同generic diagnostics。故本場歷史最初取消的精確原因仍未知，不能確證nonce、signer拒絕、送出與否或某個price／ID欄位矛盾。History read errors0只排除已計數讀取的拋錯，不證明取消成功；多讀到absence也不是terminal proof。
+
+**本批實作。** MM opt-in在單一signer instance、同一次真SDK呼叫中觀察sign／send邊界，保留原nonce decorator／key lock，不改SDK或全域transport；不同task直接透傳，完成／例外／取消均復原wrapper。只記固定stage及error_kind，不保留signed payload、token或raw錯誤；cancel／sign／send均須原SDK method，任意instance override不能提供未送出證明。真SDK本地sign error必須同時證明未進send且原nonce確實回退，才產生帶exact symbol／exchange ID的`OrderCancellationNotSentError`。不可觀測、可能已送出、回應解析失敗或nonce未恢復均保持不確定。
+
+補上另一個已證實的控制流缺口：MM的SDK error tuple／rejected response原先直接返回False，現在與提交例外一起進入原4次exact terminal查核，不增加send或history上限。Manager移除依錯誤文字包含429便恢復LIVE的捷徑；真正可能已送出的mutation保留原strict terminal／ownership要求，不以文字或active／absence重送。
+
+Manager只接受exact scoped no-send契約，保留原known slot、停止同輪剩餘mutation，不造terminal。正常port只對這類乾淨失敗永久停止正常報價，保留cleanup能力；任何mixed／unknown／fault變更仍halt。收尾前在原10s撤單期限及原30s退出內，另付5000REST／7WS／0TX的保守完整查核成本（包含stream掉線後的REST替代查核），保留整個既有退出預留；先fresh owned-order sync及authenticated account，再核fault／mutation generation、known ID及掛單集合。查核過期、不符、額度不足或cleanup再次失敗均不再送單；cleanup仍只用原兩撤單／三IOC預留，正常報價不恢復。撤除known orders的預先account audit不額外依賴行情；postcancel／IOC仍使用原market契約，同期fill以fresh residual處理。沒有調quote／size／loss／source或延長期限。
+
+Telemetry仍只接相符known action的allowlist，新增no-send分類不假造pending；console同時顯示固定stage／error旗標，方便下一次直接定位，JSONL保留完整證據。新增真SDK、manager、port及完整session回歸涵蓋stage／nonce、post-send error tuple、unknown、同時成交、fresh cleanup、market中斷、deadline／budget／fault與wrapper復原；以實際執行SDK的測試補足此前只有替身receipt的缺口。
+
+**同源潛在缺陷。** 獨立審查核對installed aiohttp：SDK POST可以自動follow redirect，之後才拋出配置API主機的DNS錯誤。因此DNS種類／主機相符也不證明原請求未送出。本批取消不採用DNS no-send推論，並移除既有MM create僅憑DNS便回退nonce的同源捷徑；保持ambiguous registry與禁止重送。此項會影響MM opt-in的共用Lighter送單契約，default/Grid原本即走ambiguous，行為不變。同步更新位於`test_lighter_grid_lifecycle.py`的單一MM opt-in共用轉接層測試；沒有修改Grid策略或配置。
+
+**本批最終驗證（2026-09-13）：632項V2現行契約均有通過證據。** 同一runtime批次以repository `.venv`執行全專案920 tests／100.827s，結果保存在 `logs/mm_v2_000352_final_tests.log`。首次為9 failures＋4 errors：其中一项V2舊API成本測試仍預期SDK invalid-nonce error tuple不查history，與本次統一終態取證契約不符；只更新該expectation並增加registry保留斷言後，相關34 tests／0.470s全通過（`logs/mm_v2_000352_api_budget_tests.log`），沒有再修改runtime。真SDK預算測試確認error tuple亦只送1次、最多4次history、含nonce refresh仍不超原412REST／1TX界線。其餘8 failures＋4 errors與 `logs/mm_v2_phase7_20260904/v2_only_cleanup_full_tests.log` 的12個方法逐一相同，沒有新增未解決失敗；不把首次full輸出宣稱全綠。既有固定10／30／60min離線情境包含在此次full run。獨立審查及 `git diff --check` 完成。新增實際rolling budget拒絕回歸證明額外查核不借用原exit reserve；這不是全網路行為耗用上界的實測。未啟動新live、私人API查核、VPS或commit/push。修後完整60分鐘實盤與最初provider錯誤定因仍缺實際證據。
+
+## 2026-09-12 場次 224839：取消缺證仍有殘單，補全有界查核與原因證據
+
+本場journal `logs/mm_v2_economics_20260912_224839_588.jsonl`，7507 events，SHA256 `e29bf070d991f6b0328c394b967868c7801011e05a7cd3f0a492a80a87290d58`。Planned3600s、whole-process wall1866.7408862s（31分06.7秒）、ledger1803.8071360s後code1。最後 `reconciling_quotes` 的ExecutionUnavailable／ValueError有 `cancel_nonterminal_response=1`，BUY uncertain_cancellation／SELL live；exit sync期間SELL成交消失，第三次退出在exit_health blocked、IOC attempts0。原始line7506 account snapshot與line7507 session report都明示authenticated short0.00040／BUY1單，不能宣稱自動收尾成功。
+
+使用者另外明確授權一次同帳戶Robinhood主網唯讀查核。23:40:28 +08得到positions=[]／open_orders=[]、身份驗證通過並已斷線，create/cancel皆0，耗時0.898s。順序讀取相隔約124ms，不是原run的atomic final proof；從殘留到歸零的過程與額外成本尚未歸因。結果保存在同stem `.readonly_postflight.json`，此一次授權已完成，沒有啟動新live或交易操作。
+
+| 本場已記錄診斷 | 結果 |
+|---|---:|
+| Maker fills／turnover | 22／557.394960 USDG |
+| IOC fills／turnover | 2／30.968640 USDG |
+| Realized gross／maker fees／taker fees | 0.005080／0.06688739520／0.01083902400 USDG |
+| 已記錄交易net | −0.07264641920 USDG |
+| 有單／雙邊秒，占ledger時間 | 1708.9129447／1649.1297367，94.739%／91.425% |
+| API背壓退出／可選延後 | 0／28 |
+
+原planned3600s比較窗口下maker turnover/hour為557.394960，不以早停的31分鐘縮短正式分母。9組完整flat-to-flat含7組maker-only，只有1組maker-only net正，另4組正gross不足付費；1組SELL尚未閉合。gross／fees約6.54%僅作已記錄交易診斷，formal economics仍unavailable。1s／5s maker markout各覆蓋13/22（59.09%），扣費前turnover加權−0.585371／−0.415429bps；不回填缺樣本。兩次前段退出是stream_rest_bracket account race，分別在ledger485.9093s及1689.7142s觸發，4.6164s／5.3864s後各1IOC成功flat；不是hold退出。Strict來源11664包、最大age337.9858ms、0超界；REST／WS／TX峰10100／102／9，無API拒絕退出。
+
+**根因的證據界線。** 本場此前38次正常撤換操作已成功取消43個ID，67份OrderEvidence的ID皆不同；最後BUY原price77409.4／amount0.00040與13份healthy working快照一致。沒有上輪每次正常撤單都被占位DTO拒絕、ID重用或價量改寫的證據。但舊 `cancel_nonterminal_response` 同時涵蓋真正缺terminal與strict欄位不合格，journal未保存該receipt／poll結果，因此不能確證最初是history延遲、provider錯誤或欄位矛盾。SDK會把簽名前失敗與send_tx的部分異常壓成相同err tuple，不能據此聲稱未送出或放行重送。
+
+**已重現並修復的收尾限制。** 舊恢復操作只sync一次；第一次仍active即消耗資格，縱使0.5s後exact terminal到達、原10s取證期限仍有9.5s，也沒有再讀入口。現在同一次操作仍先消耗資格，最多兩次fresh sync，第二次前等0.5s；仍受原 `min(cleanup_deadline, now+10s)`、fault／mutation generation、known IDs、無unknown／外來registry限制，每次讀取都走原admission。只有缺原pending terminal且其餘安全條件仍成立才可第二讀；額度拒絕、期限不足或新故障就停止。Exact terminal及registry確認後才接原fresh account、最多3IOC／固定價格／總30s收尾；不重送不確定撤單、不恢復正常報價、不提高API／風險限額。第二次可選讀取的額度拒絕另記secondary原因，不蓋掉最初撤單失敗。這是可重現的liveness修正，不能證明本場224839在這10s內必定會出現終態。
+
+**撤單診斷補齊。** MM opt-in的共用REST按當次已知ID最多保存兩筆固定submission類別及history attempts／read errors／exact matches／captured terminal計數；不保留raw provider錯誤、receipt或憑證，confirm後清除，Grid/default未啟用。Manager與strict驗證共用同一判定，分開PENDING／缺receipt與symbol／side／type／exchange ID／client／financial／amount／price／remaining拒絕原因；在確認清理前擷取到該cancel action。Telemetry只接當前pending ID與相符失敗cancel的allowlist資料，不借用舊單或另一操作；保留舊總旗標相容性。Recovery失敗另記讀取次數、未證明ID數、剩餘時間及固定原因。同步診斷getter拋錯或自拋CancelledError均隔離，真正交易await的task cancellation仍傳遞。
+
+Analyzer以前在incomplete replay用ledger.snapshot預設false/null覆蓋已記錄final facts；現在保留typed report的final authentication／position／count，並另列最後AccountSnapshot及兩者行號。來源矛盾或缺失照實保留，沒有重新認證或升級economics。本場重算 `.jsonl.analysis.json` 正確呈現true／−0.00040／1，formal淨值及fee-cover保持null。
+
+**驗證。** 真Adapter→REST→manager→session整合重現4次history皆無終態、對側SELL成交、第一次exit查核仍active、第二次partial CANCELED到達，再以fresh residual作單次IOC→authenticated0/0（離線fixture原量0.1、partial0.04、殘量0.06，非本次實盤交易）。正常maker只原兩張，不重送cancel，原deadline只建立一次；failed run仍failed。實際API成本fixture另驗第二次讀取計費與原1000REST／5WS準入，缺額度時不讀、不加交易。原persistent active／absence、generic fault／unknown、partial IOC及長窗口回歸保留。
+
+**最終驗證於2026-09-13完成：全專案901 tests／101.791s，613項V2全數通過。** Repository `.venv`執行 `unittest discover -v -s tests -p "test_*.py"`，完整結果 `logs/mm_v2_224839_final_verbose_tests.log`。8 failures＋4 errors與 `logs/mm_v2_phase7_20260904/v2_only_cleanup_full_tests.log` 的12個既有Grid／Lighter cancellation方法逐一相同，無新增失敗，並非宣稱全專案全綠。第一輪完整suite在沒有結果摘要時中止，沒有當作驗收，故以逐項輸出重跑取得本次完整證據。Shared default、前批修復及固定10／30／60min離線工作量皆包含；獨立審查及 `git diff --check` 完成。
+
+本批未調quote／size／loss／inventory／fee／source參數，未修改Grid策略、配置或測試；此前未提交變更保留，沒有commit/push或VPS操作。只有上述一次授權唯讀連線；修後完整60分鐘live、最初撤單provider原因及原場後續歸零成本仍待實際證據。
+
+## 2026-09-12 場次 215907：修正完整撤單終態在共用轉接層遺失
+
+使用者提供 `logs/mm_v2_economics_20260912_215907_056.jsonl` 的退出畫面後，核對同場 journal、window、budget 與重新產生的 `.jsonl.analysis.json`。Journal SHA256 `1887cd403b30fedf5108471fe24b7c089a75a718dbe223a4bde1eca8ddf4a679`；startup provenance為 `b4605b9`、dirty=true，含前批未提交修改。Planned3600s、wall128.5786228s、ledger65.6977842s後code1；0 fills／0 fees，首次60s quote expiry時 `reconciling_quotes` 報ExecutionUnavailable及下游ValueError。兩則診斷均有 `cancel_nonterminal_response=1`，buy uncertain_cancellation、sell live。
+
+**本場有成功收尾，整場仍失敗。** 原退出路徑取得晚到的確切終態、撤餘單後，cleanup与final均authenticated position/orders0/0；IOC attempts0。最後ledger會計完整，但runtime failure使formal economics維持unavailable，不能把沒有成交、沒有費用當成fee-cover通過。取消前最近診斷到cleanup flat為3.2764433s；不是已量測的wire cancellation耗時。`sendTx`共4次（2create／2cancel）、inactive-order reads7次，無API／account背壓或optional deferral。397份strict source記錄皆有效。本批未新連線或啟動live。
+
+**可重現的程式根因。** 上一批對manager取消終態加入原size／price／side／exact ID檢查，卻未走真實共用Adapter→REST的正常撤單交接。REST當時只為FILLED保留完整OrderData；CANCELED／REJECTED／EXPIRED則清掉registry後回bool。Adapter再重建amount0、price=None、side BUY的占位回覆，連有效取消也不符合manager契約；正確的history DTO已丟失。原測試fake直接回傳完整OrderData，漏掉這個整合缺口。新增真Adapter→REST→manager測試在修復前，BUY／SELL×五種終態的10個子案例中，8個非FILLED失敗、2個FILLED通過，證明交接不對稱。歷史journal未保存cancel receipt，故不能聲稱日誌直接證實某個price／ID欄位錯配；程式重現與本場首次到期故障相符。
+
+**修復。** 僅在既有MM opt-in下，REST保留CANCELED、partial CANCELED、FILLED、EXPIRED、REJECTED的原始完整DTO，Adapter直接交給consumer；registry／cache在manager完成原exact terminal檢查後才清除。尚未確認的再次呼叫只讀取終態，已有cache就直接交接，不重送signer、不新增HTTP、不延長輪詢或退出期限。仍active、absence、錯ID／symbol／size／price／side等不構成取消成功，保留前批有界取證及fail-closed。Grid/default未啟用此契約，原bool／placeholder與client-alias行為保持。
+
+獨立審查另發現同一交接生命週期內的編號碰撞：一張合法terminal的client ID可能等於另一張pending的exchange ID；舊Adapter confirmer會兩個都清除。MM confirmer現在僅確認原exchange ID，client-only／空ID不消費registry；兩張同status pending的marker／cache對照測試確認另一張保留，default client-alias行為另有回歸。這是可重現的潛在缺口，不宣稱本場曾發生。
+
+**驗證。** 真Adapter→REST→manager涵蓋雙向正常／部分取消、成交競速、expired／rejected、晚到或一直缺terminal、cached receipt不重送及default對照。新增完整session回歸以假時鐘跑125s，經兩輪60s雙向quote expiry後繼續POST_ONLY，最後fresh authenticated0/0；每張只cancel一次、每次成功取消只讀一份history，無額外active read，沒有借exit recovery把正常報價失敗掩成通過。40項Lighter execution及63項session runner測試先行通過，獨立安全審查無剩餘阻擋問題。
+
+**最終完整suite：889 tests／98.161s，601項V2全數通過。** 使用repository `.venv`／`unittest discover -s tests -p "test_*.py"`，結果保存 `logs/mm_v2_215907_final_tests.log`。8 failures＋4 errors與 `logs/mm_v2_phase7_20260904/v2_only_cleanup_full_tests.log` 的12個既有Grid／Lighter cancellation方法逐一相同，無新增失敗；不是全專案全綠。Shared defaults、read-stream observer、前批資金費／API／exact accounting／部分IOC／stop與deadline、固定10／30／60min離線負載均包含於本次full suite；`git diff --check`通過。沒有為確認相同結果再跑重複V2 suite。
+
+本批未改報價、size、風險、API額度或退出參數，未修改Grid策略／config／tests；之前未提交工作保留。未啟動新live／私人查核／VPS或commit/push。完整60分鐘實盤與經濟表現仍待修後場次；本地回歸不是實盤驗收。
+
+## 2026-09-12 場次 205914：已知撤單不確定阻斷收尾，補全退出取證
+
+使用者要求「分析我最新的測試紀錄，並且優化」。本場為 `logs/mm_v2_economics_20260912_205914_430.jsonl`，7173 events，SHA256 `b0e5d44cd214fce91ab1bd5975108fa5e1bd08e848aae6de0f6e3d1f037ca441`。Startup provenance明示 `b4605b9`、dirty=true，包含前批尚未提交的修正，不能視為該commit的乾淨版本。實際設定已有證據：size0.00040、edge0.20bps、volatility multiplier1.0、skew2.0bps、soft/hard0.00040/0.00080、max hold180s、loss0.50、stop0.15、IOC200ticks；本批未調這些值。
+
+**原輪失敗與後續觀測分開。** Planned3600s，wall1751.6822554s（29分12秒）、ledger1685.3013526s（28分05秒），exit code1。最後strict account仍short0.00040／2張委託，第三次退出blocked、IOC attempts0；原輪沒有自動收尾0/0證明。使用者確認沒有手動處理，並另外授權一次同帳戶Robinhood主網唯讀查核：21:43:28 +08觀測全帳戶positions=[]、open orders=[]，身份驗證通過、已斷線，create/cancel皆0。這是兩次相隔約126ms的順序讀取，並非原run的atomic final proof；歸零過程、後續成交與成本尚未取證，不回填原run成功。結果保存在同stem `.readonly_postflight.json`；此次唯讀授權已完成，不代表新交易授權。
+
+| 本場已記錄結果 | 數值 |
+|---|---:|
+| Maker fills／turnover | 25／680.019960 USDG |
+| IOC fills／turnover | 2／30.915860 USDG |
+| Realized gross／maker fee／taker fee | 0.017700／0.08160239520／0.01082055100 USDG |
+| 已記錄交易net／最後marked net | −0.07472294620／−0.07940294620 USDG |
+| 有單／雙邊秒 | 1603.4634884／1529.1574765 |
+| 有單／雙邊占ledger時間 | 95.14%／90.74% |
+| API／可恢復account背壓退出 | 0／0 |
+
+10組完整flat-to-flat：8組maker-only gross0.028440、fee0.05934674400、net−0.03090674400；7組gross正，僅2組net正，5組正價差不足付費。2組含IOC net−0.04010926780；最後未閉合short另有已記錄fee0.00370693440。兩次正常IOC皆由inventory_hold觸發，27筆fills全有order證據，25筆maker皆normal、passive reducing為0。診斷gross/fee19.15%，但原輪尚有未平倉損益與之後退出成本；formal economics仍unavailable，不能直接與旧輪3.12%比較為盈利改善。
+
+相較231145，有單／雙邊覆蓋82.93%／54.98%→95.14%／90.74%；maker/實際wall-hour2883.87→1397.55、maker/quote-hour3554.33→1526.74。不同時段及未完成窗口，不是控制實驗。新4343筆public BBO支持1s／5s maker markout：覆蓋17/25（68%）與19/25（76%），turnover加權分別−0.443712／−0.304824bps、均未扣每側1.2bps maker fee；缺配對為first-after sample超過250ms容差，不插值、不回填fill reference。舊輪無此public evidence，不能同口徑比較。維持先處理執行與成本證據，不盲目增加edge或成交量。
+
+**故障鏈。** 最後正常報價改價取消一側，manager留下buy live／sell uncertain_cancellation；`execution_port`把缺terminal取消標為全域halt。之後orchestrator的「execution blocked」只是下游錯誤，真正收尾在exit_health就被HALTED擋下。當時無API/backpressure退出，REST/WS/TX峰9200/98/9；12404筆strict來源最大age332.9746ms、0超界。最初cancel未取得terminal的具體原因缺少provider分類，不宣稱已證實是transport、signer拒絕或history延遲。
+
+**本地修正。** Known-cancel失敗保留該次確定owned ID；只有沒有未知委託、提交疑慮或外來取消registry時，才可在原cleanup deadline內做一次exit-only sync（單次至多10s，照原retry admission及實際API observer計費）。同ID仍active、缺席無terminal、錯ID、generation改變、來源/查核失敗，都不能清除halt或重送撤單。須原pending IDs全取得exact terminal、registry清空且剩餘known slots健康，才清除此取消專屬鎖停，接回撤餘單→fresh account→原固定價格／最多3IOC／原30s退出。通用snapshot/IOC/未知提交halt不可經此流程解除，正常報價不因收尾恢復而重啟；失敗run仍為失敗。
+
+同一路徑也覆蓋首次bounded cancel才遇到延遲terminal的情形：在原10s取消期限內最多一次補查；證明後只取消尚未處理的已知另一側，不重送不確定單。失敗未獲證明就停止；不重置期限或額外贈送IOC attempts。正常quoted path、bounded cancellation及實際API計費都有回歸，含partial fill後按fresh residual減量。
+
+獨立審查另外重現兩個安全邊界：sync期間新generic halt可能被舊取消恢复覆寫，以及同client ID／另一個已known exchange ID的terminal可能被記到原slot。新增fault generation，取消或補查期間的新generic fault都不能被降級或清除；取消終態要求exchange ID精確一致、已有client ID不矛盾、原size／price一致及remaining不增加，涵蓋直接回覆、cached terminal、history與取消中的order update。這些是允許新恢復入口前必須補上的證據邊界，不代表本場已觀測到身份錯配。
+
+另外補上取消batch的固定原因flags與pending/matched counts，僅採用目前不確定slot與相符cancel action的本地結果；未知或過期原因標unknown，不保存原始provider錯誤。修正分析器錯讀sidecar路徑（真runner為 `.jsonl.budget.json`），加入真runner寫入→analyzer CLI讀取的離線契約測試，本場provenance現在正確available；分析保存在同stem `.jsonl.analysis.json`。
+
+**最終595項V2 tests PASS（86.813s）**，repository `.venv`／`unittest discover -s tests -p "test_mm_v2_*.py"`；`git diff --check`與獨立安全審查通過。包含真normal reprice取消未確認→已知單補查→partial fill→fresh residual IOC→final0/0，以及still-open／absence負例、補查API observer與原retry allowance、取消和sync期間的新generic halt；取消proof另覆蓋4個來源×14種契約情況。舊資金費有界恢復、cash cache、API背壓、固定10／30／60min負載、部分IOC及stop／deadline回歸亦通過。嚴格terminal檢查揭露的本地fake receipt已改成原slot的真實size／price／client，不降低安全斷言。
+
+本批新production修改限V2，前批未提交的shared observer等修改保留、其已完成完整870測試的證據不重寫；沒有新Grid／shared adapter／local live YAML／quote／risk參數修改。只完成上述一次授權唯讀查核，未啟動新live、委託操作、VPS或commit/push。修後完整實盤60分鐘及fee-cover仍待新證據，595項本地PASS不代表實盤不會再失敗。
+
+## 2026-09-12 場次 231145 fee-cover 分析後：減倉容量一致性與成本歸因
+
+依使用者「請依分析進行下一步優化」完成本地修改，起點為 `refactor/lighter-volume-mm-v2`／`b4605b9`。下載報告及貼文作為待核對分析，沒有用來授權新實盤、增加風險或指定參數。上一批 funding／監控／缺側補單修復保留；歷史231145不當作修後運行結果。
+
+**歷史重算。** 原journal共3359個事件，SHA256為 `972d0c0498746f0b3ea76f41676b64c9470c44d59655989003ff40534e4d644e`。既有分析器現在按真實持倉從0到再次精確0分組，保留整筆翻倉及部分成交，不拆配勝利交易、不引入runtime episode。23組皆完整：19組maker-only的gross／fee／交易net為 `0.008163 / 0.14018300124 / -0.13202000124`；4組含taker為 `0.002376 / 0.19762771008 / -0.19525171008`。Maker-only有12組gross正、5組net正，7組正gross不足付費；合計精確重現90 fills、gross `0.010539`、fee `0.33781071132`、交易net `-0.32727171132`。交易gross／fee約3.12%只作診斷，正式fee-cover仍因final accounting不完整而不可用；不回填候選funding。
+
+**重現並修正容量缺口。** 原governor對兩側共用lot搜尋；非flat時，加倉側的風險預留可把兩側一起壓到minimum以下，連原本可負擔的正常減倉報價也消失，因而進入passive-touch。現在僅在原搜尋兩側皆不可下單時，再以同一風險公式搜尋真正減倉側，上限為 `min(abs(position), order_size)`；仍包含全部未撤舊單、working gap、stop／taker／slippage／maker reserve與嚴格 `< max_loss`。符合minimum才保留正常單側報價；不翻倉、不提高loss或inventory限額、不延長hold／deadline、不以獲利條件阻止退出。真正reserve不足及hard／hold／loss／stop退出維持原路徑。
+
+可重現合成情境：order `0.00040`、minimum `0.00020`、soft／hard `0.00040 / 0.00080`、session loss `0.5`、stop reserve基準 `0.15`、maker／taker fee `0.00012 / 0.00035`、slippage 200 ticks × 0.1。先有交易loss `0.28`，正常BUY `0.00040 @ 77103.9`成交後，fresh BBO為 `77103.9 / 77104.0`，inventory loss為0、current loss `0.28370098720`。
+
+| 同一合成快照 | 原共用容量搜尋 | 修正後 |
+|---|---|---|
+| 可執行容量 | 兩側各0.00010，均低於minimum | BUY 0／SELL 0.00040 |
+| 報價路徑 | REDUCE_ONLY，SELL @77104.0 | SKEWED，正常SELL @77113.3 |
+| 同風險公式 | 未搜尋獨立減倉候選 | current loss＋reserve `0.45619933920 < 0.5` |
+
+保留原安全對側單時仍計入舊價，合計為 `0.45620283600 < 0.5`。多空、部分持倉、subminimum、未撤加倉單及嚴格邊界皆有回歸。這是程式缺口的受控重現，不能唯一解釋缺少governor原因的歷史每筆快速減倉，也不預測新價格會成交或獲利。
+
+**下一輪能留下的證據。** 新 `GovernorDiagnostic` 記錄實際轉態原因、minimum、候選與核准容量，以及當次真實風險計算的各預留項；未經該計算的分支保持null，`remaining_loss_headroom`是扣current loss後、尚未扣reserve的餘額。`OrderEvidence`在owned order ID確認後、對應fills進帳前記錄實際提交的side／price／size／reduce-only／TIF、當時external market及本地提交／確認時間；保留單不重置原時間。IOC仍須原exact terminal證明。後續恢復才發現的未知提交可能無此證據，分析器維持unclassified，不補造確認事件。
+
+已驗證公開stream以最多4Hz抽樣BBO、原source timestamp／nonce／receipt time／size；不新增請求或訂閱，Grid預設observer為None、原REST及行情有效性規則不變。Journal先有初始AccountSnapshot，再註冊observer；final report前停止接收診斷。Callback故障不阻斷known-order清理。公開BBO可能含自己的單，只供成交後1s／5s source-clock markout，須目標時間後0.25s內樣本且列明覆蓋率；不宣稱external fill-time reference或歷史wall-clock age已驗證。本地submit→fill receipt是觀測區間，不是假定的交易所實際掛單年齡。
+
+既有 `analyze_mm_v2_session.py` 新增normal maker／passive reducing maker／IOC／unclassified成本、分組、governor原因及上述時間／markout覆蓋。類別gross採平倉fill認列，不能當作獨立策略收益或刪除退出後的反事實。原90筆fill的reference仍全null，spread capture／inventory decomposition／flatten concession缺證據仍不可用，不用後來quote或稀疏mark回填。Runner在adapter啟動前將當次commit／dirty／allowlisted有效quote、inventory、flatten、session設定寫入原budget sidecar，啟動失敗亦保存；無Git就明示unavailable，無帳戶、金鑰、路徑或exchange配置。舊場次缺此證據時不拿目前HEAD或schema example補猜。
+
+**最終驗證：全專案870 tests／91.838s，582項V2全數通過。** 其餘8 failures＋4 errors與 `logs/mm_v2_phase7_20260904/v2_only_cleanup_full_tests.log` 的12項既有Grid／Lighter cancellation基線逐一相同，無新增失敗；不是宣稱全專案全綠。共用read-stream預設、callback隔離與無額外API測試包含在本次完整suite。首次完整測試另外揭露兩個舊Buffered fixture使用float毫秒時間，與真WS `_integer` 契約不符；僅修正三處fixture為int，原immutable-book watermark及第二次IOC handoff安全斷言保留，再完成上述統一重跑。`git diff --check`與獨立order safety審查通過。
+
+固定600／1800／3600s離線回歸仍涵蓋funding race、known-order／unknown mutation、partial IOC、account cache、monitor預留及stop／deadline。最終一小時fixture為3600.106s、42 maker／8 taker、0 API退出、cash差0／final0/0，雙邊3281.967s（約91.16%）；離線模擬仍保留IOC成本及延遲場景錯過的成交，不把unit PASS當實盤成本改善。新CLI另將歷史重算存於同stem `.fee_cover.analysis.json`，明示90筆fill／23組、order／governor／公開樣本coverage為0、formal economics=false。
+
+本批未改報價參數、策略fee floor或風險限額，未啟動新live／私人帳戶連線／VPS，也未使用已完成的一次性commit/push授權。實盤完整60分鐘、最終funding對帳及fee-cover仍待新場次證據；本地容量修正與診斷完整不代表經濟達標。
+
 ## 2026-09-11 場次 231145 後：資金費有界恢復、空委託監控成本與缺側補單
 
 依使用者「ok請就這幾點先優化」完成 V2 本地修復。下面231145的歷史失敗、現金差額、實際54.98%雙邊覆蓋及未完成60分鐘的結論保留；本批沒有新live、私人帳戶連線、Grid／shared adapter／risk或quote配置修改、VPS、commit/push。公開funding等額吻合仍只是上輪歸因證據，未補造或回填私人funding ID。

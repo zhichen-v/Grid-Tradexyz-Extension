@@ -12,6 +12,7 @@ from .domain import (
     ExecutionStatus, MarketStateSnapshot, QuotePlan, QuoteAuthorization,
     InventoryDecision, MarkEvent, SessionRunResult, StrategyState, ZERO,
     BoundedExitReport, ExitStatus, FlattenIntent, Side, _boolean, _count, _identifier, _symbol, _time,
+    PublicBookObservation,
 )
 from .execution_port import Clock, ExecutionPort, MarketDataPort, ExecutionUnavailable
 from .config import require_authorization
@@ -201,6 +202,8 @@ class VolumeSession:
         self._session_complete = False
         self._funding_recovery_attempted = False
         self._funding_proof_context = None
+        self._last_public_observation = None
+        self._public_observations_closed = False
         self._quote_account = None
         self.account = LighterAccountPort(adapter, config.symbol, self.clock,
             account_index=account_index, expected_l1_address=expected_l1_address,
@@ -209,7 +212,8 @@ class VolumeSession:
                                          else 0 if config.dry_run else None),
             terminal_order_ids=lambda: self.manager.terminal_order_ids if self.manager else frozenset())
         self.market = LighterMarketData(adapter, config.symbol, self.clock,
-            working_orders=lambda: self.account.latest_orders, aligned_book=lambda: self.account.aligned_book)
+            working_orders=lambda: self.account.latest_orders, aligned_book=lambda: self.account.aligned_book,
+            aligned_diagnostics=lambda: self.account.book_diagnostics)
         self.account.before_read = self._admit_read
 
     def _admit_read(self, kind):
@@ -222,6 +226,13 @@ class VolumeSession:
                     or execution.simulated or self.manager.snapshot()):
                 raise ExecutionUnavailable("flat funding proof state changed")
         if not self._budget_active:
+            return
+        if kind == "cancel_no_send_audit":
+            # Cover a full extra audit even after stream loss: the REST
+            # fallback can need up to 4800, versus 2400 with a stream.
+            # Keep the entire normal exit reserve and do not spend a TX.
+            self.api_budget.require_normal({"rest": 5000, "ws": 7, "tx": 0},
+                                           operation="cancel_no_send_audit")
             return
         if self._budget_exiting:
             if kind == "retry":
@@ -351,11 +362,26 @@ class VolumeSession:
     def _diagnose(self, stage, error=None):
         try:
             self._emit(failure_diagnostic(self.config.symbol, stage, error,
-                       execution=self.execution, manager=self.manager))
+                       execution=self.execution, manager=self.manager,
+                       market_values=self.account.book_diagnostics))
         except Exception:
             pass  # Even warning-as-error or broken state capture must preserve cleanup.
 
-    async def snapshot(self, *, exiting=False):
+    def _observe_public_book(self, book):
+        # Use the existing validated stream; no additional request or subscription.
+        # At most four samples/s. Source timestamps are kept for offline pairing;
+        # this public BBO contains own orders and never becomes a fill-time mark.
+        if self._public_observations_closed:
+            return
+        received = book["received_monotonic"]
+        if self._last_public_observation is not None and received - self._last_public_observation < .25:
+            return
+        event = PublicBookObservation(self.config.symbol, received, book["timestamp"], book["nonce"],
+            book["bid"], book["ask"], book["bid_size"], book["ask_size"])
+        self._emit(event)
+        self._last_public_observation = received
+
+    async def snapshot(self, *, exiting=False, refresh_market=True):
         """Bridge post-cancel/IOC read; MUST NOT invalidate the OM preparation token."""
         if exiting:
             # Exit preparation establishes a new read boundary even without a
@@ -363,8 +389,13 @@ class VolumeSession:
             self.account.begin_quote_cycle()
         account = await self.account.snapshot(allow_cash_reuse=not exiting,
                                               allow_metadata_cache=not exiting,
-                                              allow_unreconciled_cash=exiting)
+                                              allow_unreconciled_cash=exiting,
+                                              require_aligned_book=refresh_market and not exiting)
         self.final_account = account
+        if not refresh_market:
+            # Known-order cancellation needs exact account truth, not a book.
+            # Pricing an IOC still takes the normal fresh-market path below.
+            return account
         try:
             market = await self.market.refresh()
         except Exception:
@@ -419,6 +450,10 @@ class VolumeSession:
             raise ValueError("configured lot/notional is not executable; never upscale")
         self.ledger = SessionLedger(initial, telemetry=self.telemetry)
         self.account.attach_ledger(self.ledger)
+        # Preserve the journal's starting authenticated account boundary.
+        observe_books = getattr(self.account.stream, "set_book_observer", None)
+        if observe_books is not None and self.telemetry is not None:
+            observe_books(self._observe_public_book)
         started = initial.observed_monotonic
         self.governor = InventoryGovernor(order_size=cfg.quote.order_size,
             soft_limit=cfg.inventory.soft_limit, hard_limit=cfg.inventory.hard_limit,
@@ -451,6 +486,10 @@ class VolumeSession:
                 before_optional_revision=self._admit_optional_revision,
                 on_optional_refusal=self._on_optional_refusal,
                 on_failure=self._diagnose,
+                on_order_evidence=self._emit,
+                before_cleanup_reconcile=lambda: self._admit_read("retry"),
+                before_cleanup_audit=lambda: self._admit_read("cancel_no_send_audit"),
+                pre_cleanup_account=lambda: self.snapshot(exiting=True, refresh_market=False),
                 reprice_threshold_ticks=cfg.quote.reprice_threshold_ticks,
                 max_quote_age_ms=cfg.quote.max_quote_age_ms)
 
@@ -491,6 +530,7 @@ class VolumeSession:
         report = replace(report, inventory_age=max(report.inventory_age, self.account.inventory_age_bound(now)))
         decision = self.governor.evaluate(market, risk_account, report,
             exposure, now=now, stop_requested=self._stop.is_set())
+        diagnostic = self.governor.last_diagnostic
         if (self._passive_until is not None and now < self._passive_until
                 and decision.state is StrategyState.FLATTENING
                 and ZERO < abs(account.position) <= self.config.inventory.hard_limit):
@@ -498,10 +538,15 @@ class VolumeSession:
             decision = InventoryDecision(StrategyState.REDUCE_ONLY,
                 buy_capacity=capacity if account.position < ZERO else ZERO,
                 sell_capacity=capacity if account.position > ZERO else ZERO)
+            if diagnostic is not None:
+                diagnostic = replace(diagnostic, state=decision.state, reason="passive_exit_grace",
+                    buy_capacity=decision.buy_capacity, sell_capacity=decision.sell_capacity)
         plan = self.policy.propose(market, account, decision, now=now)
         # Both normal and reducing proposals obey the current minimum notional.
         plan = replace(plan, quotes=tuple(q for q in plan.quotes
             if q.price * q.size >= self.market.min_quote_amount))
+        if diagnostic is not None:
+            self._emit(diagnostic)
         self._emit(decision)
         return QuoteAuthorization(account, market, decision, plan)
 
@@ -624,7 +669,13 @@ class VolumeSession:
                 # Unknown mutations remain blocked by the execution port.
                 pass
             self._passive_until = None
-            if (self.execution.snapshot().health is ExecutionHealth.PAUSED_ORDER_STATE
+            if self.execution.can_reconcile_cancellation:
+                # One bounded proof operation permits at most two admitted
+                # reads. Active/absent alone cannot clear cancellation uncertainty.
+                self.phase = "exit_order_sync"
+                await self._io(lambda: self.execution.reconcile_cancellation_for_cleanup(deadline),
+                               timeout=min(10, deadline - self.clock.monotonic()))
+            elif (self.execution.snapshot().health is ExecutionHealth.PAUSED_ORDER_STATE
                     and self.manager.can_reconcile_known_orders):
                 # Known receipts and disappeared orders may need fresh evidence.
                 # Empty adapter registries keep the generic resolver free of I/O.
@@ -650,6 +701,8 @@ class VolumeSession:
             self.cleanup_account = report.final_result.account_snapshot
         if report.complete and self.governor.exit_deadline is not None:
             decision = self.governor.confirm_exit(report.final_result, now=self.clock.monotonic())
+            if self.governor.last_diagnostic is not None:
+                self._emit(self.governor.last_diagnostic)
             self._session_complete = decision.state is StrategyState.SESSION_COMPLETE
         self._exit_id = None
         return report.complete
@@ -826,6 +879,7 @@ class VolumeSession:
                     cleaned = False
                     self.final_account = None
             try:
+                self._public_observations_closed = True
                 self.phase = "finalizing_ledger"
                 if self.ledger:
                     if self.config.dry_run:

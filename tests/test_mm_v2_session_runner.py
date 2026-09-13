@@ -5,17 +5,22 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal as D
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace as NS
 import unittest
 import time
 import warnings
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from core.adapters.exchanges.models import OrderData, OrderSide, OrderStatus, OrderType
 from core.services.market_maker_v2.config import (
     ConfigError, FlattenConfig, InventoryConfig, MarketMakerV2Config, QuoteConfig, SessionConfig,
 )
-from core.services.market_maker_v2.domain import BoundedExitReport, ExitStatus, QuotePlan, FailureDiagnostic
+from core.services.market_maker_v2.domain import (
+    AccountSnapshot, BoundedExitReport, ExitStatus, QuotePlan, FailureDiagnostic, FillAccounting,
+    OrderEvidence, PublicBookObservation, SessionReport, StrategyState,
+)
 from core.services.market_maker_v2.api_budget import ApiBudgetUnavailable
 from core.services.market_maker_v2 import orchestrator
 from test_mm_v2_lighter_runtime import Adapter, ADDRESS, Clock, ReadStream, trade
@@ -178,6 +183,175 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         return orchestrator.VolumeSession(configured, self.adapter,
             account_index=7, expected_l1_address=ADDRESS, authorize_bounded_flatten=authorized,
             telemetry=NS(emit=self.events.append), clock=self.clock, sleep=sleep or advance)
+
+    def assert_order_evidence_precedes_fills(self):
+        evidence = {}
+        for event in self.events:
+            if type(event) is OrderEvidence:
+                self.assertNotIn(event.order_id, evidence, "retained orders must not be restamped")
+                self.assertLessEqual(event.market.observed_monotonic, event.submitted_monotonic)
+                self.assertLessEqual(event.submitted_monotonic, event.confirmed_monotonic)
+                evidence[event.order_id] = event
+            elif type(event) is FillAccounting:
+                fill = event.fill
+                self.assertIn(fill.order_id, evidence, "fill must have earlier exact order-ID evidence")
+                order = evidence[fill.order_id]
+                self.assertEqual((order.symbol, order.side), (fill.symbol, fill.side))
+                self.assertLessEqual(fill.size, order.size)
+                self.assertIsNone(fill.reference_price, "quote-time market is not a fill-time mark")
+                self.assertEqual(order.time_in_force, "IOC" if fill.liquidity.value == "taker" else "POST_ONLY")
+                if order.time_in_force == "IOC":
+                    self.assertTrue(order.reduce_only)
+                    self.assertIs(order.strategy_state, StrategyState.FLATTENING)
+        return evidence
+
+    async def test_fast_confirmation_fill_has_order_evidence_before_ledger_fill(self):
+        registered = self.adapter.set_market_maker_confirmation_reader
+        filled = []
+
+        def register(reader):
+            async def confirm(symbol):
+                if not filled and self.adapter.orders:
+                    order = self.adapter.orders[-1]
+                    self.adapter.fill(order)
+                    filled.append(order.id)  # Before create_order has returned its terminal receipt.
+                return await reader(symbol)
+            registered(confirm)
+
+        self.adapter.set_market_maker_confirmation_reader = register
+        result = await self.session(dry=False, authorized=True).run(asyncio.Event())
+        self.assertTrue(result.completed, result.failure)
+        self.assertEqual(len(filled), 1)
+        evidence = self.assert_order_evidence_precedes_fills()
+        self.assertFalse(evidence[filled[0]].reduce_only)
+        self.assertEqual((result.report.maker_fill_count, result.report.taker_fill_count), (1, 1))
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+
+    async def test_retained_order_evidence_keeps_original_quote_reference_and_times(self):
+        session = self.session(dry=False, duration=8, authorized=True)
+        session.config = replace(session.config,
+            quote=replace(session.config.quote, reprice_threshold_ticks=100, max_quote_age_ms=60000))
+        original = []
+
+        async def advance(seconds):
+            if not original and self.adapter.creates == 2:
+                original.extend(event for event in self.events if type(event) is OrderEvidence)
+                self.adapter.book.asks[0].price = D("103")  # Safe old quotes remain authorized.
+            self.clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        session.sleep = advance
+        result = await session.run(asyncio.Event())
+        self.assertTrue(result.completed, result.failure)
+        self.assertEqual(self.adapter.created_tifs, ["POST_ONLY", "POST_ONLY"])
+        evidence = self.assert_order_evidence_precedes_fills()
+        self.assertEqual(len(original), 2)
+        self.assertEqual(len(evidence), 2)
+        for order in original:
+            self.assertIs(evidence[order.order_id], order)
+            self.assertEqual(order.market.external_ask, D("101"))
+        self.assertEqual(session.market.snapshot().external_ask, D("103"))
+
+    async def test_order_evidence_hook_failure_does_not_interrupt_flat_cleanup(self):
+        filled = False
+
+        async def advance(seconds):
+            nonlocal filled
+            if not filled and self.adapter.orders:
+                self.adapter.fill(next(row for row in self.adapter.orders if row.side is OrderSide.BUY))
+                filled = True
+            self.clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        def emit(event):
+            if type(event) is OrderEvidence:
+                raise RuntimeError("fixture unavailable order-evidence sink")
+            self.events.append(event)
+
+        session = self.session(dry=False, authorized=True, sleep=advance)
+        session.telemetry = NS(emit=emit)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            result = await session.run(asyncio.Event())
+        self.assertTrue(result.completed, result.failure)
+        self.assertTrue(captured)
+        self.assertEqual((result.report.maker_fill_count, result.report.taker_fill_count), (1, 1))
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertEqual(self.adapter.disconnections, 1)
+        self.assertFalse(any(type(event) is OrderEvidence for event in self.events))
+
+    async def test_public_book_sampling_preserves_source_and_receipt_without_extra_reads(self):
+        from core.services.market_maker_v2.telemetry import JsonlTelemetrySink
+        from scripts.analyze_mm_v2_session import _events
+
+        counts, published = [], []
+        methods = ("get_open_orders", "get_balances", "get_account_trades",
+                   "get_account_fee_and_funding", "get_settlement_asset")
+        for observed in (False, True):
+            self.setUp()
+            callbacks, disconnect_book_counts = [], []
+            for name in methods:
+                setattr(self.adapter, name, AsyncMock(wraps=getattr(self.adapter, name)))
+            opened = self.adapter.open_read_stream
+
+            async def stream(*args, **kwargs):
+                current = await opened(*args, **kwargs)
+                if observed:
+                    def register(callback):
+                        callbacks.append(callback)
+                        received = float(int(self.clock.now))
+                        for elapsed_ms in (0, 100, 249, 250, 500, 501):
+                            book = {"timestamp": 1700000000000 + elapsed_ms,
+                                    "received_monotonic": received + elapsed_ms / 1000,
+                                    "nonce": elapsed_ms, "bid": D("99"), "ask": D("101"),
+                                    "bid_size": D("2"), "ask_size": D("3")}
+                            published.append(book)
+                            callback(book)
+                    current.set_book_observer = register
+                return current
+
+            self.adapter.open_read_stream = stream
+            disconnected = self.adapter.disconnect
+
+            async def disconnect():
+                if callbacks:
+                    before = len(self.events)
+                    received = self.clock.monotonic()
+                    self.assertGreaterEqual(received - published[-1]["received_monotonic"], .25)
+                    callbacks[0]({**published[-1], "received_monotonic": received,
+                                  "timestamp": 1700000010000, "nonce": 10000})
+                    disconnect_book_counts.append((before, len(self.events)))
+                await disconnected()
+
+            self.adapter.disconnect = disconnect
+            with TemporaryDirectory() as directory:
+                journal = Path(directory) / "observer.jsonl"
+                with JsonlTelemetrySink(journal) as sink:
+                    def emit(event):
+                        self.events.append(event)
+                        sink.emit(event)
+
+                    session = self.session(dry=False, authorized=True)
+                    session.telemetry = NS(emit=emit)
+                    result = await session.run(asyncio.Event())
+                decoded = list(_events(journal))
+            self.assertEqual(decoded, self.events)
+            self.assertIs(type(decoded[0]), AccountSnapshot)
+            self.assertIs(type(decoded[-1]), SessionReport)
+            self.assertTrue(result.completed, result.failure)
+            counts.append({name: getattr(self.adapter, name).await_count for name in methods})
+            observations = [event for event in self.events if type(event) is PublicBookObservation]
+            if observed:
+                self.assertEqual(disconnect_book_counts, [(len(self.events), len(self.events))])
+                self.assertEqual([event.nonce for event in observations], [0, 250, 500])
+                for event, packet in zip(observations, (published[0], published[3], published[4])):
+                    self.assertEqual(event.observed_monotonic, packet["received_monotonic"])
+                    self.assertEqual(event.source_timestamp_ms, packet["timestamp"])
+                    self.assertEqual((event.bid, event.ask, event.bid_size, event.ask_size),
+                                     (D("99"), D("101"), D("2"), D("3")))
+            else:
+                self.assertFalse(observations)
+        self.assertEqual(counts[0], counts[1])
 
     async def run_optional_wait_fault(self, fault):
         # Import here: the endpoint-cost proxy itself imports this fixture.
@@ -344,13 +518,13 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.clock.now += 0.05
                 await asyncio.sleep(0)
                 inner.packet = ReadStream.book_snapshot(inner) | {
-                    "nonce": inner.engine_nonce, "timestamp": self.clock.now * 1000}
+                    "nonce": inner.engine_nonce, "timestamp": int(self.clock.now * 1000)}
                 inner.deliveries += 1
                 return inner.packet
 
         async def open_stream(symbol, *, clock):
             stream = Buffered(self.adapter, self.clock)
-            stream.packet = ReadStream.book_snapshot(stream) | {"nonce": 1, "timestamp": self.clock.now * 1000}
+            stream.packet = ReadStream.book_snapshot(stream) | {"nonce": 1, "timestamp": int(self.clock.now * 1000)}
             self.adapter.stream = stream
             return stream
         self.adapter.open_read_stream = open_stream
@@ -388,7 +562,7 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
 
             def deliver(inner):
                 inner.packet = ReadStream.book_snapshot(inner) | {
-                    "nonce": inner.order_nonce, "timestamp": self.clock.now * 1000}
+                    "nonce": inner.order_nonce, "timestamp": int(self.clock.now * 1000)}
 
             async def book_at_or_after(inner, nonce, *, after):
                 if inner.packet["nonce"] < nonce or inner.packet["received_monotonic"] < after:
@@ -524,6 +698,9 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(result.report.complete)
                     self.assertEqual(result.report.equity_reconciliation_difference, D("0"))
                     self.assertFalse([event for event in self.events if isinstance(event, FailureDiagnostic)])
+                    evidence = self.assert_order_evidence_precedes_fills()
+                    self.assertEqual(evidence[maker_filled[0]].size, D("0.00040"))
+                    self.assertFalse(evidence[maker_filled[0]].reduce_only)
 
     async def test_live_start_satisfies_real_confirmation_reader_prerequisites(self):
         from core.adapters.exchanges.adapters.lighter import LighterAdapter
@@ -1471,6 +1648,537 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("IOC", self.adapter.created_tifs)
         self.assertEqual(self.adapter.disconnections, 1)
 
+    async def test_real_lighter_cancel_handoff_survives_repeated_quote_expiry(self):
+        from core.adapters.exchanges.adapters.lighter import LighterAdapter
+        from core.adapters.exchanges.adapters.lighter_rest import LighterRest
+
+        adapter = self.adapter
+        rest = object.__new__(LighterRest)
+        rest.get_market_index = lambda symbol: 1
+        rest._mm_confirmation_reader = AsyncMock(return_value=[])
+        rest.get_open_orders = AsyncMock(side_effect=adapter.get_open_orders)
+        rest.get_order_history = AsyncMock(side_effect=adapter.get_order_history)
+        exchange_cancel = adapter.cancel_order
+        cancellations, receipts = [], []
+
+        async def signer_cancel(*, market_index, order_index):
+            self.assertEqual(market_index, 1)
+            cancellations.append((str(order_index), session.phase, self.clock.now))
+            await exchange_cancel(str(order_index), "BTC")
+            return object(), NS(code=200, tx_hash="fixture-cancel"), None
+
+        async def call_api(operation, factory, **kwargs):
+            return await factory()
+
+        rest.signer_client = NS(cancel_order=signer_cancel)
+        rest._call_api = call_api
+        boundary = object.__new__(LighterAdapter)
+        boundary._rest = rest
+        boundary._normalize_symbol = lambda symbol: symbol
+
+        async def cancel(identifier, symbol):
+            receipt = await boundary.cancel_order(identifier, symbol)
+            self.assertIs(receipt, adapter.history[identifier])
+            self.assertIn((symbol, identifier), rest.get_unresolved_cancellations())
+            receipts.append(receipt)
+            return receipt
+
+        adapter.cancel_order = cancel
+        adapter.enable_market_maker_cancellation_outcomes = boundary.enable_market_maker_cancellation_outcomes
+        adapter.get_unresolved_cancellations = boundary.get_unresolved_cancellations
+        adapter.get_terminal_cancellation_outcome = boundary.get_terminal_cancellation_outcome
+        adapter.confirm_terminal_cancellation_outcome = boundary.confirm_terminal_cancellation_outcome
+        session = self.session(dry=False, duration=125, authorized=True)
+        session.config = replace(session.config, quote=replace(session.config.quote,
+            max_quote_age_ms=60000, reprice_threshold_ticks=500))
+
+        result = await session.run(asyncio.Event())
+
+        self.assertTrue(result.completed, result.failure)
+        self.assertFalse(any(type(event) is FailureDiagnostic for event in self.events))
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertTrue(result.final_account.authenticated)
+        self.assertGreaterEqual(adapter.creates, 6, "both sides must survive two normal expiry cycles")
+        self.assertEqual(adapter.created_tifs, ["POST_ONLY"] * adapter.creates)
+        normal = [identifier for identifier, phase, _ in cancellations if phase == "reconciling_quotes"]
+        self.assertGreaterEqual(len(normal), 4)
+        self.assertEqual({receipt.side for receipt in receipts if receipt.id in normal},
+                         {OrderSide.BUY, OrderSide.SELL})
+        self.assertEqual(len(set(identifier for identifier, _, _ in cancellations)), adapter.creates)
+        self.assertEqual(len(cancellations), adapter.creates, "each order is canceled only once")
+        self.assertEqual(rest.get_order_history.await_count, adapter.creates)
+        rest.get_open_orders.assert_not_awaited()
+        rest._mm_confirmation_reader.assert_not_awaited()
+        self.assertFalse(rest.get_unresolved_cancellations())
+        self.assertFalse(rest._terminal_cancellation_outcomes)
+        self.assertEqual(adapter.disconnections, 1)
+
+    async def test_proven_not_sent_cancel_enters_fresh_bounded_cleanup_without_replacement(self):
+        await self._cancel_not_sent_cleanup("flat")
+
+    async def test_proven_not_sent_cancel_accounts_opposite_fill_before_bounded_ioc(self):
+        await self._cancel_not_sent_cleanup("opposite_fill")
+
+    async def test_proven_not_sent_cancel_market_loss_preserves_fresh_owned_cleanup(self):
+        await self._cancel_not_sent_cleanup("market_loss")
+
+    async def test_proven_not_sent_cancel_never_masks_another_unknown_mutation(self):
+        for outcome in ("cleanup_unknown", "other_unknown"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                await self._cancel_not_sent_cleanup(outcome)
+
+    async def test_proven_not_sent_cancel_preaudit_preserves_actual_exit_budget(self):
+        await self._cancel_not_sent_cleanup("budget_refused")
+
+    async def test_proven_not_sent_cancel_rest_preaudit_requires_full_read_cost(self):
+        await self._cancel_not_sent_cleanup("rest_budget_refused")
+
+    async def _cancel_not_sent_cleanup(self, outcome):
+        from core.adapters.exchanges.exceptions import OrderCancellationNotSentError
+        from core.services.market_maker_v2.domain import ExecutionHealth
+
+        adapter = self.adapter
+        budget_refused = outcome in {"budget_refused", "rest_budget_refused"}
+        if budget_refused:
+            adapter.set_market_maker_request_observer = lambda observer, *, enforce_admission: None
+        if outcome == "rest_budget_refused":
+            adapter.close_read_stream = AsyncMock()
+        session = self.session(dry=False, duration=125, authorized=True)
+        session.config = replace(session.config, quote=replace(session.config.quote,
+            max_quote_age_ms=60000, reprice_threshold_ticks=500))
+        original_cancel, original_orders = adapter.cancel_order, adapter.get_open_orders
+        original_snapshot, original_deadline = session.snapshot, session._cleanup_deadline
+        rejected, attempts, wire_cancels, registry = [], [], [], []
+        order_reads, account_reads, cleanup_checks, deadlines = [], [], [], []
+        budget_gates, denied_audit_reads = [], []
+        original_admit = session._admit_read
+
+        def admit(kind):
+            if kind == "cancel_no_send_audit":
+                self.assertTrue(session._budget_exiting)
+                # Ordinary exit still fits; the additional proof must not
+                # consume capacity already promised to that original exit.
+                self.assertTrue(session.api_budget.scheduled_live_available(
+                    {"rest": 0, "ws": 0, "tx": 0}))
+                if outcome == "rest_budget_refused":
+                    self.assertIsNone(session.account.stream)
+                    self.assertTrue(session.api_budget.scheduled_live_available(
+                        {"rest": 3000, "ws": 7, "tx": 0}),
+                        "the former stream-only allowance would admit this REST proof")
+                try:
+                    original_admit(kind)
+                except ApiBudgetUnavailable as error:
+                    budget_gates.append(error)
+                    raise
+                self.fail("actual rolling admission must reject the additional audit")
+            return original_admit(kind)
+
+        async def orders(symbol=None):
+            if budget_gates and session.phase == "bounded_exit":
+                denied_audit_reads.append("orders")
+            rows = await original_orders(symbol)
+            if rejected:
+                order_reads.append((self.clock.now, tuple(row.id for row in rows)))
+            return rows
+
+        async def snapshot(*, exiting=False, **options):
+            if budget_gates and session.phase == "bounded_exit":
+                denied_audit_reads.append("account")
+            account = await original_snapshot(exiting=exiting, **options)
+            if rejected and exiting:
+                account_reads.append((self.clock.now, account))
+            return account
+
+        def deadline():
+            value = original_deadline()
+            deadlines.append(value)
+            return value
+
+        async def cancel(identifier, symbol):
+            attempts.append((identifier, session.phase, self.clock.now))
+            if not rejected:
+                self.assertEqual(session.phase, "reconciling_quotes")
+                self.assertEqual(len(adapter.orders), 2)
+                target = adapter.history[identifier]
+                self.assertIs(target.side, OrderSide.BUY)
+                rejected.append((identifier, self.clock.now))
+                opposite = next(row for row in adapter.orders if row.side is OrderSide.SELL)
+                if outcome == "opposite_fill":
+                    adapter.fill(opposite)
+                if outcome == "market_loss":
+                    session.market.refresh = AsyncMock(side_effect=RuntimeError("private fixture book unavailable"))
+                if outcome == "other_unknown":
+                    registry.append((symbol, opposite.id))
+                if budget_refused:
+                    # Real endpoint weights, injected at the failure boundary;
+                    # no future expiry occurs inside this bounded cleanup.
+                    for _ in range(14 if outcome == "rest_budget_refused" else 20):
+                        session.api_budget.observe("rest", "account")
+                if outcome == "rest_budget_refused":
+                    session.account.stream.transport_healthy = False
+                # The shared boundary's genuine SDK tests establish no-send
+                # provenance. Here the exact typed contract drives the runner.
+                raise OrderCancellationNotSentError(symbol=symbol, order_id=identifier)
+            if not wire_cancels:
+                if outcome == "market_loss":
+                    self.assertTrue(session.account.stream.transport_healthy)
+                    session.market.refresh.assert_not_awaited()
+                cleanup_checks.append((self.clock.now, tuple(row.id for row in adapter.orders),
+                                       order_reads[:], account_reads[:]))
+            wire_cancels.append((identifier, session.phase, self.clock.now))
+            if outcome == "cleanup_unknown":
+                registry.append((symbol, identifier))
+                raise RuntimeError("private fixture failure after send began")
+            return await original_cancel(identifier, symbol)
+
+        adapter.cancel_order, adapter.get_open_orders = cancel, orders
+        adapter.get_unresolved_cancellations = lambda: registry[:]
+        session.snapshot, session._cleanup_deadline = snapshot, deadline
+        if budget_refused:
+            session._admit_read = admit
+        result = await session.run(asyncio.Event())
+
+        self.assertEqual(len(rejected), 1, "exercise a real normal quote revision")
+        self.assertFalse(result.completed, "cleanup cannot promote the failed normal run")
+        self.assertEqual(result.failure, "session_failed_closed")
+        self.assertEqual(adapter.created_tifs.count("POST_ONLY"), 2)
+        self.assertFalse([row for row in adapter.created_records
+                          if row[0] >= rejected[0][1] and row[3] == "POST_ONLY"])
+        self.assertEqual([row for row in attempts if row[1] == "reconciling_quotes"], attempts[:1])
+        self.assertEqual(len(deadlines), 1)
+        exits = [event for event in self.events if type(event) is BoundedExitReport]
+        self.assertEqual(len(exits), 1)
+        self.assertLess(exits[0].observed_monotonic, deadlines[0])
+        self.assertLessEqual(deadlines[0] - rejected[0][1], 30.1)
+        self.assertEqual(adapter.disconnections, 1)
+        self.assertNotIn("private fixture", repr(self.events))
+
+        if outcome != "other_unknown" and not budget_refused:
+            self.assertEqual(len(cleanup_checks), 1)
+            cleanup_at, actual_ids, reads, audits = cleanup_checks[0]
+            self.assertTrue(reads, "fresh owned orders must be checked before another cancel")
+            self.assertTrue(audits, "fresh authenticated account must precede cleanup mutation")
+            audit_at, audit = audits[-1]
+            self.assertLess(rejected[0][1], audit.observed_monotonic)
+            self.assertLessEqual(audit_at, cleanup_at)
+            self.assertTrue(audit.authenticated)
+            self.assertEqual(set(audit.open_order_ids), set(actual_ids))
+            self.assertEqual(audit.position, D("-0.1") if outcome == "opposite_fill" else D("0"))
+            self.assertEqual(wire_cancels[0][0], rejected[0][0])
+
+        if outcome in {"flat", "opposite_fill", "market_loss"}:
+            self.assertTrue(exits[0].complete)
+            self.assertTrue(result.report.complete)
+            self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+            self.assertTrue(result.final_account.authenticated)
+            self.assertEqual(len(wire_cancels), 1 if outcome == "opposite_fill" else 2)
+            self.assertEqual(len({identifier for identifier, _, _ in wire_cancels}), len(wire_cancels))
+            self.assertEqual(adapter.created_tifs.count("IOC"), int(outcome == "opposite_fill"))
+            self.assertEqual(exits[0].attempts, int(outcome == "opposite_fill"))
+            self.assertFalse(registry)
+            self.assertIs(session.execution.snapshot().health, ExecutionHealth.HEALTHY)
+            self.assert_order_evidence_precedes_fills()
+            if outcome == "market_loss":
+                session.market.refresh.assert_awaited_once()
+                self.assertEqual((result.report.maker_fill_count, result.report.taker_fill_count), (0, 0))
+            if outcome == "opposite_fill":
+                ioc = next(event for event in self.events if type(event) is OrderEvidence and event.time_in_force == "IOC")
+                self.assertEqual(ioc.size, D("0.1"))
+                self.assertTrue(ioc.reduce_only)
+                self.assertEqual((result.report.maker_fill_count, result.report.taker_fill_count), (1, 1))
+        else:
+            self.assertFalse(exits[0].complete)
+            self.assertEqual(len(wire_cancels), int(outcome == "cleanup_unknown"))
+            self.assertNotIn("IOC", adapter.created_tifs)
+            self.assertEqual(result.final_account.position, D("0"))
+            self.assertEqual(len(result.final_account.open_order_ids), 2)
+            self.assertEqual(bool(registry), not budget_refused)
+            self.assertIs(session.execution.snapshot().health, ExecutionHealth.HALTED)
+            if budget_refused:
+                self.assertEqual(len(budget_gates), 1)
+                self.assertEqual(budget_gates[0].operation, "cancel_no_send_audit")
+                self.assertEqual(budget_gates[0].blocking_bucket, "rest")
+                self.assertGreater(budget_gates[0].blocking_offset_seconds, 0)
+                self.assertGreater(budget_gates[0].projected_usage, budget_gates[0].limit)
+                self.assertEqual(budget_gates[0].diagnostic_values["api_next_tx"], D("0"))
+                self.assertFalse(denied_audit_reads)
+                self.assertFalse(cleanup_checks)
+                self.assertEqual(session.api_budget.snapshot()["attempts"],
+                    {"rest:account": 14 if outcome == "rest_budget_refused" else 20})
+                self.assertEqual(session.api_budget.deferrals, 0)
+                if outcome == "rest_budget_refused":
+                    adapter.close_read_stream.assert_awaited_once()
+
+    async def test_real_cancel_delayed_proof_accounts_opposite_and_partial_fills_before_exit(self):
+        from core.adapters.exchanges.adapters.lighter import LighterAdapter
+        from core.adapters.exchanges.adapters.lighter_rest import LighterRest
+
+        adapter = self.adapter
+        adapter.metadata.symbols[0].update(size_decimals=2, min_base_amount="0.01")
+        rest = object.__new__(LighterRest)
+        rest.get_market_index = lambda symbol: 1
+        rest._mm_confirmation_reader = AsyncMock(return_value=[])
+        rest.get_open_orders = AsyncMock(side_effect=adapter.get_open_orders)
+        rest.get_order_history = AsyncMock(side_effect=adapter.get_order_history)
+        pending, signers, retries, exit_deadlines = [], [], [], []
+        rest.get_order_history.side_effect = lambda symbol: [
+            row for row in adapter.history.values() if row.status in {
+                OrderStatus.CANCELED, OrderStatus.FILLED, OrderStatus.EXPIRED, OrderStatus.REJECTED}]
+        real_sleep = asyncio.sleep
+
+        async def delay(seconds):
+            self.clock.now += seconds
+            await real_sleep(0)
+
+        async def signer_cancel(*, market_index, order_index):
+            self.assertFalse(pending, "an uncertain cancel must never be sent twice")
+            self.assertEqual(session.phase, "reconciling_quotes")
+            signers.append(str(order_index))
+            pending.append(adapter.history[str(order_index)])
+            self.assertIs(pending[0].side, OrderSide.BUY)
+            adapter.fill(next(order for order in adapter.orders if order.side is OrderSide.SELL))
+            return object(), NS(code=200, tx_hash="fixture-delayed-cancel"), None
+
+        async def call_api(operation, factory, **kwargs):
+            return await factory()
+
+        rest.signer_client, rest._call_api = NS(cancel_order=signer_cancel), call_api
+        boundary = object.__new__(LighterAdapter)
+        boundary._rest, boundary._normalize_symbol = rest, lambda symbol: symbol
+        for name in ("cancel_order", "enable_market_maker_cancellation_outcomes",
+                     "get_unresolved_cancellations", "get_terminal_cancellation_outcome",
+                     "confirm_terminal_cancellation_outcome", "get_market_maker_cancellation_diagnostics"):
+            setattr(adapter, name, getattr(boundary, name))
+        session = self.session(dry=False, duration=125, authorized=True)
+        session.config = replace(session.config, quote=replace(session.config.quote,
+            max_quote_age_ms=60000, reprice_threshold_ticks=500))
+        original_admit, original_deadline = session._admit_read, session._cleanup_deadline
+
+        def admit(kind):
+            original_admit(kind)
+            if kind == "retry" and session.phase == "exit_order_sync":
+                retries.append(self.clock.now)
+                if len(retries) == 2:
+                    order = pending[0]
+                    adapter.fill(replace(order, amount=D("0.04"), remaining=D("0.04")))
+                    adapter.history[order.id] = replace(order, status=OrderStatus.CANCELED,
+                        filled=D("0.04"), remaining=D("0.06"))
+
+        def deadline():
+            result = original_deadline()
+            exit_deadlines.append(result)
+            return result
+
+        session._admit_read, session._cleanup_deadline = admit, deadline
+        with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", side_effect=delay):
+            result = await session.run(asyncio.Event())
+
+        self.assertFalse(result.completed, "successful cleanup must not promote a failed run")
+        self.assertEqual(result.failure, "session_failed_closed")
+        self.assertEqual(len(signers), 1)
+        self.assertEqual(len(retries), 2)
+        self.assertGreaterEqual(retries[1] - retries[0], 0.5)
+        self.assertEqual(len(exit_deadlines), 1)
+        exits = [event for event in self.events if type(event) is BoundedExitReport]
+        self.assertEqual(len(exits), 1)
+        self.assertTrue(exits[0].complete)
+        self.assertLess(exits[0].observed_monotonic, exit_deadlines[0])
+        self.assertEqual(exits[0].attempts, 1)
+        self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+        self.assertTrue(result.final_account.authenticated)
+        self.assertEqual(adapter.created_tifs, ["POST_ONLY", "POST_ONLY", "IOC"])
+        ioc = next(event for event in self.events if type(event) is OrderEvidence and event.time_in_force == "IOC")
+        self.assertEqual(ioc.size, D("0.06"))
+        self.assert_order_evidence_precedes_fills()
+        fault = next(event for event in self.events if type(event) is FailureDiagnostic)
+        values = {item.name: item.value for item in fault.values}
+        self.assertEqual(values["cancel_receipt_pending"], D(1))
+        self.assertEqual(values["cancel_submission_acknowledged"], D(1))
+        self.assertEqual(values["cancel_history_attempts"], D(4))
+        self.assertEqual(values["cancel_exact_history_matches"], D(0))
+        self.assertFalse(rest.get_unresolved_cancellations())
+        self.assertIsNone(boundary.get_market_maker_cancellation_diagnostics(signers[0], "BTC"))
+        rest.get_open_orders.assert_not_awaited()
+        self.assertEqual(adapter.disconnections, 1)
+
+    async def test_normal_cancel_late_terminal_cleans_nonflat_session_without_resend(self):
+        for outcome in ("canceled", "partial"):
+            with self.subTest(outcome=outcome):
+                await self._normal_cancel_failure(outcome)
+
+    async def test_normal_cancel_without_terminal_stays_halted_without_resend(self):
+        for outcome in ("still_open", "absent"):
+            with self.subTest(outcome=outcome):
+                await self._normal_cancel_failure(outcome)
+
+    async def test_normal_cancel_recovery_uses_metered_exit_retry(self):
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                await self._normal_cancel_failure("partial", metered=True, delayed=delayed)
+
+    async def _normal_cancel_failure(self, outcome, *, metered=False, delayed=False):
+        from core.services.market_maker_v2.domain import ExecutionHealth
+        self.setUp()
+        if metered:
+            from test_mm_v2_budget_sessions import MinimumCostAdapter
+            self.adapter = MinimumCostAdapter()
+            self.adapter.clock = self.clock
+        adapter = self.adapter
+        adapter.metadata.symbols[0].update(size_decimals=2, min_base_amount="0.01")
+        session = self.session(dry=False, duration=180 if metered else 55, authorized=True)
+        session.config = replace(session.config,
+            quote=replace(session.config.quote, max_quote_age_ms=120000 if metered else 60000))
+        original_start, original_orders, original_cancel = session._start, adapter.get_open_orders, adapter.cancel_order
+        original_admit = session._admit_read
+        original_deadline = session._cleanup_deadline
+        filled, armed, delivered = [], [], []
+        pending, cancellations, recovery, retry_gates = [], [], [], []
+        active_observations = []
+        deadlines, iocs = [], []
+        registry = []
+        adapter.get_unresolved_cancellations = lambda: registry[:]
+
+        def confirm(order):
+            if pending and order.id == pending[0].id and order.status in (OrderStatus.CANCELED, OrderStatus.FILLED):
+                registry.clear()
+            return True
+
+        async def cancel(identifier, symbol):
+            cancellations.append((identifier, session.phase, self.clock.now))
+            if armed and not pending and session.phase == "reconciling_quotes":
+                self.assertEqual(len(adapter.orders), 2)
+                self.assertEqual(D(adapter.position.position) * adapter.position.sign, D("-0.1"))
+                order = adapter.history[identifier]
+                pending.append(order)
+                registry.append((symbol, identifier))
+                adapter.cancels += 1
+                if metered:
+                    adapter.charge("sendTx")
+                    adapter.transactions.append((self.clock.now, "cancel", None))
+                    for _ in range(4):
+                        adapter.charge("accountInactiveOrders")
+                return replace(order, status=OrderStatus.PENDING, params={"cancel_terminal": False})
+            return await original_cancel(identifier, symbol)
+
+        async def orders(*args, **kwargs):
+            if pending and session.phase == "exit_order_sync" and not delivered:
+                if delayed and not active_observations:
+                    active_observations.append(self.clock.now)
+                    return await original_orders(*args, **kwargs)
+                order = pending[0]
+                delivered.append(self.clock.now)
+                if outcome != "still_open":
+                    if outcome == "partial":
+                        adapter.fill(replace(order, amount=D("0.04"), remaining=D("0.04")))
+                    else:
+                        adapter.orders = [row for row in adapter.orders if row.id != order.id]
+                    if outcome == "absent":
+                        adapter.history.pop(order.id)
+                    else:
+                        adapter.history[order.id] = replace(order, status=OrderStatus.CANCELED,
+                            filled=D("0.04") if outcome == "partial" else D("0"),
+                            remaining=D("0.06") if outcome == "partial" else order.remaining)
+                    adapter._counts()
+            return await original_orders(*args, **kwargs)
+
+        def admit(kind):
+            if session.phase == "exit_order_sync" and kind == "retry":
+                retry_gates.append((self.clock.now, session._exit_read_retries))
+            return original_admit(kind)
+
+        def cleanup_deadline():
+            deadline = original_deadline()
+            deadlines.append(deadline)
+            return deadline
+
+        async def start():
+            await original_start()
+            original_recover = session.execution.reconcile_cancellation_for_cleanup
+            original_flatten = session.execution.flatten_ioc
+
+            async def recover(deadline):
+                generation = session.manager.mutation_generation
+                used = session.api_budget.snapshot()["attempts"]
+                result = await original_recover(deadline)
+                self.assertEqual(session.manager.mutation_generation, generation)
+                recovery.append((deadline, result, used, session.api_budget.snapshot()["attempts"]))
+                return result
+
+            async def flatten(intent):
+                iocs.append(intent)
+                return await original_flatten(intent)
+
+            session.execution.reconcile_cancellation_for_cleanup = recover
+            session.execution.flatten_ioc = flatten
+
+        async def advance(seconds):
+            if len(adapter.orders) == 2:
+                # Let the startup API window expire while flat before introducing
+                # inventory; recovery still uses the unchanged live reserve/gates.
+                ready = not metered or self.clock.now - adapter.created_records[0][0] >= 65
+                if not filled and ready:
+                    order = next(row for row in adapter.orders if row.side is OrderSide.SELL)
+                    adapter.fill(order)
+                    filled.append(order.id)
+                elif filled and not armed:
+                    armed.append(self.clock.now)
+                    adapter.book.asks[0].price = D("105")
+            self.clock.now += float(seconds)
+            await asyncio.sleep(0)
+
+        adapter.cancel_order, adapter.get_open_orders = cancel, orders
+        adapter.confirm_terminal_cancellation_outcome = confirm
+        session._start, session.sleep, session._admit_read = start, advance, admit
+        session._cleanup_deadline = cleanup_deadline
+        result = await session.run(asyncio.Event())
+        faults = [event for event in self.events if type(event) is FailureDiagnostic]
+        self.assertTrue(pending, (result.failure, faults, adapter.created_records))
+        self.assertEqual(len(recovery), 1, "the original cancellation permits one proof sync")
+        self.assertEqual(deadlines, [recovery[0][0]], "proof and cleanup share the original exit deadline")
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(len(retry_gates), 2 if delayed or outcome in {"still_open", "absent"} else 1)
+        self.assertFalse(result.completed, "successful cleanup does not resume a failed normal run")
+        self.assertEqual(result.failure, "session_failed_closed")
+        failed_at = next(at for identifier, _, at in cancellations if identifier == pending[0].id)
+        self.assertFalse(any(at >= failed_at and tif == "POST_ONLY"
+                             for at, _, _, tif, _ in adapter.created_records))
+        self.assertEqual(len({identifier for identifier, _, _ in cancellations}), len(cancellations))
+        self.assertEqual(adapter.created_tifs.count("POST_ONLY"), 3)
+        self.assertLess(self.clock.now, recovery[0][0])
+        self.assertLessEqual(recovery[0][0] - retry_gates[0][0], 30)
+        self.assertEqual(adapter.disconnections, 1)
+        self.assertTrue(any(event.stage == "reconciling_quotes" and event.uncertain for event in faults))
+        exits = [event for event in self.events if type(event) is BoundedExitReport]
+        self.assertEqual(len(exits), 1)
+        if outcome in ("canceled", "partial"):
+            self.assertTrue(recovery[0][1])
+            self.assertTrue(exits[0].complete)
+            self.assertEqual((result.final_account.position, result.final_account.open_order_ids), (D("0"), ()))
+            self.assertEqual(adapter.created_tifs.count("IOC"), 1)
+            self.assertEqual(len(cancellations), 2)
+            self.assertEqual([intent.deadline_monotonic for intent in iocs], deadlines)
+            self.assertEqual([intent.size for intent in iocs], [D("0.06") if outcome == "partial" else D("0.1")])
+            self.assertFalse(registry)
+            self.assertFalse(session.manager.has_uncertain_state)
+            self.assertIs(session.execution.snapshot().health, ExecutionHealth.HEALTHY)
+            self.assert_order_evidence_precedes_fills()
+        else:
+            self.assertFalse(recovery[0][1])
+            self.assertFalse(exits[0].complete)
+            self.assertEqual(len(cancellations), 1)
+            self.assertNotIn("IOC", adapter.created_tifs)
+            self.assertTrue(registry)
+            self.assertTrue(session.manager.has_uncertain_state)
+            self.assertIs(session.execution.snapshot().health, ExecutionHealth.HALTED)
+        if metered:
+            self.assertEqual(retry_gates[0][1], 0)
+            self.assertEqual(session._exit_read_retries, 2 if delayed else 1)
+            before, after = recovery[0][2:]
+            self.assertEqual(after.get("rest:sendTx", 0), before.get("rest:sendTx", 0))
+            self.assertGreater(after["ws:1"], before["ws:1"])
+            self.assertGreater(after["rest:accountInactiveOrders"], before["rest:accountInactiveOrders"])
+
     async def test_exit_reconciles_pending_receipt_before_known_order_cleanup(self):
         from core.services.market_maker_v2.domain import ExecutionStatus
         from core.services.market_maker_v2.execution_models import OrderSlotState
@@ -1643,6 +2351,12 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.session(dry=False, authorized=True, passive=2,
                                     sleep=fill_then_advance).run(asyncio.Event())
         self.assertTrue(result.completed, result.failure)
+        evidence = self.assert_order_evidence_precedes_fills()
+        self.assertTrue(any(order.time_in_force == "POST_ONLY" and not order.reduce_only
+                            for order in evidence.values()))
+        passive_orders = [order for order in evidence.values() if order.time_in_force == "POST_ONLY" and order.reduce_only]
+        self.assertTrue(passive_orders)
+        self.assertTrue(all(order.strategy_state is StrategyState.REDUCE_ONLY for order in passive_orders))
         passive = [row for row in self.adapter.created_records if row[2] and row[3] == "POST_ONLY"]
         self.assertTrue(passive)
         self.assertTrue(all(row[1] == OrderSide.SELL and row[4] == D("101") for row in passive))

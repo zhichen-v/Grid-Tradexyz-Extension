@@ -374,7 +374,10 @@ class OwnedRequestObserverTests(unittest.IsolatedAsyncioTestCase):
                 counts = budget.snapshot()["attempts"]
                 self.assertEqual(counts["rest:sendTx"], 1)
                 self.assertEqual(counts["rest:nextNonce"], 2 if invalid_nonce else 1)
-                self.assertEqual(counts.get("rest:accountInactiveOrders", 0), 0 if invalid_nonce else 4)
+                # A SDK error tuple is not a scoped no-send proof. Its terminal
+                # lookup uses the same four-read allowance as an acknowledgement.
+                self.assertEqual(counts.get("rest:accountInactiveOrders", 0), 4)
+                self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
                 self.assertLessEqual(budget.snapshot()["used"]["rest"], 412)
                 self.assertEqual(budget.snapshot()["used"]["tx"], 1)
                 self.assertNotIn("ws", budget.snapshot()["used"])

@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -19,10 +20,45 @@ from core.services.market_maker_v2.domain import (
     FillAccounting, InventoryDecision, SessionReport,
 )
 from core.services.market_maker_v2.telemetry import JsonlTelemetrySink
+from core.services.market_maker_v2.order_manager import CANCELLATION_DIAGNOSTIC_NAMES
 from lighter_preflight import build_adapter, load_settings, ROBINHOOD_NETWORKS
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _git_build():
+    """Capture this checkout once; retain no paths, diffs, or subprocess errors."""
+    unavailable = {"status": "unavailable", "commit": None, "dirty": None}
+    try:
+        options = dict(cwd=ROOT, capture_output=True, text=True, check=True, timeout=3,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        commit = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], **options).stdout.strip()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None:
+            return unavailable
+        status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=normal"],
+                                **options).stdout
+        return {"status": "available", "commit": commit, "dirty": bool(status)}
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return unavailable
+
+
+def _run_provenance(config):
+    """Only the validated strategy schema is public; exchange settings never enter."""
+    effective = {"symbol": config.symbol, "profile": config.profile, "dry_run": config.dry_run}
+    sections = {
+        "quote": ("order_size", "target_net_edge_bps", "volatility_multiplier",
+                  "reprice_threshold_ticks", "max_quote_age_ms"),
+        "inventory": ("soft_limit", "hard_limit", "skew_bps_at_hard"),
+        "flatten": ("max_hold_seconds", "stop_loss_usdg", "passive_grace_seconds", "ioc_slippage_ticks"),
+        "session": ("duration_seconds", "max_loss_usdg", "cooldown_seconds"),
+    }
+    for section, names in sections.items():
+        values = getattr(config, section)
+        effective[section] = {name: str(value) if type(value) is Decimal else value
+                              for name in names for value in (getattr(values, name),)}
+    return {"schema": "mm_v2_run_provenance_v1", "capture": "run_start",
+            "build": _git_build(), "effective_config": effective}
 
 
 def parse_cli(argv=None):
@@ -125,7 +161,11 @@ class _ConsoleProgress:
                      f"authenticated={account.authenticated}" if account else "account=unconfirmed")
             self._write(f"exit={event.status.value} exit_id={event.flatten_id} attempts={event.attempts} {proof}")
         elif type(event) is FailureDiagnostic:
-            self._write(f"error={event.error_type} stage={event.stage}; details in JSONL")
+            details = "".join(" " + value.name.removeprefix("cancel_") + "=1"
+                for value in event.values if value.value == 1
+                and value.name in CANCELLATION_DIAGNOSTIC_NAMES
+                and value.name.startswith(("cancel_stage_", "cancel_error_")))
+            self._write(f"error={event.error_type} stage={event.stage}{details}; details in JSONL")
 
     def status(self, phase):
         # These are steps of one quote cycle, not operator-visible state changes.
@@ -164,6 +204,9 @@ async def run_session(config, settings, *, output, authorized=False, stop_event=
     try:
         with (JsonlTelemetrySink(output) as sink, _stop_signals(event),
               Path(str(output) + ".budget.json").open("x", encoding="utf-8") as budget_output):
+            provenance = _run_provenance(config)
+            json.dump({"provenance": provenance}, budget_output, allow_nan=False, sort_keys=True)
+            budget_output.flush()  # Retain the start version even if construction/startup fails.
             adapter = build_adapter(settings)
             console = _ConsoleProgress(sink) if progress else None
             session = orchestrator.VolumeSession(
@@ -180,12 +223,19 @@ async def run_session(config, settings, *, output, authorized=False, stop_event=
                     progress_task.cancel()
                     await asyncio.gather(progress_task, return_exceptions=True)
                 budget = session.api_budget.snapshot()
+                budget["provenance"] = provenance  # Never substitute the checkout at shutdown.
                 diagnostics = getattr(session.market.stream, "source_time_diagnostics", lambda: None)
                 budget["source_time"] = {
                     "profile": "delayed_dry" if allow_delayed_dry_book else "strict",
                     "observations": diagnostics(),
                 }
+                counts = getattr(getattr(session, "account", None), "market_read_counts", None)
+                budget["market_reads"] = ({key: counts[key] for key in ("retries", "recoveries")}
+                    if type(counts) is dict and all(type(counts.get(key)) is int and counts[key] >= 0
+                        for key in ("retries", "recoveries")) else None)
+                budget_output.seek(0)
                 json.dump(budget, budget_output, allow_nan=False, sort_keys=True)
+                budget_output.truncate()
     finally:
         logging.disable(previous_logging)
 

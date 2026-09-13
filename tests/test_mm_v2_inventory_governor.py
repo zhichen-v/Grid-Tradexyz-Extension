@@ -305,6 +305,151 @@ class InventoryGovernorTests(unittest.TestCase):
         self.assertEqual(risk.state, StrategyState.REDUCE_ONLY)
         self.assertEqual((risk.buy_capacity, risk.sell_capacity), (0, D("0.5")))
 
+    def test_minimum_increasing_quote_does_not_force_affordable_close_to_touch(self):
+        policy = VolumeQuotePolicy(order_size=D("0.0004"), target_net_edge_bps=D("0"),
+            volatility_multiplier=D("0"), hard_inventory_limit=D("0.0008"),
+            skew_bps_at_hard=D("0"))
+        for sign in (1, -1):
+            for retain_opposite in (False, True):
+                with self.subTest(sign=sign, retain_opposite=retain_opposite):
+                    governor = self.governor(order_size=D("0.0004"), soft_limit=D("0.0004"),
+                        hard_limit=D("0.0008"), stop_loss_usdg=D("0.15"),
+                        max_session_loss_usdg=D("0.5"), ioc_slippage_ticks=200)
+                    market = self.market(external_bid=D("77113.2"), external_ask=D("77113.3"),
+                        tick_size=D("0.1"), size_step=D("0.00001"), min_order_size=D("0.0002"))
+                    account = self.account(maker_fee_rate=D("0.00012"), taker_fee_rate=D("0.00035"))
+                    report = self.report(realized_net_pnl=D("-0.28"), marked_net_pnl=D("-0.28"),
+                        current_drawdown=D("0.28"), max_drawdown=D("0.28"))
+                    risk = self.evaluate(governor, market=market, account=account, report=report)
+                    entry_plan = policy.propose(market, account, risk, now=100)
+                    self.assertEqual([q.size for q in entry_plan.quotes], [D("0.0004")] * 2)
+                    filled_side = Side.BUY if sign > 0 else Side.SELL
+                    filled = next(q for q in entry_plan.quotes if q.side is filled_side)
+                    opposite = next(q for q in entry_plan.quotes if q.side is not filled_side)
+                    # The ordinary maker is hit at its own price. The refreshed
+                    # touch equals entry, so neither unrealized loss nor a hard
+                    # inventory/hold threshold explains a rush to passive touch.
+                    market = replace(market, observed_monotonic=101,
+                        external_bid=filled.price if sign > 0 else filled.price - D("0.1"),
+                        external_ask=filled.price + D("0.1") if sign > 0 else filled.price)
+                    position = sign * filled.size
+                    fee = filled.size * filled.price * account.maker_fee_rate
+                    orders = ((WorkingOrder("retained", opposite.side, opposite.size, opposite.price),)
+                              if retain_opposite else ())
+                    account = replace(account, observed_monotonic=101, position=position,
+                        entry_price=filled.price, open_order_count=len(orders))
+                    report = self.report(str(position), 101, realized_net_pnl=D("-0.28") - fee,
+                        marked_net_pnl=D("-0.28") - fee, current_drawdown=D("0.28") + fee,
+                        max_drawdown=D("0.28") + fee, inventory_age=D("0"))
+                    risk = self.evaluate(governor, now=101, market=market, account=account,
+                        report=report, execution=self.execution(101, orders))
+                    self.assertEqual(risk.state, StrategyState.SKEWED)
+                    self.assertEqual((risk.buy_capacity, risk.sell_capacity),
+                        (D("0"), filled.size) if sign > 0 else (filled.size, D("0")))
+                    quotes = policy.propose(market, account, risk, now=101).quotes
+                    self.assertEqual(len(quotes), 1)
+                    self.assertEqual((quotes[0].side, quotes[0].size, quotes[0].reduce_only),
+                                     (opposite.side, filled.size, False))
+                    if sign > 0:
+                        self.assertGreater(quotes[0].price, market.external_ask)
+                    else:
+                        self.assertLess(quotes[0].price, market.external_bid)
+                    diagnostic = governor.last_diagnostic
+                    self.assertEqual(diagnostic.reason, "reducing_capacity_only")
+                    self.assertEqual((diagnostic.previous_state, diagnostic.state),
+                                     (StrategyState.QUOTING, StrategyState.SKEWED))
+                    self.assertEqual(diagnostic.inventory_loss, D("0"))
+                    self.assertEqual(diagnostic.current_loss, D("0.28") + fee)
+                    self.assertEqual(diagnostic.worst_position, abs(position))
+                    self.assertEqual(diagnostic.total_reserve, diagnostic.stop_reserve
+                        + diagnostic.taker_fee_reserve + diagnostic.slippage_reserve
+                        + diagnostic.maker_fee_reserve)
+                    self.assertLess(diagnostic.total_reserve, diagnostic.remaining_loss_headroom)
+                    self.assertIsNone(governor.exit_deadline)
+
+    def test_reducing_capacity_fallback_never_flips_or_inflates_partial_inventory(self):
+        market = self.market(external_bid=D("77113.2"), external_ask=D("77113.3"),
+            tick_size=D("0.1"), size_step=D("0.00001"), min_order_size=D("0.0002"))
+        for sign in (1, -1):
+            for quantity, loss, expected_state, expected_capacity in (
+                    ("0.00030", "0.31", StrategyState.QUOTING, "0.00030"),
+                    ("0.00040", "0.329350618799", StrategyState.SKEWED, "0.00020"),
+                    ("0.00019", "0.33", StrategyState.REDUCE_ONLY, "0")):
+                with self.subTest(sign=sign, quantity=quantity):
+                    governor = self.governor(order_size=D("0.0004"), soft_limit=D("0.0004"),
+                        hard_limit=D("0.0008"), stop_loss_usdg=D("0.15"),
+                        max_session_loss_usdg=D("0.5"), ioc_slippage_ticks=200)
+                    position = sign * D(quantity)
+                    account = self.account(str(position), entry_price=(market.external_bid
+                        if sign > 0 else market.external_ask), maker_fee_rate=D("0.00012"),
+                        taker_fee_rate=D("0.00035"))
+                    report = self.report(str(position), realized_net_pnl=-D(loss),
+                        marked_net_pnl=-D(loss), current_drawdown=D(loss), max_drawdown=D(loss))
+                    risk = self.evaluate(governor, market=market, account=account, report=report)
+                    self.assertEqual(risk.state, expected_state)
+                    self.assertEqual(risk.sell_capacity if sign > 0 else risk.buy_capacity,
+                                     D(expected_capacity))
+                    self.assertEqual(risk.buy_capacity if sign > 0 else risk.sell_capacity, D("0"))
+                    diagnostic = governor.last_diagnostic
+                    self.assertLessEqual(diagnostic.candidate_buy + diagnostic.candidate_sell,
+                                         abs(position))
+
+    def test_reducing_capacity_fallback_preserves_old_orders_and_strict_reserve(self):
+        market = self.market(external_bid=D("77113.2"), external_ask=D("77113.3"),
+            tick_size=D("0.1"), size_step=D("0.00001"), min_order_size=D("0.0002"))
+        for sign in (1, -1):
+            for loss, old_increasing, reason in (("0.28", True, "insufficient_reserve"),
+                                                ("0.3293506188", False, "capacity_below_minimum"),
+                                                ("0.3295", False, "capacity_below_minimum")):
+                with self.subTest(sign=sign, old_increasing=old_increasing):
+                    governor = self.governor(order_size=D("0.0004"), soft_limit=D("0.0004"),
+                        hard_limit=D("0.0008"), stop_loss_usdg=D("0.15"),
+                        max_session_loss_usdg=D("0.5"), ioc_slippage_ticks=200)
+                    position = sign * D("0.0004")
+                    orders = ((WorkingOrder("old-increasing", Side.BUY if sign > 0 else Side.SELL,
+                        D("0.0004"), market.external_bid if sign > 0 else market.external_ask),)
+                        if old_increasing else ())
+                    account = self.account(str(position), entry_price=(market.external_bid
+                        if sign > 0 else market.external_ask), maker_fee_rate=D("0.00012"),
+                        taker_fee_rate=D("0.00035"), open_order_count=len(orders))
+                    report = self.report(str(position), realized_net_pnl=-D(loss),
+                        marked_net_pnl=-D(loss), current_drawdown=D(loss), max_drawdown=D(loss))
+                    risk = self.evaluate(governor, market=market, account=account, report=report,
+                        execution=self.execution(orders=orders))
+                    self.assertEqual(risk.state, StrategyState.REDUCE_ONLY)
+                    self.assertEqual(governor.last_diagnostic.reason, reason)
+                    self.assertEqual(risk.sell_capacity if sign > 0 else risk.buy_capacity, D("0.0004"))
+                    self.assertEqual(risk.buy_capacity if sign > 0 else risk.sell_capacity, D("0"))
+                    if old_increasing:
+                        self.assertEqual(governor.last_diagnostic.worst_position, D("0.0008"))
+                    else:
+                        # A normal reducing candidate below the venue minimum
+                        # is distinct from the emergency passive-touch capacity.
+                        self.assertLess(governor.last_diagnostic.candidate_buy
+                            + governor.last_diagnostic.candidate_sell, market.min_order_size)
+
+    def test_diagnostics_distinguish_risk_causes_and_do_not_reuse_previous_reserve(self):
+        for reason, changes in (
+                ("hard_inventory", dict(position="3")),
+                ("inventory_stop_loss", dict(account=self.account("1", 101, unrealized_pnl=D("-10")),
+                                             report=self.report("1", 101))),
+                ("inventory_hold", dict(position="1", report=self.report("1", 101, inventory_age=D("60")))),
+                ("inventory_hard_limit", dict(position="3.1")),
+                ("session_loss", dict(report=self.report(now=101, realized_net_pnl=D("-1000")))),
+                ("max_drawdown", dict(report=self.report(now=101, max_drawdown=D("1000")))),
+                ("operator_stop", dict(stop_requested=True)),
+                ("session_deadline", dict(now=1000))):
+            with self.subTest(reason=reason):
+                governor = self.governor()
+                self.evaluate(governor)
+                self.assertIsNotNone(governor.last_diagnostic.total_reserve)
+                self.evaluate(governor, **(dict(now=101) | changes))
+                diagnostic = governor.last_diagnostic
+                self.assertEqual(diagnostic.reason, reason)
+                self.assertEqual(diagnostic.previous_state, StrategyState.QUOTING)
+                self.assertIsNone(diagnostic.total_reserve)
+                self.assertIsNone(diagnostic.current_loss)
+
     def test_flat_minimum_quote_reserve_exhaustion_requires_terminal_exit_proof(self):
         governor = self.governor(order_size=D("0.00040"), soft_limit=D("0.00040"),
             hard_limit=D("0.00080"), stop_loss_usdg=D("0.15"),

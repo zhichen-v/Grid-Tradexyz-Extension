@@ -6,6 +6,7 @@ import time
 from decimal import Decimal
 
 import websockets
+from websockets.exceptions import ConnectionClosed, ProtocolError
 
 
 class LighterReadStream:
@@ -30,9 +31,11 @@ class LighterReadStream:
         self._sleep = sleep
         self._timeout = timeout
         self._request_observer = request_observer
+        self._book_observer = None
         self._socket = self._reader = self._pending = self._book_ready = None
         self._lock = asyncio.Lock()
         self._invalid = False
+        self._first_stream_failure = None
         self._book_invalid = False
         self._last_book_failure = None
         self._last_source_time_failure = self._wall_observation = None
@@ -59,6 +62,29 @@ class LighterReadStream:
         return self._socket is not None and not self._invalid
 
     @property
+    def first_stream_failure(self):
+        """Fixed diagnostic codes only; the original cause survives cleanup."""
+        return self._first_stream_failure
+
+    def _record_stream_failure(self, stage, error=None):
+        if self._first_stream_failure is not None or self._invalid:
+            return
+        if error is None or isinstance(error, ConnectionClosed):
+            reason = "transport_closed"
+        elif isinstance(error, TimeoutError):
+            reason = "timeout"
+        elif isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+            reason = "invalid_json"
+        elif (isinstance(error, ProtocolError)
+              or stage == "receive" and isinstance(error, (ValueError, KeyError, TypeError))):
+            reason = "protocol_error"
+        elif isinstance(error, OSError):
+            reason = "transport_error"
+        else:
+            reason = "internal_error"
+        self._first_stream_failure = stage, reason
+
+    @property
     def last_book_failure(self):
         return self._last_book_failure
 
@@ -79,6 +105,35 @@ class LighterReadStream:
                 "max_accepted_age_ms": (str(self._max_accepted_age_ms)
                                         if self._max_accepted_age_ms is not None else None)}
 
+    def set_book_observer(self, callback):
+        """Opt-in synchronous public BBO observation; no subscriptions or reads."""
+        if callback is not None and not callable(callback):
+            raise ValueError("book observer must be callable or None")
+        self._book_observer = callback
+        if callback is not None:
+            try:
+                self.book_snapshot()  # An initial handoff must still pass source health.
+            except (Exception, asyncio.CancelledError):
+                return
+            self._notify_book_observer()
+
+    def _notify_book_observer(self):
+        callback = self._book_observer
+        if (callback is None or self._book is None or self._book_invalid
+                or not self.transport_healthy or not self._levels["bids"] or not self._levels["asks"]):
+            return
+        bid, ask = max(self._levels["bids"]), min(self._levels["asks"])
+        if bid >= ask:
+            return  # Do not publish an unusable BBO or change existing book acceptance.
+        observation = {"timestamp": self._book["timestamp"],
+                       "received_monotonic": self._book["received_monotonic"],
+                       "nonce": self._book["nonce"], "bid": bid, "ask": ask,
+                       "bid_size": self._levels["bids"][bid], "ask_size": self._levels["asks"][ask]}
+        try:
+            callback(observation)
+        except (Exception, asyncio.CancelledError):
+            pass  # Optional observation cannot invalidate book/account cleanup proofs.
+
     def _fail_book(self, stage, error):
         reasons = {"invalid book sequence": "invalid_sequence",
                    "stale or future source book timestamp": "source_time_out_of_bounds",
@@ -96,6 +151,7 @@ class LighterReadStream:
     async def start(self):
         if self._invalid or self._socket is not None:
             raise RuntimeError("read stream cannot be restarted")
+        stage = "connect"
         try:
             self._socket = await asyncio.wait_for(self._connect(
                 self._url, ping_interval=30, ping_timeout=10, close_timeout=1,
@@ -111,11 +167,14 @@ class LighterReadStream:
                 protocol.send_frame = observed
             self._book_ready = asyncio.get_running_loop().create_future()
             self._reader = asyncio.create_task(self._receive())
+            stage = "subscribe_book"
             await asyncio.wait_for(self._send_wait(
                 {"type": "subscribe", "channel": f"order_book/{self._market}"},
                 self._book_ready,
             ), self._timeout)
         except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                self._record_stream_failure(stage, exc)
             await self.close()
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -151,6 +210,8 @@ class LighterReadStream:
                         await self._request_reply("unsubscribe", channel)
                     return await self._request_reply("subscribe", channel)
             except BaseException as exc:
+                if not isinstance(exc, asyncio.CancelledError):
+                    self._record_stream_failure("request_snapshot", exc)
                 await self.close()
                 if isinstance(exc, asyncio.CancelledError):
                     raise
@@ -185,6 +246,8 @@ class LighterReadStream:
                                 self._update_book(message)
                                 self._book["received_monotonic"] = received
                                 self._book_changed.set()
+                                if self._book_observer is not None:
+                                    self._notify_book_observer()
                         except Exception as error:
                             # A bad book must not disable fresh account cleanup proofs.
                             self._fail_book("receive_book", error)
@@ -207,10 +270,11 @@ class LighterReadStream:
                     # Updates are intentionally not merged into fresh snapshots.
                 else:
                     raise ValueError("unexpected read stream message")
+            self._record_stream_failure("receive")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record_stream_failure("receive", exc)
         finally:
             await self.close()
 

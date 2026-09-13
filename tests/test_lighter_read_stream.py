@@ -5,6 +5,8 @@ import unittest
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from websockets.exceptions import ConnectionClosedError, ProtocolError
+from websockets.frames import Close
 
 from core.adapters.exchanges.adapters.lighter import LighterAdapter
 from core.adapters.exchanges.adapters.lighter_read_stream import LighterReadStream
@@ -48,6 +50,8 @@ class Socket:
         value = await self.queue.get()
         if value is None:
             raise StopAsyncIteration
+        if isinstance(value, Exception):
+            raise value
         return value
 
     async def send(self, raw):
@@ -95,6 +99,156 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
     async def flush(self):
         for _ in range(5):
             await asyncio.sleep(0)
+
+    async def test_first_stream_failure_is_fixed_and_survives_repeated_cleanup(self):
+        class UnprintableTransportError(OSError):
+            def __str__(self):
+                raise AssertionError("provider exception must not be formatted")
+
+        cases = ((None, "transport_closed"), ("private-not-json", "invalid_json"),
+                 (b"\xffprivate", "invalid_json"),
+                 (ConnectionClosedError(Close(1011, "private-close-reason"), None), "transport_closed"),
+                 (ProtocolError("private-protocol-details"), "protocol_error"),
+                 (UnprintableTransportError("private-transport-details"), "transport_error"),
+                 (RuntimeError("private-internal-details"), "internal_error"))
+        for incoming, reason in cases:
+            with self.subTest(reason=reason, incoming_type=type(incoming).__name__):
+                stream, socket, connection = await self.make_stream()
+                await socket.queue.put(incoming)
+                await self.flush()
+                self.assertEqual(stream.first_stream_failure, ("receive", reason))
+                self.assertTrue(socket.closed)
+                self.assertFalse(stream.transport_healthy)
+                sent = copy.deepcopy(socket.sent)
+                with patch.object(stream, "_clock", side_effect=AssertionError("diagnostic clock read")):
+                    with self.assertRaises(RuntimeError):
+                        await stream.request_snapshot("account_all")
+                    await stream.close()
+                    self.assertEqual(stream.first_stream_failure, ("receive", reason))
+                with self.assertRaises(AttributeError):
+                    stream.first_stream_failure = ("receive", "changed")
+                self.assertEqual(socket.sent, sent)
+                connection.assert_awaited_once()
+
+    async def test_startup_timeout_identifies_connect_or_book_subscription(self):
+        for stage in ("connect", "subscribe_book"):
+            with self.subTest(stage=stage):
+                socket = Socket()
+                async def never_connect(*_args, **_kwargs):
+                    await asyncio.Event().wait()
+                connection = AsyncMock(side_effect=never_connect) if stage == "connect" else AsyncMock(return_value=socket)
+                socket.send = AsyncMock()  # A sent subscription gets no acknowledgement.
+                stream = LighterReadStream("wss://private.invalid/secret", 7, 0,
+                    lambda: "private-auth", connect_factory=connection, timeout=0.01)
+                with self.assertRaisesRegex(RuntimeError, "startup unavailable"):
+                    await stream.start()
+                self.assertEqual(stream.first_stream_failure, (stage, "timeout"))
+                self.assertFalse(stream.transport_healthy)
+                self.assertEqual(socket.send.await_count, int(stage == "subscribe_book"))
+                connection.assert_awaited_once()
+
+    async def test_normal_close_is_not_a_transport_failure(self):
+        stream, socket, _ = await self.make_stream()
+        await stream.close()
+        await stream.close()
+        self.assertTrue(socket.closed)
+        self.assertIsNone(stream.first_stream_failure)
+
+    async def test_book_failure_evidence_survives_later_transport_close(self):
+        stream, socket, _ = await self.make_stream(sleep=AsyncMock())
+        update = book_message(initial=False, nonce=11, offset=21)
+        update["timestamp"] = 1001
+        await socket.push(update)
+        await self.flush()
+        self.assertTrue(stream.transport_healthy)
+        self.assertIsNone(stream.first_stream_failure)
+        before = stream.last_book_failure, stream.last_source_time_failure, stream.source_time_diagnostics()
+        self.assertEqual(before[0], ("receive_book", "source_time_out_of_bounds"))
+        self.assertEqual((await stream.request_snapshot("account_all_orders"))["orders"], {})
+        await socket.queue.put(None)
+        await self.flush()
+        self.assertEqual(stream.first_stream_failure, ("receive", "transport_closed"))
+        self.assertEqual((stream.last_book_failure, stream.last_source_time_failure,
+                          stream.source_time_diagnostics()), before)
+
+    async def test_public_book_observer_is_opt_in_detached_and_adds_no_requests(self):
+        stream, socket, _ = await self.make_stream()
+        self.assertIsNone(stream._book_observer)
+        observations = []
+        sent = copy.deepcopy(socket.sent)
+        stream.set_book_observer(observations.append)
+        self.assertEqual(observations, [{"timestamp": 1000, "received_monotonic": 42.5, "nonce": 10,
+            "bid": Decimal("99"), "ask": Decimal("101"),
+            "bid_size": Decimal("2"), "ask_size": Decimal("3")}])
+        observations[0]["bid"] = Decimal("1")
+        self.assertEqual(stream.book_snapshot()["bids"][0][0], Decimal("99"))
+        await socket.push(book_message(initial=False, nonce=11, offset=21))
+        await self.flush()
+        self.assertEqual(observations[-1]["nonce"], 11)
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(socket.sent, sent)
+        stream.set_book_observer(None)
+        await socket.push(book_message(initial=False, nonce=12, offset=22))
+        await self.flush()
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(stream.book_snapshot()["nonce"], 12)
+        self.assertEqual(socket.sent, sent)
+
+    async def test_book_observer_before_start_gets_validated_initial_snapshot(self):
+        socket, observations = Socket(), []
+        stream = LighterReadStream("wss://api.rh.lighter.xyz/stream", 7, 0, lambda: "test-auth",
+            connect_factory=AsyncMock(return_value=socket), clock=lambda: 42.5, wall_clock=lambda: 1)
+        stream.set_book_observer(observations.append)
+        self.assertEqual(observations, [])
+        await stream.start()
+        self.addAsyncCleanup(stream.close)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["received_monotonic"], 42.5)
+        self.assertEqual(len(socket.sent), 1)
+
+    async def test_book_observer_failures_never_break_book_or_authenticated_cleanup(self):
+        for error in (RuntimeError("private-sentinel"), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                stream, socket, _ = await self.make_stream()
+                observer = MagicMock(side_effect=error)
+                stream.set_book_observer(observer)
+                await socket.push(book_message(initial=False, nonce=11, offset=21))
+                await self.flush()
+                self.assertEqual(observer.call_count, 2)
+                self.assertEqual(stream.book_snapshot()["nonce"], 11)
+                self.assertTrue(stream.transport_healthy)
+                self.assertEqual((await stream.request_snapshot("account_all"))["total_trades_count"], 10)
+
+    async def test_invalid_or_unusable_books_never_emit_public_observations(self):
+        for case in ("sequence", "price", "source_time", "empty", "crossed"):
+            with self.subTest(case=case):
+                stream, socket, _ = await self.make_stream()
+                observations = []
+                stream.set_book_observer(observations.append)
+                update = book_message(initial=False, nonce=11, offset=21)
+                if case == "sequence":
+                    update["order_book"]["begin_nonce"] = 9
+                elif case == "price":
+                    update["order_book"]["bids"][0]["price"] = "NaN"
+                elif case == "source_time":
+                    update["timestamp"] = 1001
+                elif case == "empty":
+                    update["order_book"]["bids"][0]["size"] = "0"
+                else:
+                    update["order_book"]["bids"] = [{"price": "102", "size": "2"}]
+                await socket.push(update)
+                await self.flush()
+                self.assertEqual(len(observations), 1)
+                self.assertTrue(stream.transport_healthy)
+                self.assertEqual((await stream.request_snapshot("account_all"))["total_trades_count"], 10)
+
+    async def test_default_book_updates_do_not_call_observer_hook(self):
+        stream, socket, _ = await self.make_stream()
+        with patch.object(stream, "_notify_book_observer") as observer:
+            await socket.push(book_message(initial=False, nonce=11, offset=21))
+            await self.flush()
+            observer.assert_not_called()
+        self.assertEqual(stream.book_snapshot()["nonce"], 11)
 
     async def test_fresh_snapshots_preserve_account_fields_and_empty_orders(self):
         stream, socket, connection = await self.make_stream()
@@ -228,6 +382,7 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
             await stream.request_snapshot("account_all")
         self.assertEqual(len(socket.sent), 2)
         connection.assert_awaited_once()
+        self.assertEqual(stream.first_stream_failure, ("request_snapshot", "timeout"))
 
     async def test_wrong_identity_missing_orders_and_error_are_closed_and_redacted(self):
         invalid = [account_message(), account_message("account_all_orders"),
@@ -243,6 +398,7 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
                     await stream.request_snapshot(channel)
                 self.assertNotIn("sensitive", str(caught.exception))
                 self.assertTrue(socket.closed)
+                self.assertEqual(stream.first_stream_failure, ("receive", "protocol_error"))
 
     async def test_disconnect_and_invalid_json_invalidate_book(self):
         for raw in (None, "not-json"):
@@ -573,6 +729,7 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
             await stream.request_snapshot("account_all_orders")
         self.assertNotIn("sensitive", str(caught.exception))
         self.assertTrue(socket.closed)
+        self.assertEqual(stream.first_stream_failure, ("request_snapshot", "internal_error"))
         stream, socket, _ = await self.make_stream()
         socket.reply = lambda _: None
         pending = asyncio.create_task(stream.request_snapshot("account_all"))
@@ -581,6 +738,7 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await pending
         self.assertTrue(socket.closed)
+        self.assertIsNone(stream.first_stream_failure)
 
     async def test_startup_failure_and_unsolicited_snapshot_fail_closed(self):
         connection = AsyncMock(side_effect=ValueError("sensitive-connection-details"))
@@ -589,6 +747,7 @@ class LighterReadStreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "startup unavailable") as caught:
             await stream.start()
         self.assertNotIn("sensitive", str(caught.exception))
+        self.assertEqual(stream.first_stream_failure, ("connect", "internal_error"))
         with self.assertRaises(RuntimeError):
             await stream.start()
         connection.assert_awaited_once()

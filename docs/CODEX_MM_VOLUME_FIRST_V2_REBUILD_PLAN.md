@@ -1917,7 +1917,25 @@ R4最小分析工具已可使用；不等待更多工具再進下一步。短dry
 
 ### 19.8 2026-09-06 延長 volume／fee-cover 驗證
 
-本批驗證：2026-09-11完整V2 **561 tests PASS（86.360s）**；同60min離線fixture雙邊91.17%、0 API退出、cash差0／final0/0，固定30min機會45/45。實盤與經濟驗收維持下面歷史狀態。
+**2026-09-13 最新000352分析與修復：** wall578.488854s後code1，原final authenticated flat／2單；使用者其後親自確認0/0，本輪無私人API查核，不能改寫原run為成功。真SDK隔離重現表明generic signer/provider flags不足區分送前／送後，歷史精確根因仍未知。本地加入逐attempt sign／send階段證據、exact scoped且nonce已恢復的no-send契約；只停止正常報價並保留經額外預算準入及fresh audit的原有界清理。MM error tuple／rejected response也須原exact terminal查核，移除文字429恢復LIVE的捷徑；unknown不重送。完整驗證與限制見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。沒有新live、風險調參、Git或VPS操作。
+
+**2026-09-12 前場224839分析與修復（歷史）：** wall1866.741s後code1，原final authenticated short0.00040／1單，第三次取消缺證退出blocked、IOC0。23:40:28另次授權唯讀取得0/0，不回填原run成功或後續成本。本地已修原10s／逐次API準入內最多第二次延後讀terminal，保持未知狀態不重送及原30s退出；新增精確receipt／poll／recovery原因，修分析器incomplete final facts呈現。此前43筆cancel成功，不支持占位DTO普遍故障復發，但舊資料不足確證初始provider原因。Maker557.394960、已記錄交易net−0.07264641920；完整60min、最終成本及fee-cover仍未驗收。最終驗證見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。沒有新live／風險調參／Git或VPS操作。
+
+前批224839最終2026-09-13全專案901 tests／101.791s，613项V2全數通過；其餘12項與既有8 failures＋4 errors基線逐一相同，無新增失敗。
+
+**2026-09-12 前場215907分析與修復（歷史）：** wall128.579s、0 fills後code1，第一個60s quote expiry遇到前批strict manager與Adapter占位cancel receipt不相容；收尾有界取證成功，cleanup／final皆authenticated0/0。本地已將MM所有exact terminal DTO保留並直接交consumer確認，另修client ID碰撞誤清另一pending的問題；Grid/default保持，無新增HTTP或風險／期限放寬。真Adapter→REST→manager及完整session反覆兩輪到期後继续POST_ONLY、最後0/0的回歸通過；該批沒有新live，未驗收完整60min或fee-cover。驗證與證據見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+本批全專案889 tests／98.161s，601項V2全數通過，8 failures＋4 errors與既有基線相同，無新增失敗；獨立安全審查完成。
+
+**2026-09-12 前場205914分析與修復（歷史）：** wall1751.682s後code1，原末尾short0.00040／2單，known cancel未取得terminal使執行及退出共同HALTED；非API背壓或source失效。使用者另授權21:43:28唯讀取得0/0，未做交易，後續歸零不能補成原run成功。新增同原期限／API預留內一次exit-only取消取證，exact terminal／固定generation／無unknown後才撤餘單與原bounded IOC；仍active／缺證據不重送。另加取消batch分類並修正真sidecar provenance讀取。本場25maker／680.019960、已記錄交易net−0.07472294620、雙邊90.74%；成本、未閉合持倉及失敗窗口均保留，完整60min及fee-cover仍未驗收。見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+本批最終595項V2 tests PASS（86.813s）。獨立安全審查再補取消／sync期間generic fault不可清除、取消proof exact ID／client／size／price／remaining四來源契約。風險限額、原退出期限及API預留不改；修後實盤仍未驗證。
+
+**2026-09-12 依fee-cover分析優化（本地）：** 已重現「加倉側預留把正常減倉容量一起壓到minimum以下」的缺口，增加同風險公式內的單側減倉搜尋，不提高限額或變更有界退出。新增order／governor／原時間公開行情證據、啟動版本與有效設定；既有analyzer可分normal maker／passive減倉／IOC／未分類成本、真實flat-to-flat組及markout覆蓋。歷史231145的90 fills／23組與報告精確相符，缺fill reference／funding／final accounting仍不可補猜。未改edge等參數、未新live；實盤完整60分鐘與fee-cover仍待驗證。具體風險重現及本批驗證見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
+
+本批最終全專案870 tests／91.838s，582項V2全數通過；其餘12項與既有8 failures＋4 errors基線逐一一致，無新增失敗。Shared public observer預設關閉，Grid原讀取／有效性規則保持。
+
+上一批驗證：2026-09-11完整V2 **561 tests PASS（86.360s）**；同60min離線fixture雙邊91.17%、0 API退出、cash差0／final0/0，固定30min機會45/45。實盤與經濟驗收維持下面歷史狀態。
 
 **2026-09-11 依使用者授權優化（本地）：** 已加入僅flat/empty後的資金費有界取證與final事件後fresh確認，支援cash先到／authenticated ID先到；原deadline、exact accounting及normal風控不放寬。真端點權重fixture揭露清倉後重複3IOC預留會拒絕只讀audit，新取證逐read保留最後strict proof的4400REST／15WS／0TX；normal quote/create及完整exit reserve維持。另以完整empty-order proof精算next monitor（300＋terms，其他仍1200＋terms），安全既有單優先補缺側。未啟動新live；修後實盤完整60分鐘、雙邊覆蓋與fee-cover仍待驗證。完整本批測試與歷史失敗見[EXPERIMENT_LOG](mm_v2/EXPERIMENT_LOG.md)。
 
@@ -1960,7 +1978,7 @@ R4最小分析工具已可使用；不等待更多工具再進下一步。短dry
 
 使用者本機執行一場的命令（agent不執行這段交易命令）：
 
-目前也可直接在專案PowerShell執行` .\run_live_test.ps1`；該腳本會顯示啟動提示並每10秒輸出phase。`api_quarantine_60s`是原有啟動等待，開始報價後顯示`syncing_orders`、`authorizing_quotes`、`reconciling_quotes`或`waiting`。狀態輸出不新增API請求，並不等於獨立風控監控。
+目前可直接在專案PowerShell執行` .\run_live_test.ps1`；腳本顯示啟動提示，關鍵事件立即輸出、heartbeat每60秒。`api_quarantine_60s`是原有啟動等待，正常循環合併顯示為`quoting`，另保留`api_wait`與退出phase。狀態輸出不新增API請求，並不等於獨立風控監控。下列為歷史實盤操作說明，不是本次新增授權；目前有效測試規劃見§19.9。
 
 ```powershell
 $runStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -1975,3 +1993,108 @@ $runTimer.Stop()
 第一場退出／帳戶確認完成後再執行同一命令第二場，產生不同輸出檔。把两個實際JSONL路徑與各自`.window.json`的wall_seconds傳給既有`analyze_mm_v2_session.py --candidate extended_60m --mode live --planned-seconds 3600 --wall-seconds <第一場秒數> <第二場秒數> --allocated-capital 80`；所有失敗窗口另外保留在EXPERIMENT_LOG，不用縮短分母或換檔排除。舊canary_02程序退出後的成交／外部平倉尚未完整歸因，需補齊其成本才能宣稱整輪損益通過。
 
 16:28:54 +08:00唯讀確認帳戶0/0；此為該時點狀態，不代替稍後啟動查核。延長離線檢查與本次實際完成範圍見EXPERIMENT_LOG；原定第一場已由使用者啟動但提早失敗；目前沒有完成的live長測證據。
+
+### 19.9 2026-09-13：驗證 `run_live_test` 完整流程的測試計畫
+
+**193558後本地實作：** 已補分支診斷、共用原10s／單次重試的健康book重新對齊，以及6個raw故障／恢復／舊policy反例場景。只恢復完整帳戶證明已通過的暫時不同步；持續失效、失聯或無可信IOC行情均維持安全停止與真實終態。此為下面分析後獲授權的實作；測試證據與Git結果統一見EXPERIMENT_LOG最新條目，不回填193558為成功，也不代表新的live授權。
+
+**後續實盤193558（分析）：** 使用者自行執行後提交的場次在wall2674.2750979s因報價前行情同步／transport檢查失敗而code1；三次收尾均flat，最後authenticated0/0及cash差0。毛利0.006600仍不足支付0.13246621460費用。現有紀錄缺失效分支證據；下一批需在既有wire fixture補「account查核後、market授權前失效」的完整流程及固定安全診斷，不能用前批646項PASS推論已覆蓋此時序。本次只完成紀錄分析，runtime未改；詳見EXPERIMENT_LOG最新條目。
+
+**最新狀態：第一批完整流程與啟動器測試已完成，修正後646項V2回歸全部通過（188.640s），見§19.9.7及EXPERIMENT_LOG。** 以下保留原差距與分段驗收計畫；通過數量本身不代表實盤全流程已驗收。本輪只執行合成環境的原PS1／CLI，沒有私人帳戶連線、實盤交易或commit/push。
+
+#### 19.9.1 審查當時已證實的測試差距
+
+| 現有證據 | 能證明的範圍 | 仍缺少的證據 |
+|---|---|---|
+| `tests/test_mm_v2_cli.py` | 引數、摘要、授權先後、輸出與handler邏輯 | `call_main`替換設定讀取、adapter factory與整個VolumeSession；沒有執行PowerShell入口 |
+| `tests/test_mm_v2_session_runner.py` | 真session、governor、manager、ledger及有界退出 | 大多使用RuntimeAdapter直接產生OrderData、同步修改訂單／成交／cash；未經真SDK HTTP反序列化 |
+| `tests/test_mm_v2_lighter_execution.py` | 原SDK nonce decorator與sign/send方法、真adapter／REST交接 | native／tx_api回傳仍由fixture替換；沒有與完整啟動程序、raw REST／WS同場組合 |
+| `tests/test_lighter_read_stream.py` | 原始WS JSON、序號、來源時間、身份、部分異步生命週期 | 尚未與session及SDK送單在同一故障時序下共同執行 |
+| `tests/test_mm_v2_budget_sessions.py` | 600／1800／3600秒虛擬工作量、冷快取、延遲及成本假設 | MinimumCostAdapter是成本代理；不能證明實際HTTP重導向／重試次數或真實牆鐘穩定度 |
+| CLI signal與session stop tests | 呼叫Python handler、Event停止及async取消 | 沒有真正Windows Ctrl+C穿過PowerShell／Python、`finally`、退出碼及程序樹的驗證 |
+
+另須實測的launcher契約：PS1兩次讀config是否一致、`.venv`／Unicode路徑、驗證早於try/finally時的失敗輸出、sidecar寫入失敗、顯示的`$runCode`與PowerShell自身exit code是否一致。PS1目前沒有明確`exit $runCode`；這是應新增斷言的來源證據，尚未執行程序重現。現有subprocess import隔離測試也不等於launcher測試。
+
+#### 19.9.2 第一批：一條共用的離線完整流程
+
+保留現有unittest及快速contract tests。新增薄的可組合wire fixture，供session與Windows launcher共用；預計落在`tests/test_mm_v2_wire_session.py`、`tests/test_mm_v2_launcher.py`及必要的共用fixture，不引入另一套測試框架或複製一份交易runtime。
+
+測試路徑必須是：**原PS1／Python CLI → 原VolumeSession → 原manager／port → 原LighterAdapter／Rest → 原SDK nonce／sign／send／HTTP反序列化 + 原LighterReadStream → 模擬交易所**。原生簽名／身份初始化使用合成替身，外部HTTP／WS在最底層替換；不替換整個session、adapter、create/cancel、歷史查詢方法，也不直接回傳已整理好的OrderData作為主要整合證據。native ABI、真實帳戶驗證與交易所matching engine仍須明確標為離線未涵蓋。
+
+模擬交易所返回合成raw JSON／WS frames，保存獨立的「收到請求 → 是否接受 → 成交 → 訂單／持倉／cash」紀錄。預期結果來自這份紀錄與手算Decimal範例，不能讀manager slots、重用production ledger計算，或把同一個adapter.fill同時當被測行為和答案。HTTP接受、客戶端收不到回應、WS可見、history可見、cash可見是分別可排程的事件。
+
+一般案例可在原API client的最低傳輸邊界餵raw資料；redirect／連線reset／timeout案例需另外經過真正的loopback HTTP／WS傳輸，才能核對aiohttp的實體request次數。不能把手動拋DNS exception稱為重導向測試。固定scenario seed與時序，優先組合已發生的故障；不做無上限隨機測試。
+
+**離線隔離前提：** 用暫存工作區、合成exchange設定與`.env`，不複製使用者憑證。保留原launcher預設流程，用測試bootstrap在import前接入fixture並完成ready handshake；失敗立即退出，不能退回真帳戶。開始時先驗證本機可用的封網隔離方式，涵蓋native SDK及子程序；Python monkeypatch不能單獨作為零連外證明。若原生／socket整合缺少可驗證的隔離環境，先完成傳輸全替換的測試並標出此缺口，不能把它升格為實體傳輸驗收。此規劃不要求VPS，也不授權修改系統網路設定。
+
+第一批每場需留下可重現資料：scenario／seed、目標source內容指紋（不能只有同一HEAD＋dirty=true）、實際Python executable與版本、SDK／native版本或檔案指紋、載入的公開策略欄位與其指紋、fixture版本、程序exit codes。秘密設定只驗證使用合成來源，不輸出其內容或hash。沿用JSONL、`.budget.json`、`.window.json`及既有analyzer；模擬場次要明確標示，禁止作為live economics來源。
+
+#### 19.9.3 優先故障矩陣與判定標準
+
+| 情境 | 注入位置／實際觸發 | 必須驗證 |
+|---|---|---|
+| 正常兩側與60s到期 | raw open／partial／cancel／fill回應，至少連續兩次到期更新 | 真兩側委託；exact terminal跨SDK／adapter到manager；正常流程不意外退出；最後venue與帳戶皆0/0 |
+| 未送出／已送出但回應遺失 | native sign error、HTTP200解析失敗、400錯誤tuple、timeout、redirect後DNS | no-send分支須同時證明未送＋nonce確實恢復才允許fresh cleanup；其餘須exact terminal取證，未知不能重送或錯誤回退nonce；實際send次數符合意圖 |
+| terminal發布延遲 | 第4次history、第一次／第二次exit讀、最後可用read後及原deadline前後 | 在既定讀取次數／admission／deadline內實際取得exact proof，且後續帳戶／價格条件成立時完成清理；僅在總deadline前發布但未被有界讀取得到不保證恢復，不加poll、延長期限或以absence當成功 |
+| 同時成交與撤單 | cancel pending時本側partial或對側成交；WS／history／cash不同步到達 | 不重複入帳；只對fresh residual做reduce-only IOC；原單量、side、price、ID與remaining驗證保留 |
+| 原有殘量與退出 | 多空部分成交、低於maker minimum的step-aligned殘量、IOC部分成交 | maker／IOC minimum規則不混用；剩餘量、價格界線、最多3次IOC及原退出期限不變 |
+| 不可信帳戶／行情 | 未知order、舊snapshot、重複／亂序WS、斷線、行情過期 | 不新增風險；有完整帳戶／所有權證據且無未知執行狀態時仍可清理known orders；缺必要證據如實報殘留，不能猜0/0 |
+| API真實成本 | 冷nonce／metadata、多次history、HTTP拒絕／redirect、WS掉線後REST fallback | 模擬端實體attempts與client meter一致；原exit reserve不被正常單或額外查核消耗；不足時不額外送單 |
+| 會計時間差 | 成交與cash不同步、跨整點funding、延後funding row、最終讀取 | 精確Decimal與獨立現金紀錄相符；不加大容差、丟失funding或將不完整會計列為economics通過 |
+| 真Windows停止 | connecting／quarantine／讀取／送出／收尾中送Ctrl+C | 無後續普通maker；只有原一次退出期限；最終資料、Python與PowerShell exit codes一致；無孤兒程序 |
+| 啟動／輸出故障 | 缺設定／Python、設定讀取間變動、中文空格路径、既有輸出檔、寫入失敗 | 區分啟動前失敗與有帳戶風險後故障；原錯誤不被finally覆蓋；無虛假的completed／0/0／成功碼 |
+
+每個核心故障族需加入能把測試變紅的反例。例如在隔離副本恢復215907的占位cancel DTO交接，正常到期案例必須失敗；使未知cancel重送，模擬端重複請求必須被抓到；模擬端保留掛單但報表宣稱0/0，獨立判定器必須拒絕。只增加PASS數量、或改fixture迎合目前回傳值，不是有效驗收。
+
+既有215907／224839／000352等JSONL只能重建已記錄的時序與結果，不能補出從未記錄的raw SDK回應。000352初始錯誤仍未定因；對其多種可能送前／送後原因分別做合成情境，明確區分「歷史事實重現」和「假設故障注入」。
+
+#### 19.9.4 Windows入口與真實時間
+
+父harness在獨立隱藏console啟動真正PowerShell及原PS1，子程序使用实际`.venv`；test bootstrap不接管main／VolumeSession。等journal與模擬端證明已到指定事件再送真正`CTRL_C_EVENT`，不能用直接呼叫handler、`terminate`或Ctrl+Break代替Ctrl+C。
+
+觀察PS1的`finally`、Python原30s bounded exit、final read／disconnect、summary、sidecars及整棵程序樹退出。父程序watchdog只用於超時回收，任何watchdog介入都判失敗，不能算正常清理；送訊號後的外部回收上限規劃60s，內部交易清理仍須符合原30s及各步上限。強制結束／關窗另外列為崩潰情境，不承諾Python finally可執行或自動0/0。
+
+先做短的真時鐘正常／Ctrl+C案例，再做一場60分鐘真時鐘離線穩定度驗證，保留60s quarantine、60s quote age、實際async waits與metadata／transport計時。加速行情帶繼續用於快速覆蓋，但不得代替這場牆鐘驗證。session duration由初始帳戶boundary開始，啟動quarantine不算在其中；process wall、session active time、stop到cleanup／final／disconnect分開記錄，不把3600s配置等同3600s整個程序耗時。
+
+#### 19.9.5 最後才做網路／實盤校準
+
+以下皆是後續擬定場次，本節不是連線或交易授權。網路唯讀須有明確的network／同帳戶／BTC、時長及零mutation範圍；每場live另須size／exposure、loss limits及bounded exit授權。沿用該場授權完成正常掛撤單與退出，不逐筆再次詢問。不得在真帳戶刻意製造斷網、重送、成交或自成交；故障注入全部在離線完成。
+
+| 順序 | 場次 | 用途與晉級證據 |
+|---|---|---|
+| 1 | 5分鐘strict dry／唯讀 | 真環境的載入、native初始化、身份、來源時間、raw資料與訂閱／斷線；實際送單／撤單0。不能驗live執行或獲利 |
+| 2 | 5分鐘live | 驗真POST_ONLY／撤單SDK與正常期限退出；至少跨兩次60s到期更新，fresh authenticated0/0及process exit。Ctrl+C live驗證若需要，另以明確停止條件列入該場 |
+| 3 | 15分鐘live | 重複完整掛撤循環、真maker成交／持倉／自動收尾與會計。無自然成交則持倉路徑標未涵蓋，不追價、不加碼或自動延長 |
+| 4 | 60分鐘live | 前項已取得所需事件證據後，驗跨30min／整點的實際長時間運作與最終清理；同一建置和非秘密有效設定可比較 |
+
+規劃只改場次duration，先保留本次唯讀核對的其他策略設定：BTC、單筆0.00040、soft0.00040／hard0.00080、持倉stop-loss觸發0.15 USDG、session loss觸發0.50 USDG、max hold180s、quote age60000ms、IOC slippage200ticks。這些是現行設定與待授權場次的邊界，不是新增資金配置或保證實際虧損上限。若真市場minimum不相容，停止並記錄，不能自動放大單量。真網路費率／規格／身份每場仍按現有startup重新驗證。
+
+任何實盤runtime錯誤、殘留／不確定委託、會計不完整或程序未退出都不能晉級。預期風控提前退出可通過該風控案例，但不滿足完整15／60分鐘時長證據；沒有成交也不等於已驗收持倉處理。新失敗先納入可重現的離線情境並驗證，再決定下一次有界場次；不因短場沒撞到錯誤便宣稱已解決原場根因。
+
+#### 19.9.6 報告必須分開的結論
+
+每場分列：**安全不變量、可恢復時的清理、指定事件／時長覆蓋、會計完整性、經濟表現**。有可用exact證據時，清理通過須同時有獨立venue0/0、fresh account0/0及process exit；實盤則需該場授權範圍内的新鮮認證終態查核。
+
+刻意讓terminal永遠不可得的負面情境，可以是「安全防護PASS／清理BLOCKED／有殘留」，不能算「60分鐘穩定PASS」。報表保留全部失敗場次，跨層判定不只看`completed`或exit code；不把後續人工0/0回填原場成功。632／920等數量繼續作回歸摘要，真正晉級依上面的事件、原期限與獨立證據。完整60分鐘運行成功與fee-cover達標是分開的驗收。
+
+**第一個實作批次的完成標準：** 一個共用raw-wire場景可從真CLI跑到獨立venue判定，包含正常到期、terminal延遲加成交、回應遺失不重送；同時有真PS1正常／Ctrl+C程序測試及至少一個會被抓出的歷史錯誤反例。交付測試與實際結果後才做真時間長測和網路校準。最初規劃回合只做文件審查；後續實作與實測分開記錄如下。
+
+#### 19.9.7 第一批實作：原始入口、SDK wire與Windows停止
+
+`tests/mm_v2_wire_fixture.py`共用合成交易所，原CLI／config／settings parser／adapter factory／VolumeSession／manager／port／account／ledger／SDK nonce與sign/send／HTTP反序列化／ReadStream皆保留。替換native signer及HTTP pool／WS socket；快測僅在原constructor時鐘注入點加入虛擬clock／sleep，Windows場次保留真時鐘、原Proactor喚醒及60s quarantine。原SDK呼叫的native參數、端點／帳戶／market／auth／nonce、POST_ONLY最低金額與不可跨價、IOC reduce-only／limit皆由獨立fixture驗證，不能悄悄把錯誤wire改成合法交易。
+
+完整鏈情境落在`tests/test_mm_v2_wire_session.py`：150s虛擬正常窗口跨兩轮60s正常到期（125s可能進入原期限退出，不能硬改runtime追求六張單）；取消缺證4次history＋首次recovery後才在第二次取得終態，對側成交與單次fresh residual IOC；取消已接受但回應遺失後exact取證；以及終態永不可得時不重送、不新增maker／IOC、如實保留另一側殘單。每次HTTP attempt與原budget meter逐端點對照，nonce不可重用。原始程式證據包含執行code objects，而非只有名稱或替身呼叫次數。
+
+反例包括215907完整terminal交接遺失（同時缺失當前cache fallback）必須讓正常驗收變紅；独立venue拒絕偽造flat結果的判定器敏感度；非法原始單量／身份／旗標／nonce／跨價／native模式必須在fixture改變訂單前拒絕。判定器敏感度不宣稱為已實作的REST／WS隱瞞訂單情境。所有合成帳戶設定在暫存工作區產生，不複製使用者帳戶或本機live YAML。
+
+Windows入口測試為`tests/test_mm_v2_launcher.py`與`tests/mm_v2_windows_process.py`：從其他工作目錄啟動含中文／空格的暫存路徑、隱藏獨立console、原PS1／Python、真CTRL_C_EVENT；建立子程序時先放入專屬job，再允許執行。成功前必須觀察整個job自然退出，不能把job關閉的強制回收算成功。已重現原PS1在Ctrl+C後略過`$runCode = $LASTEXITCODE`，導致window留下1、外層卻回0；修正在finally读取實際child碼並明確傳回，維持原Python啟動與清理。另覆蓋child0／7、延後finally、缺Python／缺或無效設定與watchdog回收。
+
+一般網路／DNS／native loader被fixture拒絕；唯一例外是原stdlib `socketpair`在同thread同步建立的自有loopback喚醒通道。不能把此Python層限制稱為OS封網，也沒有以假的self-pipe或修改Proactor替代Ctrl+C。真SDK native ABI、實體HTTP／WS retry／redirect、真交易所matching engine仍未覆蓋。完整矩陣中的其他raw-wire故障與60分鐘真時鐘soak仍是後續證據，這一批不自動批准網路或實盤階段。
+
+可重現檢查：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_mm_v2_wire_session tests.test_mm_v2_launcher
+```
+
+入口短測有真60s quarantine，整組通常需要數分鐘。測試將合成journal／budget／window（Windows場次）、venue與manifest保存到ignored `logs/mm_v2_wire_*`／`logs/mm_v2_launcher_*`；manifest記錄Python／SDK／native檔案指紋、執行code objects、前後一致的來源內容指紋及公開有效設定，明示不是live economics。測試配置為獨立合成案例，不修改本機實盤參數。另修正首次匯入ReadStream時可能把fixture連線留下的測試順序缺陷，獨立冷啟動反例先紅後綠。最終646项V2全PASS；同源Windows到期／Ctrl+C兩場皆自然退出與fresh0/0，Ctrl+C至整樹退出0.485s，完整證據以EXPERIMENT_LOG為準。

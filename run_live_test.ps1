@@ -15,10 +15,14 @@ Write-Host "Output: $runOutput"
 Write-Host 'Key events appear immediately; heartbeat every 60 seconds. Ctrl+C requests bounded cleanup; keep this window open.'
 
 try {
+    $LASTEXITCODE = 1
     & .\.venv\Scripts\python.exe -u .\run_volume_market_maker.py --config $runConfig --output $runOutput --authorize-bounded-flatten --progress
     $runCode = $LASTEXITCODE
 }
 finally {
+    # Ctrl+C can skip the statement after the native command, although Python
+    # has completed its handler and PowerShell has recorded its actual exit code.
+    $runCode = [int]$LASTEXITCODE
     $runTimer.Stop()
     [ordered]@{
         output = $runOutput
@@ -27,4 +31,5 @@ finally {
         exit_code = $runCode
     } | ConvertTo-Json | Set-Content -LiteralPath "$runOutput.window.json" -Encoding utf8
     Write-Host "Session ended. Exit code: $runCode. Check the final position/open-order summary."
+    exit $runCode
 }

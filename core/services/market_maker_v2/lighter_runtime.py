@@ -26,6 +26,59 @@ class AccountReadRace(LighterReadError):
     """Observations straddle activity; accepted fills remain deduplicated by ID."""
 
 
+class _MarketReadRace(AccountReadRace):
+    """Healthy book needs one fresh order bracket, within the existing audit budget."""
+
+
+_STREAM_STAGES = frozenset({"connect", "subscribe_book", "request_snapshot", "receive"})
+_STREAM_REASONS = frozenset({"timeout", "transport_closed", "invalid_json", "protocol_error",
+                             "transport_error", "internal_error"})
+_BOOK_REASONS = frozenset({"invalid_sequence", "source_time_out_of_bounds", "clock_discontinuity",
+    "wrong_channel", "unexpected_snapshot", "conflicting_offset", "discontinuous_book",
+    "invalid_depth", "invalid_level", "depth_limit", "invalid_payload"})
+MARKET_DIAGNOSTIC_NAMES = frozenset({
+    "market_transport_unhealthy", "market_book_wait_timeout", "market_book_unavailable",
+    "market_book_invalid", "market_outside_watermarks", "market_no_order_watermark",
+    "market_no_aligned_book", "market_generation_changed", "market_opening_nonce",
+    "market_book_nonce", "market_closing_nonce", "market_book_age_ms", "market_source_age_ms",
+    "market_clock_error_ms", "market_book_retry_count",
+}) | {"market_stream_stage_" + name for name in _STREAM_STAGES} | {
+    "market_stream_reason_" + name for name in _STREAM_REASONS} | {
+    "market_book_reason_" + name for name in _BOOK_REASONS}
+
+
+def _market_stream_values(stream):
+    """Only fixed categories/numeric evidence; never retain an exception or payload."""
+    values = {}
+    if stream is None:
+        return values
+    try:
+        if stream.transport_healthy is False:
+            values["market_transport_unhealthy"] = Decimal(1)
+        failure = getattr(stream, "first_stream_failure", None)
+        if type(failure) is tuple and len(failure) == 2:
+            stage, reason = failure
+            if type(stage) is str and stage in _STREAM_STAGES:
+                values["market_stream_stage_" + stage] = Decimal(1)
+            if type(reason) is str and reason in _STREAM_REASONS:
+                values["market_stream_reason_" + reason] = Decimal(1)
+        failure = getattr(stream, "last_book_failure", None)
+        if type(failure) is tuple and len(failure) == 2:
+            values["market_book_invalid"] = Decimal(1)
+            if type(failure[1]) is str and failure[1] in _BOOK_REASONS:
+                values["market_book_reason_" + failure[1]] = Decimal(1)
+        source = getattr(stream, "last_source_time_failure", None)
+        if type(source) is tuple and len(source) == 3:
+            for name, raw in zip(("market_source_age_ms", "market_clock_error_ms"), source[1:]):
+                if type(raw) in (str, Decimal) and len(str(raw)) <= 80:
+                    value = Decimal(raw)
+                    if value.is_finite():
+                        values[name] = value
+    except (Exception, asyncio.CancelledError):
+        pass  # Broken optional diagnostics cannot obstruct authorized cleanup.
+    return values
+
+
 class _AccountCashRace(AccountReadRace):
     """Cash may settle before its independently identified funding evidence."""
 
@@ -126,6 +179,10 @@ class LighterAccountPort:
         self._generation = mutation_generation
         self._opening_orders = self._audited_orders = self._confirmation_orders = None
         self._audited_book = None
+        self._book_read_diagnostics = {}
+        self._book_received_at = None
+        self._market_read_retries = self._market_read_recoveries = 0
+        self._book_attempt = 0
         self._terminal_proofs = {}
         self.latest_orders = ()
         self._ledger = self._baseline = None
@@ -159,10 +216,13 @@ class LighterAccountPort:
     def accepted_funding_ids(self):
         return frozenset(self._fundings)
 
-    def begin_quote_cycle(self):
+    def begin_quote_cycle(self, *, clear_diagnostics=True):
         """Order observations are single-use handoffs, never a cross-cycle cache."""
         self._opening_orders = self._audited_orders = self._confirmation_orders = None
         self._audited_book = None
+        if clear_diagnostics:
+            self._book_read_diagnostics = {}
+            self._book_received_at = None
 
     def inventory_age_bound(self, now):
         """Conservative risk age; ledger analytics retain actual observation times."""
@@ -178,6 +238,20 @@ class LighterAccountPort:
         if self._audited_book is not None and self._audited_book[0] == self._generation():
             return self._audited_book[1]
         return None
+
+    @property
+    def book_diagnostics(self):
+        values = self._book_read_diagnostics | _market_stream_values(self.stream)
+        if self._book_received_at is not None:
+            values["market_book_age_ms"] = (Decimal(str(self.clock.monotonic()))
+                                            - Decimal(str(self._book_received_at))) * 1000
+        if self._audited_book is not None and self._audited_book[0] != self._generation():
+            values["market_generation_changed"] = Decimal(1)
+        return values
+
+    @property
+    def market_read_counts(self):
+        return {"retries": self._market_read_retries, "recoveries": self._market_read_recoveries}
 
     def _take_orders(self, name):
         observation = getattr(self, name)
@@ -437,12 +511,26 @@ class LighterAccountPort:
         opening = (self._take_orders("_opening_orders") or self._take_orders("_confirmation_orders")
                    or await self._read_orders())
         orders = self._orders(opening[2])
+        self._book_read_diagnostics = {"market_book_retry_count": Decimal(self._book_attempt)}
+        self._book_received_at = None
+        if type(opening[3]) is int:
+            self._book_read_diagnostics["market_opening_nonce"] = Decimal(opening[3])
         book = None
         if opening[3] is not None:
             try:
                 book = await self.stream.book_at_or_after(opening[3], after=opening[1])
-            except (RuntimeError, TimeoutError):
-                pass  # An unusable book must not prevent authenticated flat cleanup.
+            except TimeoutError:
+                self._book_read_diagnostics["market_book_wait_timeout"] = Decimal(1)
+            except RuntimeError:
+                self._book_read_diagnostics["market_book_unavailable"] = Decimal(1)
+            # An unusable book must not prevent authenticated cleanup account proof.
+        else:
+            self._book_read_diagnostics["market_no_order_watermark"] = Decimal(1)
+        if book is not None:
+            self._book_read_diagnostics["market_book_nonce"] = Decimal(book["nonce"])
+            received = book.get("received_monotonic")
+            if type(received) in (int, float):
+                self._book_received_at = received
         cached = self._cash_cache
         unified_cash = (cached is not None
                         and cached[2][0].raw_data["account"].account_trading_mode == 1
@@ -462,6 +550,8 @@ class LighterAccountPort:
         cash_at = cached[1] if reuse else self.clock.monotonic()
         balances = deepcopy(cached[2] if reuse else list(await self.adapter.get_balances()))
         closing = await self._read_orders()
+        if type(closing[3]) is int:
+            self._book_read_diagnostics["market_closing_nonce"] = Decimal(closing[3])
         confirmed = self._orders(closing[2])
         account = await self.stream.request_snapshot("account_all")
         count = account["total_trades_count"]
@@ -535,6 +625,7 @@ class LighterAccountPort:
             # fill can legitimately predate a subsequent fee discount.
             raise _AccountCashRace("new fill exceeds observed fee terms")
         if book is not None and not opening[3] <= book["nonce"] <= closing[3]:
+            self._book_read_diagnostics["market_outside_watermarks"] = Decimal(1)
             book = None
         mapped_trades = _trade_map(trades)
         trade_ahead = 0
@@ -566,10 +657,11 @@ class LighterAccountPort:
                     raise AccountReadRace("active order fills not reflected in account history")
 
     async def snapshot(self, *, allow_cash_reuse=False, allow_unreconciled_cash=False,
-                       allow_metadata_cache=False):
+                       allow_metadata_cache=False, require_aligned_book=False):
         try:
             started, generation = self.clock.monotonic(), self._generation()
             force_funding = False
+            retrying_market = False
             # One shared retry/deadline covers the complete proof, not only its reads.
             for attempt in range(2 if self.stream is not None else 1):
                 remaining = 10 - (self.clock.monotonic() - started)
@@ -580,33 +672,56 @@ class LighterAccountPort:
                         if attempt:
                             self.before_read("retry")
                         self.before_read("audit")
-                    return await asyncio.wait_for(self._snapshot_once(started,
+                    if retrying_market:
+                        self._market_read_retries += 1  # Only admitted fresh attempts count.
+                    self._book_attempt = int(retrying_market)
+                    account = await asyncio.wait_for(self._snapshot_once(started,
                         allow_cash_reuse=allow_cash_reuse and not attempt, force_trades=bool(attempt),
                         allow_metadata_cache=allow_metadata_cache,
                         force_funding=force_funding, allow_unreconciled_cash=allow_unreconciled_cash), remaining)
+                    self._book_read_diagnostics["market_book_retry_count"] = Decimal(int(retrying_market))
+                    if (require_aligned_book and self.stream is not None
+                            and hasattr(self.stream, "book_at_or_after") and self.aligned_book is None):
+                        values = self.book_diagnostics | {"market_no_aligned_book": Decimal(1)}
+                        recoverable = (generation is not None and generation == self._generation()
+                            and self.stream.transport_healthy and any(values.get(name) == 1 for name in
+                                ("market_book_wait_timeout", "market_outside_watermarks")))
+                        if recoverable:
+                            try:
+                                self.stream.book_snapshot()  # Original strict source/transport validation.
+                            except Exception:
+                                recoverable = False
+                                values.update(_market_stream_values(self.stream))
+                        error_type = _MarketReadRace if recoverable else LighterReadError
+                        raise error_type("trusted aligned market unavailable", values=values)
+                    if retrying_market:
+                        self._market_read_recoveries += 1
+                    return account
                 except AccountReadRace as error:
                     if attempt or self.stream is None:
                         raise
                     force_funding = isinstance(error, _AccountCashRace)
+                    retrying_market = isinstance(error, _MarketReadRace)
                     self.begin_quote_cycle()
         except asyncio.CancelledError:
-            self.begin_quote_cycle()
+            self.begin_quote_cycle(clear_diagnostics=False)
             self._cash_cache = None
             raise
         except ApiBudgetUnavailable:
-            self.begin_quote_cycle()
+            self.begin_quote_cycle(clear_diagnostics=False)
             self._cash_cache = None
             raise  # Local backpressure is recoverable; it is not bad account data.
         except LighterReadError:
-            self.begin_quote_cycle()
+            self.begin_quote_cycle(clear_diagnostics=False)
             self._cash_cache = None
             self._fees_at = self._settlement_at = float("-inf")
             raise  # These are code-owned messages, never raw SDK/account payloads.
         except Exception:
-            self.begin_quote_cycle()
+            values = self.book_diagnostics
+            self.begin_quote_cycle(clear_diagnostics=False)
             self._cash_cache = None
             self._fees_at = self._settlement_at = float("-inf")
-            raise LighterReadError("authenticated account audit unavailable") from None
+            raise LighterReadError("authenticated account audit unavailable", values=values) from None
 
     async def _snapshot_once(self, started, *, allow_cash_reuse, allow_metadata_cache=False, force_trades=False,
                              force_funding=False, allow_unreconciled_cash=False):
@@ -728,10 +843,12 @@ class LighterAccountPort:
 class LighterMarketData:
     """Fresh nonce-checked stream depth; bounded REST only for explicit diagnostics."""
 
-    def __init__(self, adapter, symbol, clock, *, working_orders=lambda: (), aligned_book=None):
+    def __init__(self, adapter, symbol, clock, *, working_orders=lambda: (), aligned_book=None,
+                 aligned_diagnostics=lambda: {}):
         self.adapter, self.symbol, self.clock = adapter, symbol, clock
         self._working = working_orders
         self._aligned_book = aligned_book
+        self._aligned_diagnostics = aligned_diagnostics
         self._state = None
         self._valid = False
         self._last_book = None
@@ -800,12 +917,19 @@ class LighterMarketData:
             result = self._state.update(bids=levels(bids), asks=levels(asks),
                 own_bids=tuple((row.price, row.remaining_size) for row in own if row.side == Side.BUY),
                 own_asks=tuple((row.price, row.remaining_size) for row in own if row.side == Side.SELL),
-                observed_monotonic=observed, trusted=True)
+                observed_monotonic=observed, trusted=True,
+                source_timestamp_ms=book.get("timestamp") if self.stream is not None else None)
             self._valid = True
             self._last_book = source
             return result
         except Exception:
-            raise LighterReadError("trusted market read unavailable") from None
+            values = _market_stream_values(self.stream)
+            try:
+                values.update({name: value for name, value in self._aligned_diagnostics().items()
+                    if name in MARKET_DIAGNOSTIC_NAMES and type(value) is Decimal and value.is_finite()})
+            except (Exception, asyncio.CancelledError):
+                pass
+            raise LighterReadError("trusted market read unavailable", values=values) from None
 
     def snapshot(self):
         if not self._valid:

@@ -1,8 +1,30 @@
 # Market Maker V2 — Volume-first objective
 
-> 狀態：2026-09-11，依使用者授權完成V2本地資金費有界恢復、最後入帳後fresh cash確認、完整空委託證據下的監控成本精算，以及安全既有单優先補缺側。只讀取證在清理0/0後、原期限內、逐read計費並保留最後完整proof；normal quota／exit reserve／risk／quote配置不變。最新實盤仍為231145：planned3600s，wall2901.283s後code1，歷史清理0/0但cash差+0.000361530936 USDG；maker2324.147061、交易net−0.32727171132（funding未入帳）、雙邊54.98%。修後沒有新live或私人帳戶連線，實盘完整60分鐘、最終帳務、雙邊持續性與fee-cover仍待驗證。完整本地測試與歷史證據見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+**最新本地修復與驗收（2026-09-13）：** 已完成193558揭露的行情失效分支診斷、健康行情暫時不同步時的單次fresh重新對齊，以及原始完整流程／舊處理反例。重用原10s及一次read重試，與帳戶race共享額度；不重試失效book或斷線，不改風控及退出期限，無可信IOC行情時如實殘量失敗。全專案949項（231.439s）中657項V2全部PASS，其餘8F＋4E與既有Grid／Lighter基線逐項相同；原Windows Ctrl+C與到期自然收尾亦通過。精確來源、raw場景及驗證見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。本地修復已完成，最新實盤及費用結論仍為下方193558，沒有用合成測試升級經濟驗收。
 
-本批完整V2 **561 tests PASS（86.360s）**，含固定10／30／60min離線負載與晚到funding真端點成本測試；同一小時fixture雙邊由90.20%至91.17%、API退出0、cash差0／final0/0。這不是修後實盤或經濟達標證據。
+**最新實盤分析（2026-09-13，193558）：** Planned3600s、wall2674.2750979s後因`authorizing_quotes / LighterReadError`提早code1；錯誤落在aligned-book缺失或stream transport不健康的共同檢查，現有證據尚不能區分。最後自動取消2單、0次IOC，cleanup及final皆authenticated0/0、帳務差0；本輪三次bounded exit均flat。45 maker＋1 taker，maker1059.125780、gross+0.006600、fees0.13246621460、交易net−0.12586621460；毛利僅覆蓋4.9824%費用，正式economics仍unavailable。本輪完成紀錄分析，沒有修改runtime；來源、成本分組與待補測試見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。下方000352等實盤狀態保留為歷史。
+
+**前批完整流程驗收（2026-09-13，歷史）：** 已補原PS1／CLI→session／SDK／raw資料完整流程與Windows真Ctrl+C測試，修正啟動器退出碼誤報及測試冷匯入污染。修正後646項V2全PASS；同源Windows到期／Ctrl+C均自然退出、fresh account與獨立合成venue0/0。這是原始Python流程的合成驗收，native ABI／實體傳輸／真撮合／完整60分鐘實盤及economics仍未驗收。執行方法見[主計畫§19.9](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)，精確來源與時間見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+
+**前場000352（歷史）：** 該場planned3600s、wall578.488854s後code1，原final authenticated flat／2張委託，取消缺證仍阻斷收尾。使用者其後親自確認0/0，本輪沒有執行私人API唯讀查核；不能回填原run為成功。新增診斷記錄generic signer/provider error、4次history無exact terminal，2次recovery後仍pending。真SDK本地重現證明送出前／簽名失敗與transport／送出後解析失敗都可能產生同類診斷，歷史精確原因仍未知；整場sendTx31不能單獨證明最後取消是否送出。Maker77.344280、已記錄交易net−0.02983430860，formal economics unavailable。本地已補真SDK階段證據、精確no-send／nonce契約及fresh有界清理，並移除MM掛單DNS／文字429錯誤恢復；本批本地驗證完成，沒有放寬風險或將不確定mutation當成未送出。詳見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+
+本批632項V2現行契約均有通過證據：全專案920項回歸後，修正一項舊API查核次數expectation並完成相關34項補測；runtime未再改動。其餘8 failures＋4 errors與既有基線逐一相同。完整輸出及證據界線見EXPERIMENT_LOG，未宣稱全專案全綠或實盤已驗收。
+
+**前場215907（歷史）：** wall128.579s、0 fills後code1，首次60s委託到期時，正常撤單的完整終態在Adapter交接中被占位回覆取代，遭前批strict manager拒絕。先前有界取證路徑成功收尾，該場cleanup／final皆authenticated0/0；仍未完成60分鐘，無經濟通過證據。已修MM opt-in直接保留完整terminal至consumer確認，另阻止client ID碰撞誤清其他pending紀錄；原strict檢查、Grid default及API／風險限額保留。
+
+前批全專案889 tests／98.161s，601項V2全數通過；其餘8 failures＋4 errors與既有基線逐一相同，無新增失敗。
+
+**前場205914（歷史）：** wall1751.682s後code1，原run最後short0.00040／2單，取消不確定使收尾鎖停。使用者另行授權的21:43:28唯讀查核觀測0/0；後續歸零及成本未歸因，不能回填原run成功。本場雙邊90.74%、maker680.019960、已記錄交易net−0.07472294620。前批595項V2 PASS漏掉真Adapter正常撤單交接，215907已揭露並修正，不能再將該批測試當成完整契約證據。
+
+下面為前批本地修復狀態與產品目標；231145已不是最新實盤。
+
+前批595項V2 tests PASS（86.813s）仍是其當時的離線結果；205914最初cancel未確認的provider原因仍缺歷史證據。
+
+> 狀態：2026-09-12，依fee-cover分析完成減倉容量一致性修正：原兩側共用搜尋皆低於minimum時，以原預留公式確認是否仍容許正常單側減倉，避免因此提前轉passive-touch；真正風險退出保持有界。新增order／governor／公開行情時間證據、啟動時有效設定與版本，以及既有分析器的成本分類、真實flat-to-flat分組與markout覆蓋。上一批funding／monitor／缺側補單修復保留。最新實盤仍為231145：planned3600s、wall2901.283s後code1，歷史清理0/0但最後cash差+0.000361530936 USDG；maker2324.147061、交易net−0.32727171132（funding未入帳）、雙邊54.98%。沒有新live或私人帳戶連線，完整60分鐘、最終帳務與fee-cover仍待驗證。完整本地測試與歷史證據見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+
+歷史231145重算的19組maker-only交易net為−0.13202000124 USDG；7組正gross不足付費。正常fee floor已存在，這些結果支持先定位成交／退出成本；不直接放寬風險或假定加大edge即可獲利。舊90筆fill的reference缺失仍保持不可用。
+
+本批全專案870 tests／91.838s，包含582項V2全數通過；其餘8 failures＋4 errors與既有Grid／Lighter cancellation基線完全相同，無新增失敗。固定一小時离線回歸仍有42 maker／8 taker、0 API退出及final0/0／精確cash；這些不代替修後實盤與經濟驗證。
 
 ## 目標與判定
 
