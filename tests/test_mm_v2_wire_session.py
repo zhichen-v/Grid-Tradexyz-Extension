@@ -260,6 +260,87 @@ print("cold_import_restored")
         self.assertLess(exits[0]["observed_monotonic"] - hidden[0]["monotonic"], 30)
         self.assert_wire_budget(run)
 
+    def test_exit_waits_for_late_exact_terminal_without_repeating_mutations(self):
+        from tests.mm_v2_wire_fixture import WireVenue
+        original = WireVenue.accept_tx
+
+        def late_proof(venue, tx_type, tx):
+            result = original(venue, tx_type, tx)
+            if tx_type == 15 and venue.cancel_count == 1:
+                # Two known slots can need separate history queries in one sync.
+                # Seven hidden HTTP proofs put visibility after the old two-sync cap.
+                venue.delayed[tx["OrderNonce"]] = 7
+                venue.event("terminal_delay_injected", hidden_reads=7)
+            return result
+
+        with patch.object(WireVenue, "accept_tx", late_proof):
+            run = self.run_wire("late_cancel_fill", duration=5)
+        self.assertEqual(run["code"], 0)
+        self.assertTrue(run["summary"]["completed"])
+        self.assertFalse(run["summary"]["failed"])
+        self.assert_flat_proof(run["summary"], run["events"], run["venue"])
+        self.assert_original_chain(run["calls"], run["expected_codes"])
+        events = run["venue"]["events"]
+        hidden = [row for row in events if row["kind"] == "terminal_history_hidden"]
+        self.assertEqual(len(hidden), 7)
+        canceled = hidden[0]["order_id"]
+        visible = next(row for row in events if row["kind"] == "terminal_history_visible" and row["order_id"] == canceled)
+        accepted = [row for row in events if row["kind"] == "create_accepted"]
+        self.assertEqual([row["time_in_force"] for row in accepted],
+                         ["post-only", "post-only", "immediate-or-cancel"])
+        self.assertTrue(accepted[-1]["reduce_only"])
+        self.assertLess(visible["monotonic"], accepted[-1]["monotonic"])
+        requests = run["venue"]["requests"]
+        self.assertEqual(Counter(row["order_id"] for row in requests if row.get("tx_type") == 15), Counter({canceled: 1}))
+        self.assertEqual(run["venue"]["trade_count"], 2)
+        report = run["events"][-1]["data"]
+        self.assertEqual((report["maker_fill_count"], report["taker_fill_count"]), (1, 1))
+        self.assertEqual(D(report["equity_reconciliation_difference"]), D(0))
+        exits = [row["data"] for row in run["events"] if row["event"] == "bounded_exit"]
+        self.assertEqual(len(exits), 1)
+        self.assertEqual((exits[0]["status"], exits[0]["attempts"]), ("flat", 1))
+        self.assertLess(exits[0]["observed_monotonic"] - hidden[0]["monotonic"], 30)
+        self.assert_wire_budget(run)
+
+    def test_one_account_http_503_after_maker_fill_recovers_through_original_cli(self):
+        # Fault injection for a transient-read gap, not attribution of a past live failure.
+        run = self.run_wire("account_503_after_fill")
+        venue, events = run["venue"], run["venue"]["events"]
+        faults = [row for row in events if row["kind"] == "account_http_503"]
+        self.assertEqual(len(faults), 1)
+        self.assertEqual(faults[0]["trade_count"], 1)
+        maker = [row for row in events if row["kind"] == "fill" and row["liquidity"] == "maker"]
+        self.assertEqual(len(maker), 1)
+        self.assertLess(maker[0]["monotonic"], faults[0]["monotonic"])
+        account_reads = [row for row in venue["requests"] if row["operation"] == "account"]
+        failed = [index for index, row in enumerate(account_reads) if row["response_status"] == 503]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(account_reads[failed[0] + 1]["response_status"], 200)
+        self.assertEqual(run["code"], 0, "one failed GET must not terminate the session after recovery")
+        self.assertEqual(run["budget"]["balance_reads"], {"retries": 1, "recoveries": 1})
+        self.assertTrue(run["summary"]["completed"])
+        self.assertFalse(run["summary"]["failed"])
+        self.assert_flat_proof(run["summary"], run["events"], venue)
+        self.assert_original_chain(run["calls"], run["expected_codes"])
+        report = [row["data"] for row in run["events"] if row["event"] == "session_report"][-1]
+        self.assertTrue(report["complete"])
+        self.assertGreaterEqual(D(report["duration_seconds"]), D(150))
+        self.assertEqual((report["maker_fill_count"], report["taker_fill_count"]), (1, 1))
+        fills = [row["data"]["fill"] for row in run["events"] if row["event"] == "fill"]
+        self.assertEqual([(row["side"], row["liquidity"], D(row["size"])) for row in fills],
+                         [("sell", "maker", D(".00040")), ("buy", "taker", D(".00040"))])
+        self.assertEqual(venue["trade_count"], 2)
+        self.assertEqual(D(report["equity_reconciliation_difference"]), D(0))
+        mutations = [row for row in venue["requests"] if "tx_type" in row]
+        self.assertEqual(len({row["transaction_nonce"] for row in mutations}), len(mutations))
+        creates = [row["client_order_index"] for row in mutations if row["tx_type"] == 14]
+        self.assertEqual(len(set(creates)), len(creates))
+        cancels = [row["order_id"] for row in mutations if row["tx_type"] == 15]
+        filled_ids = {row["order_id"] for row in events if row["kind"] == "fill"}
+        self.assertEqual(Counter(cancels), Counter({row["id"]: 1 for row in venue["orders"]
+                                                  if row["id"] not in filled_ids}))
+        self.assert_wire_budget(run)
+
     def test_accepted_cancel_response_loss_reconciles_without_resending(self):
         run = self.run_wire("lost_cancel_response")
         self.assert_normal_run(run)
@@ -394,12 +475,22 @@ print("cold_import_restored")
         self.assertFalse([row for row in events if row["kind"] == "terminal_history_visible"])
         hidden = [row for row in events if row["kind"] == "terminal_history_hidden"]
         self.assertGreaterEqual(len(hidden), 4)
-        # The exit proof is bounded; it cannot poll indefinitely to make this case green.
-        self.assertLessEqual(len(hidden), 8)  # Includes separate final-account observation.
+        recovery = [{value["name"]: D(value["value"]) for value in row["data"]["values"]}
+                    for row in run["events"] if row["event"] == "failure_diagnostic"
+                    and any(value["name"] == "recovery_reads" for value in row["data"]["values"])]
+        self.assertEqual(len(recovery), 1)
+        reads = int(recovery[0]["recovery_reads"])
+        self.assertGreaterEqual(reads, 1)
+        self.assertLessEqual(reads, 20)
+        reasons = set(recovery[0]) & {"recovery_terminal_pending", "recovery_deadline_exhausted", "recovery_budget_refused"}
+        self.assertEqual(len(reasons), 1)
+        if "recovery_terminal_pending" in reasons:
+            self.assertEqual(reads, 20, "missing proof can stop before the cap only for time or admission")
+        self.assertLessEqual(len(hidden), 4 + reads + 2)  # Original polls and final-account observation.
         exits = [row["data"] for row in run["events"] if row["event"] == "bounded_exit"]
         self.assertEqual(len(exits), 1)
         self.assertEqual((exits[0]["status"], exits[0]["attempts"]), ("blocked", 0))
-        self.assertEqual(sum(row["monotonic"] <= exits[0]["observed_monotonic"] for row in hidden), 6)
+        self.assertEqual(sum(row["monotonic"] <= exits[0]["observed_monotonic"] for row in hidden), 4 + reads)
         self.assertLess(exits[0]["observed_monotonic"] - lost[0]["monotonic"], 30)
         self.assert_wire_budget(run)
 

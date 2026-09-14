@@ -719,6 +719,8 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     "unknown" if category == "signer_or_provider_error" else "none")
                 expected = dict(submission=category, stage="unavailable", error_kind=kind, history_attempts=attempts,
                     history_read_errors=read_errors, exact_history_matches=0, captured_terminal=0)
+                if category == "response_rejected":
+                    expected["api_code"] = 400
                 self.assertEqual(adapter.get_market_maker_cancellation_diagnostics("987", "BTC"), expected)
                 self.assertNotIn(secret, repr(rest._mm_cancellation_diagnostics))
                 self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")] if pending else [])
@@ -892,7 +894,8 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 elif mode == "parse":
                     signer._SignerClient__decode_tx_info.return_value = (15, '{malformed-fixture-private', "fixture-hash", None)
                 elif mode == "bad_request":
-                    signer.tx_api.send_tx.side_effect = BadRequestException(status=400, reason="fixture-private")
+                    signer.tx_api.send_tx.side_effect = BadRequestException(status=400, reason="fixture-private",
+                        body='{"code":1234,"message":"fixture-private","token":"fixture-private"}')
                 elif mode == "text_429":
                     signer.tx_api.send_tx.side_effect = ValueError("fixture-private HTTP 429")
                 with patch("core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep", new=AsyncMock()), \
@@ -906,6 +909,8 @@ class LighterRateLimitBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(signer.nonce_manager.nonce[0], nonce)
                 diagnostic = adapter.get_market_maker_cancellation_diagnostics("987", "BTC")
                 self.assertEqual((diagnostic["stage"], diagnostic["error_kind"]), (stage, kind))
+                if mode == "bad_request":
+                    self.assertEqual((diagnostic["http_status"], diagnostic["api_code"]), (400, 1234))
                 self.assertNotIn("fixture-private", repr(diagnostic))
                 self.assertEqual(rest.get_unresolved_cancellations(), [("BTC", "987")])
                 self.assertEqual(signer.sign_cancel_order, native_sign)

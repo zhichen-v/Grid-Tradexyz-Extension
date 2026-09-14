@@ -1,8 +1,16 @@
 # Market Maker V2 — Volume-first objective
 
-**最新本地修復與驗收（2026-09-13）：** 已完成193558揭露的行情失效分支診斷、健康行情暫時不同步時的單次fresh重新對齊，以及原始完整流程／舊處理反例。重用原10s及一次read重試，與帳戶race共享額度；不重試失效book或斷線，不改風控及退出期限，無可信IOC行情時如實殘量失敗。全專案949項（231.439s）中657項V2全部PASS，其餘8F＋4E與既有Grid／Lighter基線逐項相同；原Windows Ctrl+C與到期自然收尾亦通過。精確來源、raw場景及驗證見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。本地修復已完成，最新實盤及費用結論仍為下方193558，沒有用合成測試升級經濟驗收。
+**目前狀態（2026-09-14，213610）：** 最新60分鐘測試約920s提前失敗，買單送出與賣單撤銷同時不確定；撤單已捕獲HTTP400／API21104，exit-3直接BLOCKED，最後authenticated long0.00059 BTC／1掛單。使用者其後回報已自行清理，要求停止修復並commit/push保存現況。本批未追加runtime修正；最初買單故障、nonce失配原因與混合不確定狀態的清理仍未解決，連續60分鐘及自動收尾尚未驗收。此提交保存局部修正與證據，不代表穩定版本；詳見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。下方204125為前場歷史。
 
-**最新實盤分析（2026-09-13，193558）：** Planned3600s、wall2674.2750979s後因`authorizing_quotes / LighterReadError`提早code1；錯誤落在aligned-book缺失或stream transport不健康的共同檢查，現有證據尚不能區分。最後自動取消2單、0次IOC，cleanup及final皆authenticated0/0、帳務差0；本輪三次bounded exit均flat。45 maker＋1 taker，maker1059.125780、gross+0.006600、fees0.13246621460、交易net−0.12586621460；毛利僅覆蓋4.9824%費用，正式economics仍unavailable。本輪完成紀錄分析，沒有修改runtime；來源、成本分組與待補測試見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。下方000352等實盤狀態保留為歷史。
+**最新場次與修復（2026-09-14，204125）：** 原60分鐘測試在1124.3090153s後失敗：帳務差額觸發退出，HTTP4xx撤單狀態不確定，原取證只讀2次便停止。已修為在原10s及API admission內繼續查取精確終態，保留期限／ownership／不重送限制；原CLI／SDK完整故障流程由殘倉code1修至complete、exact0/0，持續缺證負例仍阻擋。另補安全的數字HTTP/API撤單診斷。一次已授權唯讀查核確認short0.00020／0單後，使用者自行平倉並確認0/0；沒有代為清理或再連線。本場+0.000279708480 USDG帳務差額來源及4xx原始原因仍未確證，連續60分鐘穩定性仍未驗收。全專案一次952項後修正過期預期，相關154項補測全PASS；既有8F＋4E基線不變，細節見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。本批尚未commit/push。
+
+**前批修復與實際驗證（2026-09-13，歷史）：** 已補MM暫時餘額GET故障的單次完整帳戶重讀，保留原10s、API／交易／退出限制，並保留安全的SDK內因診斷。三場各10分鐘主網實盤均code0、complete、final authenticated0/0，共39筆成交；前兩場為診斷版，最後一場使用修正版直接執行原`run_live_test.ps1`，測後原60分鐘設定已逐byte還原。完整503故障注入由舊版code1修至續跑完成；持續503／403仍fail closed並清理0/0。V2回歸唯一假時鐘問題只修fixture，相關完整wire流程重跑通過。原205600內因尚未重現，修正版實盤balance retry0/0，不能宣稱已證明原故障根治或連續60分鐘穩定；本輪沒有再commit/push。證據及驗證限制見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
+
+**前場實盤205600（2026-09-13，歷史）：** 前批0195631版本在whole-process wall216.8156427s後code1。此次失敗位於帳戶餘額讀取／轉換，尚未完成帳戶證明；故障後行情持續更新，market retries／recoveries0/0，並非前場行情對齊失效的重現。現有紀錄尚缺HTTP／SDK／轉換原因分類。最後cleanup及final均authenticated0/0、帳務差0；4筆maker turnover122.722320、gross+0.003680、fees0.01472667840、交易net−0.01104667840，formal economics unavailable。此輪完成紀錄分析，runtime未再改；完整證據及新測試缺口見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。下方193558及前批修復保留為歷史證據。
+
+**前批本地修復與驗收（2026-09-13，歷史）：** 已完成193558揭露的行情失效分支診斷、健康行情暫時不同步時的單次fresh重新對齊，以及原始完整流程／舊處理反例。重用原10s及一次read重試，與帳戶race共享額度；不重試失效book或斷線，不改風控及退出期限，無可信IOC行情時如實殘量失敗。全專案949項（231.439s）中657項V2全部PASS，其餘8F＋4E與既有Grid／Lighter基線逐項相同；原Windows Ctrl+C與到期自然收尾亦通過。精確來源、raw場景及驗證見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。本地修復已完成，該批交付時最新實盤及費用結論為下方193558，沒有用合成測試升級經濟驗收。
+
+**前場實盤分析（2026-09-13，193558）：** Planned3600s、wall2674.2750979s後因`authorizing_quotes / LighterReadError`提早code1；錯誤落在aligned-book缺失或stream transport不健康的共同檢查，現有證據尚不能區分。最後自動取消2單、0次IOC，cleanup及final皆authenticated0/0、帳務差0；本輪三次bounded exit均flat。45 maker＋1 taker，maker1059.125780、gross+0.006600、fees0.13246621460、交易net−0.12586621460；毛利僅覆蓋4.9824%費用，正式economics仍unavailable。本輪完成紀錄分析，沒有修改runtime；來源、成本分組與待補測試見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。下方000352等實盤狀態保留為歷史。
 
 **前批完整流程驗收（2026-09-13，歷史）：** 已補原PS1／CLI→session／SDK／raw資料完整流程與Windows真Ctrl+C測試，修正啟動器退出碼誤報及測試冷匯入污染。修正後646項V2全PASS；同源Windows到期／Ctrl+C均自然退出、fresh account與獨立合成venue0/0。這是原始Python流程的合成驗收，native ABI／實體傳輸／真撮合／完整60分鐘實盤及economics仍未驗收。執行方法見[主計畫§19.9](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)，精確來源與時間見[EXPERIMENT_LOG](EXPERIMENT_LOG.md)。
 

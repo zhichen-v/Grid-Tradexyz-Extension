@@ -13,7 +13,7 @@ from .domain import (
     OrderEvidence, PublicBookObservation, MarketStateSnapshot, GovernorDiagnostic,
 )
 from .order_manager import ReconcileAction, ReconcileResult, CANCELLATION_DIAGNOSTIC_NAMES
-from .lighter_runtime import MARKET_DIAGNOSTIC_NAMES
+from .lighter_runtime import LighterReadError, MARKET_DIAGNOSTIC_NAMES
 
 
 _EVENTS = {
@@ -68,6 +68,7 @@ def _cancel_values(manager, slots, stage):
         return ()
     matched = set()
     details = {}
+    protocol_results = set()
     if type(result) is ReconcileResult:
         for slot in relevant:
             if slot.order_id is None or slot.order_id not in manager.known_order_ids:
@@ -78,6 +79,7 @@ def _cancel_values(manager, slots, stage):
                         or action.order_id != slot.order_id):
                     continue
                 matched.add(slot.order_id)
+                protocol_values = {}
                 if type(action.diagnostic_values) is tuple:
                     for item in action.diagnostic_values:
                         if type(item) is not tuple or len(item) != 2:
@@ -85,7 +87,16 @@ def _cancel_values(manager, slots, stage):
                         name, value = item
                         if (type(name) is str and name in CANCELLATION_DIAGNOSTIC_NAMES
                                 and type(value) is int and 0 <= value <= 2147483647):
-                            details[name] = max(details.get(name, 0), value)
+                            if name in {"cancel_http_status", "cancel_api_code"}:
+                                if name != "cancel_http_status" or 100 <= value <= 599:
+                                    protocol_values.setdefault(name, set()).add(value)
+                            else:
+                                details[name] = max(details.get(name, 0), value)
+                protocol_results.add(tuple(sorted((name, next(iter(codes)))
+                    for name, codes in protocol_values.items() if len(codes) == 1)))
+    # Only merge identical complete results, never pair different orders' codes.
+    if len(protocol_results) == 1:
+        details.update(next(iter(protocol_results)))
     # last_result may concern a prior order or another operation. Its errors do
     # not explain today's pending slot unless an exact cancel action still matches.
     flags = set()
@@ -102,16 +113,51 @@ def _cancel_values(manager, slots, stage):
         DiagnosticValue(name, Decimal(1)) for name in sorted(flags))
 
 
+_READ_ERROR_CATEGORIES = {
+    ("builtins", "TimeoutError"): "read_cause_timeout",
+    ("builtins", "ConnectionError"): "read_cause_connection",
+    ("builtins", "ValueError"): "read_cause_value",
+    ("builtins", "TypeError"): "read_cause_type",
+    ("builtins", "RuntimeError"): "read_cause_runtime",
+    ("aiohttp.client_exceptions", "ClientConnectionError"): "read_cause_connection",
+    ("aiohttp.client_exceptions", "ClientResponseError"): "read_cause_http",
+    ("lighter.exceptions", "ApiException"): "read_cause_http",
+    ("pydantic_core._pydantic_core", "ValidationError"): "read_cause_schema",
+    ("json.decoder", "JSONDecodeError"): "read_cause_json",
+}
+_READ_SOURCE_MODULES = {
+    "core.adapters.exchanges.adapters.lighter": "lighter_adapter",
+    "core.adapters.exchanges.adapters.lighter_rest": "lighter_rest",
+    "core.adapters.exchanges.adapters.lighter_base": "lighter_base",
+    "lighter.api_client": "lighter_api_client",
+    "lighter.api.account_api": "lighter_account_api",
+    "lighter.rest": "lighter_sdk_rest",
+}
+
+
 def failure_diagnostic(symbol, stage, error=None, *, execution=None, manager=None, market_values=None):
     """Extract only code locations and local state; never format an exception."""
     error_type, source, seen = "blocked", [], set()
     values = {}
+    read_failure = isinstance(error, LighterReadError)
     if error is not None:
         module = type(error).__module__
         error_type = (type(error).__name__ if module in ("builtins", "asyncio.exceptions")
                       or module.startswith("core.services.market_maker_v2.") else "ExternalError")
     while error is not None and id(error) not in seen:
         seen.add(id(error))
+        # Fixed categories and numeric HTTP status preserve the underlying read
+        # failure without serializing SDK bodies, URLs, headers or error text.
+        if read_failure and not type(error).__module__.startswith("core.services.market_maker_v2."):
+            for cls in type(error).__mro__:
+                category = _READ_ERROR_CATEGORIES.get((cls.__module__, cls.__name__))
+                if category is not None:
+                    values.setdefault(category, DiagnosticValue(category, Decimal(1)))
+                    if category == "read_cause_http":
+                        status = getattr(error, "status", None)
+                        if type(status) is int and 100 <= status <= 599:
+                            values.setdefault("read_http_status", DiagnosticValue("read_http_status", Decimal(status)))
+                    break
         if type(error).__module__ in {"core.services.market_maker_v2.lighter_runtime",
                                      "core.services.market_maker_v2.api_budget",
                                      "core.services.market_maker_v2.execution_port"}:
@@ -133,6 +179,8 @@ def failure_diagnostic(symbol, stage, error=None, *, execution=None, manager=Non
             module = trace.tb_frame.f_globals.get("__name__", "")
             if module.startswith("core.services.market_maker_v2."):
                 source.append(f"{module.rsplit('.', 1)[-1]}:{trace.tb_lineno}")
+            elif module in _READ_SOURCE_MODULES:
+                source.append(f"{_READ_SOURCE_MODULES[module]}:{trace.tb_lineno}")
             trace = trace.tb_next
         error = error.__cause__ or error.__context__
     if type(market_values) is dict:

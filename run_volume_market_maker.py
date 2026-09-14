@@ -165,6 +165,8 @@ class _ConsoleProgress:
                 for value in event.values if value.value == 1
                 and value.name in CANCELLATION_DIAGNOSTIC_NAMES
                 and value.name.startswith(("cancel_stage_", "cancel_error_")))
+            details += "".join(" " + value.name.removeprefix("cancel_") + "=" + str(value.value)
+                for value in event.values if value.name in {"cancel_http_status", "cancel_api_code"})
             self._write(f"error={event.error_type} stage={event.stage}{details}; details in JSONL")
 
     def status(self, phase):
@@ -231,6 +233,10 @@ async def run_session(config, settings, *, output, authorized=False, stop_event=
                 }
                 counts = getattr(getattr(session, "account", None), "market_read_counts", None)
                 budget["market_reads"] = ({key: counts[key] for key in ("retries", "recoveries")}
+                    if type(counts) is dict and all(type(counts.get(key)) is int and counts[key] >= 0
+                        for key in ("retries", "recoveries")) else None)
+                counts = getattr(getattr(session, "account", None), "balance_read_counts", None)
+                budget["balance_reads"] = ({key: counts[key] for key in ("retries", "recoveries")}
                     if type(counts) is dict and all(type(counts.get(key)) is int and counts[key] >= 0
                         for key in ("retries", "recoveries")) else None)
                 budget_output.seek(0)

@@ -55,13 +55,14 @@ _CANCEL_RECEIPT_CODES = frozenset({
 _CANCEL_HISTORY_COUNTS = (
     "history_attempts", "history_read_errors", "exact_history_matches", "captured_terminal",
 )
+_CANCEL_PROTOCOL_NUMBERS = {"http_status": (100, 599), "api_code": (0, 2147483647)}
 _CANCEL_STAGE_CODES = frozenset({"unavailable", "before_sign", "sign", "send", "after_send", "complete"})
 _CANCEL_ERROR_CODES = frozenset({
     "none", "local_sign_error", "dns", "timeout", "connection", "http_4xx", "http_5xx",
     "response_decode", "unknown",
 })
 CANCELLATION_DIAGNOSTIC_NAMES = frozenset(
-    {"cancel_" + name for name in (*_CANCEL_RECEIPT_CODES, *_CANCEL_HISTORY_COUNTS)}
+    {"cancel_" + name for name in (*_CANCEL_RECEIPT_CODES, *_CANCEL_HISTORY_COUNTS, *_CANCEL_PROTOCOL_NUMBERS)}
     | {"cancel_submission_" + name for name in _CANCEL_SUBMISSION_CODES}
     | {"cancel_stage_" + name for name in _CANCEL_STAGE_CODES}
     | {"cancel_error_" + name for name in _CANCEL_ERROR_CODES})
@@ -2297,6 +2298,10 @@ class MarketMakerOrderManager:
                 for name in _CANCEL_HISTORY_COUNTS:
                     value = raw.get(name)
                     if type(value) is int and 0 <= value <= 2147483647:
+                        values["cancel_" + name] = value
+                for name, (low, high) in _CANCEL_PROTOCOL_NUMBERS.items():
+                    value = raw.get(name)
+                    if type(value) is int and low <= value <= high:
                         values["cancel_" + name] = value
         except (Exception, asyncio.CancelledError):
             values["cancel_diagnostic_unavailable"] = 1

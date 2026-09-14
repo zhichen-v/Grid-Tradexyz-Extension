@@ -29,6 +29,22 @@ class JsonlTelemetryTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "events.jsonl"
 
+    def test_wrapped_sdk_read_failure_keeps_status_without_private_payload(self):
+        from lighter.exceptions import ApiException
+
+        try:
+            try:
+                raise ApiException(status=503, reason="private-url", body="private-account-token")
+            except ApiException:
+                raise LighterReadError("authenticated account audit unavailable") from None
+        except LighterReadError as error:
+            with JsonlTelemetrySink(self.path) as sink:
+                sink.emit(failure_diagnostic("BTC", "authorizing_quotes", error))
+        encoded = self.path.read_text()
+        self.assertNotIn("private", encoded)
+        values = {row["name"]: row["value"] for row in json.loads(encoded)["data"]["values"]}
+        self.assertEqual(values, {"read_cause_http": "1", "read_http_status": "503"})
+
     def test_market_failure_keeps_fixed_numeric_causes_for_external_and_wrapped_errors(self):
         for error in (RuntimeError("secret-provider-payload"), LighterReadError("sanitized", values={
                 "market_opening_nonce": D(10), "secret-token": D(7)})):
@@ -221,6 +237,7 @@ class JsonlTelemetryTests(unittest.TestCase):
     def test_cancel_receipt_details_are_allowlisted_and_bound_to_current_failed_action(self):
         details = (("cancel_receipt_pending", 1), ("cancel_history_attempts", 4),
                    ("cancel_history_read_errors", 0), ("cancel_submission_acknowledged", 1),
+                   ("cancel_http_status", 400), ("cancel_api_code", 1234),
                    ("private-token", 1), ("cancel_exact_history_matches", "private-value"),
                    ("cancel_captured_terminal", True), ("cancel_terminal_valid", -1))
         manager = self.cancel_manager(("cancel outcome is not terminal",),
@@ -230,11 +247,27 @@ class JsonlTelemetryTests(unittest.TestCase):
         self.assertEqual(values, {"cancel_pending_count": D(1), "cancel_action_matched_count": D(1),
             "cancel_nonterminal_response": D(1), "cancel_receipt_pending": D(1),
             "cancel_history_attempts": D(4), "cancel_history_read_errors": D(0),
-            "cancel_submission_acknowledged": D(1)})
+            "cancel_submission_acknowledged": D(1), "cancel_http_status": D(400), "cancel_api_code": D(1234)})
         with JsonlTelemetrySink(self.path) as sink:
             sink.emit(diagnostic)
         self.assertNotIn("private-", self.path.read_text())
         self.assertEqual(list(_events(self.path)), [diagnostic])
+
+        # Two separate cancels must not become one invented status/code pair.
+        first_slot = manager.snapshot()[0]
+        second_slot = NS(side=OrderSide.SELL, state=OrderSlotState.UNCERTAIN_CANCELLATION,
+                         order_id="o2", cancellation_uncertain=True)
+        first_action = replace(manager.last_result.actions[0],
+                               diagnostic_values=(("cancel_http_status", 400),))
+        second_action = replace(first_action, side=OrderSide.SELL, order_id="o2",
+                                diagnostic_values=(("cancel_api_code", 1234),))
+        manager.snapshot = lambda: (first_slot, second_slot)
+        manager.known_order_ids = frozenset({"o1", "o2"})
+        manager.last_result = replace(manager.last_result, actions=(first_action, second_action))
+        values = {item.name: item.value for item in failure_diagnostic("BTC", "exit_health", manager=manager).values}
+        self.assertEqual(values["cancel_action_matched_count"], D(2))
+        self.assertNotIn("cancel_http_status", values)
+        self.assertNotIn("cancel_api_code", values)
 
     def test_definite_no_send_diagnostic_retains_stage_without_inventing_uncertainty(self):
         stale = self.cancel_manager(("cancel outcome is not terminal",),

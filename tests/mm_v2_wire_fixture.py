@@ -44,9 +44,14 @@ class WireClock:
         if self.mode == "real":
             await REAL_SLEEP(seconds)
         else:
+            if self.venue is not None:
+                for sock in self.venue.sockets:
+                    await sock.drain()
             self.value += seconds
             if self.venue is not None:
                 self.venue.broadcast_book()
+                for sock in self.venue.sockets:
+                    await sock.drain()
             for _ in range(4):
                 await REAL_SLEEP(0)
 
@@ -389,6 +394,12 @@ class WireVenue:
                 "supported_size_decimals": 5, "min_base_amount": "0.00001", "min_quote_amount": "10",
                 "price_decimals": 1, "size_decimals": 5, "last_trade_price": 77000.0}]}
         elif op == "account":
+            if self.scenario == "account_503_after_fill" and self.trades and not self.fault_used:
+                self.fault_used = True
+                self.requests[-1]["response_status"] = 503
+                self.event("account_http_503", trade_count=len(self.trades))
+                return _RawResponse({"code": 503, "message": "synthetic transient account failure"}, status=503)
+            self.requests[-1]["response_status"] = 200
             payload = {"code": 200, "total": 1, "accounts": [self.account()]}
         elif op == "accountActiveOrders":
             payload = {"code": 200, "orders": self.active()}
@@ -442,6 +453,7 @@ class _RawSocket:
     def __init__(self, venue):
         self.venue, self.queue = venue, asyncio.Queue()
         self.closed, self.book_subscribed = False, False
+        self.delivered = False
         self.subscriptions = set()
         self.suppress_book = False
         self.alignment_pending = False
@@ -478,6 +490,14 @@ class _RawSocket:
 
     async def order_snapshot_fault(self):
         venue = self.venue
+        if venue.scenario == "account_503_after_fill" and not venue.trades and len(venue.active()) == 2:
+            venue.paired_order_snapshots += 1
+            if venue.paired_order_snapshots >= 2:
+                # The first paired snapshot confirms the second maker order.
+                # Fill before the next account REST proof, then fail only that GET.
+                ask = next(key for key, row in venue.orders.items() if row["status"] == "open" and row["is_ask"])
+                venue.fill(ask, maker=True)
+            return False
         if (venue.fault_used or not venue.scenario.startswith("book_")
                 or len(venue.active()) != 2):
             return False
@@ -575,10 +595,21 @@ class _RawSocket:
         return self
 
     async def __anext__(self):
+        # Asking for another frame acknowledges that the original consumer
+        # finished processing the previous one, including any awaited work.
+        self.delivered = False
         value = await self.queue.get()
         if value is None:
             raise StopAsyncIteration
+        self.delivered = True
         return value
+
+    async def drain(self):
+        # Virtual time cannot jump over packets already in flight. Preserve
+        # their source timestamps and let the real reader validate every frame.
+        async with asyncio.timeout(1):
+            while self.book_subscribed and not self.closed and (self.delivered or not self.queue.empty()):
+                await REAL_SLEEP(0)
 
     async def close(self):
         if not self.closed:
@@ -591,7 +622,7 @@ class WireFixture:
     def __init__(self, scenario="normal", time_mode="virtual", state_path=None):
         if scenario not in {"normal", "late_cancel_fill", "lost_cancel_response", "unresolved_cancel_response",
                             "book_wait_timeout", "book_invalid_nonce", "book_transport_close", "book_invalid_nonce_fill",
-                            "book_alignment_recovers"}:
+                            "book_alignment_recovers", "account_503_after_fill"}:
             raise ValueError("unsupported synthetic wire scenario")
         if time_mode not in {"real", "virtual"}:
             raise ValueError("unsupported synthetic clock")

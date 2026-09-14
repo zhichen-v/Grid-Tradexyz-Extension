@@ -182,7 +182,7 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
                     self.time.value += seconds
                 with patch("core.services.market_maker_v2.execution_port.asyncio.sleep", new=AsyncMock(side_effect=advance)):
                     result = await self.port.cancel_all_managed()
-                expected_reads = 1 if outcome in {"terminal", "generation", "new_halt", "deadline"} else 2
+                expected_reads = 1 if outcome in {"terminal", "generation", "new_halt", "deadline"} else 20
                 self.assertEqual(len(admitted), expected_reads)
                 self.assertEqual(self.adapter.cancel_order.await_count, 1)
                 self.assertEqual(self.adapter.get_open_orders.await_count, expected_reads)
@@ -202,7 +202,7 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
                     self.account.snapshot.assert_not_called()
 
     async def test_cancel_recovery_delayed_proof_keeps_original_deadline_and_mutations(self):
-        for outcome in ("canceled", "partial_fill", "filled", "still_active", "absent"):
+        for outcome in ("canceled", "partial_fill", "filled", "later_canceled", "still_active", "absent", "frozen_clock"):
             with self.subTest(outcome=outcome):
                 self.setUp()
                 await self.seed_maker()
@@ -222,7 +222,7 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
                     remaining=D("0.1") if outcome == "partial_fill" else D("0") if outcome == "filled" else D("0.2"))
 
                 async def read(symbol):
-                    return [order] if self.adapter.get_open_orders.await_count == 1 or outcome == "still_active" else []
+                    return [order] if self.adapter.get_open_orders.await_count == 1 or outcome in {"still_active", "frozen_clock"} else []
 
                 def confirm(proof):
                     if proof is terminal:
@@ -233,20 +233,26 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
 
                 async def advance(seconds):
                     self.assertEqual(seconds, 0.5)
-                    self.time.value += seconds
+                    if outcome != "frozen_clock":
+                        self.time.value += seconds
 
                 self.adapter.get_open_orders.side_effect = read
                 self.adapter.get_order_history.return_value = [] if outcome in {"absent", "still_active"} else [terminal]
+                if outcome == "later_canceled":
+                    self.adapter.get_order_history.side_effect = lambda symbol: (
+                        [terminal] if self.adapter.get_open_orders.await_count >= 3 else [])
                 self.adapter.confirm_terminal_cancellation_outcome.side_effect = confirm
                 with patch("core.services.market_maker_v2.execution_port.asyncio.sleep", new=AsyncMock(side_effect=advance)) as sleep:
                     result = await self.port.cancel_all_managed()
-                self.assertEqual(admissions, [100.0, 100.5])
-                sleep.assert_awaited_once_with(0.5)
-                self.assertEqual(self.adapter.get_open_orders.await_count, 2)
+                valid = outcome in {"canceled", "partial_fill", "filled", "later_canceled"}
+                reads = (3 if outcome == "later_canceled" else 2) if valid else 20
+                self.assertEqual(admissions, [100.0 + (index * 0.5 if outcome != "frozen_clock" else 0)
+                                              for index in range(reads)])
+                self.assertEqual(sleep.await_count, reads - 1)
+                self.assertEqual(self.adapter.get_open_orders.await_count, reads)
                 self.adapter.cancel_order.assert_awaited_once_with("1", "BTC")
                 self.assertEqual(self.adapter.create_order.await_count, 1, "only the pre-existing maker")
                 self.assertFalse(self.port.can_reconcile_cancellation)
-                valid = outcome in {"canceled", "partial_fill", "filled"}
                 if valid:
                     self.assertIs(result.status, ExecutionStatus.CONFIRMED)
                     self.assertIs(result.snapshot.health, ExecutionHealth.HEALTHY)
@@ -257,8 +263,9 @@ class BoundedExecutionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIs(result.snapshot.health, ExecutionHealth.HALTED)
                     self.account.snapshot.assert_not_awaited()
                     recovery = [error.diagnostic_values for stage, error in diagnostics if stage == "exit_order_sync"]
-                    self.assertEqual(recovery, [{"recovery_reads": D(2), "recovery_pending_count": D(1),
-                        "recovery_deadline_remaining_ms": D("9500.0"), "recovery_terminal_pending": D(1)}])
+                    self.assertEqual(recovery, [{"recovery_reads": D(20), "recovery_pending_count": D(1),
+                        "recovery_deadline_remaining_ms": D(10000 if outcome == "frozen_clock" else 500),
+                        "recovery_terminal_pending": D(1)}])
 
     async def test_cancel_recovery_second_read_requires_unchanged_scope_admission_and_time(self):
         from core.services.market_maker_v2.api_budget import ApiBudgetUnavailable

@@ -129,10 +129,17 @@ class BoundedExitTests(unittest.IsolatedAsyncioTestCase):
                 if not proved:
                     fixture.adapter.cancel_order.side_effect = ConnectionError("unavailable")
                 report = await self.exit()
-                self.assertIs(report.status, ExitStatus.FLAT if proved else ExitStatus.BLOCKED)
+                # Without proof, the caller's original five-second deadline
+                # now ends the read-only wait before its twenty-read cap.
+                self.assertIs(report.status, ExitStatus.FLAT if proved else ExitStatus.DEADLINE)
                 self.assertEqual(report.attempts, 0)
                 fixture.adapter.create_order.assert_not_called()
                 fixture.adapter.cancel_order.assert_awaited_once()
+                if not proved:
+                    self.assertFalse(report.complete)
+                    self.assertIs(fixture.port.snapshot().health, ExecutionHealth.HALTED)
+                    self.assertGreaterEqual(fixture.adapter.get_open_orders.await_count, 1)
+                    self.assertLessEqual(fixture.adapter.get_open_orders.await_count, 20)
 
     async def test_missing_terminal_or_post_ioc_audit_never_retries(self):
         for missing in ("terminal", "account"):

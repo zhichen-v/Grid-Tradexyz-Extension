@@ -824,6 +824,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.adapter.cancel_order.return_value = receipt
                 self.adapter.get_market_maker_cancellation_diagnostics = Mock(return_value={
                     "submission": "acknowledged", "history_attempts": 4, "history_read_errors": 0,
+                    "http_status": 400, "api_code": 1234,
                     "exact_history_matches": 0 if case == "pending" else 1,
                     "captured_terminal": 0 if case in {"pending", "missing"} else 1,
                     "private-token": "do-not-emit", "raw_response": object()})
@@ -834,6 +835,7 @@ class MarketMakerOrderManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(values[expected], 1)
                 self.assertEqual(values["cancel_submission_acknowledged"], 1)
                 self.assertEqual(values["cancel_history_attempts"], 4)
+                self.assertEqual((values["cancel_http_status"], values["cancel_api_code"]), (400, 1234))
                 self.assertNotIn("do-not-emit", repr(result))
                 self.assertIn("cancel outcome is not terminal", result.errors)
                 self.assertTrue(self.manager.has_uncertain_state)

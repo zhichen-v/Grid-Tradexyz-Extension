@@ -172,7 +172,9 @@ class BoundedExecutionPort:
                     return "recovery_ineligible"
                 return None
 
-            for attempt in range(2):
+            # Keep reading within this operation's existing deadline. The cap
+            # also bounds a stalled or synthetic clock; no mutation is retried.
+            for attempt in range(20):
                 if reason := invalid_scope():
                     return failed(reason)
                 if attempt:
@@ -193,9 +195,7 @@ class BoundedExecutionPort:
                     return failed(reason)
                 pending_count = len(pending - self.manager.terminal_order_ids)
                 if pending_count:
-                    if attempt:
-                        return failed("recovery_terminal_pending")
-                    continue  # Only missing proof permits the one delayed read.
+                    continue  # Only missing proof permits another admitted read.
                 if self.manager.has_uncertain_state or self.manager.get_unresolved_cancellations():
                     return failed("recovery_registry_pending")
                 self._failed = False
@@ -203,6 +203,7 @@ class BoundedExecutionPort:
                     self._halt()
                     return failed("recovery_unhealthy")
                 return True
+            return failed("recovery_terminal_pending")
         except ApiBudgetUnavailable:
             failed("recovery_budget_refused")
             if reads:

@@ -670,8 +670,8 @@ class VolumeSession:
                 pass
             self._passive_until = None
             if self.execution.can_reconcile_cancellation:
-                # One bounded proof operation permits at most two admitted
-                # reads. Active/absent alone cannot clear cancellation uncertainty.
+                # Use the original 10s proof window with each read admitted.
+                # Active/absent alone cannot clear cancellation uncertainty.
                 self.phase = "exit_order_sync"
                 await self._io(lambda: self.execution.reconcile_cancellation_for_cleanup(deadline),
                                timeout=min(10, deadline - self.clock.monotonic()))

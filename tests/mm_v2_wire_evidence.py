@@ -109,7 +109,8 @@ def write_evidence(path, *, root, config, scenario, time_mode, venue, exit_code,
     if scenario not in {"normal", "late_cancel_fill", "lost_cancel_response", "lost_create_response",
                         "unresolved_cancel_response", "placeholder_cancel", "startup_failure",
                         "book_wait_timeout", "book_invalid_nonce", "book_transport_close",
-                        "book_invalid_nonce_fill", "book_alignment_recovers", "book_alignment_no_retry"}:
+                        "book_invalid_nonce_fill", "book_alignment_recovers", "book_alignment_no_retry",
+                        "account_503_after_fill"}:
         raise ValueError("unknown synthetic scenario")
     if time_mode not in {"virtual", "real"}:
         raise ValueError("explicit clock mode required")

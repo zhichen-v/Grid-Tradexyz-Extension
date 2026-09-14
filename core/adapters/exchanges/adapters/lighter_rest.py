@@ -400,7 +400,7 @@ class LighterRest(LighterBase):
 
     def _record_mm_cancellation_diagnostic(
         self, symbol: str, order_id: str, *, submission=None, counter=None, count=1, reset=False,
-        stage=None, error_kind=None,
+        stage=None, error_kind=None, http_status=None, api_code=None,
     ) -> None:
         """Keep only fixed labels/counts for the two current MM order sides."""
         try:
@@ -428,6 +428,10 @@ class LighterRest(LighterBase):
             if error_kind in {"none", "local_sign_error", "dns", "timeout", "connection",
                               "http_4xx", "http_5xx", "response_decode", "unknown"}:
                 row["error_kind"] = error_kind
+            for name, value, low, high in (("http_status", http_status, 100, 599),
+                                            ("api_code", api_code, 0, 2147483647)):
+                if type(value) is int and low <= value <= high:
+                    row[name] = value
         except Exception:
             pass  # Diagnostics can never change cancellation or cleanup outcomes.
 
@@ -440,6 +444,25 @@ class LighterRest(LighterBase):
             return dict(row) if row is not None else None
         except Exception:
             return None
+
+    @staticmethod
+    def _mm_cancellation_error_numbers(error: Exception) -> dict:
+        """Copy only numeric protocol codes; never retain provider text or headers."""
+        result = {}
+        try:
+            if not isinstance(error, lighter.exceptions.ApiException):
+                return result
+            if type(error.status) is int and 100 <= error.status <= 599:
+                result["http_status"] = error.status
+            data = error.data
+            if type(data) is not dict and type(error.body) is str and len(error.body) <= 16384:
+                data = json.loads(error.body)
+            code = data.get("code") if type(data) is dict else None
+            if type(code) is int and 0 <= code <= 2147483647:
+                result["api_code"] = code
+        except Exception:
+            pass  # Optional diagnostics cannot alter a cancellation outcome.
+        return result
 
     @staticmethod
     def _mm_cancellation_error_kind(error: Exception) -> str:
@@ -531,6 +554,7 @@ class LighterRest(LighterBase):
                     result = await original_send(*args, **kwargs)
                 except Exception as error:
                     observation["error_kind"] = self._mm_cancellation_error_kind(error)
+                    observation.update(self._mm_cancellation_error_numbers(error))
                     # Even DNS may fail after an HTTP redirect already sent the
                     # original POST. No send-stage exception proves no-send here.
                     raise
@@ -554,6 +578,7 @@ class LighterRest(LighterBase):
             except Exception as error:
                 if observation["error_kind"] == "none":
                     observation["error_kind"] = self._mm_cancellation_error_kind(error)
+                observation.update(self._mm_cancellation_error_numbers(error))
                 raise
             finally:
                 for name, wrapper, previous in (("sign_cancel_order", observed_sign, own_sign),
@@ -2916,9 +2941,11 @@ class LighterRest(LighterBase):
                 if capture_mm:
                     if observation["error_kind"] == "none":
                         observation["error_kind"] = self._mm_cancellation_error_kind(exc)
+                    observation.update(self._mm_cancellation_error_numbers(exc))
                     self._record_mm_cancellation_diagnostic(symbol, logical_order_id,
                         submission="signer_or_provider_error", stage=observation["stage"],
-                        error_kind=observation["error_kind"])
+                        error_kind=observation["error_kind"], http_status=observation.get("http_status"),
+                        api_code=observation.get("api_code"))
                     if observation["not_sent"]:
                         raise OrderCancellationNotSentError(symbol=symbol, order_id=logical_order_id) from None
                     return await self._handle_ambiguous_cancellation(
@@ -2940,7 +2967,8 @@ class LighterRest(LighterBase):
 
             if capture_mm:
                 self._record_mm_cancellation_diagnostic(symbol, logical_order_id,
-                    stage=observation["stage"], error_kind=observation["error_kind"])
+                    stage=observation["stage"], error_kind=observation["error_kind"],
+                    http_status=observation.get("http_status"), api_code=observation.get("api_code"))
                 if observation["not_sent"]:
                     self._record_mm_cancellation_diagnostic(symbol, logical_order_id,
                         submission="signer_or_provider_error")
@@ -2975,7 +3003,8 @@ class LighterRest(LighterBase):
                 self._require_success_response(response, "order cancellation")
             except RuntimeError as exc:
                 if capture_mm:
-                    self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="response_rejected")
+                    self._record_mm_cancellation_diagnostic(symbol, logical_order_id, submission="response_rejected",
+                                                           api_code=getattr(response, "code", None))
                     return await self._handle_ambiguous_cancellation(
                         symbol, logical_order_id, "cancellation response without terminal proof")
                 if self._is_definitive_mutation_exception(exc):

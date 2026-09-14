@@ -2134,10 +2134,10 @@ class VolumeSessionTests(unittest.IsolatedAsyncioTestCase):
         result = await session.run(asyncio.Event())
         faults = [event for event in self.events if type(event) is FailureDiagnostic]
         self.assertTrue(pending, (result.failure, faults, adapter.created_records))
-        self.assertEqual(len(recovery), 1, "the original cancellation permits one proof sync")
+        self.assertEqual(len(recovery), 1, "the original cancellation permits one bounded proof operation")
         self.assertEqual(deadlines, [recovery[0][0]], "proof and cleanup share the original exit deadline")
         self.assertEqual(len(delivered), 1)
-        self.assertEqual(len(retry_gates), 2 if delayed or outcome in {"still_open", "absent"} else 1)
+        self.assertEqual(len(retry_gates), 20 if outcome in {"still_open", "absent"} else 2 if delayed else 1)
         self.assertFalse(result.completed, "successful cleanup does not resume a failed normal run")
         self.assertEqual(result.failure, "session_failed_closed")
         failed_at = next(at for identifier, _, at in cancellations if identifier == pending[0].id)

@@ -30,6 +30,10 @@ class _MarketReadRace(AccountReadRace):
     """Healthy book needs one fresh order bracket, within the existing audit budget."""
 
 
+class _BalanceReadRace(AccountReadRace):
+    """A transient balance GET needs the same bounded, complete fresh account proof."""
+
+
 _STREAM_STAGES = frozenset({"connect", "subscribe_book", "request_snapshot", "receive"})
 _STREAM_REASONS = frozenset({"timeout", "transport_closed", "invalid_json", "protocol_error",
                              "transport_error", "internal_error"})
@@ -182,6 +186,7 @@ class LighterAccountPort:
         self._book_read_diagnostics = {}
         self._book_received_at = None
         self._market_read_retries = self._market_read_recoveries = 0
+        self._balance_read_retries = self._balance_read_recoveries = 0
         self._book_attempt = 0
         self._terminal_proofs = {}
         self.latest_orders = ()
@@ -252,6 +257,10 @@ class LighterAccountPort:
     @property
     def market_read_counts(self):
         return {"retries": self._market_read_retries, "recoveries": self._market_read_recoveries}
+
+    @property
+    def balance_read_counts(self):
+        return {"retries": self._balance_read_retries, "recoveries": self._balance_read_recoveries}
 
     def _take_orders(self, name):
         observation = getattr(self, name)
@@ -548,7 +557,7 @@ class LighterAccountPort:
                          for row in cached[2][0].raw_data["account"].positions))
                  and 0 <= self.clock.monotonic() - cached[1] < 8)
         cash_at = cached[1] if reuse else self.clock.monotonic()
-        balances = deepcopy(cached[2] if reuse else list(await self.adapter.get_balances()))
+        balances = deepcopy(cached[2] if reuse else list(await self._read_balances()))
         closing = await self._read_orders()
         if type(closing[3]) is int:
             self._book_read_diagnostics["market_closing_nonce"] = Decimal(closing[3])
@@ -643,6 +652,22 @@ class LighterAccountPort:
         self._check_active_fills(closing[2], mapped_trades)
         return balances, orders, self._fees_cache, trades, cash_at, count, (opening, closing, book), trade_state, trade_ahead
 
+    async def _read_balances(self):
+        from aiohttp import ClientConnectionError
+        from lighter.exceptions import ApiException
+
+        try:
+            return await self.adapter.get_balances()
+        except (ApiException, ClientConnectionError, TimeoutError) as error:
+            transient = (not isinstance(error, ApiException)
+                         or type(error.status) is int and error.status in {502, 503, 504})
+            if (not transient or self.stream is None or not self.stream.transport_healthy
+                    or self._generation() is None):
+                raise
+            # Retry the entire audit, never this request in isolation. Validation,
+            # list/deepcopy, HTTP 429 and uncertain mutations are not retryable here.
+            raise _BalanceReadRace("transient balance request unavailable") from error
+
     def _check_active_fills(self, rows, trades):
         observed_trades = self._trades | trades
         with localcontext() as context:
@@ -662,6 +687,7 @@ class LighterAccountPort:
             started, generation = self.clock.monotonic(), self._generation()
             force_funding = False
             retrying_market = False
+            retrying_balance = False
             # One shared retry/deadline covers the complete proof, not only its reads.
             for attempt in range(2 if self.stream is not None else 1):
                 remaining = 10 - (self.clock.monotonic() - started)
@@ -674,6 +700,8 @@ class LighterAccountPort:
                         self.before_read("audit")
                     if retrying_market:
                         self._market_read_retries += 1  # Only admitted fresh attempts count.
+                    if retrying_balance:
+                        self._balance_read_retries += 1
                     self._book_attempt = int(retrying_market)
                     account = await asyncio.wait_for(self._snapshot_once(started,
                         allow_cash_reuse=allow_cash_reuse and not attempt, force_trades=bool(attempt),
@@ -696,12 +724,15 @@ class LighterAccountPort:
                         raise error_type("trusted aligned market unavailable", values=values)
                     if retrying_market:
                         self._market_read_recoveries += 1
+                    if retrying_balance:
+                        self._balance_read_recoveries += 1
                     return account
                 except AccountReadRace as error:
                     if attempt or self.stream is None:
                         raise
                     force_funding = isinstance(error, _AccountCashRace)
                     retrying_market = isinstance(error, _MarketReadRace)
+                    retrying_balance = isinstance(error, _BalanceReadRace)
                     self.begin_quote_cycle()
         except asyncio.CancelledError:
             self.begin_quote_cycle(clear_diagnostics=False)

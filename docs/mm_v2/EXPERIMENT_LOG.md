@@ -1,5 +1,70 @@
 # Market Maker V2 — Experiment log
 
+## 2026-09-14 場次213610：送單與撤單同時不確定，停止修復並保存現況
+
+使用者再次執行原60分鐘啟動器，journal `logs/mm_v2_economics_20260914_213610_838.jsonl` 共4366 events。約920s在`reconciling_quotes`提前失敗，前兩次bounded exit均flat，exit-3則BLOCKED、0次IOC。最後fresh authenticated帳戶為long0.00059 BTC／1張掛單；使用者其後回報已自行清理，本輪未另連帳戶或代為操作。
+
+已捕获撤單`stage_send=1`、HTTP400、API code21104，且同時有buy uncertain_submission（未確認order ID）與sell uncertain_cancellation。現有`_is_invalid_nonce_rejection`以精確SDK文字將21104對應invalid nonce，但本場沒有保存最初買單失敗原因及nonce演變，不能判定誰造成失配或據此安全重送。新增的取消取證仍要求不存在未解送單，因此這條混合不確定路徑沒有進入該恢復流程。這是前批延遲終態修正未涵蓋的失敗，不是已解決的問題。另budget實錄balance retry/recovery=1/1，market=0/0，不能將該局部恢復等同整場成功。
+
+使用者要求停止無效修復、說明問題，隨後明確要求一次commit/push。本批保存既有程式／測試修改與實驗證據，沒有追加runtime修正或重跑測試；沿用下方已完成回歸結果。送單／撤單失敗後的恢復仍未解決，連續60分鐘與自動收尾均未驗收；此次Git保存不代表穩定版本。原始日誌、帳戶設定及未追蹤快取不納入提交。
+
+## 2026-09-14 場次204125：帳務差額觸發退出，撤單取證過早停止；使用者手動清理0/0
+
+Journal `logs/mm_v2_economics_20260914_204125_681.jsonl` 共4991 events，planned3600s、whole-process1124.3090153s後code1；基於`0195631`的修改工作樹。第一次bounded exit成功，第二次在elapsed約1115s因`account_cash_conflict/cash_equity`觸發。撤單送出階段記錄HTTP4xx，委託仍為uncertain cancellation；第2次唯讀取證後即放棄，診斷記錄原取證期限尚餘4595.144600000822ms。隨後exit-2 BLOCKED、IOC attempts0，final account亦失敗，原run沒有可信的最終持倉／掛單結論。
+
+末尾BUY0.00040的交易來源時間為21:00:02.481，直到exit-2 BLOCKED後才入帳。它不能證明另一張SELL0.00020已安全取消，ledger顯示0亦不能代替帳戶證明。使用者回報殘留short0.00020並授權一次既有唯讀工具：2026-09-14T13:14:12.187Z取得authenticated short0.00020 BTC／0掛單，read_complete、disconnected均true，耗時0.886s、create/cancel均0；證據為同stem `.readonly_postflight.json`。這是先後讀取持倉與委託，非原子快照。其後已備妥30s有界減倉流程，但使用者選擇自行平倉，因此未執行；使用者再明確確認持倉／掛單0/0，沒有新增帳戶連線。此人工清理不能回填原run為成功。
+
+**本批修正。** `BoundedExecutionPort`原本把已知不確定撤單的取證固定限制為2次，並非實際耗盡時間。改為在原最多10s、呼叫方deadline及API admission內繼續讀取，間隔0.5s、硬上限20次以防時鐘停滯；只對仍缺终態證明的同一批已知委託繼續，沒有重送撤單或放寬ownership／unknown-state檢查。取得精確終態才恢復有界減倉。外層30s及更短呼叫期限照常約束，無證明仍停機。
+
+Shared Lighter adapter僅在MM opt-in取消診斷中保留真SDK exception的數字HTTP status及JSON整數API code，經manager與telemetry傳至console。不保存body、message、header或憑證；多張委託只有完整數字組合一致才合併，避免拼出不存在的錯誤組合。Grid預設取消行為不改，HTTP4xx仍不能作為未送出證明。
+
+**驗證。** 重用原CLI／SDK／raw response完整場景，不新增測試框架：
+
+- 將取消終態延後至第8次history response可見。舊版code1，short0.00040／0單、0 IOC，2次取證後期限尚餘約9988ms；修後code0、complete、exact0/0，僅1次cancel＋1次IOC，maker/taker各1筆，獨立venue與ledger cash一致。證據目錄：`logs/mm_v2_wire_20260914_131916_260512_late_cancel_fill`（前）及`logs/mm_v2_wire_20260914_132327_221837_late_cancel_fill`（後）。這重現取證過早停止的流程缺口，不代表捕獲本場4xx原始原因。
+- 終態一直缺失的負例仍HALTED／code1，如實報0持倉／1掛單；20次上限、cancel仍只送1次、不送IOC或新增風險。證據：`logs/mm_v2_wire_20260914_132340_587955_unresolved_cancel_response`。
+- 全專案一次952項／291.140s，結果12F＋4E。當中8F＋4E與既有Grid／Lighter基線逐項相同；新增4F皆既有預期過期：永久缺證仍期待2次讀取（2個subcases）、5s外層期限到期仍期待BLOCKED而非DEADLINE、新API數字碼未列入預期。只修對應期待，保留不重送／無IOC／期限等斷言，補跑SDK52項、telemetry20項、bounded exit12項、session runner70項皆PASS；telemetry亦修正不同委託數字碼不可拼接，既有案例驗證通過。全量輸出：`logs/mm_v2_cleanup_recovery_full_20260914.log`。未把初次全量結果寫成全綠，沒有重跑未受影響的整批。
+
+**未解的原因與驗收界線。** 最後全部已知成交入帳後，expected equity296.572634026788、account equity296.572913735268，仍差+0.000279708480 USDG。跨21:00且持有空倉使funding成為候選，但本場38次positionFunding、0次public fundings及0筆cashflow不能證明資金費何時公布；既有cash-race重讀已強制fresh cash/trades/funding，未找到可確證的查詢範圍或TTL漏讀bug。因此沒有增加帳務容忍額、虛構funding或放寬送單。缺的證據是各次funding返回／新增紀錄與來源時間、cash重用及資料公布時序；舊run也缺精確HTTP/API數字碼，不能判定nonce、拒單或安全重送。完整60分鐘穩定性仍未通過。本批僅使用已授權的一次唯讀查核，沒有新實盤、清理交易或commit/push。
+
+## 2026-09-13 修復與真實測試循環：三場10分鐘完成，最後一場使用原啟動器
+
+使用者要求以實際運行為主，並明確授權本機、同一Robinhood主網帳戶／BTC，最多3場、每場600s另加60s啟動隔離；size0.00040、hard inventory0.00080、每場loss0.50 USDG／三場合計1.50、原30s bounded exit。每場fresh authenticated0/0後才續跑，未執行超過這三場的live，也沒有VPS或新的Git操作。以下均為實際網路與帳戶，非fixture。
+
+- 先用原CLI strict dry跑300s：100個quote cycles、41次account GET，code0、final authenticated0/0。只改dry與時長；未送單或撤單。
+- 前兩場先使用診斷增補版；原205600內因仍未重現。確認現行完整流程對單次SDK HTTP503會直接結束後，才修MM餘額GET的有界恢復，再進第三場。
+- `_read_balances`只將真正SDK ApiException的整數502/503/504、連線／請求逾時轉入既有完整帳戶重讀。需要健康stream與已知mutation generation，共用原10s及一次retry，重新取得orders/cash/trades證明；保留所有API admission、身份、Decimal、帳務與退出限制。429、權限／資料驗證、list/deepcopy和委託操作不重試。Shared adapter與Grid未改。
+- 診斷保留固定inner-cause分類、數字HTTP status、allowlisted shared/SDK程式位置；不記錄例外文字、body、header或憑證。Budget新增實際balance retry/recovery計數。
+
+| 場次／journal | 版本與啟動方式 | whole-process秒 | maker／taker成交 | bounded exits | 結果 |
+|---|---|---:|---:|---:|---|
+| `mm_v2_stability_20260913_r1.jsonl` | 原CLI；僅診斷增補 | 669.7476732 | 9／2 | 2 | code0、complete、final authenticated0/0 |
+| `mm_v2_stability_20260913_r2.jsonl` | 原CLI；僅診斷增補 | 669.4439729 | 11／1 | 1 | code0、complete、final authenticated0/0 |
+| `mm_v2_economics_20260913_215959_249.jsonl` | 修正版；原 `run_live_test.ps1` | 664.6280975 | 14／2 | 2 | code0、complete、final authenticated0/0 |
+
+三場共39筆實際成交、5次成功bounded exit，涵蓋部分成交、最大持倉減倉、逾時平倉、配額等待、冷卻恢復及清理期間新成交。三場failure_diagnostic均0；account GET分別96／96／101。第三場balance retries/recoveries=0/0，沒有實際遇到新增恢復條件，不能把故障注入成功說成實盤503恢復證明。三場淨損合計0.20400442620 USDG，低於授權上限；此處只核對測試資金支出，不做費用優化判斷。
+
+第三場直接執行使用者原啟動器，暫時將其local YAML換成僅duration不同的600s設定，finally已逐byte還原原3600s檔。原啟動器回報code0，所有runner已退出，沒有另開私人postflight連線。程式來源指紋在第三場前後相同：`88ad273b89e4f5662ff84ee6a83cb3a1e4fba87cdd2c42fa714be9b146e2755a`；基於`0195631`工作樹，精確檔案hash見`logs/mm_v2_stability_r3_source.json`。三場journal SHA、時長、結果及設定核對保存在`logs/mm_v2_stability_repair_summary_20260913.json`，原始logs／local YAML不納入Git。
+
+**故障與回歸驗證。** 僅新增一個原CLI／真SDK／raw response完整場景：maker成交後一次HTTP503。舊runtime code1（`logs/mm_v2_balance_503_before.log`）；修後完整自然到期、一次retry/recovery、exact1maker＋1IOC、獨立venue及帳戶0/0，mutation/fill未重複（`logs/mm_v2_balance_503_after.log`）。兩個一次性負例未新增永久框架：連續2次503僅retry1/recovery0；一次403 retry0/recovery0；皆fail closed後清理0/0，證據為`logs/mm_v2_wire_20260913_135223_653187_account_503_after_fill`與`...135226_101716_account_503_after_fill`。
+
+V2 suite一次659項：658通過，1個既有normal wire案例因虛擬時間跳5s越過尚未配送的book而誤報4995ms來源過期（`logs/mm_v2_balance_recovery_v2_suite.log`）。只修fixture在跳時前後等待原consumer完成已排隊封包，保留原timestamp／nonce及production source門檻；該案例重跑通過，完整wire檔14項全通過，含既有失效行情／斷線及清理。其他658項的runtime未再改，不重跑整批。沒有大量新增零散單元測試。
+
+**限制：** 本輪證明三個獨立10分鐘窗口完成，只有最後一場包含餘額恢復修正；不代表連續60分鐘驗收完成。205600底層原因仍未捕獲，不認定為503；保留下方原失敗證據。此次Git授權未重複使用，尚未commit/push。
+
+## 2026-09-13 場次205600：餘額讀取／轉換失敗，行情仍有效，原場清理0/0
+
+使用者在前批commit/push後自行執行並提交新輸出。Journal `logs/mm_v2_economics_20260913_205600_728.jsonl`共613 events，SHA256 `466173e1f4e5a2e4604c5e35dd981cd8a6ccad9e42908a01ee51a48788436da4`；原`build_report`結果保存於同stem `.jsonl.analysis.json`。Startup記錄commit`01956316a3930daef73b16319879fb97b3acbc44`、dirty=true；目前tracked檔與HEAD一致，只有先前字面`%SystemDrive%/`快取未追蹤，但run未保存當時完整source指紋。本輪僅唯讀來源／紀錄分析及既有文件更新，没有再修改runtime、執行live／私人API查核、產品suite或commit/push；上一次Git授權已完成。
+
+Planned3600s、whole-process wall216.8156427s（約3分37秒）、ledger154.0851174s後code1。唯一failure為line602 `authorizing_quotes / LighterReadError`；精確source為`orchestrator:756 → 501 → 343 → 390 → lighter_runtime:724 → 678 → 729 → 551`。此版本551是`balances = deepcopy(cached[2] if reuse else list(await self.adapter.get_balances()))`，不是193558的market.refresh共同拒絕分支，也尚未進入closing order read（552）。724是account snapshot將外部例外轉成安全generic error的出口。
+
+新診斷保存opening nonce1740020995、book nonce1740020998、book age1335.6484ms、market_book_retry_count0；沒有closing nonce、book-invalid或transport-unhealthy旗標。原public book在failure後仍持續更新（30150.1048994至30152.0048051）；ReadStream的book/transport失效皆鎖定且不重連，因此能排除已鎖死的book／WS失效。Budget `market_reads.retries/recoveries=0/0`符合實作：帳戶證明尚未完成，不能使用只對健康行情不同步開放的重讀；不是該重讀啟用失敗。Console的account_age29是最後成功帳戶快照的年齡，不能當成某個HTTP請求耗時29秒的證据。
+
+**尚未取得的根因。** 551同時包含cache/fresh分支、adapter/SDK request、list及deepcopy，現有telemetry只留下MM frames及最外層錯誤類別；不能由此分辨HTTP失敗、SDK模型驗證、adapter金額／身份解析或本地轉換異常。已核對get_balances僅轉送get_account_balance；後者會驗API成功、精確account及finite餘額，再建立BalanceData，失敗重新拋出。MM API admission模式不做內部429重試；但本run没有保存HTTP狀態或原cause類別，不能認定429、DNS、503或真餘額不一致。原重讀修復沒有涵蓋此條獨立帳戶失敗路徑，不能把657項V2通過當成此情境已有驗證。
+
+最後line610 bounded exit為flat／0次IOC，line612 final再次authenticated position0／open orders0，ledger對帳差0。4筆maker、0taker，maker turnover122.722320 USDG；gross+0.003680、fees0.01472667840、交易net−0.01104667840。兩組maker-only完整循環皆gross正而net負；毛利覆蓋費用24.9887%，樣本不足以推論改善。Formal economics仍false（runtime_failure_diagnostic），失敗場比較窗口維持3600s。Strict接受1148包、最大接受age148.6678ms、0接受超界；REST／WS／TX峰8500／95／5，optional waits3，沒有已記錄budget或account-race退出。
+
+接下來的有效補測範圍是原raw account HTTP失敗與HTTP成功但SDK／account資料不合格，搭配固定balance讀取／轉換步驟、有限cause類別及可信HTTP status診斷，驗證兩者可區分且後者必須fail closed。不能用文字推論可重試或放寬帳戶freshness；此次原始cause缺失也不能事後補回。本條為分析結果，未宣稱這個新失敗已修復。
+
 ## 2026-09-13 場次193558後：行情故障診斷、單次重新對齊與完整流程反例
 
 使用者授權本地實作、驗證及完成後一次commit/push。本批保留先前未提交MM V2修復與測試，沒有改動交易數量、費率、風險限額、source freshness、Grid策略或live設定。以下為可重現的處理缺口修復，不能事後補出193558缺失的原始觸發原因。
