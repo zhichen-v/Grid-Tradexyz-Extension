@@ -7,7 +7,7 @@ import logging
 from typing import Any, Callable, Dict, List, Sequence, Set
 
 logger = logging.getLogger(__name__)
-PATCH_VERSION = "2026-08-21.2"
+PATCH_VERSION = "2026-09-23.1"
 
 
 def _set(report: Any, name: str) -> Set[str]:
@@ -149,14 +149,24 @@ async def engine_cancel_all_owned(engine: Any) -> int:
             f"in-flight placements did not drain within {drain_timeout:.1f}s"
         ) from exc
 
-    _, filled = await engine._resolve_unresolved_submissions_read_only()
-    if filled:
-        raise RuntimeError(
-            "uncertain submissions resolved as filled: " + ", ".join(filled)
-        )
-    unresolved = engine._unresolved_submission_descriptions()
-    if unresolved:
-        raise RuntimeError("orders lack exact exchange IDs: " + ", ".join(unresolved))
+    # One unresolved intent must not leave the other, exactly identified owned
+    # orders live. Retain every unsafe condition until their cleanup completes.
+    errors: List[str] = []
+    try:
+        _, filled = await engine._resolve_unresolved_submissions_read_only()
+        if filled:
+            engine._shutdown_fill_incident = (
+                getattr(engine, "_shutdown_fill_incident", None)
+                or "uncertain submissions resolved as filled: " + ", ".join(filled)
+            )
+    except Exception as exc:
+        errors.append(f"submission reconciliation failed: {exc}")
+    try:
+        unresolved = engine._unresolved_submission_descriptions()
+        if unresolved:
+            errors.append("orders lack exact exchange IDs: " + ", ".join(unresolved))
+    except Exception as exc:
+        errors.append(f"unresolved submission inspection failed: {exc}")
 
     pending = list(engine.get_pending_orders())
     ids: List[str] = []
@@ -167,42 +177,55 @@ async def engine_cancel_all_owned(engine: Any) -> int:
             value = int(raw) if raw is not None else 0
         except (TypeError, ValueError):
             value = 0
-        if not 1 <= value < (1 << 60):
+        exchange_data = getattr(order, "exchange_data", None)
+        uncertain = isinstance(exchange_data, dict) and exchange_data.get(
+            "submission_uncertain"
+        )
+        # Numeric client IDs are valid integers too; uncertainty means the ID
+        # has not yet been proved to identify an exchange order.
+        if uncertain or not 1 <= value < (1 << 60):
             invalid.append(str(raw or getattr(order, "grid_id", "missing")))
         elif str(value) not in ids:
             ids.append(str(value))
 
     if invalid:
-        raise RuntimeError("non-final Lighter order IDs: " + ", ".join(invalid))
-    if not ids:
-        engine.logger.warning("Lighter shutdown found no strategy-owned open orders")
-        return 0
+        errors.append("non-final Lighter order IDs: " + ", ".join(invalid))
 
-    engine.logger.warning(
-        f"Lighter shutdown will selectively cancel {len(ids)} "
-        "strategy-owned orders"
-    )
-    report = await engine.cancel_orders(ids)
-
-    if _set(report, "filled"):
-        raise RuntimeError(
-            "orders filled during cancellation: "
-            + ", ".join(sorted(_set(report, "filled")))
+    cancelled = 0
+    if ids:
+        engine.logger.warning(
+            f"Lighter shutdown will selectively cancel {len(ids)} "
+            "strategy-owned orders"
         )
+        try:
+            report = await engine.cancel_orders(ids)
+        except Exception as exc:
+            errors.append(f"selective cancellation failed: {exc}")
+        else:
+            cancelled = len(_set(report, "cancelled"))
+            if _set(report, "filled"):
+                engine._shutdown_fill_incident = (
+                    getattr(engine, "_shutdown_fill_incident", None)
+                    or "orders filled during cancellation: "
+                    + ", ".join(sorted(_set(report, "filled")))
+                )
 
-    incomplete = (
-        _set(report, "uncertain")
-        | _set(report, "still_open")
-        | set(_rejected(report))
-    )
-    if incomplete:
-        raise RuntimeError(
-            "selective cancellation incomplete: " + ", ".join(sorted(incomplete))
-        )
+            incomplete = (
+                _set(report, "uncertain")
+                | _set(report, "still_open")
+                | set(_rejected(report))
+            )
+            if incomplete:
+                errors.append(
+                    "selective cancellation incomplete: " + ", ".join(sorted(incomplete))
+                )
     if engine.get_pending_orders():
-        raise RuntimeError("local orders remain without terminal cancellation proof")
+        errors.append("local orders remain without terminal cancellation proof")
+    if getattr(engine, "_shutdown_fill_incident", None):
+        errors.append(engine._shutdown_fill_incident)
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
-    cancelled = len(_set(report, "cancelled"))
     engine.logger.warning(
         f"Lighter selective shutdown cancellation completed: "
         f"cancelled={cancelled}"

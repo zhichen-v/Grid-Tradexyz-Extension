@@ -16,6 +16,7 @@ from ....adapters.exchanges import (
     OrderSide as ExchangeOrderSide,
     OrderType,
 )
+from ....adapters.exchanges.exceptions import OrderSubmissionRejectedError
 from ....logging import get_logger
 from ..interfaces.grid_engine import IGridEngine
 from ..models import GridConfig, GridOrder, GridOrderSide, GridOrderStatus
@@ -155,6 +156,7 @@ class GridEngineImpl(IGridEngine):
         batch_mode: bool = False,
         allow_while_paused: bool = False,
         defer_uncertain: bool = False,
+        retry_definitive_rejection: bool = True,
     ) -> Optional[GridOrder]:
         """Place a single limit order and track it locally."""
         if (
@@ -198,6 +200,7 @@ class GridEngineImpl(IGridEngine):
             order_params = None
             if is_lighter:
                 order_params = {
+                    "_raise_on_definitive_submission_rejection": True,
                     "time_in_force": (
                         "GTT"
                         if is_reverse_order or is_closing_order
@@ -284,6 +287,26 @@ class GridEngineImpl(IGridEngine):
             )
             return order
         except Exception as exc:
+            if (
+                isinstance(exc, OrderSubmissionRejectedError)
+                and is_lighter
+                and retry_definitive_rejection
+            ):
+                # The adapter only raises this after an exact nonce rejection;
+                # the SDK already refreshed that key while holding its lock.
+                # Re-enter the placement gates before one new attempt. Unknown
+                # outcomes retain their original client id and never enter here.
+                self.logger.warning(
+                    "Lighter definitively rejected the order; rechecking placement "
+                    f"limits before one retry: grid_id={order.grid_id}"
+                )
+                return await self._place_order_unlocked(
+                    order,
+                    batch_mode=batch_mode,
+                    allow_while_paused=allow_while_paused,
+                    defer_uncertain=defer_uncertain,
+                    retry_definitive_rejection=False,
+                )
             self.logger.error(f"Order placement failed: {exc}")
             order.mark_failed()
             raise

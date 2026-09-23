@@ -1,5 +1,15 @@
 # Market Maker V2 — Experiment log
 
+## 2026-09-23 VPS SPY Grid 拒單／停止撤單事故：唯讀診斷與本機修正
+
+本輪依使用者明確要求處理 Grid，先唯讀分析 VPS，再只修改本機；使用者另明確要求不得中斷 screen 中仍運行的策略，並選擇維持停止時保留倉位。SSH 僅讀取既有 source、日誌、SDK source、Git 與程序狀態；沒有 attach／控制 screen、部署、重啟、交易所帳戶查詢或送撤單。VPS `96672d0` worktree clean；本機 `6e043f6` 上已有大量未提交 MM／shared adapter 變更，本輪保留。修前兩端 `grid_engine_impl.py`、`grid_coordinator.py`、`selective_cancel.py` 的 LF-normalized SHA256 完全一致，共用 Lighter adapter 版本有差異。
+
+**可確認的因果鏈。** VPS `logs/SPY/` 與 adapter 日誌的脫敏診斷顯示：14:26:14 該 SELL 委託收到 SDK 回傳的明確 `21104 / invalid nonce` 拒絕；14:26:19 Grid 將其當成未確認提交而 fatal stop；後續兩輪停止清理各重試五次，均在取得可撤單清單前因缺正式 exchange ID 而失敗。`limit:grid_44_769_130000` 與 `adapter:1790173573186` 是同一未確認意圖的 Grid 暫存標籤與 adapter client ID，不能當成兩筆正式交易所訂單。VPS 與本機皆已有精確 nonce 拒絕分類，但 Grid 未選用。VPS 安裝的 `lighter-sdk==1.1.2` decorator 在該 BadRequest 後先刷新 nonce，再回傳 `(None, None, error)`；本輪不修改 SDK／nonce manager，也不據此推論 nonce 原先失配的外部原因。
+
+**本機修正範圍。** Grid 接用既有 typed definitive-rejection 通路；明確拒單不建立 phantom，nonce 拒絕後只允許一次有界重試，重試重新經過停止／暫停／持倉限制。逾時、未知錯誤與結果不明保持原 client ID 的只讀核對，不盲重送。Selective shutdown 先清理已證實屬於此策略的正式 exchange IDs；個別未知提交、無效 ID 或只讀核對失敗不再阻擋其餘已知單。未解決狀態仍回報失敗，不使用全帳戶撤單，也不將數字 client ID 當作 exchange ID。停止期間成交沿用既有 sticky incident，避免後次重試因本地清單變空而誤報安全。停止保留倉位的政策不變。
+
+**最終驗證與 Git 範圍。** 使用者後續明確要求直接 commit／push 至 `main`，原 market maker 分支保留、VPS 延後更新。本輪從最新 `origin/main`（`96672d0`）建立獨立 worktree，只套用此次 Grid／tests patch 與本節紀錄；保留 `main` 原有 MM 及 DNS 測試差異，未帶入原工作目錄的 MM／shared adapter 未提交內容。12 個歷史 Grid／Lighter 失敗案例改用現行 selective-cancel 契約與真實格式 exchange IDs；未刪測試，仍驗證未知結果、終態證據、成交只處理一次與禁止全帳戶撤單。待提交的 `main` 版本使用原專案 `.venv` 執行完整 `python -m unittest discover -s tests -p "test_*.py" -v`：**632 項全部 PASS（含 345 項 V2），17.992 秒**。entrypoints／core／tests 的 LF-normalized 合併 SHA256 在測試前後同為 `e8a71e12394c3046e2692d41946caa1b5fd3d7db4cc90895b703ddb30f467741`；證據保存在原工作目錄 ignored `logs/grid_vps_recovery_main_full_20260923.log`、`logs/grid_vps_recovery_main_summary_20260923.json`，不提交原始日誌。原 worktree 分支仍為 `refactor/lighter-volume-mm-v2`。修正未部署 VPS，歷史日誌不能證明目前交易所掛單／倉位狀態。
+
 唯一 phase/run 記錄；不另建 status、campaign、checkpoint 報告。規格見 [rebuild plan](../CODEX_MM_VOLUME_FIRST_V2_REBUILD_PLAN.md)，產品與架構見 [OBJECTIVE](OBJECTIVE.md)、[ARCHITECTURE](ARCHITECTURE.md)。歷史帳戶讀值不代表現況。
 
 09-04→09-05 的 Phase 7 測試僅授權讀取重構、10min dry smoke→30min dry T3，未授權 live／帳戶模式調整。09-05 使用者另明確授權清除 V1、完成後 commit/push 並 merge/push main，保留 V2 分支、刪除本機與遠端舊 MM 分支。現行 live read-budget 仍是 No-Go，程式清理與 Git 合併不代表 promotion。

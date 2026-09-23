@@ -168,6 +168,7 @@ class Order:
         self.order_id = str(order_id)
         self.grid_id = int(order_id)
         self.cancelled = False
+        self.exchange_data = {}
 
     def mark_cancelled(self):
         self.cancelled = True
@@ -186,6 +187,10 @@ class Engine:
             state=SimpleNamespace(active_orders=dict(self.orders))
         )
         self.logger = MagicMock()
+        self._placements_drained = asyncio.Event()
+        self._placements_drained.set()
+        self._resolve_unresolved_submissions_read_only = AsyncMock(return_value=([], []))
+        self._unresolved_submission_descriptions = MagicMock(return_value=[])
 
     def _find_cached_order(self, *ids):
         for order_id in ids:
@@ -223,6 +228,150 @@ class Engine:
 
     def get_pending_orders(self):
         return list(self._pending_orders.values())
+
+    @staticmethod
+    def _string_or_none(value):
+        return None if value in (None, "") else str(value)
+
+    async def cancel_orders(self, ids):
+        return await grid.engine_cancel_orders(self, ids)
+
+
+class ShutdownCancellationSafetyTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def cancellation_report(ids, _symbol):
+        return SimpleNamespace(
+            requested=set(ids),
+            acknowledged=set(ids),
+            cancelled=set(ids),
+            filled=set(),
+            still_open=set(),
+            uncertain=set(),
+            rejected={},
+            terminal_orders={},
+        )
+
+    def engine_with_unresolved_order(self, client_id):
+        engine = Engine([101, 102, 103])
+        phantom = engine._pending_orders.pop("103")
+        phantom.order_id = client_id
+        phantom.exchange_data["submission_uncertain"] = True
+        engine._pending_orders[client_id] = phantom
+        engine._unresolved_submission_descriptions.return_value = [
+            f"limit:{client_id}", "adapter:1790173573186"
+        ]
+        engine.exchange.cancel_orders = AsyncMock(side_effect=self.cancellation_report)
+        return engine, phantom
+
+    async def test_unresolved_submission_does_not_block_known_owned_cancellation(self):
+        for client_id in ("grid_44_769_130000", "1790173573186"):
+            with self.subTest(client_id=client_id):
+                engine, phantom = self.engine_with_unresolved_order(client_id)
+                with self.assertRaisesRegex(RuntimeError, "orders lack exact exchange IDs"):
+                    await grid.engine_cancel_all_owned(engine)
+                engine.exchange.cancel_orders.assert_awaited_once_with(["101", "102"], "BTC")
+                self.assertEqual(engine.get_pending_orders(), [phantom])
+                self.assertFalse(phantom.cancelled)
+
+                # Retrying unsafe cleanup must not resend proven cancellations.
+                with self.assertRaisesRegex(RuntimeError, "orders lack exact exchange IDs"):
+                    await grid.engine_cancel_all_owned(engine)
+                self.assertEqual(engine.exchange.cancel_orders.await_count, 1)
+
+    async def test_read_failures_and_reconciled_fill_preserve_known_order_cleanup(self):
+        for failure in ("resolve", "inspect", "filled"):
+            with self.subTest(failure=failure):
+                engine = Engine([101, 102])
+                engine.exchange.cancel_orders = AsyncMock(side_effect=self.cancellation_report)
+                if failure == "resolve":
+                    engine._resolve_unresolved_submissions_read_only.side_effect = RuntimeError("read unavailable")
+                    message = "submission reconciliation failed: read unavailable"
+                elif failure == "inspect":
+                    engine._unresolved_submission_descriptions.side_effect = RuntimeError("registry unavailable")
+                    message = "unresolved submission inspection failed: registry unavailable"
+                else:
+                    engine._resolve_unresolved_submissions_read_only.return_value = ([], ["999"])
+                    message = "uncertain submissions resolved as filled: 999"
+                with self.assertRaisesRegex(RuntimeError, message):
+                    await grid.engine_cancel_all_owned(engine)
+                engine.exchange.cancel_orders.assert_awaited_once_with(["101", "102"], "BTC")
+                self.assertEqual(engine.get_pending_orders(), [])
+
+    async def test_invalid_placeholder_does_not_block_known_order_cleanup(self):
+        engine, phantom = self.engine_with_unresolved_order("pending")
+        phantom.exchange_data.clear()
+        engine._unresolved_submission_descriptions.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "non-final Lighter order IDs: pending"):
+            await grid.engine_cancel_all_owned(engine)
+        engine.exchange.cancel_orders.assert_awaited_once_with(["101", "102"], "BTC")
+        self.assertEqual(engine.get_pending_orders(), [phantom])
+
+    async def test_cancellation_failure_keeps_original_submission_uncertainty(self):
+        engine, phantom = self.engine_with_unresolved_order("1790173573186")
+        engine.exchange.cancel_orders.side_effect = RuntimeError("cancel response lost")
+        with self.assertRaises(RuntimeError) as raised:
+            await grid.engine_cancel_all_owned(engine)
+        self.assertIn("orders lack exact exchange IDs", str(raised.exception))
+        self.assertIn("selective cancellation failed: cancel response lost", str(raised.exception))
+        engine.exchange.cancel_orders.assert_awaited_once_with(["101", "102"], "BTC")
+        self.assertEqual(len(engine.get_pending_orders()), 3)
+        self.assertFalse(phantom.cancelled)
+
+    async def test_task_cancellation_is_not_swallowed(self):
+        for phase in ("reconcile", "cancel"):
+            with self.subTest(phase=phase):
+                engine = Engine([101])
+                engine.exchange.cancel_orders = AsyncMock(side_effect=self.cancellation_report)
+                if phase == "reconcile":
+                    engine._resolve_unresolved_submissions_read_only.side_effect = asyncio.CancelledError
+                else:
+                    engine.exchange.cancel_orders.side_effect = asyncio.CancelledError
+                with self.assertRaises(asyncio.CancelledError):
+                    await grid.engine_cancel_all_owned(engine)
+                self.assertEqual(len(engine.get_pending_orders()), 1)
+                if phase == "reconcile":
+                    engine.exchange.cancel_orders.assert_not_awaited()
+
+    async def test_exact_reconciliation_makes_previously_unknown_order_cancellable(self):
+        engine, phantom = self.engine_with_unresolved_order("1790173573186")
+
+        async def reconcile():
+            engine._pending_orders.pop(phantom.order_id)
+            phantom.order_id = "104"
+            phantom.exchange_data["submission_uncertain"] = False
+            engine._pending_orders[phantom.order_id] = phantom
+            engine._unresolved_submission_descriptions.return_value = []
+            return ["104"], []
+
+        engine._resolve_unresolved_submissions_read_only.side_effect = reconcile
+        self.assertEqual(await grid.engine_cancel_all_owned(engine), 3)
+        engine.exchange.cancel_orders.assert_awaited_once_with(["101", "102", "104"], "BTC")
+        self.assertEqual(engine.get_pending_orders(), [])
+
+    async def test_fill_incident_stays_unsafe_after_retry_has_no_pending_orders(self):
+        for phase in ("reconcile", "cancel"):
+            with self.subTest(phase=phase):
+                engine = Engine([101, 102])
+                if phase == "reconcile":
+                    engine._resolve_unresolved_submissions_read_only.side_effect = [
+                        ([], ["999"]), ([], [])
+                    ]
+                    engine.exchange.cancel_orders = AsyncMock(side_effect=self.cancellation_report)
+                else:
+                    report = self.cancellation_report(["101", "102"], "BTC")
+                    report.cancelled.remove("102")
+                    report.filled.add("102")
+                    report.terminal_orders["102"] = SimpleNamespace(id="102")
+                    engine.exchange.cancel_orders = AsyncMock(return_value=report)
+                    engine._handle_exchange_order_object = AsyncMock(
+                        side_effect=lambda order: engine._clear_pending_order_refs(order.id)
+                    )
+                with self.assertRaisesRegex(RuntimeError, "filled"):
+                    await grid.engine_cancel_all_owned(engine)
+                self.assertEqual(engine.get_pending_orders(), [])
+                with self.assertRaisesRegex(RuntimeError, "filled"):
+                    await grid.engine_cancel_all_owned(engine)
+                engine.exchange.cancel_orders.assert_awaited_once_with(["101", "102"], "BTC")
 
 
 class GridOwnershipTests(unittest.IsolatedAsyncioTestCase):

@@ -50,7 +50,10 @@ class LighterGridPostOnlyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             exchange.create_order.await_args.kwargs["params"],
-            {"time_in_force": "POST_ONLY"},
+            {
+                "_raise_on_definitive_submission_rejection": True,
+                "time_in_force": "POST_ONLY",
+            },
         )
 
     async def test_lighter_reverse_opening_order_uses_gtt_without_reduce_only(self):
@@ -70,7 +73,11 @@ class LighterGridPostOnlyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             exchange.create_order.await_args.kwargs["params"],
-            {"time_in_force": "GTT", "skip_order_index_query": True},
+            {
+                "_raise_on_definitive_submission_rejection": True,
+                "time_in_force": "GTT",
+                "skip_order_index_query": True,
+            },
         )
 
     async def test_lighter_closing_order_uses_gtt_and_reduce_only(self):
@@ -91,6 +98,7 @@ class LighterGridPostOnlyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             exchange.create_order.await_args.kwargs["params"],
             {
+                "_raise_on_definitive_submission_rejection": True,
                 "time_in_force": "GTT",
                 "skip_order_index_query": True,
                 "reduce_only": True,

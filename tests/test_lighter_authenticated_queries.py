@@ -707,18 +707,21 @@ class LighterAdapterCancellationTests(unittest.IsolatedAsyncioTestCase):
         adapter.get_order.assert_not_awaited()
         self.assertEqual(result.status, OrderStatus.CANCELED)
 
-    async def test_cancel_all_uses_canonical_order_id(self):
+    async def test_account_wide_cancel_all_rejects_even_canonical_order_ids(self):
         adapter = LighterAdapter.__new__(LighterAdapter)
         adapter.get_open_orders = AsyncMock(
             return_value=[SimpleNamespace(id="12", symbol="ETH")]
         )
         cancelled = SimpleNamespace(id="12", symbol="ETH")
         adapter.cancel_order = AsyncMock(return_value=cancelled)
+        adapter.cancel_orders = AsyncMock()
 
-        result = await adapter.cancel_all_orders("ETH")
+        with self.assertRaisesRegex(RuntimeError, "account-wide cancel_all_orders is disabled"):
+            await adapter.cancel_all_orders("ETH")
 
-        adapter.cancel_order.assert_awaited_once_with("12", "ETH")
-        self.assertEqual(result, [cancelled])
+        adapter.get_open_orders.assert_not_awaited()
+        adapter.cancel_order.assert_not_awaited()
+        adapter.cancel_orders.assert_not_awaited()
 
 
 if __name__ == "__main__":

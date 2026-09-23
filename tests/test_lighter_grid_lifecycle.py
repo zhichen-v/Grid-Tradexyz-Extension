@@ -11,6 +11,7 @@ from core.adapters.exchanges.adapters.lighter import LighterAdapter
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
 from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
 from core.adapters.exchanges.exceptions import OrderSubmissionNotSentError
+from core.adapters.exchanges.adapters.lighter_selective_cancel import CancelReport
 from core.adapters.exchanges.models import (
     OrderData,
     OrderSide,
@@ -457,7 +458,9 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
             _rest=rest,
-            cancel_all_orders=AsyncMock(return_value=[]),
+            cancel_orders=AsyncMock(return_value=CancelReport(
+                requested={"101"}, uncertain={"101"},
+            )),
             get_open_orders=AsyncMock(return_value=[]),
             get_order_history=AsyncMock(return_value=[]),
         )
@@ -466,22 +469,27 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         engine._register_pending_order(order, order.order_id, "client-101")
         engine._uncertain_cancel_order_ids.update({"101", "client-101"})
 
-        with self.assertRaisesRegex(RuntimeError, "cancellations remain uncertain"):
+        with self.assertRaisesRegex(RuntimeError, "selective cancellation incomplete: 101"):
             await engine.cancel_all_orders()
 
         self.assertEqual(engine.get_pending_orders(), [order])
         self.assertEqual(order.status, GridOrderStatus.PENDING)
         self.assertEqual(rest._uncertain_cancellations, {("BTC", "101")})
+        exchange.cancel_orders.assert_awaited_once_with(["101"], "BTC")
 
     async def test_cancel_all_accepts_exact_terminal_cancel_history(self):
         terminal = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
         terminal.id = "101"
         terminal.client_id = "client-101"
-        rest = SimpleNamespace(_uncertain_cancellations={("BTC", "101")})
+        # The adapter report carries exact terminal history; its REST marker
+        # has been consumed, while the engine still holds the earlier aliases.
+        rest = SimpleNamespace(_uncertain_cancellations=set())
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
             _rest=rest,
-            cancel_all_orders=AsyncMock(return_value=[]),
+            cancel_orders=AsyncMock(return_value=CancelReport(
+                requested={"101"}, cancelled={"101"}, terminal_orders={"101": terminal},
+            )),
             get_open_orders=AsyncMock(return_value=[]),
             get_order_history=AsyncMock(return_value=[terminal]),
         )
@@ -497,12 +505,16 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order.status, GridOrderStatus.CANCELLED)
         self.assertEqual(engine._uncertain_cancel_order_ids, set())
         self.assertEqual(rest._uncertain_cancellations, set())
+        exchange.cancel_orders.assert_awaited_once_with(["101"], "BTC")
 
     async def test_shutdown_requires_exact_cancel_history_for_local_pending_order(self):
         terminal = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
-            cancel_all_orders=AsyncMock(return_value=[nonterminal_cancel_ack()]),
+            cancel_orders=AsyncMock(side_effect=[
+                CancelReport(requested={"101"}, acknowledged={"101"}, uncertain={"101"}),
+                CancelReport(requested={"101"}, cancelled={"101"}, terminal_orders={"101": terminal}),
+            ]),
             get_open_orders=AsyncMock(return_value=[]),
             get_order_history=AsyncMock(return_value=[terminal]),
         )
@@ -511,17 +523,28 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         engine._register_pending_order(order, order.order_id, "client-101")
         engine.begin_shutdown()
 
+        with self.assertRaisesRegex(RuntimeError, "selective cancellation incomplete: 101"):
+            await engine.cancel_all_orders()
+        self.assertEqual(order.status, GridOrderStatus.PENDING)
+        self.assertEqual(engine.get_pending_orders(), [order])
         self.assertEqual(await engine.cancel_all_orders(), 1)
 
         self.assertEqual(order.status, GridOrderStatus.CANCELLED)
         self.assertEqual(engine.get_pending_orders(), [])
-        exchange.get_order_history.assert_awaited_once_with("BTC", limit=100)
+        self.assertEqual(
+            [call.args for call in exchange.cancel_orders.await_args_list],
+            [(["101"], "BTC"), (["101"], "BTC")],
+        )
+        self.assertEqual(engine._uncertain_cancel_order_ids, set())
 
     async def test_shutdown_fill_is_finalized_once_and_remains_unsafe(self):
         filled = exchange_order(OrderStatus.FILLED, "0.00020", "0")
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
-            cancel_all_orders=AsyncMock(return_value=[nonterminal_cancel_ack()]),
+            cancel_orders=AsyncMock(return_value=CancelReport(
+                requested={"101"}, acknowledged={"101"}, filled={"101"},
+                terminal_orders={"101": filled},
+            )),
             get_open_orders=AsyncMock(return_value=[]),
             get_order_history=AsyncMock(return_value=[filled]),
             create_order=AsyncMock(),
@@ -545,21 +568,25 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         engine.subscribe_order_updates(try_reverse)
         engine.begin_shutdown()
 
-        with self.assertRaisesRegex(RuntimeError, "filled during shutdown"):
+        with self.assertRaisesRegex(RuntimeError, "orders filled during cancellation: 101"):
             await engine.cancel_all_orders()
-        with self.assertRaisesRegex(RuntimeError, "filled during shutdown"):
+        with self.assertRaisesRegex(RuntimeError, "orders filled during cancellation: 101"):
             await engine.cancel_all_orders()
 
         self.assertEqual(order.status, GridOrderStatus.FILLED)
         self.assertEqual(engine.get_pending_orders(), [])
         self.assertEqual(reverse_attempts, [None])
         exchange.create_order.assert_not_awaited()
-        coordinator._request_fatal_stop.assert_called_once()
+        self.assertIsNotNone(engine._shutdown_fill_incident)
+        self.assertTrue(engine._shutting_down)
+        exchange.cancel_orders.assert_awaited_once_with(["101"], "BTC")
 
     async def test_shutdown_absence_without_terminal_proof_stays_unsafe(self):
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
-            cancel_all_orders=AsyncMock(return_value=[]),
+            cancel_orders=AsyncMock(return_value=CancelReport(
+                requested={"101"}, acknowledged={"101"}, uncertain={"101"},
+            )),
             get_open_orders=AsyncMock(return_value=[]),
             get_order_history=AsyncMock(return_value=[]),
         )
@@ -568,11 +595,13 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         engine._register_pending_order(order, order.order_id, "client-101")
         engine.begin_shutdown()
 
-        with self.assertRaisesRegex(RuntimeError, "lacks exact terminal proof"):
+        with self.assertRaisesRegex(RuntimeError, "selective cancellation incomplete: 101"):
             await engine.cancel_all_orders()
 
         self.assertEqual(order.status, GridOrderStatus.PENDING)
         self.assertEqual(engine.get_pending_orders(), [order])
+        exchange.cancel_orders.assert_awaited_once_with(["101"], "BTC")
+        self.assertIn("101", engine._uncertain_cancel_order_ids)
 
     async def test_uncertain_cancel_bulk_history_finalizes_fill_once(self):
         filled = exchange_order(OrderStatus.FILLED, "0.00020", "0")
@@ -704,7 +733,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
     async def test_uncertain_submission_prevents_safe_cancel_all(self):
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
-            cancel_all_orders=AsyncMock(return_value=[]),
+            cancel_orders=AsyncMock(),
             get_open_orders=AsyncMock(return_value=[]),
             get_unresolved_submissions=MagicMock(
                 return_value=[{"client_order_id": "client-uncertain"}]
@@ -716,28 +745,26 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         order.exchange_data = {"submission_uncertain": True}
         engine._register_pending_order(order, order.order_id)
 
-        with self.assertRaisesRegex(RuntimeError, "submissions remain uncertain"):
+        with self.assertRaisesRegex(RuntimeError, "orders lack exact exchange IDs"):
             await engine.cancel_all_orders()
 
         self.assertEqual(engine.get_pending_orders(), [order])
         self.assertEqual(engine._expected_cancellations, set())
+        exchange.cancel_orders.assert_not_awaited()
 
     async def test_cancel_all_retries_when_resolved_order_lacks_cancel_proof(self):
         late_active = exchange_order(OrderStatus.OPEN, "0", "0.00020")
-        late_active.id = "late-original"
+        late_active.id = "201"
         late_active.client_id = "client-uncertain"
+        terminal = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
+        terminal.id = late_active.id
+        terminal.client_id = late_active.client_id
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
-            cancel_all_orders=AsyncMock(
+            cancel_orders=AsyncMock(
                 side_effect=[
-                    [],
-                    [
-                        SimpleNamespace(
-                            id="late-original",
-                            client_id="client-uncertain",
-                            status=OrderStatus.CANCELED,
-                        )
-                    ],
+                    CancelReport(requested={"201"}, acknowledged={"201"}, uncertain={"201"}),
+                    CancelReport(requested={"201"}, cancelled={"201"}, terminal_orders={"201": terminal}),
                 ]
             ),
             get_open_orders=AsyncMock(return_value=[]),
@@ -750,21 +777,25 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         order.exchange_data = {"submission_uncertain": True}
         engine._register_pending_order(order, order.order_id)
 
-        with self.assertRaisesRegex(RuntimeError, "lacks exact terminal proof"):
+        with self.assertRaisesRegex(RuntimeError, "selective cancellation incomplete: 201"):
             await engine.cancel_all_orders()
 
-        self.assertEqual(order.order_id, "late-original")
+        self.assertEqual(order.order_id, "201")
         self.assertFalse(order.exchange_data["submission_uncertain"])
         self.assertEqual(engine.get_pending_orders(), [order])
 
         exchange.resolve_unresolved_submissions.return_value = []
         self.assertEqual(await engine.cancel_all_orders(), 1)
-        self.assertEqual(exchange.cancel_all_orders.await_count, 2)
+        self.assertEqual(
+            [call.args for call in exchange.cancel_orders.await_args_list],
+            [(["201"], "BTC"), (["201"], "BTC")],
+        )
         self.assertEqual(engine.get_pending_orders(), [])
+        self.assertEqual(engine._uncertain_cancel_order_ids, set())
 
     async def test_cancel_all_resolves_acknowledged_id_before_cancelling(self):
         active = exchange_order(OrderStatus.OPEN, "0", "0.00020")
-        active.id = "exact-101"
+        active.id = "201"
         active.client_id = "client-101"
         cancelled = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
         cancelled.id = active.id
@@ -775,14 +806,19 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
             events.append("resolve")
             return [active] if events.count("resolve") == 1 else []
 
-        async def cancel_all(_symbol):
+        async def cancel_owned(order_ids, symbol):
             events.append("cancel")
             self.assertEqual(order.order_id, active.id)
-            return [cancelled]
+            self.assertEqual(order_ids, [active.id])
+            self.assertEqual(symbol, "BTC")
+            return CancelReport(
+                requested={active.id}, cancelled={active.id},
+                terminal_orders={active.id: cancelled},
+            )
 
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
-            cancel_all_orders=AsyncMock(side_effect=cancel_all),
+            cancel_orders=AsyncMock(side_effect=cancel_owned),
             get_open_orders=AsyncMock(return_value=[]),
             resolve_unresolved_submissions=AsyncMock(
                 side_effect=resolve_submissions
@@ -801,14 +837,15 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await engine.cancel_all_orders(), 1)
         self.assertEqual(events, ["resolve", "cancel"])
         self.assertEqual(engine.get_pending_orders(), [])
+        exchange.cancel_orders.assert_awaited_once_with(["201"], "BTC")
 
     async def test_cancel_all_accepts_late_terminal_submission_proof(self):
         terminal = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
-        terminal.id = "late-original"
+        terminal.id = "201"
         terminal.client_id = "client-uncertain"
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
-            cancel_all_orders=AsyncMock(return_value=[]),
+            cancel_orders=AsyncMock(),
             get_open_orders=AsyncMock(return_value=[]),
             resolve_unresolved_submissions=AsyncMock(return_value=[terminal]),
             get_unresolved_submissions=MagicMock(return_value=[]),
@@ -819,9 +856,12 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         order.exchange_data = {"submission_uncertain": True}
         engine._register_pending_order(order, order.order_id)
 
-        self.assertEqual(await engine.cancel_all_orders(), 1)
+        # Read-only reconciliation proves the old cancellation; this call sends
+        # no new cancellation and therefore reports zero newly cancelled IDs.
+        self.assertEqual(await engine.cancel_all_orders(), 0)
         self.assertEqual(order.status, GridOrderStatus.CANCELLED)
         self.assertEqual(engine.get_pending_orders(), [])
+        exchange.cancel_orders.assert_not_awaited()
 
     async def test_cancel_all_keeps_filled_uncertain_submission_fatal(self):
         filled = exchange_order(OrderStatus.FILLED, "0.00020", "0")
@@ -862,7 +902,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
             create_order=AsyncMock(return_value=uncertain),
-            cancel_all_orders=AsyncMock(return_value=[]),
+            cancel_orders=AsyncMock(),
             get_open_orders=AsyncMock(return_value=[]),
         )
         engine = grid_engine(exchange)
@@ -882,8 +922,9 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
             await engine.place_market_order(GridOrderSide.BUY, Decimal("0.00020"))
         exchange.create_order.assert_awaited_once()
 
-        with self.assertRaisesRegex(RuntimeError, "submissions remain uncertain"):
+        with self.assertRaisesRegex(RuntimeError, "orders lack exact exchange IDs: market:market-client"):
             await engine.cancel_all_orders()
+        exchange.cancel_orders.assert_not_awaited()
 
         engine.reconcile_market_open_reservations(Decimal("0.00020"))
         self.assertEqual(engine._reserved_market_open_amount, Decimal("0"))
@@ -2632,28 +2673,26 @@ class LighterAdapterHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, OrderStatus.PENDING)
         self.assertFalse(result.params["cancel_terminal"])
 
-    async def test_cancel_all_continues_after_failure_then_raises_summary(self):
+    async def test_account_wide_cancel_all_is_disabled_before_read_or_mutation(self):
         adapter = object.__new__(LighterAdapter)
         adapter.get_open_orders = AsyncMock(
             return_value=[
-                SimpleNamespace(id="first", symbol="BTC"),
-                SimpleNamespace(id="second", symbol="BTC"),
+                SimpleNamespace(id="101", symbol="BTC"),
+                SimpleNamespace(id="102", symbol="BTC"),
             ]
         )
-        adapter.cancel_order = AsyncMock(
-            side_effect=[RuntimeError("rejected"), nonterminal_cancel_ack()]
-        )
+        adapter.cancel_order = AsyncMock()
+        adapter.cancel_orders = AsyncMock()
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "Failed to cancel 1 order.*first: rejected",
+            "account-wide cancel_all_orders is disabled",
         ):
             await adapter.cancel_all_orders("BTC")
 
-        self.assertEqual(
-            [call.args for call in adapter.cancel_order.await_args_list],
-            [("first", "BTC"), ("second", "BTC")],
-        )
+        adapter.get_open_orders.assert_not_awaited()
+        adapter.cancel_order.assert_not_awaited()
+        adapter.cancel_orders.assert_not_awaited()
 
     async def test_order_history_delegates_to_rest(self):
         adapter = object.__new__(LighterAdapter)
