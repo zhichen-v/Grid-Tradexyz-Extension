@@ -1,6 +1,6 @@
 """Version bridge for the pagination-safe Lighter selective cancel patch."""
 
-PATCH_VERSION = "2026-08-21.3"
+PATCH_VERSION = "2026-09-24.1"
 
 
 def install_grid_selective_cancel_v3() -> None:

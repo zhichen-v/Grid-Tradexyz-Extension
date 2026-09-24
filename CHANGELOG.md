@@ -11,6 +11,12 @@
 
 ### Fixed
 
+#### 2026-09-24
+
+- Fixed Lighter selective batch cancellation after an explicit HTTP 400 / `21104 invalid nonce` rejection: refresh the SDK nonce under the existing per-key lock and allow one bounded, freshly signed retry of the same owned order IDs. Rejected batches no longer become permanently read-only "uncertain" cancellations; refresh failures remain visible, while 502/timeout outcomes still cannot trigger blind retries.
+- Persisted selective-cancellation batch responses and reconciliation counts in `ExchangeAdapter.log`, removed the misleading "accepted" message during uncertain-result verification, and updated shutdown route diagnostics to `2026-09-24.1`.
+- Added regression coverage for the BTC shutdown incident, including actual SDK rejection formats, nonce-refresh failure/timeout, repeated rejection, and transport loss during the recovery attempt. Order ownership, unknown submissions, partial-fill behavior, and stop-time position retention are unchanged.
+
 #### 2026-08-18
 
 - Hardened the Lighter grid lifecycle after the BTC incident: unexpected cancellations now use bounded backoff/circuit breaking, all REST traffic shares 429 throttling, direct order WebSocket subscriptions recover after reconnect, and opening maker orders are separated from GTT/reduce-only closing orders.

@@ -1,11 +1,17 @@
 import asyncio
 import importlib.util
+import logging
 import sys
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from lighter.exceptions import BadRequestException, ServiceException
+from lighter.models.result_code import ResultCode
+from lighter.nonce_manager import OptimisticNonceManager
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,9 +24,17 @@ def load(name, path):
     return module
 
 
+PACKAGE = "selective_cancel_extension_testpkg"
+package = ModuleType(PACKAGE)
+package.__path__ = []
+sys.modules[PACKAGE] = package
 lighter = load(
-    "lighter_cancel_test",
+    f"{PACKAGE}.lighter_selective_cancel",
     "core/adapters/exchanges/adapters/lighter_selective_cancel.py",
+)
+paginated = load(
+    f"{PACKAGE}.lighter_selective_cancel_v3",
+    "core/adapters/exchanges/adapters/lighter_selective_cancel_v3.py",
 )
 grid = load("grid_cancel_test", "core/services/grid/selective_cancel.py")
 
@@ -161,6 +175,198 @@ class LighterBatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_account_wide_cancel_is_disabled(self):
         with self.assertRaisesRegex(RuntimeError, "account-wide"):
             await lighter.adapter_cancel_all_disabled(SimpleNamespace(), "BTC")
+
+
+class LighterBatchNonceRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def rejection(*, raw_body=False, code=21104):
+        if raw_body:
+            return BadRequestException(
+                status=400, body='{"code":21104,"message":"invalid nonce"}',
+            )
+        return BadRequestException(
+            status=400, data=ResultCode(code=code, message="invalid nonce"),
+        )
+
+    def rest(self, outcomes, *, active=False):
+        rest = Rest([301, 302], active=active)
+        manager = OptimisticNonceManager(7, SimpleNamespace(), [2])
+        manager.nonce[2] = 9
+
+        async def fetch_nonce(key):
+            self.assertEqual(key, 2)
+            self.assertTrue(manager.lock(key).locked())
+            return 55
+
+        manager._fetch_nonce = AsyncMock(side_effect=fetch_nonce)
+        rest.signer_client.nonce_manager = manager
+        rest.signer_client.send_tx_batch = AsyncMock(side_effect=outcomes)
+        rest.signer_client.create_auth_token_with_expiry = lambda **_kwargs: ("test-token", None)
+        return rest, manager
+
+    @staticmethod
+    def accepted():
+        return SimpleNamespace(code=200, predicted_execution_time_ms=0)
+
+    async def cancel(self, module, rest):
+        with patch.object(lighter.asyncio, "sleep", new=AsyncMock()):
+            return await module.cancel_orders_batch(rest, "BTC", [301, 302])
+
+    async def test_sdk_nonce_rejection_refreshes_and_resigns_once_for_base_and_v3(self):
+        for module in (lighter, paginated):
+            for raw_body in (False, True):
+                with self.subTest(module=module.__name__, raw_body=raw_body):
+                    rest, manager = self.rest([
+                        self.rejection(raw_body=raw_body), self.accepted(),
+                    ])
+                    report = await self.cancel(module, rest)
+                    self.assertEqual(report.cancelled, {"301", "302"})
+                    self.assertEqual(report.acknowledged, {"301", "302"})
+                    self.assertEqual(report.rejected, {})
+                    self.assertEqual(rest._uncertain_cancellations, set())
+                    self.assertEqual(rest.signer_client.send_tx_batch.await_count, 2)
+                    manager._fetch_nonce.assert_awaited_once_with(2)
+                    signed = rest.signer_client.signed
+                    self.assertEqual([row["nonce"] for row in signed], [10, 11, 55, 56])
+                    self.assertEqual([row["order_index"] for row in signed], [301, 302, 301, 302])
+                    self.assertTrue(all(row["api_key_index"] == 2 for row in signed))
+                    self.assertFalse(rest.retry_on_429)
+
+    async def test_recurrent_nonce_rejection_is_bounded_and_not_read_only_on_outer_retry(self):
+        for module in (lighter, paginated):
+            with self.subTest(module=module.__name__):
+                rest, manager = self.rest([self.rejection(), self.rejection()])
+                report = await self.cancel(module, rest)
+                self.assertEqual(set(report.rejected), {"301", "302"})
+                self.assertEqual(report.uncertain, set())
+                self.assertEqual(rest._uncertain_cancellations, set())
+                self.assertEqual(rest.signer_client.send_tx_batch.await_count, 2)
+                self.assertEqual(manager._fetch_nonce.await_count, 2)
+                self.assertEqual(rest.open_reads, 0)
+
+                rest.signer_client.send_tx_batch.side_effect = None
+                rest.signer_client.send_tx_batch.return_value = self.accepted()
+                retry = await self.cancel(module, rest)
+                self.assertEqual(retry.cancelled, {"301", "302"})
+                self.assertEqual(rest.signer_client.send_tx_batch.await_count, 3)
+
+    async def test_failed_nonce_refresh_does_not_resend_or_mark_cancellation_uncertain(self):
+        for module in (lighter, paginated):
+            for error in (ConnectionError("nonce lookup unavailable"), asyncio.TimeoutError()):
+                with self.subTest(module=module.__name__, error=type(error).__name__):
+                    rest, manager = self.rest([self.rejection(), self.accepted()])
+                    manager._fetch_nonce.side_effect = error
+                    report = await self.cancel(module, rest)
+                    self.assertEqual(set(report.rejected), {"301", "302"})
+                    self.assertEqual(report.uncertain, set())
+                    self.assertEqual(rest._uncertain_cancellations, set())
+                    self.assertEqual(rest.signer_client.send_tx_batch.await_count, 1)
+                    self.assertEqual(len(rest.signer_client.signed), 2)
+                    self.assertFalse(manager.lock(2).locked())
+
+    async def test_nonce_refresh_timeout_is_definitive_without_resend(self):
+        for module in (lighter, paginated):
+            with self.subTest(module=module.__name__):
+                rest, manager = self.rest([self.rejection(), self.accepted()])
+
+                async def never_returns(_key):
+                    await asyncio.Event().wait()
+
+                manager._fetch_nonce.side_effect = never_returns
+                with patch.object(lighter, "_send_timeout", return_value=0.01):
+                    report = await self.cancel(module, rest)
+                self.assertEqual(set(report.rejected), {"301", "302"})
+                self.assertEqual(report.uncertain, set())
+                self.assertEqual(rest._uncertain_cancellations, set())
+                self.assertEqual(rest.signer_client.send_tx_batch.await_count, 1)
+                self.assertFalse(manager.lock(2).locked())
+
+    async def test_presend_timeout_returns_reserved_nonce_before_releasing_key_lock(self):
+        for module in (lighter, paginated):
+            with self.subTest(module=module.__name__):
+                rest, manager = self.rest([self.accepted()])
+                next_nonce = manager.async_next_nonce
+                rollback = manager.acknowledge_failure
+
+                async def reserve_then_wait(key):
+                    if manager.nonce[key] == 10:
+                        await asyncio.Event().wait()
+                    return await next_nonce(key)
+
+                def rollback_locked(key):
+                    self.assertTrue(manager.lock(key).locked())
+                    rollback(key)
+
+                manager.async_next_nonce = AsyncMock(side_effect=reserve_then_wait)
+                manager.acknowledge_failure = MagicMock(side_effect=rollback_locked)
+                with patch.object(lighter, "_send_timeout", return_value=0.01):
+                    report = await self.cancel(module, rest)
+                self.assertEqual(set(report.rejected), {"301", "302"})
+                self.assertEqual(report.uncertain, set())
+                self.assertEqual(rest._uncertain_cancellations, set())
+                rest.signer_client.send_tx_batch.assert_not_awaited()
+                manager.acknowledge_failure.assert_called_once_with(2)
+                self.assertEqual(manager.nonce[2], 9)
+                self.assertFalse(manager.lock(2).locked())
+
+    async def test_502_or_timeout_remains_uncertain_without_refresh_or_resend(self):
+        for module in (lighter, paginated):
+            for error in (ServiceException(status=502, body="Bad Gateway"), asyncio.TimeoutError()):
+                with self.subTest(module=module.__name__, error=type(error).__name__):
+                    rest, manager = self.rest([error], active=True)
+                    first = await self.cancel(module, rest)
+                    second = await self.cancel(module, rest)
+                    self.assertEqual(first.uncertain, {"301", "302"})
+                    self.assertEqual(second.uncertain, {"301", "302"})
+                    self.assertEqual(first.rejected, {})
+                    self.assertEqual(rest.signer_client.send_tx_batch.await_count, 1)
+                    manager._fetch_nonce.assert_not_awaited()
+                    self.assertEqual(manager.nonce[2], 11)
+
+    async def test_502_after_nonce_recovery_retains_second_attempt_nonces_and_markers(self):
+        for module in (lighter, paginated):
+            with self.subTest(module=module.__name__):
+                rest, manager = self.rest([
+                    self.rejection(), ServiceException(status=502, body="Bad Gateway"),
+                ], active=True)
+                report = await self.cancel(module, rest)
+                self.assertEqual(report.uncertain, {"301", "302"})
+                self.assertEqual(report.rejected, {})
+                await self.cancel(module, rest)
+                self.assertEqual(rest.signer_client.send_tx_batch.await_count, 2)
+                manager._fetch_nonce.assert_awaited_once_with(2)
+                self.assertEqual(manager.nonce[2], 56)
+                self.assertEqual(rest._uncertain_cancellations, {("BTC", "301"), ("BTC", "302")})
+
+    async def test_unrelated_or_unstructured_error_does_not_trigger_nonce_resend(self):
+        for error in (
+            self.rejection(code=21105),
+            RuntimeError("HTTP 400 code=21104 invalid nonce"),
+            ServiceException(status=502, data=ResultCode(code=21104, message="invalid nonce")),
+        ):
+            with self.subTest(error=str(error)):
+                rest, manager = self.rest([error], active=True)
+                report = await self.cancel(lighter, rest)
+                self.assertEqual(report.uncertain, {"301", "302"})
+                self.assertEqual(rest.signer_client.send_tx_batch.await_count, 1)
+                manager._fetch_nonce.assert_not_awaited()
+
+    def test_batch_diagnostics_reach_rest_file_handler(self):
+        parent = logging.getLogger("core.adapters.exchanges.adapters.lighter_rest")
+        with tempfile.TemporaryDirectory(dir=".", prefix="cancel-log-test-") as directory:
+            path = Path(directory) / "adapter.log"
+            handler = logging.FileHandler(path, encoding="utf-8")
+            parent.addHandler(handler)
+            try:
+                for module in (lighter, paginated):
+                    module.logger.warning("cancel regression %s", module.PATCH_VERSION)
+                handler.flush()
+                messages = path.read_text(encoding="utf-8")
+                for module in (lighter, paginated):
+                    self.assertIn(f"cancel regression {module.PATCH_VERSION}", messages)
+            finally:
+                parent.removeHandler(handler)
+                handler.close()
 
 
 class Order:

@@ -15,9 +15,10 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import lighter_selective_cancel as base
 
-logger = logging.getLogger(__name__)
+# Inherit the REST adapter's file handler; these diagnostics must survive exit.
+logger = logging.getLogger("core.adapters.exchanges.adapters.lighter_rest.selective_cancel_v3")
 
-PATCH_VERSION = "2026-08-21.3"
+PATCH_VERSION = "2026-09-24.1"
 HISTORY_PAGE_LIMIT = 100
 
 
@@ -250,7 +251,7 @@ async def _reconcile_paginated(
 
     if initial_delay:
         logger.warning(
-            "Lighter selective cancel accepted; waiting %.2fs before paginated verification",
+            "Lighter selective cancel reconciling; waiting %.2fs before paginated verification",
             initial_delay,
         )
         await asyncio.sleep(initial_delay)

@@ -9,12 +9,14 @@ bounded bulk snapshots.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
-logger = logging.getLogger(__name__)
+# Inherit the REST adapter's file handler as well as console diagnostics.
+logger = logging.getLogger("core.adapters.exchanges.adapters.lighter_rest.selective_cancel")
 
 PATCH_VERSION = "2026-08-21.2"
 MAX_BATCH = 50
@@ -144,6 +146,27 @@ def _wait_seconds(rest: Any, predicted_ms: int) -> float:
     return min(max(0.3, predicted_ms / 1000 + 0.2), configured_max)
 
 
+def _is_invalid_nonce_rejection(exc: Exception) -> bool:
+    """Recognize the SDK's explicit rejection, never a transport-error substring."""
+    try:
+        from lighter.exceptions import BadRequestException
+    except ImportError:
+        return False
+    if not isinstance(exc, BadRequestException) or exc.status != 400:
+        return False
+    data = exc.data
+    if data is None:
+        try:
+            data = json.loads(exc.body or "null")
+        except (TypeError, ValueError):
+            return False
+    if isinstance(data, dict):
+        code, message = data.get("code"), data.get("message")
+    else:
+        code, message = getattr(data, "code", None), getattr(data, "message", None)
+    return code == 21104 and message == "invalid nonce"
+
+
 async def _send_chunk(rest: Any, market: int, indexes: Sequence[int]) -> Any:
     signer = getattr(rest, "signer_client", None)
     manager = getattr(signer, "nonce_manager", None)
@@ -158,59 +181,93 @@ async def _send_chunk(rest: Any, market: int, indexes: Sequence[int]) -> Any:
 
     async def request() -> Any:
         async with manager.lock(key):
-            tx_types: List[int] = []
-            tx_infos: List[str] = []
-            try:
-                for index in indexes:
-                    _, nonce = await manager.async_next_nonce(key)
-                    state["reserved"] += 1
-                    tx_type, tx_info, _, error = signer.sign_cancel_order(
-                        market_index=market,
-                        order_index=index,
-                        nonce=nonce,
-                        api_key_index=key,
-                    )
-                    if error or tx_type is None or not tx_info:
-                        raise BatchSubmissionError(
-                            error or f"cannot sign cancel {index}",
-                            ambiguous=False,
+            # send_tx_batch bypasses the SDK's single-transaction nonce recovery.
+            # Only a proven nonce rejection permits one freshly signed retry.
+            for attempt in range(2):
+                state.update(reserved=0, send_started=False)
+                tx_types: List[int] = []
+                tx_infos: List[str] = []
+                try:
+                    for index in indexes:
+                        _, nonce = await manager.async_next_nonce(key)
+                        state["reserved"] += 1
+                        tx_type, tx_info, _, error = signer.sign_cancel_order(
+                            market_index=market,
+                            order_index=index,
+                            nonce=nonce,
+                            api_key_index=key,
                         )
-                    tx_types.append(tx_type)
-                    tx_infos.append(tx_info)
+                        if error or tx_type is None or not tx_info:
+                            raise BatchSubmissionError(
+                                error or f"cannot sign cancel {index}",
+                                ambiguous=False,
+                            )
+                        tx_types.append(tx_type)
+                        tx_infos.append(tx_info)
 
-                state["send_started"] = True
-                response = await signer.send_tx_batch(
-                    tx_types=tx_types,
-                    tx_infos=tx_infos,
-                )
-                code = getattr(response, "code", None)
-                if code != 200:
-                    _rollback(manager, key, state["reserved"])
-                    state["reserved"] = 0
-                    raise BatchSubmissionError(
-                        f"selective batch cancellation rejected (code={code})",
-                        ambiguous=False,
-                        rate_limited=str(code) == "429",
+                    state["send_started"] = True
+                    response = await signer.send_tx_batch(
+                        tx_types=tx_types,
+                        tx_infos=tx_infos,
                     )
-                return response
+                    code = getattr(response, "code", None)
+                    if code != 200:
+                        _rollback(manager, key, state["reserved"])
+                        state["reserved"] = 0
+                        raise BatchSubmissionError(
+                            f"selective batch cancellation rejected (code={code})",
+                            ambiguous=False,
+                            rate_limited=str(code) == "429",
+                        )
+                    return response
 
-            except BatchSubmissionError:
-                if not state["send_started"] and state["reserved"]:
-                    _rollback(manager, key, state["reserved"])
-                    state["reserved"] = 0
-                raise
-            except Exception as exc:
-                rate_limited = bool(rest._is_rate_limited(exc))
-                if (
-                    not state["send_started"] or rate_limited
-                ) and state["reserved"]:
-                    _rollback(manager, key, state["reserved"])
-                    state["reserved"] = 0
-                raise BatchSubmissionError(
-                    str(exc),
-                    ambiguous=state["send_started"] and not rate_limited,
-                    rate_limited=rate_limited,
-                ) from exc
+                except BatchSubmissionError:
+                    if not state["send_started"] and state["reserved"]:
+                        _rollback(manager, key, state["reserved"])
+                        state["reserved"] = 0
+                    raise
+                except asyncio.CancelledError:
+                    # Roll back pre-send reservations before releasing the key
+                    # lock, not later in wait_for's timeout handler.
+                    if not state["send_started"] and state["reserved"]:
+                        _rollback(manager, key, state["reserved"])
+                        state["reserved"] = 0
+                    raise
+                except Exception as exc:
+                    if state["send_started"] and _is_invalid_nonce_rejection(exc):
+                        # This send was rejected. A slow/failed refresh must not
+                        # reclassify it as uncertain or roll back refreshed state.
+                        state.update(reserved=0, send_started=False)
+                        logger.warning(
+                            "Lighter selective cancel explicitly rejected invalid nonce; "
+                            "refreshing key nonce (attempt %d/2)", attempt + 1,
+                        )
+                        try:
+                            await manager.async_hard_refresh_nonce(key)
+                        except Exception as refresh_exc:
+                            raise BatchSubmissionError(
+                                "selective batch cancellation rejected (invalid nonce); "
+                                f"nonce refresh failed: {refresh_exc}",
+                                ambiguous=False,
+                            ) from refresh_exc
+                        if attempt == 0:
+                            continue
+                        raise BatchSubmissionError(
+                            "selective batch cancellation rejected (invalid nonce) "
+                            "after one nonce-refresh retry",
+                            ambiguous=False,
+                        ) from exc
+                    rate_limited = bool(rest._is_rate_limited(exc))
+                    if (
+                        not state["send_started"] or rate_limited
+                    ) and state["reserved"]:
+                        _rollback(manager, key, state["reserved"])
+                        state["reserved"] = 0
+                    raise BatchSubmissionError(
+                        str(exc),
+                        ambiguous=state["send_started"] and not rate_limited,
+                        rate_limited=rate_limited,
+                    ) from exc
 
     try:
         return await asyncio.wait_for(
@@ -222,12 +279,8 @@ async def _send_chunk(rest: Any, market: int, indexes: Sequence[int]) -> Any:
             timeout=_send_timeout(rest),
         )
     except asyncio.TimeoutError as exc:
-        # Before send_tx_batch starts, reserved optimistic nonces are safe to
-        # return. Once the send starts, the outcome is intentionally treated
-        # as ambiguous and the nonces are retained.
-        if not state["send_started"] and state["reserved"]:
-            _rollback(manager, key, state["reserved"])
-            state["reserved"] = 0
+        # Pre-send reservations were returned while holding the key lock.
+        # Once a send starts, unknown outcomes retain their nonces.
         raise BatchSubmissionError(
             f"selective batch cancellation timed out after {_send_timeout(rest):.1f}s",
             ambiguous=bool(state["send_started"]),
@@ -278,7 +331,7 @@ async def _reconcile(
 
     if initial_delay:
         logger.warning(
-            "Lighter selective cancel %s accepted; waiting %.2fs before terminal verification",
+            "Lighter selective cancel %s reconciling; waiting %.2fs before terminal verification",
             group_label,
             initial_delay,
         )
