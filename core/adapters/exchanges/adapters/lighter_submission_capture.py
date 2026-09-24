@@ -103,21 +103,23 @@ class SubmissionCapture:
     def record(self, event, tx_hash, **fields):
         try:
             self.journal.append(event, tx_hash, **fields)
+            return True
         except Exception as exc:
             # A disk failure AFTER send cannot change the mutation outcome.
             # The fsynced pre_send record remains available after restart.
             logger.error("Submission evidence append failed: tx_hash=%s error=%s",
                          tx_hash, type(exc).__name__)
+            return False
 
     def observe_order(self, client_id, order_id, status=None, source="exact_client_lookup"):
         record = self.pending.get(str(client_id))
         if record is None or order_id in (None, ""):
             return
-        self.record("order_observed", record["tx_hash"],
-                    api_key_index=record["api_key_index"],
-                    client_order_id=str(client_id), order_id=str(order_id),
-                    order_status=getattr(status, "value", status), source=source)
-        self.pending.pop(str(client_id), None)
+        if self.record("order_observed", record["tx_hash"],
+                       api_key_index=record["api_key_index"],
+                       client_order_id=str(client_id), order_id=str(order_id),
+                       order_status=getattr(status, "value", status), source=source):
+            self.pending.pop(str(client_id), None)
 
     async def probe_transaction(self, client_id, rest):
         record = self.pending.get(str(client_id))

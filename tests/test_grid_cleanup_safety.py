@@ -454,7 +454,13 @@ class EngineShutdownTests(unittest.IsolatedAsyncioTestCase):
             get_open_orders=AsyncMock(return_value=[]),
         )
         engine = self.make_engine(exchange)
-        order = MagicMock()
+        order = MagicMock(
+            order_id="old-1",
+            grid_id=1,
+            side=GridOrderSide.BUY,
+            price=Decimal("10"),
+            exchange_data={},
+        )
         engine._pending_orders["old-1"] = order
 
         count = await engine.cancel_all_orders()

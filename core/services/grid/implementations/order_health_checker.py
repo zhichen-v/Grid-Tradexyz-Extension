@@ -1191,7 +1191,7 @@ class OrderHealthChecker:
         return Decimal(str(getattr(state, "current_position", Decimal("0"))))
 
     def _get_open_take_profit_amount(self, exchange_orders: List[OrderData]) -> Decimal:
-        """Return the total open take-profit amount implied by exchange orders."""
+        """Return physical open TP remainders, not their original logical amounts."""
         total = Decimal("0")
         tracked_tp_keys = self._get_tracked_take_profit_price_keys()
         if not tracked_tp_keys:
@@ -1201,7 +1201,7 @@ class OrderHealthChecker:
             key = (self._normalize_price_key(order.price), order.side.value.lower())
             if key not in tracked_tp_keys:
                 continue
-            total += Decimal(str(order.amount or 0))
+            total += self._get_exchange_remaining_amount(order)
         return total
 
     def _get_expected_take_profit_amount(self, actual_position: Decimal) -> Decimal:
@@ -2094,6 +2094,17 @@ class OrderHealthChecker:
         except Exception:
             return Decimal("0")
 
+    def _get_exchange_remaining_amount(self, order: OrderData) -> Decimal:
+        """Read an exchange order's physical remainder, falling back to amount - filled."""
+        amount = max(self._decimal_or_zero(getattr(order, "amount", None)), Decimal("0"))
+        raw_remaining = getattr(order, "remaining", None)
+        if raw_remaining is None:
+            filled = max(self._decimal_or_zero(getattr(order, "filled", None)), Decimal("0"))
+            remaining = max(amount - filled, Decimal("0"))
+        else:
+            remaining = max(self._decimal_or_zero(raw_remaining), Decimal("0"))
+        return min(remaining, amount) if amount > 0 else remaining
+
     def _calculate_expected_position(self, exchange_orders: List[OrderData]) -> Decimal:
         """Estimate exposure from open TP remainders and partial base fills."""
         buy_remaining = Decimal("0")
@@ -2108,14 +2119,7 @@ class OrderHealthChecker:
             if amount > 0:
                 filled = min(filled, amount)
 
-            raw_remaining = getattr(order, "remaining", None)
-            remaining = (
-                max(self._decimal_or_zero(raw_remaining), Decimal("0"))
-                if raw_remaining is not None
-                else max(amount - filled, Decimal("0"))
-            )
-            if amount > 0:
-                remaining = min(remaining, amount)
+            remaining = self._get_exchange_remaining_amount(order)
 
             if side == "buy":
                 buy_remaining += remaining

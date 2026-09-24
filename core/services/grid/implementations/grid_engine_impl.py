@@ -170,6 +170,17 @@ class GridEngineImpl(IGridEngine):
             )
             return None
 
+        retry_after = self._restore_circuit_retry_after(order)
+        if retry_after > 0:
+            # Every limit-order path, including health gap repair and batch retries,
+            # must honor the same per-level restoration circuit.
+            self.logger.warning(
+                "Skip order placement while restoration circuit is open: "
+                f"grid_id={order.grid_id}, side={order.side.value}, "
+                f"price={order.price}, retry_after={retry_after:.1f}s"
+            )
+            return None
+
         position_gate = getattr(
             getattr(self, "coordinator", None),
             "can_place_order_within_max_position",
@@ -437,6 +448,16 @@ class GridEngineImpl(IGridEngine):
             return []
         if self._placements_paused and not allow_while_paused:
             self.logger.warning("Skip batch placement while reset gate is active")
+            return []
+
+        ready_orders = [order for order in orders if self._restore_circuit_retry_after(order) <= 0]
+        if len(ready_orders) != len(orders):
+            self.logger.info(
+                "Defer batch orders while restoration circuits are open: "
+                f"count={len(orders) - len(ready_orders)}"
+            )
+        orders = ready_orders
+        if not orders:
             return []
 
         total_orders = len(orders)
@@ -2458,7 +2479,13 @@ class GridEngineImpl(IGridEngine):
 
     def _restore_key(self, grid_order: GridOrder) -> str:
         """Return the stable identity shared by replacement orders for one level."""
-        return f"{grid_order.grid_id}:{grid_order.side.value}:{grid_order.price}"
+        price = format(grid_order.price.normalize(), "f")
+        return f"{grid_order.grid_id}:{grid_order.side.value}:{price}"
+
+    def _restore_circuit_retry_after(self, grid_order: GridOrder) -> float:
+        """Return the cooldown shared by restoration and every placement path."""
+        state = getattr(self, "_restore_state", {}).get(self._restore_key(grid_order), {})
+        return max(state.get("circuit_until", 0.0) - time.monotonic(), 0.0)
 
     def _clear_restore_state(self, grid_order: GridOrder) -> None:
         """Clear retry history once the logical order reaches a terminal success."""

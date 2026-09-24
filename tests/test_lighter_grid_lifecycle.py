@@ -273,6 +273,42 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order.filled_amount, Decimal("0.00020"))
         self.assertEqual(engine.get_pending_orders(), [])
 
+    async def test_partial_take_profit_waits_for_full_size_before_one_reverse_buy(self):
+        engine = grid_engine()
+        order = grid_order()
+        order.side = GridOrderSide.SELL
+        order.amount = Decimal("0.00100")
+        order.price = Decimal("84350")
+        engine._register_pending_order(order, order.order_id, "client-101")
+        strategy = GridStrategyImpl()
+        reversals = []
+
+        async def on_filled(filled_order):
+            side, price, _ = strategy.calculate_reverse_order(filled_order, Decimal("50"))
+            reversals.append((side, price, filled_order.filled_amount))
+
+        engine.subscribe_order_updates(on_filled)
+        partial = exchange_order(OrderStatus.OPEN, "0.00089", "0.00011")
+        partial.side = OrderSide.SELL
+        partial.amount = order.amount
+        partial.price = order.price
+        partial.average = order.price
+        await engine._handle_exchange_order_object(partial)
+        await engine._handle_exchange_order_object(partial)
+        self.assertEqual(reversals, [])
+        self.assertTrue(order.is_pending())
+
+        final = exchange_order(OrderStatus.FILLED, "0.00100", "0")
+        final.side = OrderSide.SELL
+        final.amount = order.amount
+        final.price = order.price
+        final.average = order.price
+        await engine._handle_exchange_order_object(final)
+        await engine._handle_exchange_order_object(final)
+        self.assertEqual(reversals, [
+            (GridOrderSide.BUY, Decimal("84300"), Decimal("0.00100")),
+        ])
+
     async def test_rest_sync_keeps_partial_open_until_final_status(self):
         final = exchange_order(OrderStatus.FILLED, "0.00020", "0")
         exchange = SimpleNamespace(
@@ -1310,6 +1346,106 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LighterCancellationRestoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_health_gap_repair_obeys_circuit_until_expiry(self):
+        from core.services.grid.implementations.order_health_checker import OrderHealthChecker
+
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            create_order=AsyncMock(
+                return_value=SimpleNamespace(id="replacement", client_id=None, raw_data={})
+            ),
+        )
+        engine = grid_engine(exchange)
+        original = grid_order()
+        original.price = Decimal("84350.0")
+        restore_state = {"attempts": 3.0, "last_attempt": 990.0, "circuit_until": 1300.0}
+        engine._restore_state[engine._restore_key(original)] = restore_state
+        checker = OrderHealthChecker.__new__(OrderHealthChecker)
+        checker.engine = engine
+        checker.logger = MagicMock()
+
+        for source_id in (original.order_id, ""):
+            with self.subTest(source_id=source_id):
+                # Tracked and inferred repairs can format the same price differently.
+                repair = grid_order()
+                repair.order_id = source_id
+                repair.price = Decimal("84350")
+                with patch(
+                    "core.services.grid.implementations.grid_engine_impl.time.monotonic",
+                    return_value=1093.0,
+                ):
+                    self.assertEqual(await checker._place_missing_orders([repair]), 0)
+                exchange.create_order.assert_not_awaited()
+                self.assertEqual(restore_state["circuit_until"], 1300.0)
+
+        with patch(
+            "core.services.grid.implementations.grid_engine_impl.time.monotonic",
+            return_value=1300.0,
+        ):
+            self.assertEqual(await checker._place_missing_orders([repair]), 1)
+        exchange.create_order.assert_awaited_once()
+
+    async def test_health_batch_gap_repair_cannot_retry_through_circuit(self):
+        from core.services.grid.implementations.order_health_checker import OrderHealthChecker
+
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            create_order=AsyncMock(
+                return_value=SimpleNamespace(id="other-level", client_id=None, raw_data={})
+            ),
+        )
+        engine = grid_engine(exchange)
+        blocked = grid_order()
+        allowed = grid_order()
+        allowed.grid_id += 1
+        allowed.price += Decimal("100")
+        engine._restore_state[engine._restore_key(blocked)] = {
+            "attempts": 3.0, "last_attempt": 990.0, "circuit_until": 1300.0,
+        }
+        engine._sync_order_status_after_batch = AsyncMock()
+        checker = OrderHealthChecker.__new__(OrderHealthChecker)
+        checker.engine = engine
+        checker.logger = MagicMock()
+
+        with patch(
+            "core.services.grid.implementations.grid_engine_impl.time.monotonic",
+            return_value=1093.0,
+        ), patch(
+            "core.services.grid.implementations.grid_engine_impl.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep_mock:
+            self.assertEqual(await checker._place_missing_orders([blocked, allowed]), 1)
+            self.assertEqual(await engine.place_batch_orders([blocked]), [])
+
+        exchange.create_order.assert_awaited_once()
+        self.assertEqual(exchange.create_order.await_args.kwargs["price"], allowed.price)
+        self.assertEqual(engine.get_pending_orders(), [allowed])
+        sleep_mock.assert_not_awaited()
+        engine._sync_order_status_after_batch.assert_awaited_once()
+
+    async def test_circuit_is_rechecked_after_waiting_for_placement_lock(self):
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            create_order=AsyncMock(),
+        )
+        engine = grid_engine(exchange)
+        engine.config.max_position = Decimal("0.01")
+        order = grid_order()
+        lock = engine._get_placement_lock()
+        await lock.acquire()
+        placement = asyncio.create_task(engine.place_order(order))
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(placement.done())
+            engine._restore_state[engine._restore_key(order)] = {
+                "circuit_until": asyncio.get_running_loop().time() + 300,
+            }
+        finally:
+            lock.release()
+
+        self.assertIsNone(await placement)
+        exchange.create_order.assert_not_awaited()
+
     async def test_unexpected_cancel_restore_is_bounded_and_opens_circuit(self):
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),

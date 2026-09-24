@@ -162,6 +162,36 @@ class LighterAdapter(ExchangeAdapter):
 
         self.logger.info("Lighter适配器初始化完成")
 
+    def _capture_submission_order_update(self, order: OrderData) -> None:
+        capture = getattr(self._rest, "_submission_capture", None)
+        if capture is None:
+            return
+        intent = capture.pending.get(str(order.client_id))
+        raw = order.raw_data or {}
+        order_index = raw.get("order_index")
+        client_index = raw.get("client_order_index")
+        # Only account_all_orders' exact identifiers resolve submission evidence;
+        # trade events, placeholders and price/quantity matches cannot do so.
+        if (intent is None or type(order_index) is not int
+                or not 1 <= order_index < (1 << 60)
+                or type(client_index) is not int
+                or str(order_index) != str(order.id)
+                or str(client_index) != str(order.client_id)
+                or type(raw.get("market_index")) is not int
+                or raw["market_index"] != intent["market_index"]
+                or order.symbol != intent.get("symbol")
+                or raw.get("owner_account_index", self._rest.account_index) != self._rest.account_index):
+            return
+        capture.observe_order(order.client_id, order.id, order.status, source="websocket")
+
+    def _ensure_submission_observer(self) -> None:
+        # Register only for an actual order subscription; otherwise an internal
+        # observer would make public-only connections require an account stream.
+        callbacks = self._websocket._order_callbacks
+        if (getattr(self._rest, "_submission_capture", None) is not None
+                and self._capture_submission_order_update not in callbacks):
+            callbacks.insert(0, self._capture_submission_order_update)
+
     def _convert_config_to_dict(self, config: ExchangeConfig) -> Dict[str, Any]:
         """
         将ExchangeConfig转换为字典
@@ -1075,6 +1105,7 @@ class LighterAdapter(ExchangeAdapter):
         """
         # Lighter的用户数据流包括订单和持仓更新
         # 我们订阅订单更新流，这是网格系统最关键的需求
+        self._ensure_submission_observer()
         await self._websocket.subscribe_orders(callback)
         self.logger.info("✅ 已订阅Lighter用户数据流（订单更新）")
 
@@ -1121,6 +1152,7 @@ class LighterAdapter(ExchangeAdapter):
         """
         if callback:
             self._order_callbacks.append(callback)
+        self._ensure_submission_observer()
         await self._websocket.subscribe_orders(callback)
 
     async def subscribe_positions(self, callback: Optional[Callable] = None):

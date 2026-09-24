@@ -13,8 +13,11 @@ from lighter.nonce_manager import OptimisticNonceManager
 from lighter.signer_client import SignerClient
 
 from core.adapters.exchanges.adapters.lighter_submission_capture import SubmissionCapture
+from core.adapters.exchanges.adapters.lighter import LighterAdapter
 from core.adapters.exchanges.adapters.lighter_rest import LighterRest
+from core.adapters.exchanges.adapters.lighter_websocket import LighterWebSocket
 from core.adapters.exchanges.exceptions import OrderSubmissionNotSentError
+from core.adapters.exchanges.models import OrderStatus
 from core.lighter_submission_journal import SubmissionJournal, read_pending
 
 
@@ -55,6 +58,175 @@ class LighterSubmissionCaptureTests(unittest.IsolatedAsyncioTestCase):
         if not self.journal.path.exists():
             return []
         return [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+
+    async def _adapter_fixture(self, subscribe=True):
+        rest, _ = self._rest_fixture()
+        rest.base_url = "https://api.rh.lighter.xyz"
+        rest.ws_url = "wss://api.rh.lighter.xyz/stream"
+        rest.account_index = 7
+        websocket = object.__new__(LighterWebSocket)
+        websocket._order_callbacks = []
+        websocket._order_fill_callbacks = []
+        websocket._markets_cache = {1: {"symbol": "BTC"}, 2: {"symbol": "ETH"}}
+        websocket._subscribed_markets = []
+        websocket._subscribed_accounts = []
+        websocket._subscribed_market_stats = []
+        websocket._subscribed_trades = []
+        websocket._subscribe_account_all_orders = AsyncMock()
+        websocket._ensure_direct_ws_running = AsyncMock()
+        websocket.subscribe_positions = AsyncMock()
+        adapter = object.__new__(LighterAdapter)
+        adapter.logger = Mock()
+        config = SimpleNamespace(extra_params={"load_credentials_from_file": False})
+        with (
+            patch("core.adapters.exchanges.adapters.lighter.ExchangeAdapter.__init__", return_value=None),
+            patch.object(LighterAdapter, "_convert_config_to_dict", return_value={}),
+            patch.object(LighterAdapter, "_get_symbol_cache_service", return_value=None),
+            patch("core.adapters.exchanges.adapters.lighter.LighterRest", return_value=rest),
+            patch("core.adapters.exchanges.adapters.lighter.LighterWebSocket", return_value=websocket),
+            patch("core.adapters.exchanges.adapters.lighter.create_subscription_manager"),
+        ):
+            adapter.__init__(config)
+        if subscribe:
+            await adapter.subscribe_orders()
+        return adapter, websocket
+
+    def _ws_order(self, **overrides):
+        return {
+            "order_index": 844424837519875, "client_order_index": 1001,
+            "market_index": 1, "owner_account_index": 7,
+            "initial_base_amount": "0.00100", "filled_base_amount": "0.00100",
+            "remaining_base_amount": "0", "filled_quote_amount": "84.15",
+            "price": "84150", "is_ask": False, "status": "filled", "type": "limit",
+            **overrides,
+        }
+
+    async def _ws_update(self, websocket, **overrides):
+        await websocket._handle_direct_ws_message({
+            "type": "update/account_all_orders", "channel": "account_all_orders:7",
+            "orders": {"1": [self._ws_order(**overrides)]},
+        })
+
+    async def test_fast_ws_fill_records_exact_observation_before_strategy_callback(self):
+        await self._create()
+        adapter, websocket = await self._adapter_fixture()
+
+        def strategy_callback(order):
+            self.assertEqual(read_pending(self.journal.path), [])
+            self.assertEqual(order.status, OrderStatus.FILLED)
+
+        callback = Mock(side_effect=strategy_callback)
+        websocket._order_callbacks.append(callback)
+        await self._ws_update(websocket)
+        await self._ws_update(websocket)
+        adapter._rest._clear_resolved_submissions_from_orders([
+            websocket._parse_order_from_direct_ws(self._ws_order()),
+        ])
+
+        observations = [row for row in self._events() if row["event"] == "order_observed"]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["order_id"], "844424837519875")
+        self.assertEqual(observations[0]["order_status"], "filled")
+        self.assertEqual(observations[0]["source"], "websocket")
+        self.assertEqual(callback.call_count, 2)
+        self.signer.tx_api.send_tx.assert_awaited_once()
+
+    async def test_partial_ws_observation_does_not_change_order_or_emit_full_fill(self):
+        await self._create()
+        _, websocket = await self._adapter_fixture()
+        callback = Mock()
+        filled_callback = Mock()
+        websocket._order_callbacks.append(callback)
+        websocket._order_fill_callbacks.append(filled_callback)
+
+        await self._ws_update(websocket, status="open", filled_base_amount="0.00089",
+                              remaining_base_amount="0.00011")
+
+        order = callback.call_args.args[0]
+        self.assertEqual(order.status, OrderStatus.OPEN)
+        self.assertEqual(order.remaining, Decimal("0.00011"))
+        filled_callback.assert_not_called()
+        self.assertEqual(read_pending(self.journal.path), [])
+        self.signer.tx_api.send_tx.assert_awaited_once()
+
+    async def test_ws_observation_requires_exact_client_market_account_and_order_ids(self):
+        await self._create()
+        _, websocket = await self._adapter_fixture()
+        for overrides in (
+            {"client_order_index": None}, {"client_order_index": 2002},
+            {"market_index": 2}, {"owner_account_index": 8},
+            {"order_index": None}, {"order_index": "tx-hash-not-an-index"},
+        ):
+            with self.subTest(overrides=overrides):
+                await self._ws_update(websocket, **overrides)
+                self.assertEqual(len(read_pending(self.journal.path)), 1)
+        self.assertEqual([row["event"] for row in self._events()], ["pre_send", "acknowledged"])
+
+    async def test_ws_journal_failure_does_not_block_fill_and_can_retry_observation(self):
+        await self._create()
+        _, websocket = await self._adapter_fixture()
+        callback = Mock()
+        websocket._order_fill_callbacks.append(callback)
+        with patch.object(self.journal, "append", side_effect=OSError("disk fixture")):
+            await self._ws_update(websocket)
+        callback.assert_called_once()
+        self.assertIn("1001", self.capture.pending)
+        self.assertEqual(len(read_pending(self.journal.path)), 1)
+
+        await self._ws_update(websocket)
+        self.assertEqual(read_pending(self.journal.path), [])
+        self.assertEqual(len([row for row in self._events() if row["event"] == "order_observed"]), 1)
+        self.signer.tx_api.send_tx.assert_awaited_once()
+
+    async def test_ws_observation_before_http_ack_does_not_reopen_pending(self):
+        _, websocket = await self._adapter_fixture()
+
+        async def send(**kwargs):
+            await self._ws_update(websocket)
+            return self.response
+
+        self.signer.tx_api.send_tx.side_effect = send
+        await self._create()
+
+        self.assertEqual([row["event"] for row in self._events()],
+                         ["pre_send", "order_observed", "acknowledged"])
+        self.assertEqual(read_pending(self.journal.path), [])
+        self.assertEqual(self.capture.pending, {})
+
+    async def test_history_resolves_fast_fill_when_ws_update_was_missed(self):
+        await self._create()
+        adapter, _ = await self._adapter_fixture()
+        rest = adapter._rest
+        rest.api_key_index = 0
+        rest._markets_cache = {1: {"symbol": "BTC"}}
+        rest.get_market_index = Mock(return_value=1)
+        rest.get_open_orders = AsyncMock(return_value=[])
+        rest.signer_client.create_auth_token_with_expiry = Mock(return_value=("fixture-token", None))
+        rest.order_api = SimpleNamespace(account_inactive_orders=AsyncMock(return_value=SimpleNamespace(
+            code=200, orders=[SimpleNamespace(**self._ws_order())],
+        )))
+
+        result = await rest.get_order("1001", "BTC")
+
+        self.assertEqual(result.status, OrderStatus.FILLED)
+        self.assertEqual(read_pending(self.journal.path), [])
+        self.assertEqual(self._events()[-1]["order_id"], "844424837519875")
+        self.signer.tx_api.send_tx.assert_awaited_once()
+
+    async def test_observer_is_lazy_and_single_across_subscribe_and_reconnect(self):
+        adapter, websocket = await self._adapter_fixture(subscribe=False)
+        self.assertEqual(websocket._order_callbacks, [])
+        self.assertFalse(websocket._needs_direct_ws())
+
+        callback = Mock()
+        await adapter.subscribe_user_data(callback)
+        await adapter.subscribe_orders(callback)
+        await adapter.subscribe_orders()
+        await websocket._resubscribe_all()
+
+        self.assertEqual(websocket._order_callbacks[0], adapter._capture_submission_order_update)
+        self.assertEqual(websocket._order_callbacks.count(adapter._capture_submission_order_update), 1)
+        websocket._ensure_direct_ws_running.assert_awaited_once()
 
     async def test_pre_send_fsync_failure_prevents_http_and_rolls_back_under_sdk_lock(self):
         lock_held = []

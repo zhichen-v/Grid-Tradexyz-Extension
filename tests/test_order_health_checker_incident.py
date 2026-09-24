@@ -402,6 +402,98 @@ class OrderHealthCheckerIncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rest._uncertain_cancellations, set())
         restore.assert_not_awaited()
 
+    def test_take_profit_coverage_counts_remaining_for_long_and_short(self):
+        for grid_type, grid_side, exchange_side in (
+            (GridType.LONG, GridOrderSide.SELL, OrderSide.SELL),
+            (GridType.SHORT, GridOrderSide.BUY, OrderSide.BUY),
+        ):
+            with self.subTest(grid_type=grid_type):
+                local_order = GridOrder(
+                    order_id="tp-37",
+                    grid_id=37,
+                    side=grid_side,
+                    price=Decimal("84350"),
+                    amount=Decimal("0.00100"),
+                    status=GridOrderStatus.PENDING,
+                    created_at=datetime.now(),
+                    parent_order_id="entry-37",
+                )
+                checker = OrderHealthChecker.__new__(OrderHealthChecker)
+                checker.config = SimpleNamespace(grid_type=grid_type)
+                checker.engine = SimpleNamespace(
+                    coordinator=None,
+                    get_pending_orders=lambda: [local_order],
+                )
+                snapshot = SimpleNamespace(
+                    side=exchange_side,
+                    price=local_order.price,
+                    amount=Decimal("0.00100"),
+                    filled=Decimal("0.00089"),
+                    remaining=Decimal("0.00011"),
+                )
+
+                self.assertEqual(
+                    checker._get_open_take_profit_amount([snapshot]),
+                    Decimal("0.00011"),
+                )
+                # Coverage accounting must not rewrite the logical full-fill target.
+                self.assertEqual(local_order.amount, Decimal("0.00100"))
+                self.assertEqual(local_order.status, GridOrderStatus.PENDING)
+
+    def test_take_profit_coverage_falls_back_to_physical_amount_minus_filled(self):
+        checker = OrderHealthChecker.__new__(OrderHealthChecker)
+        checker._get_tracked_take_profit_price_keys = lambda: {("84350", "sell")}
+        for amount, filled, remaining, expected in (
+            ("0.00100", "0.00089", None, "0.00011"),
+            ("0.00030", "0.00019", None, "0.00011"),
+            ("0.00100", "0.00100", Decimal("0"), "0"),
+            ("0.00100", "0.00200", None, "0"),
+            ("0.00100", "0", Decimal("-0.001"), "0"),
+            ("0.00100", "0", Decimal("0.002"), "0.00100"),
+        ):
+            with self.subTest(amount=amount, filled=filled, remaining=remaining):
+                snapshot = SimpleNamespace(
+                    side=OrderSide.SELL,
+                    price=Decimal("84350.0"),
+                    amount=Decimal(amount),
+                    filled=Decimal(filled),
+                    remaining=remaining,
+                )
+                self.assertEqual(
+                    checker._get_open_take_profit_amount([snapshot]),
+                    Decimal(expected),
+                )
+
+    def test_partial_take_profit_coverage_does_not_emit_mismatch(self):
+        checker = OrderHealthChecker.__new__(OrderHealthChecker)
+        for method in (
+            "_get_exchange_open_order_keys", "_get_local_open_order_keys",
+            "_get_state_open_order_keys", "_get_exchange_open_order_price_keys",
+            "_get_engine_open_order_price_keys", "_get_state_open_order_price_keys",
+        ):
+            setattr(checker, method, MagicMock(return_value={"tp-37"}))
+        for method in (
+            "_extract_actual_position", "_get_tracker_position",
+            "_get_state_position", "_get_expected_take_profit_amount",
+        ):
+            setattr(checker, method, MagicMock(return_value=Decimal("0.00011")))
+        checker._position_tolerance = lambda: Decimal("0.00001")
+        checker._get_pending_partial_base_fill_exposure = lambda: Decimal("0")
+        checker._get_tracked_take_profit_price_keys = lambda: {("84350", "sell")}
+        checker._log_runtime_consistency_message = MagicMock()
+        snapshot = SimpleNamespace(
+            side=OrderSide.SELL, price=Decimal("84350"),
+            amount=Decimal("0.00100"), filled=Decimal("0.00089"),
+            remaining=Decimal("0.00011"),
+        )
+
+        checker._log_runtime_consistency([snapshot], [], False, 0)
+
+        level, message = checker._log_runtime_consistency_message.call_args.args
+        self.assertEqual(level, "info")
+        self.assertIn("Runtime consistency verified", message)
+        self.assertIn("take_profit_coverage=0.00011", message)
+
     def test_expected_long_position_uses_tp_remaining_and_partial_base_fill(self):
         checker = OrderHealthChecker.__new__(OrderHealthChecker)
         checker.config = SimpleNamespace(grid_type=GridType.LONG)

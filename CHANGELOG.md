@@ -18,6 +18,9 @@
 
 #### 2026-09-24
 
+- Made the existing grid restoration cooldown apply at the shared placement boundary, so tracked/inferred gap repairs and batch placements cannot bypass an active restoration circuit.
+- Counted only the remaining open take-profit quantity in health coverage checks, including partial-fill continuations. Partial fills still never create a reverse order; exactly one full logical-size reverse follows complete execution.
+- Completed durable Lighter submission observations from exact WebSocket updates, supplementing the existing REST snapshot/history path so fast-filled orders do not appear unresolved solely because they disappeared before the next health check. Evidence remains exact-identity-based; journal failures after sending do not authorize retries.
 - Fixed Lighter selective batch cancellation after an explicit HTTP 400 / `21104 invalid nonce` rejection: refresh the SDK nonce under the existing per-key lock and allow one bounded, freshly signed retry of the same owned order IDs. Rejected batches no longer become permanently read-only "uncertain" cancellations; refresh failures remain visible, while 502/timeout outcomes still cannot trigger blind retries.
 - Persisted selective-cancellation batch responses and reconciliation counts in `ExchangeAdapter.log`, removed the misleading "accepted" message during uncertain-result verification, and updated shutdown route diagnostics to `2026-09-24.1`.
 - Added regression coverage for the BTC shutdown incident, including actual SDK rejection formats, nonce-refresh failure/timeout, repeated rejection, and transport loss during the recovery attempt. Order ownership, unknown submissions, partial-fill behavior, and stop-time position retention are unchanged.

@@ -28,6 +28,12 @@ GET 之間保留間隔，遇到 429 即停止本次後續查詢，不立即重�
 index 不符會跳過；訂單證據必須符合 exact client ID、market 與 owner account。
 工具不下單、不撤單、不回寫 journal，也不會將歷史紀錄注入目前策略。
 
+運行中的策略會透過符合原始委託 exact client/order/market 身分的 WebSocket 更新，
+以及既有 REST 掛單／歷史查詢補記 `order_observed`，避免快速成交的訂單在下次
+健康檢查前消失而留下假 pending。送單後紀錄寫入失敗不會重送訂單；未能持久化的
+觀察仍保留待確認狀態，不會誤報已存證。若實際磁碟寫入失敗導致 journal 被封鎖，
+仍維持既有 fail-closed 保護，不自動修補檔案。此修正不會自動改寫舊 journal。
+
 `tx.status` 僅為 API 原始數值；hash 查到不等於訂單已成交或已撤銷。查無資料、逾時、
 分頁上限或查詢失敗都不代表「未送出／已拒絕」，不可據此直接重送。
 尚未部署這項功能前的 502，若當時未留下 hash，無法事後從 journal 還原。
