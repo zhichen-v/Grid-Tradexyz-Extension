@@ -4,6 +4,11 @@
 
 ### Added
 
+#### 2026-09-24
+
+- Added durable Lighter create-order evidence under `logs/lighter_submission_evidence/*.jsonl`: save the signed transaction hash, actual nonce/key index, Grid/client identity and order parameters before HTTP submission, then append sanitized response/502 timing and allowlisted gateway trace IDs. Journals survive normal startup log cleanup; no private keys, auth tokens, signatures or signed payloads are recorded.
+- Added a bounded transaction-hash lookup after uncertain submissions and `lighter_submission_diagnostics.py` for offline inspection or opt-in, read-only transaction / exact-client active-order / paginated-history follow-up across restarts. Missing evidence stays unresolved, never authorizes resubmission, and transaction hashes never become exchange order IDs. Pre-send journal failures prevent sending through the SDK's existing nonce rollback; post-send evidence failures cannot cause retries. See `docs/lighter_submission_diagnostics.md`.
+
 #### 2026-05-21
 
 - Added price-based grid stop loss settings: when enabled, long grids trigger at or below `stop_loss_price`, short grids trigger at or above it, then cancel open orders, market-close the current position, and stop the grid runtime.

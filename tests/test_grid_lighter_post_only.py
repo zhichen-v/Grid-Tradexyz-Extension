@@ -52,6 +52,8 @@ class LighterGridPostOnlyTests(unittest.IsolatedAsyncioTestCase):
             exchange.create_order.await_args.kwargs["params"],
             {
                 "_raise_on_definitive_submission_rejection": True,
+                "_evidence_grid_id": 1,
+                "_evidence_logical_client_id": "grid_1_62900_200",
                 "time_in_force": "POST_ONLY",
             },
         )
@@ -75,6 +77,8 @@ class LighterGridPostOnlyTests(unittest.IsolatedAsyncioTestCase):
             exchange.create_order.await_args.kwargs["params"],
             {
                 "_raise_on_definitive_submission_rejection": True,
+                "_evidence_grid_id": 1,
+                "_evidence_logical_client_id": "grid_1_62900_200",
                 "time_in_force": "GTT",
                 "skip_order_index_query": True,
             },
@@ -99,6 +103,8 @@ class LighterGridPostOnlyTests(unittest.IsolatedAsyncioTestCase):
             exchange.create_order.await_args.kwargs["params"],
             {
                 "_raise_on_definitive_submission_rejection": True,
+                "_evidence_grid_id": 1,
+                "_evidence_logical_client_id": "grid_1_62925_200",
                 "time_in_force": "GTT",
                 "skip_order_index_query": True,
                 "reduce_only": True,

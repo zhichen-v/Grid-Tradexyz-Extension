@@ -50,6 +50,8 @@ except ImportError:
     logging.warning("lighter SDK未安装。请执行: uv pip install lighter-sdk==1.1.2")
 
 from .lighter_base import LighterBase
+from .lighter_submission_capture import SubmissionCapture
+from core.lighter_submission_journal import SubmissionJournal
 from ..exceptions import (
     OrderSubmissionNotSentError,
     OrderSubmissionRejectedError,
@@ -152,6 +154,11 @@ class LighterRest(LighterBase):
         self._capture_terminal_cancellation_outcomes = False
         self._terminal_cancellation_outcomes = {}
         self._unresolved_submissions = {}
+        self._submission_capture = (
+            SubmissionCapture(self.signer_client, SubmissionJournal(
+                self.base_url, self.account_index, self.api_key_index,
+            )) if self.signer_client else None
+        )
 
         # WebSocket由统一adapter持有，避免重复连接与SignerClient nonce状态。
         self._websocket = None
@@ -396,6 +403,10 @@ class LighterRest(LighterBase):
         self,
         orders: List[OrderData],
     ) -> None:
+        capture = getattr(self, "_submission_capture", None)
+        if capture is not None:
+            for order in orders:
+                capture.observe_order(order.client_id, order.id, order.status)
         registry = getattr(self, "_unresolved_submissions", None)
         if not registry:
             return
@@ -608,6 +619,9 @@ class LighterRest(LighterBase):
         **kwargs,
     ) -> OrderData:
         client_order_id = kwargs["client_order_id"]
+        capture = getattr(self, "_submission_capture", None)
+        if capture is not None:
+            await capture.probe_transaction(client_order_id, self)
         reconciled = await self._reconcile_order_submission(symbol, client_order_id)
         if reconciled is not None:
             return reconciled
@@ -2008,6 +2022,16 @@ class LighterRest(LighterBase):
             params['order_expiry'] = lighter.SignerClient.DEFAULT_IOC_EXPIRY
         return params
 
+    async def _submit_order_with_evidence(self, request, symbol, quantity, price, kwargs):
+        capture = getattr(self, "_submission_capture", None)
+        if capture is None:
+            return await request()
+        return await capture.run(
+            request, symbol=symbol, quantity=str(quantity), limit_price=str(price),
+            grid_id=kwargs.get("_evidence_grid_id"),
+            logical_client_id=kwargs.get("_evidence_logical_client_id"),
+        )
+
     async def _execute_market_order(
         self,
         symbol: str,
@@ -2051,7 +2075,10 @@ class LighterRest(LighterBase):
         try:
             tx, response, err = await self._call_api(
                 "market order submission",
-                lambda: self.signer_client.create_market_order(**params),
+                lambda: self._submit_order_with_evidence(
+                    lambda: self.signer_client.create_market_order(**params),
+                    symbol, quantity, avg_execution_price, kwargs,
+                ),
                 retry_on_429=False,
             )
 
@@ -2061,6 +2088,8 @@ class LighterRest(LighterBase):
                 quantity, avg_execution_price, batch_mode=batch_mode,
                 skip_order_index_query=skip_order_index_query, **kwargs
             )
+        except OrderSubmissionNotSentError:
+            raise
         except Exception as exc:
             if self._is_definitive_mutation_exception(exc):
                 logger.error("执行市价单失败: HTTP 429 rate limited")
@@ -2122,7 +2151,10 @@ class LighterRest(LighterBase):
             import lighter
             tx, response, err = await self._call_api(
                 "limit order submission",
-                lambda: self.signer_client.create_order(**params),
+                lambda: self._submit_order_with_evidence(
+                    lambda: self.signer_client.create_order(**params),
+                    symbol, quantity, price, kwargs,
+                ),
                 retry_on_429=False,
             )
         except OrderSubmissionNotSentError:

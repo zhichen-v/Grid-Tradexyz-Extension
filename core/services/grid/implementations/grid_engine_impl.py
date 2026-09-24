@@ -201,6 +201,8 @@ class GridEngineImpl(IGridEngine):
             if is_lighter:
                 order_params = {
                     "_raise_on_definitive_submission_rejection": True,
+                    "_evidence_grid_id": order.grid_id,
+                    "_evidence_logical_client_id": self._build_temp_order_id(order),
                     "time_in_force": (
                         "GTT"
                         if is_reverse_order or is_closing_order
