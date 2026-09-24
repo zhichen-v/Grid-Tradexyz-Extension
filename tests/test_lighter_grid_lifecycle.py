@@ -30,9 +30,6 @@ from core.services.grid.models import (
     GridState,
     GridType,
 )
-from core.services.market_maker_v2.config import ExecutionSettings
-from core.services.market_maker_v2.execution_models import MarketMetadata, OrderSlotState
-from core.services.market_maker_v2.order_manager import MarketMakerOrderManager
 
 
 def exchange_order(
@@ -2277,56 +2274,6 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rest.get_unresolved_submissions()), 1)
         rest._query_order_index.assert_awaited_once()
 
-    async def test_success_ack_placeholder_cannot_cancel_by_client_id(self):
-        rest = self._rest()
-        rest.signer_client = SimpleNamespace(
-            create_order=AsyncMock(
-                return_value=(
-                    object(),
-                    SimpleNamespace(code=200, tx_hash="accepted-tx"),
-                    None,
-                )
-            )
-        )
-        rest._query_order_index = AsyncMock(return_value=None)
-        placeholder = await rest._execute_limit_order(
-            "BTC",
-            "buy",
-            Decimal("0.00020"),
-            Decimal("64000"),
-            self._market_info(),
-        )
-        cancel_order = AsyncMock()
-        manager = MarketMakerOrderManager(
-            SimpleNamespace(cancel_order=cancel_order),
-            ExecutionSettings(
-                symbol="BTC",
-                order_size=Decimal("0.00020"),
-                max_position=Decimal("0.001"),
-                reprice_threshold_ticks=1,
-                dry_run=False,
-            ),
-            MarketMetadata(
-                symbol="BTC",
-                price_decimals=1,
-                size_decimals=5,
-                price_tick=Decimal("0.1"),
-                quantity_step=Decimal("0.00001"),
-                min_base_amount=Decimal("0.00020"),
-                min_quote_amount=Decimal("10"),
-            ),
-        )
-        manager._apply_order_update(OrderSide.BUY, placeholder)
-
-        result = await manager.cancel_managed_orders("safety stop")
-
-        cancel_order.assert_not_awaited()
-        self.assertEqual(
-            manager.slots[OrderSide.BUY].state,
-            OrderSlotState.UNCERTAIN_SUBMISSION,
-        )
-        self.assertTrue(result.errors)
-
     async def test_unknown_market_submission_is_not_resent(self):
         rest = self._rest()
         rest._calculate_slippage_protection_price = AsyncMock(
@@ -2705,6 +2652,16 @@ class LighterRestOrderParsingTests(unittest.TestCase):
 
 
 class LighterAdapterHistoryTests(unittest.IsolatedAsyncioTestCase):
+    def test_enable_terminal_cancellation_outcomes_delegates_to_rest(self):
+        rest = object.__new__(LighterRest)
+        rest._capture_terminal_cancellation_outcomes = False
+        adapter = object.__new__(LighterAdapter)
+        adapter._rest = rest
+
+        adapter.enable_terminal_cancellation_outcomes()
+
+        self.assertIs(rest._capture_terminal_cancellation_outcomes, True)
+
     def test_terminal_order_clears_exact_uncertain_cancellation_key(self):
         for status in (OrderStatus.CANCELED, OrderStatus.FILLED):
             with self.subTest(status=status):

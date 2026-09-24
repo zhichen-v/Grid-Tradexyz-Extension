@@ -2,6 +2,13 @@
 
 ## [Unreleased] - 2026-04-08
 
+### Removed
+
+#### 2026-09-24
+
+- Made `main` Grid-only by removing Market Maker V2 and legacy volume-maker strategy runtimes and their dedicated configs, scripts, tests, and docs; retained shared exchange-adapter fixes and Grid regressions. Updated repository guidance for Grid safety and cancel-only shutdown. Removed source remains recoverable at `5537f0f`; future Market Maker work stays on a separate branch or in a separately scoped package/project, with only reviewed, Grid-tested shared fixes eligible for `main`.
+- Removed the MM-only dependency from the shared Lighter lifecycle tests and added offline Grid import/CLI independence checks. Renamed the optional adapter outcome-capture switch to `enable_terminal_cancellation_outcomes` without changing its default or behavior; selective cancellation, nonce recovery, disconnect protection, and submission evidence remain intact.
+
 ### Added
 
 #### 2026-09-24

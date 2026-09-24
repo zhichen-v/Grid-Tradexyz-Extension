@@ -425,7 +425,7 @@ class LighterRest(LighterBase):
         return sorted(getattr(self, "_uncertain_cancellations", set()))
 
     def enable_terminal_cancellation_outcomes(self) -> None:
-        """Enable the MM-only exact outcome side channel."""
+        """Enable exact terminal outcome capture for cancellation reconciliation."""
         self._capture_terminal_cancellation_outcomes = True
 
     def get_terminal_cancellation_outcome(

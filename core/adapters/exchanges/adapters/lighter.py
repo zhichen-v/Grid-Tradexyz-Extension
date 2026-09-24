@@ -819,8 +819,8 @@ class LighterAdapter(ExchangeAdapter):
         """Return read-only keys for cancellations lacking terminal proof."""
         return self._rest.get_unresolved_cancellations()
 
-    def enable_market_maker_cancellation_outcomes(self) -> None:
-        """Opt this adapter into MM-only exact cancel/fill outcome capture."""
+    def enable_terminal_cancellation_outcomes(self) -> None:
+        """Opt this adapter into exact terminal cancel/fill outcome capture."""
         self._rest.enable_terminal_cancellation_outcomes()
 
     def get_terminal_cancellation_outcome(

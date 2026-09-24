@@ -1,6 +1,6 @@
 # Quick Start
 
-This is the shortest path to get the repository running.
+This is the shortest path to run the Grid strategy on `main`.
 If you want the full explanation, read `README.md`.
 
 ## 1. Enter the Project Directory
@@ -73,7 +73,9 @@ Debug mode:
 uv run python run_grid_trading.py config/grid/tradexyz_test_follow_long.yaml --debug
 ```
 
-Exit with `Ctrl+C` or `Q`.
+Exit with `Ctrl+C` or `Q`. Shutdown attempts to cancel managed orders but leaves
+filled positions open. Check the cleanup result; do not assume a cleanup error
+means all orders were cancelled.
 
 ## 7. Optional Smoke Checks
 
