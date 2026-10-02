@@ -860,6 +860,45 @@ class ShutdownRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(coordinator.get_unsafe_shutdown_incident())
         self.assertIn("incident recovered", coordinator.get_status_text())
 
+    async def test_lighter_emergency_stop_shares_failed_cleanup_before_disconnect(self):
+        cancel_started = asyncio.Event()
+        allow_cancel = asyncio.Event()
+        real_sleep = asyncio.sleep
+
+        async def cancel_orders():
+            cancel_started.set()
+            await allow_cancel.wait()
+            raise RuntimeError("cancel failed")
+
+        coordinator = self.make_coordinator(cancel_orders)
+        coordinator.engine.config = SimpleNamespace(exchange="lighter")
+
+        with patch(
+            "core.services.grid.coordinator.grid_coordinator.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            first_stop = asyncio.create_task(coordinator.stop())
+            await cancel_started.wait()
+            coordinator._request_fatal_stop("fill discovered during shutdown")
+            await real_sleep(0)
+            allow_cancel.set()
+            results = await asyncio.gather(
+                first_stop, coordinator._emergency_stop_task, return_exceptions=True
+            )
+
+        self.assertIsInstance(results[0], RuntimeError)
+        self.assertIn("order cancellation", str(results[0]))
+        self.assertIsNone(results[1])  # The emergency caller records the same failure.
+        self.assertEqual(coordinator.engine.cancel_all_orders.await_count, 5)
+        coordinator.engine.stop.assert_awaited_once_with()
+
+        # A later explicit retry remains possible while the exchange is connected.
+        coordinator.engine.cancel_all_orders.side_effect = None
+        coordinator.engine.cancel_all_orders.return_value = 0
+        await coordinator.stop()
+        self.assertTrue(coordinator._shutdown_completed)
+        self.assertIsNotNone(coordinator.get_unsafe_shutdown_incident())
+
 
 class FatalStopTests(unittest.IsolatedAsyncioTestCase):
     async def test_error_threshold_records_reason_for_nonzero_runner_exit(self):

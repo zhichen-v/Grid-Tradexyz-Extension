@@ -1351,13 +1351,20 @@ class GridCoordinator:
         return should_pause
 
     async def stop(self):
-        """Stop once, while allowing a later retry after failed cleanup."""
+        """Share concurrent cleanup outcomes; allow a later explicit retry."""
         if not hasattr(self, "_stop_lock"):
             self._stop_lock = asyncio.Lock()
 
+        joining_stop = self._stop_lock.locked()
         async with self._stop_lock:
             if getattr(self, "_shutdown_completed", False):
                 return
+            if joining_stop and getattr(self, "_shutdown_cleanup_error", None):
+                # A queued emergency stop must not restart exchange calls while
+                # the original caller proceeds to disconnect after this failure.
+                raise RuntimeError(
+                    "Grid stopped with cleanup errors: " + self._shutdown_cleanup_error
+                )
             await self._stop_once()
 
     async def _stop_once(self):

@@ -570,7 +570,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(engine._uncertain_cancel_order_ids, set())
 
-    async def test_shutdown_fill_is_finalized_once_and_remains_unsafe(self):
+    async def test_shutdown_fill_is_finalized_once_and_retains_position(self):
         filled = exchange_order(OrderStatus.FILLED, "0.00020", "0")
         exchange = SimpleNamespace(
             config=SimpleNamespace(exchange_id="lighter"),
@@ -601,18 +601,136 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         engine.subscribe_order_updates(try_reverse)
         engine.begin_shutdown()
 
-        with self.assertRaisesRegex(RuntimeError, "orders filled during cancellation: 101"):
-            await engine.cancel_all_orders()
-        with self.assertRaisesRegex(RuntimeError, "orders filled during cancellation: 101"):
-            await engine.cancel_all_orders()
+        self.assertEqual(await engine.cancel_all_orders(), 0)
+        self.assertEqual(await engine.cancel_all_orders(), 0)
 
         self.assertEqual(order.status, GridOrderStatus.FILLED)
         self.assertEqual(engine.get_pending_orders(), [])
         self.assertEqual(reverse_attempts, [None])
         exchange.create_order.assert_not_awaited()
-        self.assertIsNotNone(engine._shutdown_fill_incident)
+        self.assertIsNone(engine._shutdown_fill_incident)
+        coordinator._request_fatal_stop.assert_not_called()
         self.assertTrue(engine._shutting_down)
         exchange.cancel_orders.assert_awaited_once_with(["101"], "BTC")
+
+    async def test_shutdown_historical_fill_does_not_fail_remaining_cancellations(self):
+        for exchange_name in ("lighter", "tradexyz"):
+            with self.subTest(exchange=exchange_name):
+                filled = exchange_order(OrderStatus.FILLED, "0.00020", "0")
+                filled.id = "201"
+                filled.client_id = "client-uncertain"
+                cancelled = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
+                exchange = SimpleNamespace(
+                    config=SimpleNamespace(exchange_id=exchange_name),
+                    resolve_unresolved_submissions=AsyncMock(side_effect=[[filled], []]),
+                    get_unresolved_submissions=MagicMock(return_value=[]),
+                    cancel_orders=AsyncMock(return_value=CancelReport(
+                        requested={"101"}, cancelled={"101"},
+                        terminal_orders={"101": cancelled},
+                    )),
+                    cancel_all_orders=AsyncMock(side_effect=[[cancelled], []]),
+                    get_open_orders=AsyncMock(return_value=[]),
+                    create_order=AsyncMock(),
+                )
+                engine = grid_engine(exchange)
+                engine.config.exchange = exchange_name
+                engine.coordinator = SimpleNamespace(
+                    _grid_level_locks={}, _request_fatal_stop=MagicMock(),
+                )
+                old_order = grid_order()
+                old_order.order_id = filled.client_id
+                old_order.exchange_data = {"submission_uncertain": True}
+                engine._register_pending_order(old_order, old_order.order_id)
+                open_order = grid_order()
+                engine._register_pending_order(open_order, open_order.order_id)
+                callback = AsyncMock()
+                engine.subscribe_order_updates(callback)
+                engine.begin_shutdown()
+
+                self.assertEqual(await engine.cancel_all_orders(), 1)
+                self.assertEqual(await engine.cancel_all_orders(), 0)
+
+                self.assertEqual(old_order.status, GridOrderStatus.FILLED)
+                self.assertEqual(open_order.status, GridOrderStatus.CANCELLED)
+                self.assertEqual(engine.get_pending_orders(), [])
+                callback.assert_awaited_once_with(old_order)
+                engine.coordinator._request_fatal_stop.assert_not_called()
+                exchange.create_order.assert_not_awaited()
+
+    async def test_shutdown_fill_does_not_hide_unproven_order(self):
+        filled = exchange_order(OrderStatus.FILLED, "0.00020", "0")
+        filled.id = "201"
+        filled.client_id = "old-client"
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            resolve_unresolved_submissions=AsyncMock(return_value=[filled]),
+            get_unresolved_submissions=MagicMock(return_value=[]),
+            cancel_orders=AsyncMock(return_value=CancelReport(
+                requested={"101"}, acknowledged={"101"}, uncertain={"101"},
+            )),
+        )
+        engine = grid_engine(exchange)
+        order = grid_order()
+        engine._register_pending_order(order, order.order_id)
+        engine.begin_shutdown()
+
+        with self.assertRaisesRegex(RuntimeError, "selective cancellation incomplete: 101"):
+            await engine.cancel_all_orders()
+
+        self.assertEqual(engine.get_pending_orders(), [order])
+        self.assertEqual(order.status, GridOrderStatus.PENDING)
+
+    async def test_shutdown_legacy_history_fill_is_not_counted_as_cancelled(self):
+        for uncertain_cancel in (False, True):
+            with self.subTest(uncertain_cancel=uncertain_cancel):
+                filled = exchange_order(OrderStatus.FILLED, "0.00020", "0")
+                exchange = SimpleNamespace(
+                    config=SimpleNamespace(exchange_id="tradexyz"),
+                    cancel_all_orders=AsyncMock(return_value=[]),
+                    get_open_orders=AsyncMock(return_value=[]),
+                    get_order_history=AsyncMock(return_value=[filled]),
+                )
+                engine = grid_engine(exchange)
+                engine.config.exchange = "tradexyz"
+                engine.coordinator = SimpleNamespace(_request_fatal_stop=MagicMock())
+                order = grid_order()
+                engine._register_pending_order(order, order.order_id)
+                if uncertain_cancel:
+                    engine._uncertain_cancel_order_ids.add(order.order_id)
+                callback = AsyncMock()
+                engine.subscribe_order_updates(callback)
+                engine.begin_shutdown()
+
+                self.assertEqual(await engine.cancel_all_orders(), 0)
+
+                self.assertEqual(order.status, GridOrderStatus.FILLED)
+                self.assertEqual(engine.get_pending_orders(), [])
+                callback.assert_awaited_once_with(order)
+                engine.coordinator._request_fatal_stop.assert_not_called()
+
+    async def test_shutdown_uncertain_submission_with_cancel_proof_is_not_fatal(self):
+        terminal = exchange_order(OrderStatus.CANCELED, "0", "0.00020")
+        terminal.client_id = "client-uncertain"
+        exchange = SimpleNamespace(
+            config=SimpleNamespace(exchange_id="lighter"),
+            resolve_unresolved_submissions=AsyncMock(return_value=[terminal]),
+            get_unresolved_submissions=MagicMock(return_value=[]),
+            cancel_orders=AsyncMock(),
+        )
+        engine = grid_engine(exchange)
+        engine.coordinator = SimpleNamespace(_request_fatal_stop=MagicMock())
+        order = grid_order()
+        order.order_id = terminal.client_id
+        order.exchange_data = {"submission_uncertain": True}
+        engine._register_pending_order(order, order.order_id)
+        engine.begin_shutdown()
+
+        self.assertEqual(await engine.cancel_all_orders(), 0)
+
+        self.assertEqual(order.status, GridOrderStatus.CANCELLED)
+        self.assertEqual(engine.get_pending_orders(), [])
+        engine.coordinator._request_fatal_stop.assert_not_called()
+        exchange.cancel_orders.assert_not_awaited()
 
     async def test_shutdown_absence_without_terminal_proof_stays_unsafe(self):
         exchange = SimpleNamespace(
@@ -910,7 +1028,7 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         engine = grid_engine(exchange)
         coordinator = SimpleNamespace(
             _grid_level_locks={},
-            _request_fatal_stop=MagicMock(),
+            _request_fatal_stop=MagicMock(side_effect=lambda _reason: engine.begin_shutdown()),
         )
         engine.coordinator = coordinator
         order = grid_order()
@@ -924,6 +1042,10 @@ class LighterPartialFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order.status, GridOrderStatus.FILLED)
         self.assertEqual(engine.get_pending_orders(), [])
         coordinator._request_fatal_stop.assert_called_once()
+
+        # The runtime failure remains reported, but its later cancel-only
+        # cleanup must not fail solely on the already-accounted terminal fill.
+        self.assertEqual(await engine.cancel_all_orders(), 0)
 
     async def test_uncertain_opening_market_submission_is_reserved_and_not_resent(self):
         uncertain = exchange_order(OrderStatus.PENDING, "0", "0.00020")

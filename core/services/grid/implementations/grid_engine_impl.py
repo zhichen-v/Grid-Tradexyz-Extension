@@ -613,15 +613,16 @@ class GridEngineImpl(IGridEngine):
         if self.config is None:
             return 0
 
+        shutting_down = self._shutting_down
+
         # Shutdown first blocks new placements, then waits for any request that
         # already crossed that gate to finish before taking the cancel snapshot.
         await self._placements_drained.wait()
 
-        initial_pending_count = len(self.get_pending_orders())
         expected_keys: set[str] = set()
         try:
             _, resolved_filled = await self._resolve_unresolved_submissions_read_only()
-            if resolved_filled:
+            if resolved_filled and not shutting_down:
                 self._shutdown_fill_incident = (
                     "Previously uncertain submissions resolved as filled: "
                     + ", ".join(resolved_filled)
@@ -647,7 +648,7 @@ class GridEngineImpl(IGridEngine):
                     "Previously uncertain submissions resolved as active after the "
                     f"cancel snapshot: {', '.join(resolved_active)}"
                 )
-            if resolved_filled:
+            if resolved_filled and not shutting_down:
                 self._shutdown_fill_incident = (
                     "Previously uncertain submissions resolved as filled: "
                     + ", ".join(resolved_filled)
@@ -658,7 +659,7 @@ class GridEngineImpl(IGridEngine):
             unresolved_cancels, filled_cancels = (
                 await self._resolve_uncertain_cancellations_read_only()
             )
-            if filled_cancels:
+            if filled_cancels and not shutting_down:
                 self._shutdown_fill_incident = (
                     "Previously uncertain cancellations resolved as filled: "
                     + ", ".join(filled_cancels)
@@ -683,7 +684,7 @@ class GridEngineImpl(IGridEngine):
                     cancelled_orders,
                 )
             )
-            if filled_pending:
+            if filled_pending and not shutting_down:
                 self._shutdown_fill_incident = (
                     "Orders filled during shutdown instead of being cancelled: "
                     + ", ".join(filled_pending)
@@ -696,15 +697,18 @@ class GridEngineImpl(IGridEngine):
                     "Cancel-all lacks exact terminal proof for local orders: "
                     + ", ".join(unresolved_pending)
                 )
-            if getattr(self, "_shutdown_fill_incident", None):
+            if not shutting_down and getattr(self, "_shutdown_fill_incident", None):
                 raise RuntimeError(self._shutdown_fill_incident)
         except Exception as exc:
             self._expected_cancellations.difference_update(expected_keys)
             self.logger.error(f"Cancel-all failed: {exc}")
             raise
 
-        cancelled_count = (
-            len(cancelled_orders) if cancelled_orders else initial_pending_count
+        cancelled_count = sum(
+            self._exchange_order_status(order) not in {"filled", "closed"}
+            for order in cancelled_orders
+        ) if cancelled_orders else sum(
+            order.status == GridOrderStatus.CANCELLED for order in pending_orders
         )
         self._pending_orders.clear()
         self._expected_cancellations.difference_update(expected_keys)
@@ -2048,6 +2052,12 @@ class GridEngineImpl(IGridEngine):
 
         if submission_was_uncertain:
             self._clear_restore_state(grid_order)
+            if self._shutting_down:
+                self.logger.info(
+                    f"Uncertain submission confirmed terminal during shutdown: "
+                    f"order_id={grid_order.order_id}"
+                )
+                return
             self._fail_closed_submission(
                 "Uncertain order submission reached a terminal failure without being "
                 f"restored: grid_id={grid_order.grid_id}, order_id={grid_order.order_id}",
@@ -3197,6 +3207,7 @@ class GridEngineImpl(IGridEngine):
         self,
     ) -> Tuple[List[str], List[str]]:
         """Resolve adapter intents by reads before declaring cancel-all safe."""
+        shutting_down = self._shutting_down
         resolver = getattr(self.exchange, "resolve_unresolved_submissions", None)
         if not callable(resolver):
             return [], []
@@ -3246,7 +3257,12 @@ class GridEngineImpl(IGridEngine):
                     "Previously uncertain submission resolved as filled during "
                     f"shutdown verification: order_id={label}"
                 )
-                self._fail_closed_submission(reason, grid_order)
+                if shutting_down:
+                    self.logger.warning(
+                        f"{reason}; shutdown only cancels open orders and retains positions"
+                    )
+                else:
+                    self._fail_closed_submission(reason, grid_order)
                 filled.append(label)
                 continue
 
@@ -3273,6 +3289,7 @@ class GridEngineImpl(IGridEngine):
         cancelled_orders: Any,
     ) -> Tuple[List[str], List[str]]:
         """Require exact cancel-response or terminal-history proof per local order."""
+        shutting_down = self._shutting_down
         cancel_proof_by_key: Dict[str, Any] = {}
         if isinstance(cancelled_orders, (list, tuple, set)):
             for exchange_order in cancelled_orders:
@@ -3365,7 +3382,12 @@ class GridEngineImpl(IGridEngine):
                     "Order filled during shutdown cancellation verification: "
                     f"order_id={label}"
                 )
-                self._fail_closed_submission(reason, grid_order)
+                if shutting_down:
+                    self.logger.warning(
+                        f"{reason}; shutdown only cancels open orders and retains positions"
+                    )
+                else:
+                    self._fail_closed_submission(reason, grid_order)
                 filled.append(label)
                 continue
 
@@ -3388,6 +3410,7 @@ class GridEngineImpl(IGridEngine):
         self,
     ) -> Tuple[List[str], List[str]]:
         """Require exact terminal history before clearing response-loss cancels."""
+        shutting_down = self._shutting_down
         uncertain_ids = set(getattr(self, "_uncertain_cancel_order_ids", set()))
         marker_sources = (
             self.exchange,
@@ -3481,7 +3504,12 @@ class GridEngineImpl(IGridEngine):
                 "Previously uncertain cancellation resolved as filled during "
                 f"shutdown verification: order_id={label}"
             )
-            self._fail_closed_submission(reason, grid_order)
+            if shutting_down:
+                self.logger.warning(
+                    f"{reason}; shutdown only cancels open orders and retains positions"
+                )
+            else:
+                self._fail_closed_submission(reason, grid_order)
             filled.append(label)
 
         return unresolved, filled

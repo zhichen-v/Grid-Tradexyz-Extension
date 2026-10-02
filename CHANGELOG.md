@@ -23,6 +23,11 @@
 
 ### Fixed
 
+#### 2026-10-02
+
+- Fixed cancel-only Grid shutdown reporting failure after exact history proved previously uncertain orders had filled: account for fills once, retain positions, and complete cancellation of remaining managed orders. Runtime/reset reconciliation still fails closed, and open or unproven orders still prevent successful cleanup. Cancellation totals exclude confirmed fills.
+- Made concurrent stop requests share the same cleanup outcome so an emergency stop cannot restart exchange queries while the original shutdown disconnects; a later explicit cleanup retry remains supported.
+
 #### 2026-09-24
 
 - Made the existing grid restoration cooldown apply at the shared placement boundary, so tracked/inferred gap repairs and batch placements cannot bypass an active restoration circuit.

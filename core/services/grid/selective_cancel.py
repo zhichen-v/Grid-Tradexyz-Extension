@@ -137,6 +137,10 @@ async def engine_cancel_all_owned(engine: Any) -> int:
     if not _is_lighter(engine):
         return await engine._legacy_cancel_all_orders()
 
+    # Runtime/reset cancellation still treats unexpected fills as fatal. Capture
+    # the phase before reconciliation callbacks can initiate an emergency stop.
+    shutting_down = bool(getattr(engine, "_shutting_down", False))
+
     engine.logger.warning(
         f"Lighter shutdown cancellation route active: version={PATCH_VERSION}"
     )
@@ -154,7 +158,7 @@ async def engine_cancel_all_owned(engine: Any) -> int:
     errors: List[str] = []
     try:
         _, filled = await engine._resolve_unresolved_submissions_read_only()
-        if filled:
+        if filled and not shutting_down:
             engine._shutdown_fill_incident = (
                 getattr(engine, "_shutdown_fill_incident", None)
                 or "uncertain submissions resolved as filled: " + ", ".join(filled)
@@ -204,11 +208,17 @@ async def engine_cancel_all_owned(engine: Any) -> int:
         else:
             cancelled = len(_set(report, "cancelled"))
             if _set(report, "filled"):
-                engine._shutdown_fill_incident = (
-                    getattr(engine, "_shutdown_fill_incident", None)
-                    or "orders filled during cancellation: "
-                    + ", ".join(sorted(_set(report, "filled")))
+                reason = "orders filled during cancellation: " + ", ".join(
+                    sorted(_set(report, "filled"))
                 )
+                if shutting_down:
+                    engine.logger.warning(
+                        f"{reason}; shutdown only cancels open orders and retains positions"
+                    )
+                else:
+                    engine._shutdown_fill_incident = (
+                        getattr(engine, "_shutdown_fill_incident", None) or reason
+                    )
 
             incomplete = (
                 _set(report, "uncertain")
@@ -221,7 +231,7 @@ async def engine_cancel_all_owned(engine: Any) -> int:
                 )
     if engine.get_pending_orders():
         errors.append("local orders remain without terminal cancellation proof")
-    if getattr(engine, "_shutdown_fill_incident", None):
+    if not shutting_down and getattr(engine, "_shutdown_fill_incident", None):
         errors.append(engine._shutdown_fill_incident)
     if errors:
         raise RuntimeError("; ".join(errors))
