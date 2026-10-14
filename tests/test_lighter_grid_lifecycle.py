@@ -1706,6 +1706,30 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertFalse(websocket._account_orders_subscribed)
 
+    async def test_slow_order_callback_does_not_block_direct_reader(self):
+        websocket = object.__new__(LighterWebSocket)
+        release = asyncio.Event()
+        handled = []
+
+        async def slow_handle(data):
+            await release.wait()
+            handled.append(data["n"])
+
+        websocket._handle_direct_ws_message = slow_handle
+
+        for n in range(3):
+            websocket._enqueue_direct_ws_message({"n": n})
+        await asyncio.sleep(0)
+
+        self.assertEqual(handled, [])
+        release.set()
+        await websocket._direct_message_queue.join()
+        self.assertEqual(handled, [0, 1, 2])
+
+        websocket._direct_dispatch_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await websocket._direct_dispatch_task
+
     async def test_sdk_stream_normal_exit_schedules_reconnect(self):
         websocket = object.__new__(LighterWebSocket)
         websocket.ws_client = SimpleNamespace(run_async=AsyncMock())

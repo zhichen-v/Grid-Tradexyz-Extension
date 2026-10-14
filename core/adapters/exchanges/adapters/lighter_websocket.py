@@ -62,6 +62,10 @@ class LighterWebSocket(LighterBase):
         self._direct_ws_connected = False
         self._account_orders_subscribed = False
         self._direct_last_message_time = 0.0
+        # Callbacks run off the socket reader so slow fill handling cannot
+        # starve keepalive pongs and drop the stream during volatile bursts.
+        self._direct_message_queue: Optional[asyncio.Queue] = None
+        self._direct_dispatch_task: Optional[asyncio.Task] = None
         self._subscribed_market_stats: List[int] = []  # 订阅的market_stats市场
         self._subscribed_trades: List[int] = []
 
@@ -183,6 +187,20 @@ class LighterWebSocket(LighterBase):
 
         if self._reconnect_task is reconnect_task:
             self._reconnect_task = None
+
+        dispatch_task = getattr(self, "_direct_dispatch_task", None)
+        if (
+            dispatch_task is not None
+            and dispatch_task is not current_task
+            and not dispatch_task.done()
+        ):
+            dispatch_task.cancel()
+            try:
+                await dispatch_task
+            except asyncio.CancelledError:
+                pass
+        self._direct_dispatch_task = None
+        self._direct_message_queue = None
 
         try:
             async with self._lifecycle_lock:
@@ -1429,7 +1447,7 @@ class LighterWebSocket(LighterBase):
                         try:
                             self._direct_last_message_time = time.time()
                             data = json.loads(message)
-                            await self._handle_direct_ws_message(data)
+                            self._enqueue_direct_ws_message(data)
                         except json.JSONDecodeError as e:
                             logger.error(f"❌ JSON解析失败: {e}")
                         except Exception as e:
@@ -1487,6 +1505,29 @@ class LighterWebSocket(LighterBase):
                 self._direct_ws = None
 
         logger.info("🛑 WebSocket订阅任务已停止")
+
+    def _enqueue_direct_ws_message(self, data: Dict[str, Any]) -> None:
+        """Queue one message for in-order dispatch without blocking the reader."""
+        queue = getattr(self, "_direct_message_queue", None)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._direct_message_queue = queue
+        queue.put_nowait(data)
+
+        task = getattr(self, "_direct_dispatch_task", None)
+        if task is None or task.done():
+            self._direct_dispatch_task = asyncio.create_task(
+                self._dispatch_direct_ws_messages(queue)
+            )
+
+    async def _dispatch_direct_ws_messages(self, queue: asyncio.Queue) -> None:
+        """Deliver queued messages one at a time; survives socket reconnects."""
+        while True:
+            data = await queue.get()
+            try:
+                await self._handle_direct_ws_message(data)
+            finally:
+                queue.task_done()
 
     async def _handle_direct_ws_message(self, data: Dict[str, Any]):
         """

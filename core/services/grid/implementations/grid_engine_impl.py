@@ -246,6 +246,10 @@ class GridEngineImpl(IGridEngine):
 
             if not order_id or order_id == "pending":
                 temp_id = self._build_temp_order_id(order)
+                if client_id:
+                    # The base temp id repeats whenever price oscillates around
+                    # one level; finalization guards and fill dedup key on it.
+                    temp_id = f"{temp_id}_{client_id}"
                 order_id = temp_id
                 self.logger.warning(
                     f"Exchange returned no final order id, using temporary id: {temp_id}"

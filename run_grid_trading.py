@@ -18,7 +18,7 @@ from pathlib import Path
 import yaml
 
 from core.logging import get_system_logger, initialize
-from core.logging.logger import LineLimitedFileHandler
+from core.logging.logger import build_rotating_file_handler
 
 
 # Add the project root to the import path.
@@ -606,7 +606,8 @@ async def main(
     if wallet_name:
         _load_dotenv(wallet_name)
     log_dir = build_grid_log_dir(config_data, wallet_name=wallet_name)
-    initialize(log_dir=log_dir, clear_existing=True)
+    # Append across restarts; size rotation bounds disk use and keeps history.
+    initialize(log_dir=log_dir, clear_existing=False)
     from core.services.grid.coordinator import GridCoordinator
     from core.services.grid.implementations import (
         GridEngineImpl,
@@ -635,11 +636,7 @@ async def main(
         )
 
         if not has_exchange_log_handler:
-            ws_handler = LineLimitedFileHandler(
-                str(exchange_log_path),
-                max_lines=1000,
-                encoding="utf-8",
-            )
+            ws_handler = build_rotating_file_handler(str(exchange_log_path))
             ws_handler.setLevel(logging.DEBUG)
             ws_formatter = logging.Formatter(
                 "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"

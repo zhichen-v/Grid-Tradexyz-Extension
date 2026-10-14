@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,16 +18,14 @@ class LogConfig:
         level: str = "INFO",
         console_level: str = "INFO",
         file_level: str = "DEBUG",
-        max_log_lines: int = 1000,
-        max_file_size: int = 5 * 1024 * 1024,
-        backup_count: int = 3,
+        max_file_size: int = 10 * 1024 * 1024,
+        backup_count: int = 5,
         enable_console: bool = True,
     ) -> None:
         self.log_dir = log_dir
         self.level = getattr(logging, level.upper())
         self.console_level = getattr(logging, console_level.upper())
         self.file_level = getattr(logging, file_level.upper())
-        self.max_log_lines = max_log_lines
         self.max_file_size = max_file_size
         self.backup_count = backup_count
         self.enable_console = enable_console
@@ -35,68 +34,28 @@ class LogConfig:
 
 
 def clear_log_files(log_dir: str = "logs") -> None:
-    """Remove existing `.log` files so each runtime starts fresh."""
+    """Remove existing `.log` files and their rotated backups."""
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
-    for file_path in log_path.rglob("*.log"):
-        if file_path.is_file():
-            file_path.unlink(missing_ok=True)
+    for pattern in ("*.log", "*.log.[0-9]*"):
+        for file_path in log_path.rglob(pattern):
+            if file_path.is_file():
+                file_path.unlink(missing_ok=True)
 
 
-class LineLimitedFileHandler(logging.FileHandler):
-    """Reset a log file once it reaches the configured line cap."""
-
-    def __init__(self, filename: str, max_lines: int = 1000, encoding: str = "utf-8"):
-        self.max_lines = max(1, int(max_lines))
-        super().__init__(filename, mode="a", encoding=encoding)
-        self._line_count = self._read_existing_line_count()
-        if self._line_count >= self.max_lines:
-            self._reset_file()
-
-    def emit(self, record: logging.LogRecord) -> None:
-        message = self.format(record)
-        message_line_count = self._count_lines(f"{message}{self.terminator}")
-
-        if self._line_count + message_line_count > self.max_lines:
-            self._reset_file()
-
-        super().emit(record)
-        self._line_count += message_line_count
-
-    def _reset_file(self) -> None:
-        if self.stream:
-            self.stream.flush()
-            self.stream.close()
-            self.stream = None
-
-        with open(
-            self.baseFilename,
-            "w",
-            encoding=self.encoding or "utf-8",
-        ) as file:
-            file.write("")
-
-        self._line_count = 0
-        self.stream = self._open()
-
-    def _read_existing_line_count(self) -> int:
-        if not os.path.exists(self.baseFilename):
-            return 0
-
-        with open(
-            self.baseFilename,
-            "r",
-            encoding=self.encoding or "utf-8",
-            errors="ignore",
-        ) as file:
-            return sum(1 for _ in file)
-
-    @staticmethod
-    def _count_lines(message: str) -> int:
-        if not message:
-            return 0
-        return len(message.splitlines()) or 1
+def build_rotating_file_handler(
+    filename: str,
+    config: Optional[LogConfig] = None,
+) -> RotatingFileHandler:
+    """Append to one log file and keep bounded size-rotated history."""
+    config = config or get_config()
+    return RotatingFileHandler(
+        filename,
+        maxBytes=config.max_file_size,
+        backupCount=config.backup_count,
+        encoding="utf-8",
+    )
 
 
 class BaseLogger:
@@ -122,11 +81,7 @@ class BaseLogger:
             self.logger.addHandler(console_handler)
 
         log_file = os.path.join(self.config.log_dir, f"{self.name}.log")
-        file_handler = LineLimitedFileHandler(
-            log_file,
-            max_lines=self.config.max_log_lines,
-            encoding="utf-8",
-        )
+        file_handler = build_rotating_file_handler(log_file, self.config)
         file_handler.setLevel(self.config.file_level)
         file_handler.setFormatter(
             logging.Formatter(

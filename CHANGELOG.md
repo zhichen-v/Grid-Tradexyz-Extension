@@ -23,6 +23,12 @@
 
 ### Fixed
 
+#### 2026-10-15
+
+- Fixed Lighter Grid dropping reverse orders when price oscillates around one level: placeholder ids for orders without an exchange id now include the unique client order id. Previously consecutive orders on the same grid/side/price shared one temporary id, so after a health-check-confirmed fill the next fill on that level was treated as a duplicate and discarded without a TP. The later position-drift repair then market-closed the inventory and left the level empty. Seen on the VPS BTC grid on 2026-10-14 12:30 UTC: 4 fills between 83100 and 83350 left without TPs and closed 7 minutes later.
+- Lighter direct WebSocket messages are now dispatched in order from a separate task, so the socket keeps reading (and answering keepalive pings) while fill callbacks place reverse orders. A burst of fills could previously stall the reader long enough to cause `1011 keepalive ping timeout` disconnects, losing order updates sent during the reconnect gap.
+- Grid file logs now rotate by size (10 MB, 5 backups per file) and are kept across restarts instead of being truncated at 1000 lines and deleted at startup. Health-repair market orders now log at WARNING.
+
 #### 2026-10-02
 
 - Fixed cancel-only Grid shutdown reporting failure after exact history proved previously uncertain orders had filled: account for fills once, retain positions, and complete cancellation of remaining managed orders. Runtime/reset reconciliation still fails closed, and open or unproven orders still prevent successful cleanup. Cancellation totals exclude confirmed fills.

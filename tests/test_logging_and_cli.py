@@ -2,6 +2,7 @@ import asyncio
 import io
 import runpy
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -43,6 +44,47 @@ class LazyLoggingInitializationTests(unittest.TestCase):
                     enable_console=True,
                     clear_existing=False,
                 )
+
+
+class RotatingFileLogTests(unittest.TestCase):
+    def test_file_logs_rotate_by_size_instead_of_truncating(self):
+        from logging.handlers import RotatingFileHandler
+
+        from core.logging.logger import BaseLogger, LogConfig
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            log_file = Path(log_dir) / "rotation.probe.log"
+            log_file.write_text("previous run line\n", encoding="utf-8")
+            config = LogConfig(
+                log_dir=log_dir,
+                max_file_size=2000,
+                backup_count=2,
+                enable_console=False,
+            )
+            wrapper = BaseLogger("rotation.probe", config)
+            try:
+                handlers = [
+                    handler
+                    for handler in wrapper.logger.handlers
+                    if isinstance(handler, RotatingFileHandler)
+                ]
+                self.assertEqual(len(handlers), 1)
+                self.assertEqual(handlers[0].maxBytes, 2000)
+                self.assertEqual(handlers[0].backupCount, 2)
+
+                for index in range(200):
+                    wrapper.info(f"line {index}")
+                for handler in handlers:
+                    handler.flush()
+
+                backup = Path(f"{log_file}.1")
+                self.assertTrue(backup.exists())
+                self.assertFalse(Path(f"{log_file}.3").exists())
+                self.assertIn("line 199", log_file.read_text(encoding="utf-8"))
+            finally:
+                for handler in list(wrapper.logger.handlers):
+                    handler.close()
+                    wrapper.logger.removeHandler(handler)
 
 
 class CliFailureMessageTests(unittest.TestCase):

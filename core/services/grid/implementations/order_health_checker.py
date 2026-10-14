@@ -2344,7 +2344,7 @@ class OrderHealthChecker:
                 reduce_only=reduce_only,
                 reference_price=current_price,
             )
-            self.logger.info(
+            self.logger.warning(
                 f"Submitted market order for health repair: reason={reason}, "
                 f"side={side.value}, amount={amount}, reference_price={current_price}"
             )
