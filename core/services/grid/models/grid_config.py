@@ -133,6 +133,10 @@ class GridConfig:
     # - 包含 tolerance_multiplier 等配置
     # - 避免因手续费等微小差异导致的错误告警
 
+    # Confirmed exit-side excess repair: "market_close" (default) market-reduces the
+    # excess; "restore_take_profit" re-places missing TPs for unambiguous orphaned slots.
+    position_repair_mode: str = "market_close"
+
     def __post_init__(self):
         """初始化后计算网格数量"""
         # 初始化 logger
@@ -161,6 +165,11 @@ class GridConfig:
                 raise ValueError("max_position must be greater than 0")
             if self.max_position < self.order_amount:
                 raise ValueError("max_position must be at least order_amount")
+
+        if self.position_repair_mode not in {"market_close", "restore_take_profit"}:
+            raise ValueError(
+                "position_repair_mode must be 'market_close' or 'restore_take_profit'"
+            )
 
         if self.position_monitor_interval < 5:
             raise ValueError("position_monitor_interval must be at least 5 seconds")

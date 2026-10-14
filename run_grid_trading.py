@@ -260,6 +260,8 @@ def create_grid_config(config_data: dict) -> GridConfig:
     # Health-check tolerance settings.
     if "position_tolerance" in grid_config:
         params["position_tolerance"] = grid_config["position_tolerance"]
+    if "position_repair_mode" in grid_config:
+        params["position_repair_mode"] = str(grid_config["position_repair_mode"])
 
     return GridConfig(**params)
 
