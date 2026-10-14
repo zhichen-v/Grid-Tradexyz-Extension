@@ -532,33 +532,10 @@ class GridTerminalUI:
 
         return Panel(content, title="Position Information", border_style="yellow")
 
-    def _get_display_realized_profit(self, stats: GridStatistics) -> Decimal:
-        """
-        Normalize realized PnL for the TUI to completed-cycle profit.
-
-        The tracker keeps the raw realized PnL stream, which can include
-        non-cycle realized events or temporary reconciliation noise. The
-        terminal's grid PnL panel should reflect completed grid cycles, so
-        it uses `avg_cycle_profit * completed_cycles` when available.
-        """
-        avg_cycle_profit = getattr(stats, "avg_cycle_profit", None)
-        if avg_cycle_profit is None:
-            return stats.realized_profit
-
-        try:
-            avg_cycle_profit = Decimal(str(avg_cycle_profit))
-        except Exception:
-            return stats.realized_profit
-
-        if stats.completed_cycles <= 0:
-            return Decimal("0")
-
-        return avg_cycle_profit * Decimal(str(stats.completed_cycles))
-
     def create_pnl_panel(self, stats: GridStatistics) -> Panel:
         """Create the profit and loss panel."""
         content = Text()
-        realized_profit = self._get_display_realized_profit(stats)
+        realized_profit = stats.realized_profit
         total_profit = realized_profit + stats.unrealized_profit
         net_profit = total_profit - stats.total_fees
         if getattr(stats, "initial_capital", Decimal("0")) > 0:

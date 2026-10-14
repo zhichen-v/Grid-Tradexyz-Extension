@@ -503,7 +503,7 @@ class GridCoordinator:
             if grid_id_check in self._grid_level_locks:
                 lock_info = self._grid_level_locks[grid_id_check]
                 if lock_info['tp_side'] == filled_order.side.value:
-                    self.logger.info(
+                    self.logger.debug(
                             f"Unlocked Grid {grid_id_check} after take-profit fill "
                             f"{filled_order.side.value}@{filled_order.price} "
                         )
@@ -704,7 +704,7 @@ class GridCoordinator:
                 'tp_price': new_price,
                 'tp_order_id': placed_order.order_id,
             }
-            self.logger.info(
+            self.logger.debug(
                 f"Grid {new_grid_id} locked until {new_side.value}@{new_price} fills"
             )
 
@@ -1571,10 +1571,11 @@ class GridCoordinator:
 
         stats.current_position = selected_position
         stats.average_cost = selected_average_cost
-        if selected_position != 0 and selected_average_cost > 0 and current_price > 0:
-            stats.unrealized_profit = selected_position * (current_price - selected_average_cost)
-        else:
-            stats.unrealized_profit = Decimal('0')
+        stats.unrealized_profit = self._position_unrealized_profit(
+            current_price,
+            selected_position,
+            selected_average_cost,
+        )
 
         if hasattr(self.position_monitor, "get_last_liquidation_price"):
             stats.liquidation_price = self.position_monitor.get_last_liquidation_price()
@@ -2398,6 +2399,59 @@ class GridCoordinator:
 
         return estimated_capital
 
+    def _position_unrealized_profit(
+        self,
+        current_price: Decimal,
+        position: Decimal,
+        average_cost: Decimal,
+    ) -> Decimal:
+        """Value held grid lots at their own entries, the rest at exchange cost.
+
+        Realized PnL is booked per grid pair (TP price minus the lot's entry),
+        so unrealized PnL must use the same lot entries. The exchange average
+        entry is not reduced when a lot's TP fills, so after one-way moves it
+        drifts away from the lots still held and overstates net profit.
+        """
+        if position == 0 or current_price <= 0:
+            return Decimal('0')
+
+        direction = Decimal('1') if position > 0 else Decimal('-1')
+        exit_side = GridOrderSide.SELL if position > 0 else GridOrderSide.BUY
+        offset = self.config.grid_interval * Decimal(
+            str(getattr(self.config, "reverse_order_grid_distance", 1) or 1)
+        )
+        remaining_of = getattr(self.engine, "_get_remaining_order_amount", None)
+
+        lot_profit = Decimal('0')
+        covered = Decimal('0')
+        try:
+            pending_orders = self.engine.get_pending_orders()
+        except Exception:
+            pending_orders = []
+        for order in pending_orders:
+            if (
+                order.status != GridOrderStatus.PENDING
+                or order.side != exit_side
+                or not order.parent_order_id
+            ):
+                continue
+            amount = remaining_of(order) if callable(remaining_of) else order.amount
+            if amount <= 0:
+                continue
+            entry_price = order.price - direction * offset
+            lot_profit += direction * (current_price - entry_price) * amount
+            covered += amount
+
+        uncovered = abs(position) - covered
+        if uncovered < 0:
+            # TP orders exceed the position (stale snapshot); fall back.
+            if average_cost <= 0:
+                return Decimal('0')
+            return position * (current_price - average_cost)
+        if uncovered > 0 and average_cost > 0:
+            lot_profit += direction * uncovered * (current_price - average_cost)
+        return lot_profit
+
     def get_symbol_isolated_snapshot(
         self,
         current_price: Optional[Decimal] = None,
@@ -2444,10 +2498,11 @@ class GridCoordinator:
         except Exception:
             total_fees = Decimal('0')
 
-        if current_position != 0 and average_cost > 0 and reference_price > 0:
-            unrealized_profit = current_position * (reference_price - average_cost)
-        else:
-            unrealized_profit = Decimal('0')
+        unrealized_profit = self._position_unrealized_profit(
+            reference_price,
+            current_position,
+            average_cost,
+        )
 
         net_profit = realized_profit + unrealized_profit - total_fees
         current_equity = initial_capital + net_profit if initial_capital > 0 else net_profit
@@ -2555,7 +2610,7 @@ class GridCoordinator:
             filled_order.filled_price,
             filled_amount,
         ):
-            self.logger.info(
+            self.logger.debug(
                 f"State fill matched by direct order id: "
                 f"order_id={filled_order.order_id}, grid_id={filled_order.grid_id}, "
                 f"side={filled_order.side.value}, price={filled_order.price}"

@@ -194,7 +194,8 @@ class OrderHealthChecker:
             local_count = len(self.engine.get_pending_orders())
             self._log_health_summary(
                 f"Health check complete: exchange_orders={len(exchange_orders)}, "
-                f"local_orders={local_count}, repairs={repair_count}"
+                f"local_orders={local_count}, repairs={repair_count}",
+                level="info" if repair_count else "debug",
             )
 
             self.engine._last_health_repair_count = repair_count
@@ -1104,8 +1105,10 @@ class OrderHealthChecker:
             self._reset_tp_only_mismatch_tracking()
             if tp_issue:
                 structural_issues.append(tp_issue)
+            # Snapshots taken right after a fill routinely race the reverse
+            # order; a real divergence is still reported once fills settle.
             self._log_runtime_consistency_message(
-                "warning",
+                "info" if self._has_recent_fill() else "warning",
                 "Runtime consistency issue detected: " + "; ".join(structural_issues),
             )
             return
@@ -1124,7 +1127,7 @@ class OrderHealthChecker:
 
         self._reset_tp_only_mismatch_tracking()
         self._log_runtime_consistency_message(
-            "info",
+            "debug",
             "Runtime consistency verified: "
             f"exchange_orders={len(exchange_keys)}, engine_orders={len(engine_keys)}, state_orders={len(state_keys)}, "
             f"exchange_position={actual_position}, tracker_position={tracker_position}, state_position={state_position}, "
@@ -1951,7 +1954,12 @@ class OrderHealthChecker:
         self._runtime_consistency_log_key = log_key
         self._runtime_consistency_log_time = now
 
-    def _log_health_summary(self, message: str, throttle_seconds: float = 300.0) -> None:
+    def _log_health_summary(
+        self,
+        message: str,
+        throttle_seconds: float = 300.0,
+        level: str = "info",
+    ) -> None:
         """Avoid writing identical health-check summaries every cycle."""
         now = time.time()
         if (
@@ -1960,7 +1968,7 @@ class OrderHealthChecker:
         ):
             return
 
-        self.logger.info(message)
+        getattr(self.logger, level)(message)
         self._health_summary_log_key = message
         self._health_summary_log_time = now
 

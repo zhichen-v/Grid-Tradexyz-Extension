@@ -251,7 +251,7 @@ class GridEngineImpl(IGridEngine):
                     # one level; finalization guards and fill dedup key on it.
                     temp_id = f"{temp_id}_{client_id}"
                 order_id = temp_id
-                self.logger.warning(
+                self.logger.debug(
                     f"Exchange returned no final order id, using temporary id: {temp_id}"
                 )
 
@@ -1141,7 +1141,7 @@ class GridEngineImpl(IGridEngine):
 
                     exchange_name = str(self.config.exchange).lower()
                     if exchange_name == "lighter":
-                        self.logger.info(
+                        self.logger.debug(
                             "WebSocket health status: connected, "
                             f"last_message_age={time_since_last_message:.0f}s"
                         )
@@ -1174,7 +1174,7 @@ class GridEngineImpl(IGridEngine):
                         self._last_ws_check_time = current_time
                         continue
 
-                    self.logger.info(
+                    self.logger.debug(
                         "WebSocket health status: connected, "
                         f"heartbeat_age={heartbeat_age:.0f}s, "
                         f"last_message_age={time_since_last_message:.0f}s"
@@ -1235,13 +1235,13 @@ class GridEngineImpl(IGridEngine):
                 elapsed = current_time - self._last_health_check_time
 
                 if elapsed >= interval:
-                    self.logger.info(
+                    self.logger.debug(
                         f"Triggering health check: since_last={elapsed:.0f}s, interval={interval}s"
                     )
                     if self._health_checker:
                         success = await self._health_checker.perform_health_check()
                         if success:
-                            self.logger.info("Health check complete")
+                            self.logger.debug("Health check complete")
                         else:
                             self.logger.warning(
                                 "Health check finished with repair errors"
@@ -3068,7 +3068,12 @@ class GridEngineImpl(IGridEngine):
         for key in (order_id, client_id):
             if key:
                 resolved.add(key)
-        self.logger.warning(
+        log = (
+            self.logger.debug
+            if exchange_data.get("submission_acknowledged")
+            else self.logger.warning
+        )
+        log(
             "Adopted previously uncertain order submission by exact client id: "
             f"grid_id={grid_order.grid_id}, order_id={order_id}, client_id={client_id}"
         )

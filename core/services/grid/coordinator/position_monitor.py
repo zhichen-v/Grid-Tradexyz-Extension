@@ -564,7 +564,7 @@ class PositionMonitor:
                     return
 
                 self._last_event_query_time = current_time
-                self.logger.info(f" 事件触发持仓查询: {event_name}")
+                self.logger.debug(f" 事件触发持仓查询: {event_name}")
 
                 await self._query_and_update_position(
                     is_initial=False,

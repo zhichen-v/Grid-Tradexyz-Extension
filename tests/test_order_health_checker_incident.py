@@ -490,7 +490,7 @@ class OrderHealthCheckerIncidentTests(unittest.IsolatedAsyncioTestCase):
         checker._log_runtime_consistency([snapshot], [], False, 0)
 
         level, message = checker._log_runtime_consistency_message.call_args.args
-        self.assertEqual(level, "info")
+        self.assertEqual(level, "debug")
         self.assertIn("Runtime consistency verified", message)
         self.assertIn("take_profit_coverage=0.00011", message)
 

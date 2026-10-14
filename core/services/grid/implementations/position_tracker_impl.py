@@ -110,10 +110,16 @@ class PositionTrackerImpl(IPositionTracker):
         cycle_profit = None
         parent_fill = self._get_parent_fill(order)
 
-        # Realized PnL is recognized when the fill closes a previously opened leg.
+        # Realized PnL is recognized only when the fill closes a grid lot. A
+        # re-entry after a TP fill pairs with that TP but opens a new lot;
+        # counting it too would book every oscillation twice.
         if order.is_buy_order():
             self.buy_count += 1
-            if parent_fill and parent_fill['side'] == 'sell':
+            if (
+                parent_fill
+                and parent_fill['side'] == 'sell'
+                and self._opening_side() != 'buy'
+            ):
                 profit = (parent_fill['price'] - filled_price) * filled_amount
                 cycle_profit = profit
                 self.realized_pnl += profit
@@ -129,7 +135,11 @@ class PositionTrackerImpl(IPositionTracker):
             self.sell_count += 1
 
             # Prefer parent-fill pairing, then fall back to synced average cost.
-            if parent_fill and parent_fill['side'] == 'buy':
+            if (
+                parent_fill
+                and parent_fill['side'] == 'buy'
+                and self._opening_side() != 'sell'
+            ):
                 profit = (filled_price - parent_fill['price']) * filled_amount
                 cycle_profit = profit
                 self.realized_pnl += profit
@@ -202,6 +212,15 @@ class PositionTrackerImpl(IPositionTracker):
         }
 
         self.trade_history.append(trade_record)
+
+    def _opening_side(self) -> Optional[str]:
+        """Return the side that opens grid lots: buy for long, sell for short."""
+        value = getattr(self.config.grid_type, "value", str(self.config.grid_type)).lower()
+        if value in {"long", "follow_long", "martingale_long"}:
+            return 'buy'
+        if value in {"short", "follow_short", "martingale_short"}:
+            return 'sell'
+        return None
 
     def _get_parent_fill(self, order: GridOrder) -> Optional[Dict[str, object]]:
         """Return the stored parent fill, if this order was created from one."""
@@ -459,9 +478,9 @@ class PositionTrackerImpl(IPositionTracker):
         else:
             self.position_cost = Decimal('0')
 
-        # Log at INFO only when the synced position actually changed.
+        # position_monitor already logs every exchange position change.
         if old_position != position:
-            self.logger.info(
+            self.logger.debug(
                 f"Initial position synced: {old_position} -> {position}, "
                 f"avg_cost=${entry_price}, position_cost=${self.position_cost}"
             )
