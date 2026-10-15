@@ -69,3 +69,7 @@ grid_system:
   # Optional position health-check tolerance.
   position_tolerance:
     tolerance_multiplier: 0.25
+
+  # Optional confirmed-drift repair for uncovered inventory:
+  # market_close (default) or restore_take_profit.
+  # position_repair_mode: market_close

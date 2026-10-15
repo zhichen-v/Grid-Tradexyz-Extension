@@ -227,6 +227,7 @@ grid_system:
 | `order_health_check_interval` | 否 | `600` | 健康檢查間隔，單位秒 |
 | `position_monitor_interval` | 否 | `10` | REST 持倉輪詢基礎間隔，至少 5 秒；失敗時指數退避至最長 60 秒 |
 | `fee_rate` | 否 | `0.0001` | 手續費率，供損益估算使用 |
+| `position_repair_mode` | 否 | `market_close` | 健康檢查確認「持倉多於止盈覆蓋」時的修復方式，見 [`position_repair_mode`](#position_repair_mode) |
 
 ### fixed range 專用欄位
 
@@ -401,6 +402,26 @@ grid_system:
 grid_system:
   position_tolerance:
     tolerance_multiplier: 0.5
+```
+
+### `position_repair_mode`
+
+健康檢查連續兩個週期確認同一筆持倉偏差後才會修復。當實際持倉大於掛單止盈所覆蓋的數量（做多：多頭過多；做空：空頭過多）時：
+
+| 值 | 行為 |
+|----|------|
+| `market_close`（預設） | 以 reduce-only 市價單平掉多出的部位；對應的網格層級會暫時沒有開倉單也沒有止盈單 |
+| `restore_take_profit` | 為「孤兒網格」重新掛回止盈單，保留網格層級；無法安全判斷時退回 `market_close` |
+
+`restore_take_profit` 的孤兒網格定義：該格沒有存活的開倉單與止盈單、開倉價位於現價與最遠一張存活止盈單的來源格之間（做多為現價之上，做空為現價之下），且沒有本地追蹤的止盈或衝突的層級鎖。只有這些格子的網格數量總和與多出的持倉完全相符（容差為數量精度的一半）時才會掛單；止盈單沿用一般反手單的下單路徑（Lighter 為 GTT + reduce-only），仍受 `max_position` 與恢復熔斷限制。
+
+以下情況退回市價平倉：沒有任何存活止盈單可界定網格範圍、孤兒格數量與偏差不符、層級鎖衝突、Scalping 模式，或連續三次掛單皆未成功。健康週期已過期（重置後）、取不到現價或恢復熔斷開啟時，本週期不下任何單，待下次檢查。
+
+限制：如果遺失止盈的是最外層（沒有更遠的存活止盈單），該格不在範圍內，會退回市價平倉。
+
+```yaml
+grid_system:
+  position_repair_mode: restore_take_profit
 ```
 
 ## 常見範例

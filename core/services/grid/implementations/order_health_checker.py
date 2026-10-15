@@ -35,6 +35,8 @@ class OrderHealthChecker:
     TP_ONLY_MISMATCH_WARNING_CYCLES = 4
     TP_ONLY_MISMATCH_WARNING_SECONDS = 60.0
     ORDER_HISTORY_LIMIT = 100
+    POSITION_REPAIR_MODE_RESTORE_TP = "restore_take_profit"
+    TP_RESTORE_MAX_FAILED_ATTEMPTS = 3
 
     def __init__(self, config: GridConfig, engine, reserve_manager=None):
         self.config = config
@@ -59,6 +61,7 @@ class OrderHealthChecker:
         self._position_drift_cycles = 0
         self._tp_only_mismatch_cycles = 0
         self._tp_only_mismatch_started_at = 0.0
+        self._tp_restore_failed_attempts = 0
 
         # Reuse the shared line-limited handler and keep file output at INFO.
         self.logger.logger.setLevel(logging.INFO)
@@ -1926,6 +1929,15 @@ class OrderHealthChecker:
             )
             return False
 
+        restored = await self._restore_orphaned_take_profits_if_safe(
+            result,
+            exchange_orders,
+        )
+        if restored is not None:
+            if restored:
+                self._reset_position_drift_confirmation()
+            return restored
+
         adjusted = await self._adjust_position(result)
         if adjusted:
             self._reset_position_drift_confirmation()
@@ -1934,6 +1946,206 @@ class OrderHealthChecker:
     def _reset_position_drift_confirmation(self) -> None:
         self._position_drift_signature = None
         self._position_drift_cycles = 0
+        self._tp_restore_failed_attempts = 0
+
+    async def _restore_orphaned_take_profits_if_safe(
+        self,
+        result: PositionHealthResult,
+        exchange_orders: List[OrderData],
+    ) -> Optional[bool]:
+        """Re-place missing TPs for uncovered inventory instead of market-closing it.
+
+        Returns None to fall back to market repair, True when TPs were placed,
+        and False to defer without any market order this cycle.
+        """
+        config = getattr(self, "config", None)
+        mode = str(getattr(config, "position_repair_mode", "market_close") or "")
+        if mode.lower() != self.POSITION_REPAIR_MODE_RESTORE_TP:
+            return None
+
+        excess = self._get_uncovered_exit_excess(result)
+        if excess is None:
+            return None
+
+        if self._health_cycle_is_stale():
+            self.logger.info("Skip stale take-profit restore after reset")
+            return False
+
+        current_price = self._decimal_or_zero(await self.engine.get_current_price())
+        if current_price <= 0:
+            self.logger.warning(
+                f"Defer take-profit restore because current price is unavailable: {current_price}"
+            )
+            return False
+
+        restore_orders, reason = self._plan_take_profit_restore(
+            exchange_orders,
+            current_price,
+            excess,
+        )
+        if restore_orders is None:
+            self.logger.warning(
+                "Take-profit restore not safe; falling back to market position repair: "
+                f"excess={excess}, current_price={current_price}, reason={reason}"
+            )
+            return None
+
+        retry_after = getattr(self.engine, "_restore_circuit_retry_after", None)
+        if callable(retry_after):
+            blocked = [order for order in restore_orders if retry_after(order) > 0]
+            if blocked:
+                self.logger.warning(
+                    "Defer take-profit restore while restoration circuits are open: "
+                    f"keys={self._summarize_order_price_keys(blocked)}"
+                )
+                return False
+
+        # Reserve each level like a coordinator reverse order so base-side gap
+        # repair cannot refill it; failed placements release matching locks.
+        coordinator = getattr(self.engine, "coordinator", None)
+        locks = getattr(coordinator, "_grid_level_locks", None) if coordinator else None
+        if isinstance(locks, dict):
+            for order in restore_orders:
+                locks[order.grid_id] = {
+                    "tp_side": order.side.value,
+                    "tp_price": order.price,
+                    "tp_order_id": None,
+                    "reason": "health_tp_restore",
+                }
+
+        self.logger.warning(
+            "Restoring orphaned take-profit orders instead of market-closing excess: "
+            f"excess={excess}, current_price={current_price}, "
+            f"keys={self._summarize_order_price_keys(restore_orders, limit=len(restore_orders))}"
+        )
+        placed = await self._place_missing_orders(restore_orders)
+        if placed:
+            self._tp_restore_failed_attempts = 0
+            return True
+
+        attempts = getattr(self, "_tp_restore_failed_attempts", 0) + 1
+        self._tp_restore_failed_attempts = attempts
+        if attempts >= self.TP_RESTORE_MAX_FAILED_ATTEMPTS:
+            self._tp_restore_failed_attempts = 0
+            self.logger.error(
+                "Take-profit restore failed repeatedly; falling back to market position repair: "
+                f"attempts={attempts}, excess={excess}"
+            )
+            return None
+        self.logger.warning(
+            f"Take-profit restore placed no orders; retrying next cycle: attempts={attempts}"
+        )
+        return False
+
+    def _get_uncovered_exit_excess(self, result: PositionHealthResult) -> Optional[Decimal]:
+        """Return inventory beyond TP-backed exposure, or None for other drift shapes."""
+        expected = result.expected_position
+        actual = result.actual_position
+        base_side = self._base_side_for_grid_type()
+        if base_side == GridOrderSide.BUY and actual > 0 and expected >= 0:
+            excess = actual - expected
+        elif base_side == GridOrderSide.SELL and actual < 0 and expected <= 0:
+            excess = expected - actual
+        else:
+            return None
+        return excess if excess > result.tolerance else None
+
+    def _plan_take_profit_restore(
+        self,
+        exchange_orders: List[OrderData],
+        current_price: Decimal,
+        excess: Decimal,
+    ) -> Tuple[Optional[List[GridOrder]], str]:
+        """Build TPs for orphaned slots only when they explain the excess exactly."""
+        base_side = self._base_side_for_grid_type()
+        if base_side is None:
+            return None, "unsupported grid type"
+        if getattr(self.config, "scalping_enabled", False):
+            return None, "scalping mode manages its own take-profit"
+        is_long = base_side == GridOrderSide.BUY
+        exit_side = GridOrderSide.SELL if is_long else GridOrderSide.BUY
+
+        distance = getattr(self.config, "reverse_order_grid_distance", 1) or 1
+        offset = self.config.grid_interval * Decimal(str(distance))
+
+        existing_keys = {
+            (self._normalize_price_key(order.price), order.side.value.lower())
+            for order in exchange_orders
+            if getattr(order, "price", None) is not None
+            and getattr(order, "side", None) is not None
+        }
+
+        # The active ladder spans from market to the farthest live TP's source level;
+        # untouched levels beyond it never held inventory and must not be restored.
+        anchors: List[Decimal] = []
+        for order in exchange_orders:
+            price = getattr(order, "price", None)
+            side = getattr(order, "side", None)
+            if price is None or side is None:
+                continue
+            if side.value.lower() != exit_side.value.lower():
+                continue
+            tp_price = Decimal(str(price))
+            anchors.append(tp_price - offset if is_long else tp_price + offset)
+        if not anchors:
+            return None, "no live take-profit orders anchor the active ladder"
+        ladder_edge = max(anchors) if is_long else min(anchors)
+
+        protected_grid_ids = self._get_local_protected_base_grid_ids()
+        protected_grid_ids.update(self._get_exchange_protected_base_grid_ids(exchange_orders))
+        coordinator = getattr(self.engine, "coordinator", None)
+        locks = getattr(coordinator, "_grid_level_locks", None) if coordinator else None
+
+        restore_orders: List[GridOrder] = []
+        for grid_id in range(1, self.config.grid_count + 1):
+            source_price = self.config.get_grid_price(grid_id)
+            if is_long:
+                inside = current_price < source_price < ladder_edge
+                tp_price = source_price + offset
+            else:
+                inside = ladder_edge < source_price < current_price
+                tp_price = source_price - offset
+            if not inside:
+                continue
+            if (self._normalize_price_key(source_price), base_side.value.lower()) in existing_keys:
+                continue
+            if (self._normalize_price_key(tp_price), exit_side.value.lower()) in existing_keys:
+                continue
+            if grid_id in protected_grid_ids:
+                continue
+
+            lock = locks.get(grid_id) if isinstance(locks, dict) else None
+            if lock is not None and not (
+                isinstance(lock, dict)
+                and str(lock.get("tp_side", "")).lower() == exit_side.value.lower()
+                and self._normalize_price_key(lock.get("tp_price"))
+                == self._normalize_price_key(tp_price)
+            ):
+                return None, f"grid {grid_id} holds a conflicting level lock"
+
+            restore_orders.append(
+                GridOrder(
+                    order_id="",
+                    grid_id=grid_id,
+                    side=exit_side,
+                    price=tp_price,
+                    amount=self.config.get_formatted_grid_order_amount(grid_id),
+                    status=GridOrderStatus.PENDING,
+                    created_at=datetime.now(),
+                    parent_order_id=f"health_tp_restore:{grid_id}",
+                )
+            )
+
+        if not restore_orders:
+            return None, "no orphaned grid slots inside the active ladder"
+
+        orphaned_amount = sum((order.amount for order in restore_orders), Decimal("0"))
+        if abs(orphaned_amount - excess) > self._get_order_fill_tolerance():
+            return None, (
+                f"orphaned slot amount {orphaned_amount} does not match excess {excess} "
+                f"(slots={len(restore_orders)})"
+            )
+        return restore_orders, ""
 
     def _log_runtime_consistency_message(
         self,
@@ -2062,6 +2274,7 @@ class OrderHealthChecker:
         """Clear isolated TP-mismatch tracking after the runtime state converges or changes class."""
         self._tp_only_mismatch_cycles = 0
         self._tp_only_mismatch_started_at = 0.0
+        self._tp_restore_failed_attempts = 0
 
     def _get_pending_partial_base_fill_exposure(self) -> Decimal:
         """Return live exposure caused by partial base fills that should not yet have TP coverage."""

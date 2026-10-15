@@ -11,6 +11,10 @@
 
 ### Added
 
+#### 2026-10-15
+
+- Added opt-in `position_repair_mode: restore_take_profit` for Grid health checks. When a confirmed drift shows inventory beyond open take-profit coverage, the checker re-places the missing take-profit orders for orphaned grid slots (no live entry or TP, between market and the farthest live TP) instead of market-closing the excess, keeping those grid levels intact. It acts only when those slots' grid amounts exactly explain the excess; ambiguous or unexplained drift, missing TP anchors, conflicting level locks, or three failed placement attempts fall back to the existing market close. Stale health cycles, unavailable prices, and open restoration circuits defer without any market order. Long and short grids are mirrored; the default `market_close` behavior is unchanged.
+
 #### 2026-09-24
 
 - Added durable Lighter create-order evidence under `logs/lighter_submission_evidence/*.jsonl`: save the signed transaction hash, actual nonce/key index, Grid/client identity and order parameters before HTTP submission, then append sanitized response/502 timing and allowlisted gateway trace IDs. Journals survive normal startup log cleanup; no private keys, auth tokens, signatures or signed payloads are recorded.
