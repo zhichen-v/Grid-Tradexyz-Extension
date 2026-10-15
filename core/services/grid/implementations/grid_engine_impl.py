@@ -181,12 +181,11 @@ class GridEngineImpl(IGridEngine):
             )
             return None
 
-        position_gate = getattr(
-            getattr(self, "coordinator", None),
-            "can_place_order_within_max_position",
-            None,
-        )
-        if position_gate and not position_gate(
+        coordinator = getattr(self, "coordinator", None)
+        position_gate = getattr(coordinator, "can_place_order_within_max_position", None)
+        neutral_check = getattr(coordinator, "is_exposure_neutral_reverse", None)
+        exposure_neutral = callable(neutral_check) and neutral_check(order)
+        if position_gate and not exposure_neutral and not position_gate(
             order.side,
             order.amount,
             additional_open_amount=getattr(

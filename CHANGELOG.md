@@ -39,6 +39,8 @@
 
 #### 2026-10-15 (adapters)
 
+- Grid no longer fatal-stops when take-profit fills are followed by their buy-backs while `max_position` is fully used. The reverse entry created for a closing fill re-opens exactly the closed amount, so it is tagged exposure-neutral and skips the max_position check in the coordinator and engine; the REST-synced tracker position could lag several fills behind (seen on Arcus mainnet). Health repairs drop the tag and stay gated.
+- Arcus `connect()` is now idempotent, fixing an `Unclosed client session` leak when the grid engine reconnects on start.
 - Lighter now feeds adapter-level position callbacks (used by scalping mode) with `{symbol, size (signed), entry_price, unrealized_pnl}` dicts, like Arcus. Previously that list never fired and the WebSocket sent `PositionData` objects instead.
 - A Lighter limit order that fails after the request was sent now returns the uncertain-submission placeholder (client id kept, no retry) instead of `None`, which the engine treated as a definitive rejection. HTTP 429 is still a definitive rejection.
 

@@ -150,11 +150,13 @@ class ArcusAdapter(ExchangeAdapter):
         if not self._address or not self._signing_key:
             self.logger.error("Arcus requires wallet_address and api_signing_key")
             return False
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.config.request_timeout)
-        )
+        # The grid engine calls connect() again on start; reuse the live session.
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.config.request_timeout)
+            )
         await self._load_markets()
-        if self.config.enable_websocket:
+        if self.config.enable_websocket and (self._ws_task is None or self._ws_task.done()):
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
             self._ws_task = asyncio.create_task(self._ws_loop())
         self.logger.info(

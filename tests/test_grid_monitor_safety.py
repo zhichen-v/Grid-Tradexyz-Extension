@@ -341,6 +341,39 @@ class MaxPositionTests(unittest.TestCase):
 
         self.assertEqual([order.order_id for order in accepted], ["buy-1", "sell-1"])
 
+    def test_reverse_entry_after_take_profit_fill_bypasses_stale_position(self):
+        # Arcus mainnet incident: three TPs filled within one REST interval, so the
+        # tracker still showed 0.0003 while the real position was 0.0001.
+        coordinator = self.make_coordinator(
+            "0.0009",
+            pending=[make_order("rebuy-1", GridOrderSide.BUY)],
+        )
+        tp_fill = make_order("tp", GridOrderSide.SELL)
+        reverse = make_order("reverse", GridOrderSide.BUY)
+        coordinator._tag_exposure_neutral_reverse(reverse, tp_fill)
+
+        self.assertTrue(coordinator.is_exposure_neutral_reverse(reverse))
+        self.assertFalse(
+            coordinator.can_place_order_within_max_position(GridOrderSide.BUY, reverse.amount)
+        )
+        accepted = coordinator.filter_orders_within_max_position([reverse], "batch")
+        self.assertEqual([order.order_id for order in accepted], ["reverse"])
+
+    def test_entry_fills_and_mismatched_amounts_are_not_tagged(self):
+        coordinator = self.make_coordinator("0.0009")
+        entry_fill = make_order("entry", GridOrderSide.BUY)
+        reverse_sell = make_order("tp", GridOrderSide.SELL)
+        coordinator._tag_exposure_neutral_reverse(reverse_sell, entry_fill)
+        self.assertFalse(coordinator.is_exposure_neutral_reverse(reverse_sell))
+
+        tp_fill = make_order("tp", GridOrderSide.SELL)
+        bigger = make_order("bigger", GridOrderSide.BUY, amount="0.0004")
+        coordinator._tag_exposure_neutral_reverse(bigger, tp_fill)
+        self.assertFalse(coordinator.is_exposure_neutral_reverse(bigger))
+        self.assertEqual(
+            coordinator.filter_orders_within_max_position([bigger], "batch"), []
+        )
+
     def test_closing_order_is_allowed_even_when_position_is_over_limit(self):
         coordinator = self.make_coordinator("0.002")
 
@@ -380,6 +413,21 @@ class EnginePlacementSafetyTests(unittest.IsolatedAsyncioTestCase):
         coordinator._paused = False
         engine.coordinator = coordinator
         return engine, coordinator
+
+    async def test_engine_places_tagged_reverse_entry_despite_stale_position(self):
+        create_order = AsyncMock(
+            return_value=SimpleNamespace(id="rebuy", client_id=None, raw_data={})
+        )
+        engine, coordinator = self.make_engine(create_order, current="0.0008")
+        reverse = make_order("", GridOrderSide.BUY)
+        coordinator._tag_exposure_neutral_reverse(
+            reverse, make_order("tp", GridOrderSide.SELL)
+        )
+        plain = make_order("", GridOrderSide.BUY)
+
+        self.assertIsNone(await engine.place_order(plain))
+        self.assertIsNotNone(await engine.place_order(reverse))
+        create_order.assert_awaited_once()
 
     async def test_concurrent_limit_orders_share_atomic_exposure_gate(self):
         started = asyncio.Event()

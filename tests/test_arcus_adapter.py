@@ -172,6 +172,22 @@ class ArcusOrderTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ArcusConnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_connect_reuses_session(self):
+        adapter = make_adapter()
+
+        async def no_markets():
+            return None
+
+        adapter._load_markets = no_markets
+        self.assertTrue(await adapter._do_connect())
+        session = adapter._session
+        self.assertTrue(await adapter._do_connect())
+        self.assertIs(adapter._session, session)
+        await adapter._do_disconnect()
+        self.assertTrue(session.closed)
+
+
 class ArcusWebSocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_order_and_position_frames(self):
         adapter = make_adapter()

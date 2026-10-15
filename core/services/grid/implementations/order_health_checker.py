@@ -1406,6 +1406,8 @@ class OrderHealthChecker:
     ) -> Dict[str, Any]:
         """Carry partial-fill ledger data onto a replacement missing order."""
         data = deepcopy(grid_order.exchange_data) if isinstance(grid_order.exchange_data, dict) else {}
+        # Repairs re-enter the normal max_position gate.
+        data.pop("exposure_neutral_reverse", None)
         tracking = data.get("tradexyz_fill_tracking")
         if not isinstance(tracking, dict):
             tracking = {}

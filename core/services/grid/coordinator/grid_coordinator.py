@@ -647,8 +647,11 @@ class GridCoordinator:
                 created_at=datetime.now(),
                 parent_order_id=filled_order.order_id
             )
+            self._tag_exposure_neutral_reverse(reverse_order, filled_order)
 
-            if not self.can_place_order_within_max_position(
+            if not self.is_exposure_neutral_reverse(
+                reverse_order
+            ) and not self.can_place_order_within_max_position(
                 reverse_order.side,
                 reverse_order.amount,
             ):
@@ -956,6 +959,7 @@ class GridCoordinator:
                     created_at=datetime.now(),
                     parent_order_id=filled_orders[index].order_id,
                 )
+                self._tag_exposure_neutral_reverse(order, filled_orders[index])
                 reverse_orders.append(order)
 
             reverse_orders = self.filter_orders_within_max_position(
@@ -1705,6 +1709,30 @@ class GridCoordinator:
             )
         return within_limit
 
+    def _tag_exposure_neutral_reverse(
+        self, reverse_order: GridOrder, filled_order: GridOrder
+    ) -> None:
+        """Mark the entry that re-opens what a take-profit fill just closed.
+
+        Position + pending entries stays unchanged (the fill removed the amount
+        from the position, the reverse adds it back as a pending entry), so the
+        max_position gate must not judge it against the REST-synced tracker
+        position, which can lag several fills behind.
+        """
+        opening_side = self._strategy_opening_side()
+        if (
+            opening_side is not None
+            and filled_order.side != opening_side
+            and reverse_order.side == opening_side
+            and reverse_order.amount == (filled_order.filled_amount or filled_order.amount)
+        ):
+            reverse_order.exchange_data["exposure_neutral_reverse"] = True
+
+    @staticmethod
+    def is_exposure_neutral_reverse(order: GridOrder) -> bool:
+        data = getattr(order, "exchange_data", None)
+        return isinstance(data, dict) and data.get("exposure_neutral_reverse") is True
+
     def filter_orders_within_max_position(
         self,
         orders: List[GridOrder],
@@ -1719,6 +1747,9 @@ class GridCoordinator:
         accepted_orders: List[GridOrder] = []
 
         for order in orders:
+            if self.is_exposure_neutral_reverse(order):
+                accepted_orders.append(order)
+                continue
             if self.can_place_order_within_max_position(
                 order.side,
                 order.amount,
