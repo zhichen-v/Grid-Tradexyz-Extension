@@ -211,7 +211,6 @@ def main(argv=None):
     parser.add_argument("--query", action="store_true", help="Opt in to bounded authenticated GET queries")
     parser.add_argument("--tx-hash", help="Select one transaction hash")
     parser.add_argument("--config", type=Path, default=Path("config/exchanges/lighter_config.yaml"))
-    parser.add_argument("--env", type=Path, default=Path(".env"))
     parser.add_argument("--limit", type=int, default=10, help="Maximum records (1-100)")
     parser.add_argument("--pages", type=int, default=3, help="History page budget per record (1-10)")
     parser.add_argument("--timeout", type=float, default=5.0, help="Per-request timeout seconds (0-30)")
@@ -223,7 +222,7 @@ def main(argv=None):
         selected = records[-args.limit:]
         if args.query and selected:
             from scripts.lighter_preflight import load_settings
-            results = asyncio.run(query_records(selected, load_settings(args.config, args.env),
+            results = asyncio.run(query_records(selected, load_settings(args.config),
                                                 pages=args.pages, timeout=args.timeout))
         else:
             results = [_display(record) for record in selected]

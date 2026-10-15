@@ -1,7 +1,6 @@
 import os
 import unittest
 from decimal import Decimal
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -112,7 +111,6 @@ class AdapterConnectionTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with (
-            patch("run_grid_trading._load_dotenv", return_value=Path(".env")),
             patch("core.adapters.exchanges.ExchangeFactory") as factory_class,
             patch.dict(os.environ, env, clear=False),
         ):

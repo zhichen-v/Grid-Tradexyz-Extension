@@ -314,41 +314,6 @@ def detect_market_type(symbol: str, exchange_name: str) -> ExchangeType:
     return ExchangeType.PERPETUAL
 
 
-def _read_env_file(env_path: Path) -> dict[str, str]:
-    """Read simple KEY=VALUE entries from an env file."""
-    values: dict[str, str] = {}
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            if (
-                len(value) >= 2
-                and value[0] == value[-1]
-                and value[0] in {"'", '"'}
-            ):
-                value = value[1:-1]
-            values[key] = value
-
-    return values
-
-
-def _load_dotenv() -> Path | None:
-    """Load optional KEY=VALUE overrides from the default `.env`."""
-    import os
-
-    env_path = Path(".env")
-    if not env_path.exists():
-        return None
-
-    for key, value in _read_env_file(env_path).items():
-        os.environ.setdefault(key, value)
-
-    return env_path
-
-
 def _load_wallet_profile(wallet_name: str) -> dict[str, str]:
     """Load a named Hyperliquid/TradeXYZ agent wallet profile."""
     profile_path = _wallet_profile_path(wallet_name)
@@ -412,9 +377,6 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
     exchange_name = grid_config["exchange"].lower()
     symbol = grid_config["symbol"]
 
-    # Optional .env overrides; a named wallet profile is loaded explicitly below.
-    _load_dotenv()
-
     # Detect spot vs perpetual automatically.
     market_type = detect_market_type(symbol, exchange_name)
     print(f"   - Market type: {market_type.value}")
@@ -428,12 +390,6 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
         api_key = api_key or api_secret
         api_secret = api_secret or api_key
 
-    # Lighter 的 .env 使用 LIGHTER_API_KEY_PRIVATE_KEY 命名（與 wallet profile 一致）。
-    if exchange_name == "lighter":
-        lighter_private_key = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY")
-        api_key = api_key or lighter_private_key
-        api_secret = api_secret or lighter_private_key
-
     # A named wallet profile is explicit and overrides any stale shell vars.
     if wallet_name:
         if exchange_name not in WALLET_PROFILE_EXCHANGES:
@@ -446,7 +402,8 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
         print(f"   - Wallet profile: {wallet_name} ({_wallet_profile_path(wallet_name)})")
 
     # Fall back to the exchange config file if env vars are not set.
-    if not api_key or not api_secret:
+    # Lighter's adapter reads config/exchanges/lighter_config.yaml itself.
+    if exchange_name != "lighter" and (not api_key or not api_secret):
         try:
             exchange_config_path = Path(
                 f"config/exchanges/{exchange_name}_config.yaml"
@@ -471,13 +428,6 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                     wallet_address = wallet_address or auth_config.get(
                         "wallet_address", ""
                     )
-                elif exchange_name == "lighter":
-                    api_config = exchange_config_data.get("api_config", {})
-                    auth_config = api_config.get("auth", {})
-                    api_key = api_key or auth_config.get("api_key_private_key", "")
-                    api_secret = api_secret or auth_config.get(
-                        "api_key_private_key", ""
-                    )
                 else:
                     api_key = api_key or auth_config.get("api_key", "")
                     api_secret = api_secret or auth_config.get(
@@ -497,24 +447,15 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                             f"   - Wallet address: {wallet_address[:10]}...{wallet_address[-6:]}"
                         )
         except yaml.YAMLError:
-            if exchange_name == "lighter":
-                raise RuntimeError(
-                    "Invalid YAML in config/exchanges/lighter_config.yaml"
-                ) from None
             print("   - Warning: exchange config contains invalid YAML")
         except Exception as exc:
-            if exchange_name == "lighter":
-                raise RuntimeError(
-                    "Failed to read Lighter config "
-                    f"({type(exc).__name__})"
-                ) from exc
             print(
                 "   - Warning: failed to read exchange config file "
                 f"({type(exc).__name__})"
             )
 
     # Print a warning if credentials are still missing.
-    if not api_key or not api_secret:
+    if exchange_name != "lighter" and (not api_key or not api_secret):
         print("   - Warning: API credentials were not found")
         print(
             f"   - Hint: set environment variables or configure config/exchanges/{exchange_name}_config.yaml"
@@ -530,64 +471,35 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
             print("      - wallet_address: master Ethereum address that registered the key")
             print("      - api_signing_key: Ed25519 API signing key (hex)")
             print("      - account_index: subaccount index (default 0)")
-        elif exchange_name == "lighter":
-            print("   - Lighter requires:")
-            print("      - api_key_private_key: API key private key")
-            print("      - account_index: account index")
-            print("      - api_key_index: API key index (default 0)")
 
     # Build the exchange configuration.
     if exchange_name == "lighter":
-        try:
-            lighter_config_path = Path("config/exchanges/lighter_config.yaml")
-            if lighter_config_path.exists():
-                with open(lighter_config_path, "r", encoding="utf-8") as file:
-                    lighter_config_data = yaml.safe_load(file) or {}
-                api_config = lighter_config_data.get("api_config", {})
-                lighter_network = str(
-                    api_config.get("network")
-                    or ("testnet" if api_config.get("testnet", False) else "mainnet")
-                ).strip().lower()
+        from core.adapters.exchanges.adapters.lighter_base import (
+            LIGHTER_CONFIG_PATH,
+            read_lighter_config,
+        )
 
-                exchange_config = ExchangeConfig(
-                    exchange_id="lighter",
-                    name="Lighter",
-                    exchange_type=market_type,
-                    api_key="",
-                    api_secret="",
-                    testnet=api_config.get("testnet", False),
-                    enable_websocket=True,
-                    enable_auto_reconnect=True,
-                    extra_params={"network": lighter_network},
-                )
-                print(
-                    "   - Lighter config loaded successfully "
-                    f"(network={lighter_network}; adapter will read API credentials automatically)"
-                )
-            else:
-                print(f"   - Warning: Lighter config file not found: {lighter_config_path}")
-                exchange_config = ExchangeConfig(
-                    exchange_id="lighter",
-                    name="Lighter",
-                    exchange_type=market_type,
-                    api_key="",
-                    api_secret="",
-                    testnet=False,
-                    enable_websocket=True,
-                    enable_auto_reconnect=True,
-                    extra_params={"network": "mainnet"},
-                )
-        except yaml.YAMLError:
-            # Parser exceptions include the offending source line, which may
-            # contain the API private key. Never echo them or fall back to mainnet.
+        try:
+            lighter_settings = read_lighter_config()
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        if not lighter_settings.get("api_key_private_key"):
             raise RuntimeError(
-                "Invalid YAML in config/exchanges/lighter_config.yaml"
-            ) from None
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to load Lighter config "
-                f"({type(exc).__name__})"
-            ) from exc
+                f"Lighter credentials missing: set lighter.authentication in {LIGHTER_CONFIG_PATH} "
+                "(copy lighter_config_example.yaml)"
+            )
+        lighter_network = str(lighter_settings.get("network") or "mainnet").strip().lower()
+        exchange_config = ExchangeConfig(
+            exchange_id="lighter",
+            name="Lighter",
+            exchange_type=market_type,
+            api_key="",
+            api_secret="",
+            enable_websocket=True,
+            enable_auto_reconnect=True,
+            extra_params={"network": lighter_network},
+        )
+        print(f"   - Lighter network: {lighter_network} (credentials from {LIGHTER_CONFIG_PATH})")
     elif exchange_name == "arcus":
         arcus_settings = _read_arcus_settings()
         exchange_config = ExchangeConfig(

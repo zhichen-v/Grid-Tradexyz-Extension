@@ -93,9 +93,10 @@ The main runtime dependencies include:
 
 ## 6. Configure Exchange Credentials
 
-All account credentials live under `config/exchanges/` (every file holding a
-key is git-ignored). Environment variables such as `TRADEXYZ_API_KEY` still
-override the files for one-off runs.
+All account credentials live under `config/exchanges/`. Git tracks only the
+`*_example.yaml` templates there; copy one to `<exchange>_config.yaml` and fill
+it in. `.env` is no longer read. Shell environment variables such as
+`TRADEXYZ_API_KEY` still override HL/TradeXYZ/Arcus files for one-off runs.
 
 ### Option A: Per-exchange config file
 
@@ -109,8 +110,19 @@ tradexyz:
 ```
 
 Lighter uses `config/exchanges/lighter_config.yaml` (copy
-`lighter_config_example.yaml`); Arcus uses `config/exchanges/arcus_config.yaml`
-(copy `arcus_config_example.yaml`):
+`lighter_config_example.yaml`):
+
+```yaml
+lighter:
+  network: "robinhood"        # robinhood | robinhood_testnet | mainnet | testnet
+  authentication:
+    api_key_private_key: ""
+    account_index: 0
+    api_key_index: 0
+    expected_l1_address: ""   # optional
+```
+
+Arcus uses `config/exchanges/arcus_config.yaml` (copy `arcus_config_example.yaml`):
 
 ```yaml
 arcus:
@@ -370,7 +382,7 @@ Bare filenames are resolved under `config/grid/`.
 The runtime checks:
 
 1. Named wallet profile `config/exchanges/wallets/<name>.yaml`, when a wallet shortcut such as `--main` is provided (Hyperliquid / TradeXYZ only)
-2. Environment variables / `.env`
+2. Shell environment variables (not for Lighter)
 3. `config/exchanges/<exchange>_config.yaml`
 
 If all sources are empty, startup continues far enough to print warnings but trading cannot work correctly.
@@ -417,7 +429,7 @@ grid1.3/
 
 ## 15. Security Notes
 
-- Do not commit private keys, wallet addresses, or `.env` secrets.
+- Do not commit private keys or wallet addresses; only `config/exchanges/*_example.yaml` is tracked.
 - Do not commit `config/exchanges/wallets/` or `*_config.yaml` with keys; they hold live trading keys.
 - Start with small size and non-critical capital.
 - Treat all order-placement scripts as potentially live.

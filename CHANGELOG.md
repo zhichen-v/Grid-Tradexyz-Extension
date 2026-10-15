@@ -159,6 +159,7 @@
 
 #### 2026-10-15
 
+- Lighter credentials moved from `.env` into a slim `config/exchanges/lighter_config.yaml` (`lighter.network` + `lighter.authentication`, same layout as Arcus); the old `api_config` layout and every `.env` reader (adapter, startup, preflight, diagnostics `--env`) are removed. A missing Lighter config now stops startup instead of falling back to mainnet. Git now tracks only `config/exchanges/*_example.yaml`.
 - Hyperliquid / TradeXYZ wallet profiles moved from `.env.wallets/<name>.env` to `config/exchanges/wallets/<name>.yaml` (same `authentication` block as `<exchange>_config.yaml`); `setup_agent_wallet.py` writes there (default profile `main`). `HL_AGENT_KEY` / `HL_WALLET_ADDRESS` env vars are no longer read.
 
 #### 2026-05-16

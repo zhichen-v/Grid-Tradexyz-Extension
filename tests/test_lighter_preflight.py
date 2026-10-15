@@ -118,10 +118,9 @@ class LighterPreflightTest(unittest.IsolatedAsyncioTestCase):
                 wallet = "0x1234567890abcdef1234567890abcdef12345678"
                 config_path = Path(directory) / "lighter_config.yaml"
                 config_path.write_text(
-                    "api_config:\n"
+                    "lighter:\n"
                     f"  network: {network}\n"
-                    f"  testnet: {'true' if network.endswith('_testnet') else 'false'}\n"
-                    "  auth:\n"
+                    "  authentication:\n"
                     f"    api_key_private_key: {secret}\n"
                     "    account_index: 123\n"
                     "    api_key_index: 4\n"
@@ -167,10 +166,9 @@ class LighterPreflightTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "lighter_config.yaml"
             config_path.write_text(
-                "api_config:\n"
+                "lighter:\n"
                 "  network: robinhood\n"
-                "  testnet: false\n"
-                "  auth:\n"
+                "  authentication:\n"
                 "    api_key_private_key: 0xsecret\n"
                 "    account_index: 1\n"
                 "    api_key_index: 4\n"
@@ -200,10 +198,9 @@ class LighterPreflightTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "lighter_config.yaml"
             config_path.write_text(
-                "api_config:\n"
+                "lighter:\n"
                 "  network: mainnet\n"
-                "  testnet: false\n"
-                "  auth:\n"
+                "  authentication:\n"
                 "    api_key_private_key: 0xsecret\n"
                 "    account_index: 1\n"
                 "    api_key_index: 4\n",
@@ -219,10 +216,9 @@ class LighterPreflightCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "lighter_config.yaml"
             config_path.write_text(
-                "api_config:\n"
+                "lighter:\n"
                 "  network: robinhood\n"
-                "  testnet: false\n"
-                "  auth:\n"
+                "  authentication:\n"
                 "    api_key_private_key: 0xsecret\n"
                 "    account_index: 1\n"
                 "    api_key_index: 4\n",
@@ -256,9 +252,9 @@ class LighterPreflightCliTest(unittest.TestCase):
             secret = "0xTHIS_MUST_NOT_PRINT"
             config_path = Path(directory) / "lighter_config.yaml"
             config_path.write_text(
-                "api_config:\n"
+                "lighter:\n"
                 "  network: robinhood\n"
-                "  auth:\n"
+                "  authentication:\n"
                 f"    api_key_private_key: [{secret}\n",
                 encoding="utf-8",
             )
@@ -275,10 +271,9 @@ class LighterPreflightCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "lighter_config.yaml"
             config_path.write_text(
-                "api_config:\n"
+                "lighter:\n"
                 "  network: robinhood\n"
-                "  testnet: false\n"
-                "  auth:\n"
+                "  authentication:\n"
                 "    api_key_private_key: 0xsecret\n"
                 "    account_index: 1\n"
                 "    api_key_index: 255\n",

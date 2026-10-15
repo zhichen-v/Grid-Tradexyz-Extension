@@ -10,51 +10,10 @@ from typing import Any, Callable
 # Run from the repo root as `python scripts/<name>.py`; make `core` importable.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import yaml
 from lighter.endpoint_profiles import get_endpoint_profile
 
 DEFAULT_CONFIG = Path("config/exchanges/lighter_config.yaml")
-DEFAULT_ENV = Path(".env")
 ROBINHOOD_NETWORKS = {"robinhood", "robinhood_testnet"}
-
-# .env 欄位名稱 → load_settings 的 settings 欄位名稱
-_ENV_FIELD_NAMES = (
-    ("LIGHTER_NETWORK", "network"),
-    ("LIGHTER_API_KEY_PRIVATE_KEY", "api_key_private_key"),
-    ("LIGHTER_ACCOUNT_INDEX", "account_index"),
-    ("LIGHTER_API_KEY_INDEX", "api_key_index"),
-    ("LIGHTER_EXPECTED_L1_ADDRESS", "expected_l1_address"),
-)
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    """Read KEY=VALUE lines from a .env file (skips comments and blank lines)."""
-    values: dict[str, str] = {}
-    if not path.is_file():
-        return values
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[key.strip()] = value
-    return values
-
-
-def _env_fill_in(env_path: Path) -> dict[str, Any]:
-    """Non-empty LIGHTER_* values from .env, keyed by settings field name.
-
-    只回傳非空的欄位；空值代表「未配置」，不會覆蓋 YAML。
-    """
-    env_values = _read_env_file(env_path)
-    return {
-        field: env_values[env_key]
-        for env_key, field in _ENV_FIELD_NAMES
-        if env_values.get(env_key, "").strip()
-    }
 
 
 def _wallet_address(value: Any) -> str | None:
@@ -66,71 +25,43 @@ def _wallet_address(value: Any) -> str | None:
     return address.lower()
 
 
-def load_settings(path: Path, env_path: Path = DEFAULT_ENV) -> dict[str, Any]:
+def load_settings(path: Path) -> dict[str, Any]:
+    from core.adapters.exchanges.adapters.lighter_base import read_lighter_config
+
     if not path.is_file():
         raise ValueError(
             f"Config not found: {path}. Copy lighter_config_example.yaml first."
         )
-
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError:
-        raise ValueError(f"Invalid YAML in config: {path}") from None
-
-    # .env 填空：YAML 留空的欄位由 .env 的非空值補上（YAML 有值時以 YAML 為準）。
-    fill_in = _env_fill_in(env_path)
-    if fill_in:
-        api_config = data.get("api_config") or {}
-        auth = dict(api_config.get("auth") or {})
-        for field, value in fill_in.items():
-            if field == "network":
-                if not str(api_config.get("network") or "").strip():
-                    api_config = {**api_config, "network": value}
-            elif not str(auth.get(field) or "").strip():
-                auth[field] = value
-        data = {**data, "api_config": {**api_config, "auth": auth}}
-
-    api_config = data.get("api_config") or {}
-    auth = api_config.get("auth") or {}
-    network = str(api_config.get("network") or "").strip().lower()
-
+    raw = read_lighter_config(path)
+    network = str(raw.get("network") or "").strip().lower()
     if network not in ROBINHOOD_NETWORKS:
-        raise ValueError("api_config.network must be robinhood or robinhood_testnet")
+        raise ValueError("lighter.network must be robinhood or robinhood_testnet")
 
-    expected_testnet = network.endswith("_testnet")
-    configured_testnet = api_config.get("testnet")
-    if configured_testnet is not None:
-        if not isinstance(configured_testnet, bool):
-            raise ValueError("api_config.testnet must be true or false")
-        if configured_testnet != expected_testnet:
-            raise ValueError("api_config.testnet conflicts with api_config.network")
-
-    private_key = auth.get("api_key_private_key")
+    private_key = raw.get("api_key_private_key")
     if not isinstance(private_key, str) or not private_key.strip():
-        raise ValueError("api_config.auth.api_key_private_key is required")
+        raise ValueError("lighter.authentication.api_key_private_key is required")
 
     settings = {
         "network": network,
-        "testnet": expected_testnet,
+        "testnet": network.endswith("_testnet"),
         "api_key_private_key": private_key.strip(),
-        "expected_l1_address": _wallet_address(auth.get("expected_l1_address")),
+        "expected_l1_address": _wallet_address(raw.get("expected_l1_address")),
     }
     for field in ("account_index", "api_key_index"):
-        value = auth.get(field)
+        value = raw.get(field)
+        message = f"lighter.authentication.{field} must be a non-negative integer"
         if isinstance(value, bool):
-            raise ValueError(f"api_config.auth.{field} must be a non-negative integer")
+            raise ValueError(message)
         try:
             value = int(value)
         except (TypeError, ValueError):
-            raise ValueError(
-                f"api_config.auth.{field} must be a non-negative integer"
-            ) from None
+            raise ValueError(message) from None
         if value < 0:
-            raise ValueError(f"api_config.auth.{field} must be a non-negative integer")
+            raise ValueError(message)
         settings[field] = value
 
     if settings["api_key_index"] > 254:
-        raise ValueError("api_config.auth.api_key_index must be between 0 and 254")
+        raise ValueError("lighter.authentication.api_key_index must be between 0 and 254")
 
     return settings
 

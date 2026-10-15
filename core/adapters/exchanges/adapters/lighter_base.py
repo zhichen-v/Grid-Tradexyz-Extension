@@ -7,7 +7,38 @@ Lighter交易所适配器 - 基础模块
 from typing import Dict, Any, Optional, List
 from decimal import Decimal
 from datetime import datetime
+from pathlib import Path
 import logging
+
+import yaml
+
+LIGHTER_CONFIG_PATH = Path("config/exchanges/lighter_config.yaml")
+
+
+def read_lighter_config(path: Path = LIGHTER_CONFIG_PATH) -> Dict[str, Any]:
+    """Flat Lighter settings from the `lighter:` section of lighter_config.yaml.
+
+    Returns {} when the file is missing. YAML errors never echo the source line,
+    which may contain the API private key.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError:
+        raise ValueError(f"Invalid YAML in {path}") from None
+    section = data.get("lighter") if isinstance(data, dict) else None
+    section = section if isinstance(section, dict) else {}
+    auth = section.get("authentication") if isinstance(section.get("authentication"), dict) else {}
+    return {
+        "network": section.get("network"),
+        "market_order_slippage": section.get("market_order_slippage"),
+        "api_key_private_key": auth.get("api_key_private_key") or "",
+        "account_index": auth.get("account_index", 0),
+        "api_key_index": auth.get("api_key_index", 0),
+        "expected_l1_address": auth.get("expected_l1_address"),
+    }
 
 logger = logging.getLogger(__name__)
 

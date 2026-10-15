@@ -8,54 +8,17 @@ Lighter交易所适配器
 
 import asyncio
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 from decimal import Decimal
-import yaml
-import os
 
 from ....logging import get_logger
 
 from ..adapter import ExchangeAdapter
 from ..interface import ExchangeConfig
 from ..models import *
+from .lighter_base import read_lighter_config
 from .lighter_rest import LighterRest
 from .lighter_websocket import LighterWebSocket
-
-
-def _read_env_file(path: Path) -> Dict[str, str]:
-    """Read KEY=VALUE lines from a .env file (skips comments and blank lines)."""
-    values: Dict[str, str] = {}
-    if not path.is_file():
-        return values
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[key.strip()] = value
-    return values
-
-
-def _env_auth_fill_in(env_path: Path = Path(".env")) -> Dict[str, Any]:
-    """Non-empty LIGHTER_* auth values from .env, keyed by auth field name."""
-    env_values = _read_env_file(env_path)
-    mapping = {
-        "LIGHTER_NETWORK": "network",
-        "LIGHTER_API_KEY_PRIVATE_KEY": "api_key_private_key",
-        "LIGHTER_ACCOUNT_INDEX": "account_index",
-        "LIGHTER_API_KEY_INDEX": "api_key_index",
-        "LIGHTER_EXPECTED_L1_ADDRESS": "expected_l1_address",
-    }
-    return {
-        field: env_values[env_key]
-        for env_key, field in mapping.items()
-        if env_values.get(env_key, "").strip()
-    }
-
 
 
 class LighterAdapter(ExchangeAdapter):
@@ -161,39 +124,27 @@ class LighterAdapter(ExchangeAdapter):
             "market_order_slippage": extra_params.get('market_order_slippage'),
         }
 
-        # 如果api_key_private_key为空，从配置文件加载
+        # 如果api_key_private_key为空，从 config/exchanges/lighter_config.yaml 加载
         if (
             not config_dict.get('api_key_private_key')
             and extra_params.get('load_credentials_from_file', True)
         ):
             try:
-                lighter_config = self._load_lighter_config()
-                api_config = lighter_config.get('api_config', {})
-                auth_config = api_config.get('auth', {})
-
-                config_dict['api_key_private_key'] = auth_config.get(
-                    'api_key_private_key', '')
-                config_dict['account_index'] = auth_config.get(
-                    'account_index', 0)
-                config_dict['api_key_index'] = auth_config.get(
-                    'api_key_index', 0)
-                config_dict['testnet'] = api_config.get('testnet', False)
-                config_dict['network'] = (
-                    config_dict.get('network') or api_config.get('network')
-                )
-                market_order_config = (
-                    lighter_config.get('trading', {}).get('market_order', {})
-                )
-                if config_dict.get('market_order_slippage') is None:
-                    config_dict['market_order_slippage'] = market_order_config.get(
-                        'max_slippage', 0.01
-                    )
-
-                if self.logger:
-                    self.logger.info("✅ 从lighter_config.yaml加载API配置")
+                file_config = read_lighter_config()
             except Exception as e:
+                file_config = {}
                 if self.logger:
                     self.logger.warning(f"⚠️ 无法从配置文件加载Lighter配置: {e}")
+            if file_config:
+                for field in ("api_key_private_key", "account_index", "api_key_index"):
+                    config_dict[field] = file_config[field]
+                config_dict['network'] = config_dict.get('network') or file_config['network']
+                if config_dict.get('market_order_slippage') is None:
+                    config_dict['market_order_slippage'] = (
+                        file_config['market_order_slippage'] or 0.01
+                    )
+                if self.logger:
+                    self.logger.info("✅ 从lighter_config.yaml加载API配置")
 
         # 添加可选配置
         if getattr(config, 'base_url', None):
@@ -202,48 +153,6 @@ class LighterAdapter(ExchangeAdapter):
             config_dict['ws_url'] = config.ws_url
 
         return config_dict
-
-    def _load_lighter_config(self) -> Dict[str, Any]:
-        """加载Lighter配置文件"""
-        config_path = "config/exchanges/lighter_config.yaml"
-
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-                if self.logger:
-                    self.logger.info(f"✅ 加载Lighter配置文件: {config_path}")
-
-                # .env 填空：YAML 留空的 auth 欄位由 .env 的非空值補上。
-                fill_in = _env_auth_fill_in()
-                if fill_in:
-                    api_config = config.get('api_config') or {}
-                    auth = dict(api_config.get('auth') or {})
-                    for field, value in fill_in.items():
-                        if field == "network":
-                            if not str(api_config.get('network') or '').strip():
-                                api_config = {**api_config, 'network': value}
-                        elif not str(auth.get(field) or '').strip():
-                            auth[field] = value
-                    config = {
-                        **config,
-                        'api_config': {**api_config, 'auth': auth},
-                    }
-
-                return config
-        except FileNotFoundError:
-            if self.logger:
-                self.logger.warning(f"Lighter配置文件未找到: {config_path}")
-            return {'exchange_id': 'lighter'}
-        except yaml.YAMLError:
-            if self.logger:
-                self.logger.error(f"Lighter配置文件YAML格式无效: {config_path}")
-            return {'exchange_id': 'lighter'}
-        except Exception as e:
-            if self.logger:
-                self.logger.error(
-                    f"加载Lighter配置文件失败: {type(e).__name__}"
-                )
-            return {'exchange_id': 'lighter'}
 
     # ============= 连接管理 =============
 

@@ -11,8 +11,8 @@
 .venv/bin/python scripts/lighter_submission_diagnostics.py
 ```
 
-需再次確認時，明確啟用有界唯讀查詢（依 exchange config 與 `.env`，可用
-`--config` / `--env` 指定）；不必啟動策略：
+需再次確認時，明確啟用有界唯讀查詢（依 `config/exchanges/lighter_config.yaml`，可用
+`--config` 指定）；不必啟動策略：
 
 ```bash
 .venv/bin/python scripts/lighter_submission_diagnostics.py --query --tx-hash HASH

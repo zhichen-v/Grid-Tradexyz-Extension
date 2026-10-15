@@ -5,12 +5,9 @@
 *.key
 .gitignore
 
-# 交易所設定（含私鑰）
-config/exchanges/tradexyz_config.yaml
-config/exchanges/hyperliquid_config.yaml
-config/exchanges/lighter_config.yaml
-config/exchanges/arcus_config.yaml
-config/exchanges/wallets/
+# 交易所設定（含私鑰）：只追蹤 *_example.yaml 範本
+config/exchanges/*
+!config/exchanges/*_example.yaml
 
 # Python
 __pycache__/

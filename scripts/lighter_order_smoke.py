@@ -128,7 +128,7 @@ async def run_live_smoke(
 ) -> tuple[Decimal, Decimal, Decimal]:
     """Submit exactly one passive order, cancel it, and verify no BTC exposure."""
     if settings["network"] != "robinhood":
-        raise ValueError("live order smoke test requires api_config.network=robinhood")
+        raise ValueError("live order smoke test requires lighter.network=robinhood")
     if samples < 2:
         raise ValueError("at least two order-book samples are required")
 
