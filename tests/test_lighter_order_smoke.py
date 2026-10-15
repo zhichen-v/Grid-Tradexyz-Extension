@@ -2,7 +2,7 @@ import unittest
 from decimal import Decimal
 from types import SimpleNamespace
 
-from lighter_order_smoke import _matching_orders, build_passive_buy_plan
+from scripts.lighter_order_smoke import _matching_orders, build_passive_buy_plan
 
 from core.adapters.exchanges.models import OrderSide
 

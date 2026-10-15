@@ -4,12 +4,22 @@
 
 ### Removed
 
+#### 2026-10-15
+
+- Merged the Lighter selective-cancel v1 and v3 modules into one `lighter_selective_cancel.py` (paginated verification, version `2026-09-24.1`), installed once with no version override; cancellation behavior is unchanged. Removed the volume-maker-only Lighter `subscribe_order_fills` path; Grid fills still arrive through `subscribe_orders` callbacks.
+
+- Removed leftover Market Maker / volume-maker code from the Lighter adapter (read stream, fee/funding and settlement-asset reads, account-trade history, unused subscription manager and parsers), the price/quantity order-id fallback, tracked backup files (`*.bak`, `*_backup.md`), `.DS_Store` files, the unused `websocket_manager.py`, and local `config/market_maker_v2/` test configs. Moved the live TradeXYZ order/cancel-all scripts from `tests/` and the Lighter preflight, order-smoke and submission-diagnostics scripts from the repo root into `scripts/` (run them as `python scripts/<name>.py` from the repo root).
+
 #### 2026-09-24
 
 - Made `main` Grid-only by removing Market Maker V2 and legacy volume-maker strategy runtimes and their dedicated configs, scripts, tests, and docs; retained shared exchange-adapter fixes and Grid regressions. Updated repository guidance for Grid safety and cancel-only shutdown. Removed source remains recoverable at `5537f0f`; future Market Maker work stays on a separate branch or in a separately scoped package/project, with only reviewed, Grid-tested shared fixes eligible for `main`.
 - Removed the MM-only dependency from the shared Lighter lifecycle tests and added offline Grid import/CLI independence checks. Renamed the optional adapter outcome-capture switch to `enable_terminal_cancellation_outcomes` without changing its default or behavior; selective cancellation, nonce recovery, disconnect protection, and submission evidence remain intact.
 
 ### Added
+
+#### 2026-10-15 (Arcus)
+
+- Added an Arcus perpetuals adapter (`exchange: "arcus"`): Ed25519 typed-payload signing, REST orders/cancels/reads, one WebSocket for orders, positions and BBO prices. Lost-response submissions keep their client id and resolve read-only by exact client id; lost cancels stay uncertain until history proves them. Off-tick prices or off-step sizes are rejected before sending. See `config/exchanges/arcus_config_example.yaml` and `config/grid/arcus_btc_example.yaml`.
 
 #### 2026-10-15
 
@@ -26,6 +36,15 @@
 - Documented stop loss settings in `config/grid/README.md` and filled `config/grid/example.yaml` with a complete English TradeXYZ example.
 
 ### Fixed
+
+#### 2026-10-15 (adapters)
+
+- Lighter now feeds adapter-level position callbacks (used by scalping mode) with `{symbol, size (signed), entry_price, unrealized_pnl}` dicts, like Arcus. Previously that list never fired and the WebSocket sent `PositionData` objects instead.
+- A Lighter limit order that fails after the request was sent now returns the uncertain-submission placeholder (client id kept, no retry) instead of `None`, which the engine treated as a definitive rejection. HTTP 429 is still a definitive rejection.
+
+- Hyperliquid no longer retries order submissions (a timeout could duplicate orders), forwards `reduce_only` as ccxt `reduceOnly`, and gives price-less market closes a reference price.
+- TradeXYZ XYZ market orders without a price now use a 5%-bounded IOC price instead of 0; partial IOC fills report their real size; open-order reads and cancel-all raise on failure instead of returning an empty or partial success.
+- The Grid engine treats WebSocket `REJECTED` / `EXPIRED` order updates as terminal, like dict-style updates already did.
 
 #### 2026-10-15
 
@@ -135,6 +154,10 @@
 - Fixed top-bound reverse take-profit handling in `OrderHealthChecker` by comparing open orders with normalized `price + side` matching instead of lossy grid-id mapping.
 
 ### Changed
+
+#### 2026-10-15
+
+- Hyperliquid / TradeXYZ wallet profiles moved from `.env.wallets/<name>.env` to `config/exchanges/wallets/<name>.yaml` (same `authentication` block as `<exchange>_config.yaml`); `setup_agent_wallet.py` writes there (default profile `main`). `HL_AGENT_KEY` / `HL_WALLET_ADDRESS` env vars are no longer read.
 
 #### 2026-05-16
 

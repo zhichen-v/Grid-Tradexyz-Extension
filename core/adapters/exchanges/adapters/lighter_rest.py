@@ -1150,165 +1150,6 @@ class LighterRest(LighterBase):
             logger.error(f"获取最近成交失败 {symbol}: {e}")
             return []
 
-    async def get_account_trades(
-        self, symbol: str, limit: int = 100
-    ) -> List[TradeData]:
-        """Return authenticated account trades with exact role, fee and PnL."""
-        if not self.signer_client:
-            raise RuntimeError("未配置SignerClient，无法获取账户成交")
-        if type(limit) is not int or not 1 <= limit <= 100:
-            raise ValueError("account trade limit must be between 1 and 100")
-        market_id = self.get_market_index(symbol)
-        if market_id is None:
-            raise ValueError(f"未找到交易对 {symbol} 的市场索引")
-
-        auth_result = self.signer_client.create_auth_token_with_expiry(
-            deadline=3600,
-            api_key_index=self.api_key_index,
-        )
-        if isinstance(auth_result, tuple):
-            auth_token, error = auth_result
-            if error:
-                raise RuntimeError(f"生成认证令牌失败: {error}")
-        else:
-            auth_token = auth_result
-        if not auth_token:
-            raise RuntimeError("生成认证令牌失败: empty token")
-
-        response = await self._call_api(
-            "account trades query",
-            lambda: self.order_api.trades(
-                sort_by="timestamp",
-                limit=limit,
-                authorization=auth_token,
-                market_id=market_id,
-                market_type="perp",
-                account_index=self.account_index,
-                sort_dir="desc",
-                aggregate=False,
-            ),
-        )
-        self._require_success_response(response, "account trades query")
-        if not hasattr(response, "trades"):
-            raise RuntimeError("账户成交 API 回应缺少 trades 字段")
-
-        parsed: List[TradeData] = []
-        for trade in response.trades or []:
-            own_ask = getattr(trade, "ask_account_id", None) == self.account_index
-            own_bid = getattr(trade, "bid_account_id", None) == self.account_index
-            if own_ask == own_bid:
-                raise RuntimeError(
-                    "账户成交无法唯一归因，可能是 self-trade 或账户索引不符"
-                )
-            is_maker_ask = getattr(trade, "is_maker_ask", None)
-            if type(is_maker_ask) is not bool:
-                raise RuntimeError("账户成交缺少可信 maker/taker 角色")
-            is_maker = is_maker_ask == own_ask
-            fee_tick = getattr(
-                trade, "maker_fee" if is_maker else "taker_fee", None
-            )
-            if fee_tick is None:
-                raise RuntimeError("账户成交缺少实际 fee tick")
-            def parse_value(value: Any, name: str) -> Decimal:
-                try:
-                    result = Decimal(str(value))
-                except (InvalidOperation, TypeError, ValueError) as exc:
-                    raise RuntimeError(f"账户成交 {name} 无效") from exc
-                if not result.is_finite():
-                    raise RuntimeError(f"账户成交 {name} 无效")
-                return result
-
-            fee_tick_decimal = parse_value(fee_tick, "fee tick")
-            amount = parse_value(getattr(trade, "size", None), "size")
-            price = parse_value(getattr(trade, "price", None), "price")
-            turnover = parse_value(
-                getattr(trade, "usd_amount", None), "usd amount"
-            )
-            gross_value = getattr(
-                trade,
-                "ask_account_pnl" if own_ask else "bid_account_pnl",
-                None,
-            )
-            # Lighter returns null when this fill does not realize inventory PnL.
-            gross = (
-                Decimal("0")
-                if gross_value is None
-                else parse_value(gross_value, "account pnl")
-            )
-            if (
-                fee_tick_decimal < 0
-                or fee_tick_decimal != fee_tick_decimal.to_integral_value()
-            ):
-                raise RuntimeError("账户成交 fee tick 无效")
-            if amount <= 0:
-                raise RuntimeError("账户成交 size 无效")
-            if price <= 0:
-                raise RuntimeError("账户成交 price 无效")
-            if turnover <= 0:
-                raise RuntimeError("账户成交 usd amount 无效")
-            integrator_fee = getattr(
-                trade,
-                "integrator_maker_fee" if is_maker else "integrator_taker_fee",
-                None,
-            )
-            integrator_fee_tick = (
-                None
-                if integrator_fee is None
-                else parse_value(integrator_fee, "integrator fee")
-            )
-            if integrator_fee_tick is not None and integrator_fee_tick != 0:
-                raise RuntimeError("账户成交包含未纳入的 integrator fee")
-            fee_rate = fee_tick_decimal / Decimal("1000000")
-            order_id = getattr(
-                trade,
-                "ask_id_str" if own_ask else "bid_id_str",
-                None,
-            ) or getattr(trade, "ask_id" if own_ask else "bid_id", None)
-            timestamp = getattr(trade, "timestamp", None)
-            if type(timestamp) is not int or timestamp < 0:
-                raise RuntimeError("账户成交 timestamp 无效")
-            trade_sequence_value = getattr(trade, "trade_id", None)
-            trade_id = getattr(trade, "trade_id_str", None) or trade_sequence_value
-            try:
-                trade_sequence = int(str(trade_sequence_value))
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("账户成交 trade id 无效") from exc
-            if trade_sequence < 0 or trade_id is None or not str(trade_id):
-                raise RuntimeError("账户成交 trade id 无效")
-            parsed.append(
-                TradeData(
-                    id=str(trade_id),
-                    symbol=symbol,
-                    side=OrderSide.SELL if own_ask else OrderSide.BUY,
-                    amount=amount,
-                    price=price,
-                    cost=turnover,
-                    fee={
-                        "role": "maker" if is_maker else "taker",
-                        "tick": int(fee_tick_decimal),
-                        "rate": fee_rate,
-                        "cost": turnover * fee_rate,
-                        "currency": (
-                            "USDG"
-                            if self.network in {"robinhood", "robinhood_testnet"}
-                            else "USDC"
-                        ),
-                    },
-                    timestamp=self._parse_timestamp(timestamp) or datetime.now(),
-                    order_id=str(order_id) if order_id is not None else None,
-                    raw_data={
-                        "timestamp": timestamp,
-                        "trade_sequence": trade_sequence,
-                        "trade_type": str(getattr(trade, "type", "")),
-                        "realized_pnl": gross,
-                        "integrator_fee_tick": integrator_fee_tick,
-                    },
-                )
-            )
-        return parsed
-
-    # ============= 账户信息 =============
-
     async def get_account_balance(self) -> List[BalanceData]:
         """
         获取账户余额
@@ -2197,11 +2038,26 @@ class LighterRest(LighterBase):
         # Keep post-send response handling outside the pre-connect DNS catch.
         # A later confirmation read must never make an accepted submission
         # look retry-safe.
-        return await self._handle_order_result(
-            tx, response, err, symbol, side, "limit",
-            quantity, price_rounded, batch_mode=batch_mode,
-            skip_order_index_query=skip_order_index_query, **kwargs
-        )
+        try:
+            return await self._handle_order_result(
+                tx, response, err, symbol, side, "limit",
+                quantity, price_rounded, batch_mode=batch_mode,
+                skip_order_index_query=skip_order_index_query, **kwargs
+            )
+        except Exception as exc:
+            # The request already left; only an explicit 429 is definitive.
+            # Returning None here would let the engine treat it as rejected.
+            if self._is_definitive_mutation_exception(exc):
+                raise
+            return await self._handle_ambiguous_order_submission(
+                symbol,
+                side,
+                "limit",
+                quantity,
+                price_rounded,
+                str(exc),
+                **kwargs,
+            )
 
     async def _handle_order_result(
         self,
@@ -2303,9 +2159,8 @@ class LighterRest(LighterBase):
         # - 依赖批量同步建立 order_index 映射
         #
         # 跳过查询模式（skip_order_index_query=True）：
-        # - Volume Maker 刷量程序使用
-        # - 市价单立即成交，查询必然失败且浪费资源
-        # - 使用状态机匹配（基于方向+数量，不依赖 order_id）
+        # - 网格 GTT 反手单与市价单使用
+        # - 由 WebSocket 依 client_order_id 采用真实 order_index
         #
         # 单个模式（batch_mode=False, skip_order_index_query=False，默认）：
         # - 网格程序使用
@@ -2454,6 +2309,7 @@ class LighterRest(LighterBase):
                     )
                     continue
 
+                # Exact client-id match only; never infer ids from price/quantity.
                 if client_order_id is not None:
                     for order in open_orders:
                         if self._order_matches_client_id(order, client_order_id):
@@ -2462,25 +2318,6 @@ class LighterRest(LighterBase):
                                 f"(client_order_id={client_order_id})"
                             )
                             return order.id
-                    continue
-
-                # Legacy fallback when a caller has no client id.
-                for order in open_orders:
-                    # 价格匹配（容差 0.01 USD）
-                    price_match = abs(float(order.price) - float(price)) < 0.01
-                    # 数量匹配（容差 0.00001）
-                    amount_match = abs(float(order.amount) -
-                                       float(amount)) < 0.00001
-                    # 方向匹配
-                    side_str = "BUY" if side.lower() == "buy" else "SELL"
-                    side_match = order.side.name == side_str
-
-                    if price_match and amount_match and side_match:
-                        logger.info(
-                            f"✅ 查询到 order_index: {order.id} "
-                            f"({side} {amount}@{price})"
-                        )
-                        return order.id
 
                 logger.debug(
                     f"🔍 尝试 {attempt+1}/{max_retries}: "
@@ -2758,7 +2595,7 @@ class LighterRest(LighterBase):
             side: 订单方向
             quantity: 数量
             reduce_only: 只减仓模式（平仓专用，不会开新仓或加仓）
-            skip_order_index_query: 跳过 order_index 查询（Volume Maker 使用）
+            skip_order_index_query: 跳过 order_index 查询（由 WebSocket 依 client_order_id 采用）
 
         Returns:
             订单数据 或 None

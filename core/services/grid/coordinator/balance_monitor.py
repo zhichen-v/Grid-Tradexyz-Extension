@@ -148,7 +148,7 @@ class BalanceMonitor:
                         raw_data.get('total', '0'))  # Hyperliquid的总余额
                     self._order_locked_balance = self._safe_decimal(
                         raw_data.get('used', '0'))  # 订单冻结资产
-                elif exchange_name == 'lighter':
+                elif exchange_name in {'lighter', 'arcus'}:
                     # Lighter格式：BalanceData 直接包含 free, used, total
                     self._spot_balance = collateral_balance.free  # 可用余额
                     self._collateral_balance = collateral_balance.total  # 总余额（包含冻结）

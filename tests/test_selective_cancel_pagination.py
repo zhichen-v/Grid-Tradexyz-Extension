@@ -1,80 +1,22 @@
 import asyncio
 import importlib.util
 import sys
-import types
 import unittest
-from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = "selective_cancel_v3_testpkg.adapters"
+PACKAGE = "selective_cancel_pagination_test"
 
 
-for package_name in (
-    "selective_cancel_v3_testpkg",
-    PACKAGE,
-):
-    package = types.ModuleType(package_name)
-    package.__path__ = []
-    sys.modules[package_name] = package
-
-
-base = types.ModuleType(f"{PACKAGE}.lighter_selective_cancel")
-base.CANCELLED = {"canceled", "cancelled", "rejected", "expired"}
-base.FILLED = {"filled", "closed"}
-
-
-@dataclass
-class CancelReport:
-    requested: set = field(default_factory=set)
-    acknowledged: set = field(default_factory=set)
-    cancelled: set = field(default_factory=set)
-    filled: set = field(default_factory=set)
-    still_open: set = field(default_factory=set)
-    uncertain: set = field(default_factory=set)
-    rejected: dict = field(default_factory=dict)
-    terminal_orders: dict = field(default_factory=dict)
-
-    def merge_resolution(self, other):
-        terminal = other.cancelled | other.filled
-        self.cancelled.update(other.cancelled)
-        self.filled.update(other.filled)
-        self.terminal_orders.update(other.terminal_orders)
-        self.still_open.difference_update(terminal)
-        self.uncertain.difference_update(terminal)
-        self.still_open.update(other.still_open)
-        self.uncertain.update(other.uncertain)
-
-
-class BatchSubmissionError(RuntimeError):
-    def __init__(self, message, *, ambiguous=False, rate_limited=False):
-        super().__init__(message)
-        self.ambiguous = ambiguous
-        self.rate_limited = rate_limited
-
-
-def order_keys(order):
-    return {
-        str(value)
-        for value in (
-            getattr(order, "id", None),
-            getattr(order, "client_id", None),
-            getattr(order, "order_id", None),
-        )
-        if value not in (None, "")
-    }
-
-
-def validate_ids(values):
-    report = CancelReport()
-    indexes = []
-    for value in values:
-        index = int(value)
-        report.requested.add(str(index))
-        indexes.append(index)
-    return indexes, report
+spec = importlib.util.spec_from_file_location(
+    f"{PACKAGE}.lighter_selective_cancel",
+    ROOT / "core/adapters/exchanges/adapters/lighter_selective_cancel.py",
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
 
 
 async def send_chunk(rest, market, indexes):
@@ -82,31 +24,8 @@ async def send_chunk(rest, market, indexes):
     return SimpleNamespace(code=200, predicted_execution_time_ms=0)
 
 
-async def disabled_cancel_all(*_args, **_kwargs):
-    raise RuntimeError("account-wide cancel disabled")
-
-
-base.CancelReport = CancelReport
-base.BatchSubmissionError = BatchSubmissionError
-base._keys = order_keys
-base._status = lambda order: str(
-    getattr(getattr(order, "status", None), "value", getattr(order, "status", ""))
-    or ""
-).lower()
-base._validated_ids = validate_ids
-base._batch_size = lambda _rest: 50
-base._send_chunk = send_chunk
-base.adapter_cancel_all_disabled = disabled_cancel_all
-sys.modules[base.__name__] = base
-
-
-spec = importlib.util.spec_from_file_location(
-    f"{PACKAGE}.lighter_selective_cancel_v3",
-    ROOT / "core/adapters/exchanges/adapters/lighter_selective_cancel_v3.py",
-)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
+# Pagination tests exercise reconciliation only; signing is covered elsewhere.
+module._send_chunk = send_chunk
 
 
 class Signer:
@@ -246,6 +165,27 @@ class SelectiveCancelPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.cancelled, set())
         self.assertEqual(report.still_open, {"401"})
         self.assertEqual(report.uncertain, {"401"})
+
+
+class SelectiveCancelInstallTests(unittest.TestCase):
+    def test_single_module_installs_paginated_cancel(self):
+        import importlib
+
+        from core.adapters.exchanges.adapters import lighter_selective_cancel as merged
+        from core.adapters.exchanges.adapters.lighter import LighterAdapter
+        from core.adapters.exchanges.adapters.lighter_rest import LighterRest
+
+        self.assertIs(LighterRest.cancel_orders_batch, merged.cancel_orders_batch)
+        self.assertIs(LighterAdapter.cancel_orders, merged.adapter_cancel_orders)
+        self.assertIs(
+            LighterAdapter.cancel_all_orders, merged.adapter_cancel_all_disabled
+        )
+        self.assertEqual(LighterRest._selective_cancel_version, merged.PATCH_VERSION)
+        self.assertEqual(merged.PATCH_VERSION, "2026-09-24.1")
+        with self.assertRaises(ModuleNotFoundError):
+            importlib.import_module(
+                "core.adapters.exchanges.adapters.lighter_selective_cancel_v3"
+            )
 
 
 if __name__ == "__main__":

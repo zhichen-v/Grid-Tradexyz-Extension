@@ -1,0 +1,12 @@
+# Arcus exchange config example.
+# Copy to config/exchanges/arcus_config.yaml (gitignored) and fill in your values.
+#
+# Create the API key at https://app.arcus.xyz/api-keys (testnet: https://testnet.arcus.xyz/api-keys):
+# copy the "API Signing Key" (shown once), pick the Subaccount #, then Authorize in your wallet.
+
+arcus:
+  network: "mainnet"          # mainnet | testnet
+  authentication:
+    wallet_address: "0xYOUR_MAIN_WALLET_ADDRESS"   # wallet that authorized the key
+    account_index: 0                               # Subaccount # chosen for the key (0-9)
+    api_signing_key: ""                            # Ed25519 private key hex; never commit

@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, patch
 
-import lighter_submission_diagnostics as diagnostics
+import scripts.lighter_submission_diagnostics as diagnostics
 from core.lighter_submission_journal import SubmissionJournal
 
 

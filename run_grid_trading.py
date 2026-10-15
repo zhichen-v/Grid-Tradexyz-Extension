@@ -26,7 +26,8 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 GRID_CONFIG_DIR = Path("config/grid")
-WALLET_PROFILES_DIR = Path(".env.wallets")
+WALLET_PROFILES_DIR = Path("config/exchanges/wallets")
+WALLET_PROFILE_EXCHANGES = {"hyperliquid", "tradexyz"}
 
 
 class WalletProfileError(RuntimeError):
@@ -50,15 +51,15 @@ def _validate_wallet_name(wallet_name: str) -> str:
 
 
 def _available_wallet_profiles() -> list[str]:
-    """Return wallet profile names available under .env.wallets."""
+    """Return wallet profile names available under config/exchanges/wallets."""
     if not WALLET_PROFILES_DIR.exists():
         return []
-    return sorted(path.stem for path in WALLET_PROFILES_DIR.glob("*.env"))
+    return sorted(path.stem for path in WALLET_PROFILES_DIR.glob("*.yaml"))
 
 
 def _wallet_profile_path(wallet_name: str) -> Path:
-    """Return the env file path for a validated wallet profile name."""
-    return WALLET_PROFILES_DIR / f"{_validate_wallet_name(wallet_name)}.env"
+    """Return the YAML path for a validated wallet profile name."""
+    return WALLET_PROFILES_DIR / f"{_validate_wallet_name(wallet_name)}.yaml"
 
 
 def _apply_wallet_shortcut(
@@ -334,31 +335,9 @@ def _read_env_file(env_path: Path) -> dict[str, str]:
     return values
 
 
-def _load_dotenv(wallet_name: str | None = None) -> Path | None:
-    """Load credentials from a named wallet profile or from the default `.env`."""
+def _load_dotenv() -> Path | None:
+    """Load optional KEY=VALUE overrides from the default `.env`."""
     import os
-
-    if wallet_name:
-        env_path = _wallet_profile_path(wallet_name)
-        if not env_path.exists():
-            available = ", ".join(_available_wallet_profiles()) or "(none)"
-            raise WalletProfileError(
-                f"Wallet profile not found: {wallet_name}. "
-                f"Expected file: {env_path}. Available profiles: {available}"
-            )
-
-        values = _read_env_file(env_path)
-        required_keys = {"HL_AGENT_KEY", "HL_WALLET_ADDRESS"}
-        missing_keys = sorted(key for key in required_keys if not values.get(key))
-        if missing_keys:
-            raise WalletProfileError(
-                f"Wallet profile {wallet_name} is missing required keys: "
-                f"{', '.join(missing_keys)}"
-            )
-
-        for key, value in values.items():
-            os.environ[key] = value
-        return env_path
 
     env_path = Path(".env")
     if not env_path.exists():
@@ -368,6 +347,52 @@ def _load_dotenv(wallet_name: str | None = None) -> Path | None:
         os.environ.setdefault(key, value)
 
     return env_path
+
+
+def _load_wallet_profile(wallet_name: str) -> dict[str, str]:
+    """Load a named Hyperliquid/TradeXYZ agent wallet profile."""
+    profile_path = _wallet_profile_path(wallet_name)
+    if not profile_path.exists():
+        available = ", ".join(_available_wallet_profiles()) or "(none)"
+        raise WalletProfileError(
+            f"Wallet profile not found: {wallet_name}. "
+            f"Expected file: {profile_path}. Available profiles: {available}"
+        )
+
+    try:
+        with open(profile_path, "r", encoding="utf-8") as file:
+            data = yaml.safe_load(file) or {}
+    except yaml.YAMLError:
+        # Parser errors echo the offending line, which may hold the key.
+        raise WalletProfileError(f"Invalid YAML in wallet profile: {profile_path}") from None
+
+    auth = data.get("authentication") if isinstance(data, dict) else None
+    auth = auth if isinstance(auth, dict) else {}
+    missing = sorted(
+        key for key in ("private_key", "wallet_address") if not str(auth.get(key) or "").strip()
+    )
+    if missing:
+        raise WalletProfileError(
+            f"Wallet profile {wallet_name} is missing authentication keys: {', '.join(missing)}"
+        )
+    return {key: str(value).strip() for key, value in auth.items() if value is not None}
+
+
+def _read_arcus_settings() -> dict:
+    """Return non-secret Arcus settings (network, account index) from its config."""
+    settings: dict = {}
+    path = Path("config/exchanges/arcus_config.yaml")
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                settings = (yaml.safe_load(file) or {}).get("arcus", {}) or {}
+        except yaml.YAMLError:
+            raise RuntimeError(f"Invalid YAML in {path}") from None
+    auth = settings.get("authentication", {}) or {}
+    return {
+        "network": str(settings.get("network", "mainnet")).strip().lower(),
+        "account_index": int(auth.get("account_index", 0)),
+    }
 
 
 async def create_exchange_adapter(config_data: dict, wallet_name: str | None = None):
@@ -387,10 +412,8 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
     exchange_name = grid_config["exchange"].lower()
     symbol = grid_config["symbol"]
 
-    # Load additional credentials from .env or a named wallet profile.
-    wallet_env_path = _load_dotenv(wallet_name)
-    if wallet_name:
-        print(f"   - Wallet profile: {wallet_name} ({wallet_env_path})")
+    # Optional .env overrides; a named wallet profile is loaded explicitly below.
+    _load_dotenv()
 
     # Detect spot vs perpetual automatically.
     market_type = detect_market_type(symbol, exchange_name)
@@ -411,25 +434,16 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
         api_key = api_key or lighter_private_key
         api_secret = api_secret or lighter_private_key
 
-    # TradeXYZ additionally supports HL_AGENT_KEY / HL_WALLET_ADDRESS.
     # A named wallet profile is explicit and overrides any stale shell vars.
-    if exchange_name == "tradexyz":
-        hl_agent_key = os.getenv("HL_AGENT_KEY")
-        hl_wallet_address = os.getenv("HL_WALLET_ADDRESS")
-        if wallet_name:
-            if hl_agent_key:
-                api_key = hl_agent_key
-                api_secret = hl_agent_key
-                print(f"   - Using HL_AGENT_KEY from wallet profile: {wallet_name}")
-            if hl_wallet_address:
-                wallet_address = hl_wallet_address
-        else:
-            if hl_agent_key and not api_key:
-                api_key = hl_agent_key
-                api_secret = hl_agent_key
-                print("   - Using HL_AGENT_KEY (Agent Wallet)")
-            if hl_wallet_address and not wallet_address:
-                wallet_address = hl_wallet_address
+    if wallet_name:
+        if exchange_name not in WALLET_PROFILE_EXCHANGES:
+            raise WalletProfileError(
+                f"Wallet profiles only apply to {', '.join(sorted(WALLET_PROFILE_EXCHANGES))}"
+            )
+        profile = _load_wallet_profile(wallet_name)
+        api_key = api_secret = profile["private_key"]
+        wallet_address = profile["wallet_address"]
+        print(f"   - Wallet profile: {wallet_name} ({_wallet_profile_path(wallet_name)})")
 
     # Fall back to the exchange config file if env vars are not set.
     if not api_key or not api_secret:
@@ -448,6 +462,12 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                 if exchange_name in {"hyperliquid", "tradexyz"}:
                     api_key = api_key or auth_config.get("private_key", "")
                     api_secret = api_secret or auth_config.get("private_key", "")
+                    wallet_address = wallet_address or auth_config.get(
+                        "wallet_address", ""
+                    )
+                elif exchange_name == "arcus":
+                    api_secret = api_secret or auth_config.get("api_signing_key", "")
+                    api_key = api_key or api_secret
                     wallet_address = wallet_address or auth_config.get(
                         "wallet_address", ""
                     )
@@ -505,6 +525,11 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
             print(f"   - {display_name} requires:")
             print("      - private_key: wallet private key")
             print("      - wallet_address: wallet address")
+        elif exchange_name == "arcus":
+            print("   - Arcus requires (config/exchanges/arcus_config.yaml):")
+            print("      - wallet_address: master Ethereum address that registered the key")
+            print("      - api_signing_key: Ed25519 API signing key (hex)")
+            print("      - account_index: subaccount index (default 0)")
         elif exchange_name == "lighter":
             print("   - Lighter requires:")
             print("      - api_key_private_key: API key private key")
@@ -563,6 +588,20 @@ async def create_exchange_adapter(config_data: dict, wallet_name: str | None = N
                 "Failed to load Lighter config "
                 f"({type(exc).__name__})"
             ) from exc
+    elif exchange_name == "arcus":
+        arcus_settings = _read_arcus_settings()
+        exchange_config = ExchangeConfig(
+            exchange_id="arcus",
+            name="Arcus",
+            exchange_type=market_type,
+            api_key="",
+            api_secret=api_secret or "",
+            wallet_address=wallet_address,
+            enable_websocket=True,
+            enable_auto_reconnect=True,
+            extra_params=arcus_settings,
+        )
+        print(f"   - Arcus network: {arcus_settings['network']}")
     else:
         display_name = "TradeXYZ" if exchange_name == "tradexyz" else exchange_name.capitalize()
         exchange_config = ExchangeConfig(
@@ -601,12 +640,12 @@ async def main(
     Args:
         config_path: Configuration file path.
         debug: Whether to enable debug mode.
-        wallet_name: Optional wallet profile name from .env.wallets.
+        wallet_name: Optional wallet profile name from config/exchanges/wallets.
     """
     print("\nStep 1/6: Loading configuration...")
     config_data = await load_config(config_path)
     if wallet_name:
-        _load_dotenv(wallet_name)
+        _load_wallet_profile(wallet_name)
     log_dir = build_grid_log_dir(config_data, wallet_name=wallet_name)
     # Append across restarts; size rotation bounds disk use and keeps history.
     initialize(log_dir=log_dir, clear_existing=False)
@@ -941,6 +980,7 @@ Supported exchanges:
   Hyperliquid - Perpetual markets (long / short), spot (long only)
   Lighter     - Perpetual markets (long / short)
   TradeXYZ    - Perpetual markets through Hyperliquid DEX support
+  Arcus       - Perpetual markets (long / short), symbols like BTC-USD
 
 Notes:
   1. Make sure API credentials are configured correctly.
@@ -971,7 +1011,7 @@ Notes:
         "--walletname",
         dest="wallet_name",
         type=_validate_wallet_name,
-        help="Use a named wallet profile from .env.wallets/<name>.env (legacy form; prefer --<name>)",
+        help="Use a named wallet profile from config/exchanges/wallets/<name>.yaml (legacy form; prefer --<name>)",
     )
 
     parser.add_argument(

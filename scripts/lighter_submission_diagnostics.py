@@ -4,7 +4,11 @@ import argparse
 import asyncio
 import json
 import math
+import sys
 from pathlib import Path
+
+# Run from the repo root as `python scripts/<name>.py`; make `core` importable.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.lighter_submission_journal import read_pending, read_records, safe_error_fields
 
@@ -218,7 +222,7 @@ def main(argv=None):
         records = select_records(args.journal, args.tx_hash)
         selected = records[-args.limit:]
         if args.query and selected:
-            from lighter_preflight import load_settings
+            from scripts.lighter_preflight import load_settings
             results = asyncio.run(query_records(selected, load_settings(args.config, args.env),
                                                 pages=args.pages, timeout=args.timeout))
         else:

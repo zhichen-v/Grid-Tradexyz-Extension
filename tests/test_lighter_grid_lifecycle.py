@@ -1648,7 +1648,6 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         websocket._subscribed_market_stats = []
         websocket._subscribed_trades = []
         websocket._order_callbacks = [lambda order: None]
-        websocket._order_fill_callbacks = []
         websocket._recreate_ws_client = AsyncMock()
         websocket._ensure_direct_ws_running = AsyncMock()
 
@@ -1673,7 +1672,6 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         websocket._subscribed_market_stats = []
         websocket._subscribed_trades = []
         websocket._order_callbacks = [lambda order: None]
-        websocket._order_fill_callbacks = []
 
         status = websocket.get_connection_status()
         self.assertFalse(status["healthy"])
@@ -1690,7 +1688,6 @@ class LighterWebSocketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         websocket = object.__new__(LighterWebSocket)
         websocket._account_orders_subscribed = False
         websocket._order_callbacks = []
-        websocket._order_fill_callbacks = []
         websocket._trade_callbacks = []
 
         await websocket._handle_direct_ws_message({
@@ -2156,17 +2153,43 @@ class LighterMutationAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             side_effect=self._dns_failure()
         )
 
-        result = await rest.place_order(
-            "BTC",
-            "buy",
-            "limit",
-            Decimal("0.00020"),
-            Decimal("64000"),
-            _raise_on_definitive_pre_send_failure=True,
+        with patch(
+            "core.adapters.exchanges.adapters.lighter_rest.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await rest.place_order(
+                "BTC",
+                "buy",
+                "limit",
+                Decimal("0.00020"),
+                Decimal("64000"),
+                _raise_on_definitive_pre_send_failure=True,
+            )
+
+        # None would read as a definitive rejection; a sent order stays tracked.
+        self.assertTrue(result.raw_data["submission_uncertain"])
+        self.assertEqual(result.client_id, str(self.CLIENT_ID))
+        self.assertEqual(len(rest.get_unresolved_submissions()), 1)
+        nonce_manager.acknowledge_failure.assert_not_called()
+
+    async def test_post_send_429_remains_definitive_rate_limit(self):
+        rest = self._rest()
+        rest._validate_order_preconditions = MagicMock(return_value=True)
+        rest._get_market_info = AsyncMock(return_value=self._market_info())
+        rest._validate_order_minimums = MagicMock()
+        rest.signer_client = SimpleNamespace(
+            create_order=AsyncMock(return_value=(object(), None, "HTTP 429")),
+        )
+        rest._handle_order_result = AsyncMock(
+            side_effect=RuntimeError("order submission rate limited (HTTP 429)")
         )
 
-        self.assertIsNone(result)
-        nonce_manager.acknowledge_failure.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+            await rest.place_order(
+                "BTC", "buy", "limit", Decimal("0.00020"), Decimal("64000"),
+            )
+
+        self.assertEqual(rest.get_unresolved_submissions(), [])
 
     async def test_dns_failure_during_cancel_remains_uncertain(self):
         rest = self._rest()

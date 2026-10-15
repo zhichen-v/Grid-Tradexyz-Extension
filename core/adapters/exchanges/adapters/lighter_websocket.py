@@ -85,7 +85,6 @@ class LighterWebSocket(LighterBase):
         self._orderbook_callbacks: List[Callable] = []
         self._trade_callbacks: List[Callable] = []
         self._order_callbacks: List[Callable] = []
-        self._order_fill_callbacks: List[Callable] = []  # 🔥 新增：订单成交回调
         self._position_callbacks: List[Callable] = []
 
         # 连接状态
@@ -324,7 +323,6 @@ class LighterWebSocket(LighterBase):
         """Return whether any active subscription depends on the direct socket."""
         return bool(
             self._order_callbacks
-            or self._order_fill_callbacks
             or self._subscribed_market_stats
             or self._subscribed_trades
         )
@@ -332,9 +330,7 @@ class LighterWebSocket(LighterBase):
     def get_connection_status(self) -> Dict[str, Any]:
         """Return connection health including the direct account-order stream."""
         direct_required = self._needs_direct_ws()
-        account_orders_required = bool(
-            self._order_callbacks or self._order_fill_callbacks
-        )
+        account_orders_required = bool(self._order_callbacks)
         sdk_required = bool(
             getattr(self, "_subscribed_markets", ())
             or getattr(self, "_subscribed_accounts", ())
@@ -557,18 +553,6 @@ class LighterWebSocket(LighterBase):
             self._order_callbacks.append(callback)
 
         # account_all_orders包含完整订单状态；单笔trade不能推导整单FILLED。
-        await self._subscribe_account_all_orders()
-
-    async def subscribe_order_fills(self, callback: Callable) -> None:
-        """
-        订阅订单成交（专门监控FILLED状态的订单）
-
-        Args:
-            callback: 订单成交回调函数，参数为OrderData
-        """
-        if callback:
-            self._order_fill_callbacks.append(callback)
-
         await self._subscribe_account_all_orders()
 
     async def subscribe_positions(self, callback: Optional[Callable] = None):
@@ -849,21 +833,6 @@ class LighterWebSocket(LighterBase):
             logger.error(f"提取ticker数据失败: {e}")
             return None
 
-    def _parse_orders(self, orders_data: Dict[str, Any]) -> List[OrderData]:
-        """解析订单列表"""
-        orders = []
-        for market_index_str, order_list in orders_data.items():
-            try:
-                market_index = int(market_index_str)
-                symbol = self._get_symbol_from_market_index(market_index)
-
-                for order_info in order_list:
-                    orders.append(self._parse_order(order_info, symbol))
-            except Exception as e:
-                logger.error(f"解析订单失败: {e}")
-
-        return orders
-
     def _parse_order_from_ws(self, order_info: Dict[str, Any]) -> Optional[OrderData]:
         """
         解析WebSocket推送的Order JSON
@@ -1012,93 +981,6 @@ class LighterWebSocket(LighterBase):
             order_data.average = average_price
 
         return order_data
-
-    def _parse_trade_as_order(self, trade_info: Dict[str, Any]) -> Optional[OrderData]:
-        """
-        将trade数据解析为OrderData（用于WebSocket订单成交通知）
-
-        Lighter WebSocket中，交易成交数据在'trades'键中
-
-        Trade JSON格式（根据文档）:
-        {
-            "trade_id": INTEGER,
-            "tx_hash": STRING,
-            "market_id": INTEGER,
-            "size": STRING,
-            "price": STRING,
-            "ask_id": INTEGER,        # 卖单订单ID
-            "bid_id": INTEGER,        # 买单订单ID
-            "ask_account_id": INTEGER, # 卖方账户ID
-            "bid_account_id": INTEGER, # 买方账户ID
-            "is_maker_ask": BOOLEAN   # maker是卖方(true)还是买方(false)
-        }
-        """
-        try:
-            # 🔥 获取市场ID
-            market_id = trade_info.get("market_id")
-            if market_id is None:
-                logger.warning(f"交易数据缺少market_id: {trade_info}")
-                return None
-
-            symbol = self._get_symbol_from_market_index(market_id)
-
-            # 🔥 判断当前账户是买方还是卖方
-            ask_account_id = trade_info.get("ask_account_id")
-            bid_account_id = trade_info.get("bid_account_id")
-
-            # 根据账户ID判断是买还是卖
-            is_sell = (ask_account_id == self.account_index)
-            is_buy = (bid_account_id == self.account_index)
-
-            if not (is_sell or is_buy):
-                # 这个trade不属于当前账户
-                return None
-
-            # 🔥 获取正确的订单ID（ask_id或bid_id）
-            order_id = trade_info.get(
-                "ask_id") if is_sell else trade_info.get("bid_id")
-            if order_id is None:
-                logger.warning(f"交易数据缺少订单ID: {trade_info}")
-                return None
-
-            # 解析交易数量和价格
-            size_str = trade_info.get("size", "0")
-            price_str = trade_info.get("price", "0")
-            usd_amount_str = trade_info.get("usd_amount", "0")
-
-            base_amount = self._safe_decimal(size_str)
-            trade_price = self._safe_decimal(price_str)
-            usd_amount = self._safe_decimal(usd_amount_str)
-
-            # 🔥 构造OrderData
-            from ..models import OrderSide, OrderType, OrderStatus
-
-            order_data = OrderData(
-                id=str(order_id),  # ✅ 使用ask_id或bid_id作为订单ID
-                client_id="",
-                symbol=symbol,
-                side=OrderSide.SELL if is_sell else OrderSide.BUY,
-                type=OrderType.LIMIT,  # Trade可能来自限价单
-                amount=base_amount,
-                price=trade_price,
-                filled=base_amount,  # 交易全部成交
-                remaining=Decimal("0"),  # 已全部成交
-                cost=usd_amount,  # 成交金额
-                average=trade_price,  # 成交价
-                status=OrderStatus.FILLED,  # 已成交
-                timestamp=self._parse_timestamp(trade_info.get("timestamp")),
-                updated=self._parse_timestamp(trade_info.get("timestamp")),
-                fee=None,
-                trades=[],
-                params={},
-                raw_data=trade_info
-            )
-
-            return order_data
-
-        except Exception as e:
-            logger.error(f"解析交易数据失败: {e}", exc_info=True)
-            return None
 
     def _parse_trade_data(self, trade_info: Dict[str, Any]) -> Optional[TradeData]:
         """Parse the current Lighter Trade schema into the shared model."""
@@ -1282,65 +1164,6 @@ class LighterWebSocket(LighterBase):
                     callback(trade)
             except Exception as e:
                 logger.error(f"成交回调执行失败: {e}")
-
-    def _trigger_order_callbacks(self, order: OrderData):
-        """触发订单回调（线程安全，带错误捕获）"""
-        for callback in self._order_callbacks:
-            try:
-                if asyncio.iscoroutinefunction(callback):
-                    # 🔥 WebSocket在同步线程中运行，需要线程安全地调度协程
-                    if self._event_loop and self._event_loop.is_running():
-                        future = asyncio.run_coroutine_threadsafe(
-                            callback(order), self._event_loop)
-
-                        # 🔥 添加完成回调来捕获异常
-                        def log_error(fut):
-                            try:
-                                fut.result()  # 获取结果，如果有异常会抛出
-                            except Exception as e:
-                                logger.error(
-                                    f"❌ 订单回调执行出错: order_id={order.id}, "
-                                    f"side={order.side}, status={order.status}, "
-                                    f"error={e}",
-                                    exc_info=True
-                                )
-
-                        future.add_done_callback(log_error)
-                    else:
-                        logger.warning("⚠️ 事件循环未运行，跳过订单回调")
-                else:
-                    callback(order)
-            except Exception as e:
-                logger.error(f"订单回调执行失败: {e}", exc_info=True)
-
-    def _trigger_order_fill_callbacks(self, order: OrderData):
-        """触发订单成交回调（线程安全，带错误捕获）"""
-        for callback in self._order_fill_callbacks:
-            try:
-                if asyncio.iscoroutinefunction(callback):
-                    # 🔥 WebSocket在同步线程中运行，需要线程安全地调度协程
-                    if self._event_loop and self._event_loop.is_running():
-                        future = asyncio.run_coroutine_threadsafe(
-                            callback(order), self._event_loop)
-
-                        # 🔥 添加完成回调来捕获异常
-                        def log_error(fut):
-                            try:
-                                fut.result()
-                            except Exception as e:
-                                logger.error(
-                                    f"❌ 订单成交回调执行出错: order_id={order.id}, "
-                                    f"error={e}",
-                                    exc_info=True
-                                )
-
-                        future.add_done_callback(log_error)
-                    else:
-                        logger.warning("⚠️ 事件循环未运行，无法调度异步回调")
-                else:
-                    callback(order)
-            except Exception as e:
-                logger.error(f"订单成交回调执行失败: {e}", exc_info=True)
 
     def _trigger_position_callbacks(self, position: PositionData):
         """触发持仓回调（线程安全）"""
@@ -1586,14 +1409,6 @@ class LighterWebSocket(LighterBase):
                                     # 触发订单回调
                                     if self._order_callbacks:
                                         for callback in self._order_callbacks:
-                                            if asyncio.iscoroutinefunction(callback):
-                                                await callback(order)
-                                            else:
-                                                callback(order)
-
-                                    # 如果是成交状态，触发成交回调
-                                    if order.status == OrderStatus.FILLED and self._order_fill_callbacks:
-                                        for callback in self._order_fill_callbacks:
                                             if asyncio.iscoroutinefunction(callback):
                                                 await callback(order)
                                             else:

@@ -9,10 +9,10 @@ TradeXYZ 掛單清理工具
 
 前置條件:
   - 已執行 setup_agent_wallet.py 完成授權
-  - .env 檔案中含有 HL_AGENT_KEY / HL_WALLET_ADDRESS
+  - config/exchanges/wallets/<name>.yaml 已存在（預設 main）
 
 執行:
-    uv run python -m tests.test_tradexyz_cancel_orders
+    uv run python scripts/tradexyz_cancel_all_smoke.py [--<wallet>]
 """
 
 import os
@@ -35,27 +35,25 @@ console = Console()
 
 
 def load_env():
-    """從 .env 載入認證資訊"""
-    env_path = Path(".env")
-    if not env_path.exists():
+    """從 config/exchanges/wallets/<name>.yaml 載入 Agent 認證（預設 main，可用 --<name>）"""
+    import yaml
+
+    names = [arg[2:] for arg in sys.argv[1:] if arg.startswith("--") and len(arg) > 2]
+    profile_path = Path("config/exchanges/wallets") / f"{names[0] if names else 'main'}.yaml"
+    if not profile_path.exists():
         console.print(Panel(
-            "[red]找不到 .env 檔案\n請先執行: [bold]uv run python setup_agent_wallet.py[/bold][/red]",
+            f"[red]找不到 {profile_path}\n請先執行: [bold]uv run python setup_agent_wallet.py[/bold][/red]",
             title="[red]ERROR[/red]", border_style="red"
         ))
         sys.exit(1)
 
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
-
-    agent_key = os.environ.get("HL_AGENT_KEY", "")
-    wallet_address = os.environ.get("HL_WALLET_ADDRESS", "")
+    auth = (yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}).get("authentication", {})
+    agent_key = str(auth.get("private_key") or "")
+    wallet_address = str(auth.get("wallet_address") or "")
 
     if not agent_key or not wallet_address:
         console.print(Panel(
-            "[red].env 中缺少 HL_AGENT_KEY 或 HL_WALLET_ADDRESS\n"
+            f"[red]{profile_path} 缺少 private_key 或 wallet_address\n"
             "請先執行: [bold]uv run python setup_agent_wallet.py[/bold][/red]",
             title="[red]ERROR[/red]", border_style="red"
         ))
@@ -110,7 +108,7 @@ def main():
 
     # ── 載入設定 ──────────────────────────────────────────────────────
     console.print(Rule("[bold]載入設定[/bold]", style="dim"))
-    with console.status("[cyan]讀取 .env ...[/cyan]", spinner="dots"):
+    with console.status("[cyan]讀取 wallet profile ...[/cyan]", spinner="dots"):
         agent_key, wallet_address = load_env()
         agent_account = eth_account.Account.from_key(agent_key)
 

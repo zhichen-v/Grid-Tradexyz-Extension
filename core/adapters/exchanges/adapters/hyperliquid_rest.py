@@ -313,16 +313,25 @@ class HyperliquidRest(HyperliquidBase):
     ) -> OrderData:
         """创建订单"""
         mapped_symbol = self.map_symbol(symbol)
+        order_params = dict(params or {})
+        # ccxt only reads reduceOnly; grid callers pass reduce_only.
+        if order_params.pop("reduce_only", False):
+            order_params["reduceOnly"] = True
+        if price is None and order_type == OrderType.MARKET:
+            # ccxt needs a reference price to bound Hyperliquid market slippage.
+            ticker = await self.get_ticker(symbol)
+            price = ticker.last or ticker.close
+            if not price:
+                raise RuntimeError(f"No reference price for market order on {symbol}")
 
-        order_data = await self._execute_with_retry(
-            self._place_order,
+        # Never retry a submission: a timeout may already have placed the order.
+        order_data = await self._place_order(
             mapped_symbol,
             order_type.value,
             side.value,
             float(amount),
             float(price) if price else None,
-            params or {},
-            operation_name="create_order"
+            order_params,
         )
 
         return self._parse_order(order_data, symbol)
@@ -568,26 +577,34 @@ class HyperliquidRest(HyperliquidBase):
         """取消指定交易对的所有订单"""
         orders = await self._fetch_open_orders_by_symbol(symbol)
         results = []
+        failed = []
         for order in orders:
             try:
                 result = await self._cancel_single_order(order['id'], symbol)
                 results.append(result)
             except Exception as e:
+                failed.append(order['id'])
                 if self.logger:
                     self.logger.error(f"取消订单失败 {order['id']}: {str(e)}")
+        if failed:
+            raise RuntimeError(f"Failed to cancel {len(failed)} order(s): {failed}")
         return results
 
     async def _cancel_all_open_orders(self) -> List[Dict[str, Any]]:
         """取消所有开放订单"""
         orders = await self._fetch_all_open_orders()
         results = []
+        failed = []
         for order in orders:
             try:
                 result = await self._cancel_single_order(order['id'], order['symbol'])
                 results.append(result)
             except Exception as e:
+                failed.append(order['id'])
                 if self.logger:
                     self.logger.error(f"取消订单失败 {order['id']}: {str(e)}")
+        if failed:
+            raise RuntimeError(f"Failed to cancel {len(failed)} order(s): {failed}")
         return results
 
     async def _fetch_order_info(self, order_id: str, symbol: str) -> Dict[str, Any]:

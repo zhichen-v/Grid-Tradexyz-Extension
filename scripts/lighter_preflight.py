@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+# Run from the repo root as `python scripts/<name>.py`; make `core` importable.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import yaml
 from lighter.endpoint_profiles import get_endpoint_profile
 

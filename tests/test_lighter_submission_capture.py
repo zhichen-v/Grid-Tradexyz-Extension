@@ -66,7 +66,8 @@ class LighterSubmissionCaptureTests(unittest.IsolatedAsyncioTestCase):
         rest.account_index = 7
         websocket = object.__new__(LighterWebSocket)
         websocket._order_callbacks = []
-        websocket._order_fill_callbacks = []
+        websocket._position_callbacks = []
+        websocket._account_data = {}
         websocket._markets_cache = {1: {"symbol": "BTC"}, 2: {"symbol": "ETH"}}
         websocket._subscribed_markets = []
         websocket._subscribed_accounts = []
@@ -81,10 +82,8 @@ class LighterSubmissionCaptureTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("core.adapters.exchanges.adapters.lighter.ExchangeAdapter.__init__", return_value=None),
             patch.object(LighterAdapter, "_convert_config_to_dict", return_value={}),
-            patch.object(LighterAdapter, "_get_symbol_cache_service", return_value=None),
             patch("core.adapters.exchanges.adapters.lighter.LighterRest", return_value=rest),
             patch("core.adapters.exchanges.adapters.lighter.LighterWebSocket", return_value=websocket),
-            patch("core.adapters.exchanges.adapters.lighter.create_subscription_manager"),
         ):
             adapter.__init__(config)
         if subscribe:
@@ -131,13 +130,52 @@ class LighterSubmissionCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(callback.call_count, 2)
         self.signer.tx_api.send_tx.assert_awaited_once()
 
+    async def test_ws_position_reaches_adapter_callbacks_as_signed_dict(self):
+        adapter, websocket = await self._adapter_fixture(subscribe=False)
+        websocket._event_loop = asyncio.get_running_loop()
+        received = asyncio.Queue()
+
+        async def scalping_callback(position_info):
+            await received.put(position_info)
+
+        # Scalping registers directly on the adapter list, not via subscribe.
+        adapter._position_callbacks.append(scalping_callback)
+        # The SDK stream calls back from its own thread.
+        await asyncio.to_thread(websocket._on_account_update, "7", {
+            "positions": {"1": {
+                "position": "0.25", "sign": -1, "avg_entry_price": "84000",
+                "unrealized_pnl": "-1.5", "realized_pnl": "0",
+                "initial_margin_fraction": "10.00", "margin_mode": 0,
+                "allocated_margin": "0",
+            }},
+        })
+        payload = await asyncio.wait_for(received.get(), timeout=2)
+
+        self.assertEqual(payload, {
+            "symbol": "BTC",
+            "size": Decimal("-0.25"),
+            "entry_price": Decimal("84000"),
+            "unrealized_pnl": Decimal("-1.5"),
+        })
+
+    async def test_filled_ws_update_reaches_only_grid_order_callbacks(self):
+        # The volume-maker-only fill-callback list was removed; fills flow
+        # through subscribe_orders() callbacks exactly once per update.
+        self.assertFalse(hasattr(LighterWebSocket, "subscribe_order_fills"))
+        await self._create()
+        _, websocket = await self._adapter_fixture()
+        self.assertFalse(hasattr(websocket, "_order_fill_callbacks"))
+        callback = Mock()
+        websocket._order_callbacks.append(callback)
+        await self._ws_update(websocket)
+        callback.assert_called_once()
+        self.assertEqual(callback.call_args.args[0].status, OrderStatus.FILLED)
+
     async def test_partial_ws_observation_does_not_change_order_or_emit_full_fill(self):
         await self._create()
         _, websocket = await self._adapter_fixture()
         callback = Mock()
-        filled_callback = Mock()
         websocket._order_callbacks.append(callback)
-        websocket._order_fill_callbacks.append(filled_callback)
 
         await self._ws_update(websocket, status="open", filled_base_amount="0.00089",
                               remaining_base_amount="0.00011")
@@ -145,7 +183,7 @@ class LighterSubmissionCaptureTests(unittest.IsolatedAsyncioTestCase):
         order = callback.call_args.args[0]
         self.assertEqual(order.status, OrderStatus.OPEN)
         self.assertEqual(order.remaining, Decimal("0.00011"))
-        filled_callback.assert_not_called()
+        callback.assert_called_once()
         self.assertEqual(read_pending(self.journal.path), [])
         self.signer.tx_api.send_tx.assert_awaited_once()
 
@@ -166,7 +204,7 @@ class LighterSubmissionCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self._create()
         _, websocket = await self._adapter_fixture()
         callback = Mock()
-        websocket._order_fill_callbacks.append(callback)
+        websocket._order_callbacks.append(callback)
         with patch.object(self.journal, "append", side_effect=OSError("disk fixture")):
             await self._ws_update(websocket)
         callback.assert_called_once()

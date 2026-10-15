@@ -8,14 +8,14 @@
 先離線查看未確認紀錄（不載入憑證，不查網路）：
 
 ```bash
-.venv/bin/python lighter_submission_diagnostics.py
+.venv/bin/python scripts/lighter_submission_diagnostics.py
 ```
 
 需再次確認時，明確啟用有界唯讀查詢（依 exchange config 與 `.env`，可用
 `--config` / `--env` 指定）；不必啟動策略：
 
 ```bash
-.venv/bin/python lighter_submission_diagnostics.py --query --tx-hash HASH
+.venv/bin/python scripts/lighter_submission_diagnostics.py --query --tx-hash HASH
 ```
 
 Windows 使用 `.venv\Scripts\python.exe`。預設最多查詢 10 筆紀錄、每筆 3 頁歷史

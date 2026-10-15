@@ -57,6 +57,7 @@ class ExchangeFactory:
             from .adapters.edgex import EdgeXAdapter
             from .adapters.lighter import LighterAdapter
             from .adapters.tradexyz import TradeXYZAdapter
+            from .adapters.arcus import ArcusAdapter
 
             # 注册Hyperliquid适配器
             self.register_adapter(
@@ -193,6 +194,16 @@ class ExchangeFactory:
                         "trading": {"max_requests": 20, "time_window": 60}
                     }
                 }
+            )
+
+            self.register_adapter(
+                exchange_id="arcus",
+                adapter_class=ArcusAdapter,
+                exchange_type=ExchangeType.PERPETUAL,
+                name="Arcus",
+                description="Arcus perpetuals (Ed25519 API key)",
+                supported_features=["perpetual_trading", "websocket", "ticker", "user_data"],
+                default_config={"testnet": False, "default_leverage": 1, "enable_websocket": True},
             )
 
             self.logger.info("内置交易所适配器注册完成")

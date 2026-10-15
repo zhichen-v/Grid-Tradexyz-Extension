@@ -1,0 +1,24 @@
+grid_system:
+  # Arcus perpetual market; use the display name from GET /v1/markets.
+  exchange: "arcus"
+  symbol: "BTC-USD"
+
+  grid_type: "long"
+  lower_price: 90000.0
+  upper_price: 100000.0
+
+  # Prices must be multiples of the market tick (and its tick tier) and
+  # order_amount a multiple of stepSize; the adapter rejects anything else.
+  grid_interval: 500.0
+  order_amount: 0.001
+  quantity_precision: 3
+
+  stop_loss_enabled: true
+  stop_loss_price: 88000.0
+  stop_loss_check_interval: 1
+
+  reverse_order_grid_distance: 1
+  order_health_check_interval: 15
+  position_monitor_interval: 10
+
+  # max_position: 0.02

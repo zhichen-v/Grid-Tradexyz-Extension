@@ -90,16 +90,6 @@ async def check_client_lifecycle() -> None:
     await ws_client.disconnect()
     assert stopped.is_set() and ws_client._ws_task is None
 
-    order_fill_subscription_started = False
-
-    async def mark_order_fill_subscription():
-        nonlocal order_fill_subscription_started
-        order_fill_subscription_started = True
-
-    ws_client._subscribe_account_all_orders = mark_order_fill_subscription
-    await ws_client.subscribe_order_fills(lambda order: None)
-    assert order_fill_subscription_started
-
 
 async def check_collateral_currency() -> None:
     class FakeAccountApi:

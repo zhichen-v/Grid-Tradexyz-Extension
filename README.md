@@ -1,7 +1,7 @@
 # Grid Trading System
 
 The `main` branch contains the Grid trading runtime centered on
-`run_grid_trading.py`, with Lighter, TradeXYZ, and other exchange adapters.
+`run_grid_trading.py`, with Lighter, TradeXYZ, Arcus, and other exchange adapters.
 
 Market Maker strategy runtimes and their dedicated configs, tests, scripts, and
 docs are no longer part of `main`. Their source remains in Git at `5537f0f`.
@@ -20,8 +20,8 @@ environment, configure credentials, choose a grid config, and run the bot.
 - Grid coordinator, engine, tracker, and TUI: `core/services/grid/`
 - Exchange configs: `config/exchanges/`
 - Grid configs: `config/grid/`
-- Lighter read-only preflight and submission diagnostics: `lighter_preflight.py`, `lighter_submission_diagnostics.py`
-- Smoke scripts for TradeXYZ under `tests/`: public data, order flow, and cleanup
+- Lighter read-only preflight and submission diagnostics: `scripts/lighter_preflight.py`, `scripts/lighter_submission_diagnostics.py`
+- Live smoke scripts under `scripts/`: TradeXYZ order/cancel-all, Lighter order smoke
 - Runtime logs: `logs/`
 
 ## 2. Prerequisites
@@ -93,53 +93,49 @@ The main runtime dependencies include:
 
 ## 6. Configure Exchange Credentials
 
-There are three practical ways to provide credentials.
+All account credentials live under `config/exchanges/` (every file holding a
+key is git-ignored). Environment variables such as `TRADEXYZ_API_KEY` still
+override the files for one-off runs.
 
-### Option A: Put credentials in the exchange config file
+### Option A: Per-exchange config file
 
-Edit `config/exchanges/tradexyz_config.yaml`:
+Edit `config/exchanges/tradexyz_config.yaml` (or `hyperliquid_config.yaml`):
 
 ```yaml
 tradexyz:
   authentication:
-    private_key: "0xYOUR_PRIVATE_KEY"
-    wallet_address: "0xYOUR_WALLET_ADDRESS"
+    private_key: "0xYOUR_AGENT_OR_WALLET_KEY"
+    wallet_address: "0xYOUR_MAIN_WALLET_ADDRESS"
 ```
 
-This is the most direct setup path.
+Lighter uses `config/exchanges/lighter_config.yaml` (copy
+`lighter_config_example.yaml`); Arcus uses `config/exchanges/arcus_config.yaml`
+(copy `arcus_config_example.yaml`):
 
-### Option B: Use environment variables or `.env`
-
-The runtime reads environment variables first, then falls back to the exchange config file.
-
-For `tradexyz`, the relevant variables are:
-
-```env
-TRADEXYZ_API_KEY=0xYOUR_PRIVATE_KEY
-TRADEXYZ_API_SECRET=0xYOUR_PRIVATE_KEY
-TRADEXYZ_WALLET_ADDRESS=0xYOUR_WALLET_ADDRESS
+```yaml
+arcus:
+  network: "mainnet"          # or testnet
+  authentication:
+    wallet_address: "0xYOUR_MAIN_WALLET_ADDRESS"
+    account_index: 0          # Subaccount # chosen when creating the key
+    api_signing_key: ""       # Ed25519 "API Signing Key" from app.arcus.xyz/api-keys
 ```
 
-For Hyperliquid-style agent wallet flow, the runtime also supports:
+### Option B: Named Hyperliquid / TradeXYZ agent wallet profiles
 
-```env
-HL_AGENT_KEY=0xYOUR_AGENT_PRIVATE_KEY
-HL_WALLET_ADDRESS=0xYOUR_MAIN_WALLET_ADDRESS
-HL_AGENT_ADDRESS=0xYOUR_AGENT_ADDRESS
-```
-
-You can place these in a local `.env` file. The repository already ignores `.env`, so it should not be committed.
-
-### Option C: Use named TradeXYZ agent wallet profiles
-
-For multiple TradeXYZ accounts, create one profile per main EVM wallet:
+For multiple accounts, create one profile per main EVM wallet:
 
 ```bash
 uv run python setup_agent_wallet.py --nvda01
 uv run python setup_agent_wallet.py --nvda02
 ```
 
-Each profile is saved under `.env.wallets/<name>.env` and contains the agent key plus the corresponding main wallet address. Existing named profiles are not overwritten unless you pass `--overwrite`. The legacy `--wallet-name <name>` form is still accepted, but `--<name>` is preferred.
+Each profile is saved as `config/exchanges/wallets/<name>.yaml` with the same
+`authentication` block (agent `private_key`, `wallet_address`, `agent_address`)
+and is selected at runtime with `--<name>`. Existing profiles are not
+overwritten unless you pass `--overwrite`. Profiles from the old
+`.env.wallets/<name>.env` location are no longer read; move them over (same
+values, YAML format) and then delete `.env.wallets/`.
 
 ## 7. Optional: Create a TradeXYZ Agent Wallet
 
@@ -153,7 +149,7 @@ What this script does:
 
 - Reads or prompts for your main wallet credentials
 - Approves a new agent wallet through the Hyperliquid / TradeXYZ flow
-- Writes agent credentials into `.env`
+- Writes agent credentials into `config/exchanges/wallets/main.yaml` (or `<name>.yaml`)
 - Clears the raw private key from `config/exchanges/tradexyz_config.yaml`
 
 For multiple accounts, prefer named profiles:
@@ -172,6 +168,11 @@ The main ready-to-run examples are under `config/grid/`:
 - `config/grid/tradexyz_test_long.yaml`
 - `config/grid/backpack_capital_protection_long.yaml`
 - `config/grid/backpack_capital_protection_short.yaml`
+
+For Arcus, start from `config/grid/arcus_btc_example.yaml`. Use the market
+display name (`BTC-USD`); grid prices must be multiples of the market tick (and
+its price tier) and `order_amount` a multiple of `stepSize`, otherwise the
+adapter rejects the order before sending it.
 
 For a first TradeXYZ run, start with one of these:
 
@@ -317,7 +318,7 @@ Before a live Lighter Robinhood run, copy
 `robinhood_testnet`, fill its Lighter API credentials, and run:
 
 ```bash
-uv run python lighter_preflight.py --symbol ETH --expected-wallet-address 0xYOUR_PUBLIC_ADDRESS
+uv run python scripts/lighter_preflight.py --symbol ETH --expected-wallet-address 0xYOUR_PUBLIC_ADDRESS
 ```
 
 This authenticated preflight only reads the selected endpoint profile, account,
@@ -325,16 +326,16 @@ USDG balance, market metadata, positions, and open orders. It never submits or
 cancels orders, and it never prints the API private key. The public wallet check
 is optional; it can also be set as `auth.expected_l1_address` in the local YAML.
 
-Order placement flow:
+Order placement flow (places and cancels one real order):
 
 ```bash
-uv run python -m tests.test_tradexyz_order
+uv run python scripts/tradexyz_order_smoke.py --main
 ```
 
-Cancel-order flow:
+Cancel-all flow (cancels every open order on the wallet):
 
 ```bash
-uv run python -m tests.test_tradexyz_cancel_orders
+uv run python scripts/tradexyz_cancel_all_smoke.py --main
 ```
 
 These scripts may hit real exchange endpoints. Do not run them with production credentials unless you understand the effect.
@@ -368,7 +369,7 @@ Bare filenames are resolved under `config/grid/`.
 
 The runtime checks:
 
-1. Named wallet profile from `.env.wallets/<name>.env`, when a wallet shortcut such as `--main` is provided
+1. Named wallet profile `config/exchanges/wallets/<name>.yaml`, when a wallet shortcut such as `--main` is provided (Hyperliquid / TradeXYZ only)
 2. Environment variables / `.env`
 3. `config/exchanges/<exchange>_config.yaml`
 
@@ -376,7 +377,7 @@ If all sources are empty, startup continues far enough to print warnings but tra
 
 ### Wallet profile not found
 
-You passed a wallet shortcut such as `--main`, but `.env.wallets/<name>.env` does not exist. Create it first:
+You passed a wallet shortcut such as `--main`, but `config/exchanges/wallets/<name>.yaml` does not exist. Create it first:
 
 ```bash
 uv run python setup_agent_wallet.py --nvda01
@@ -410,17 +411,14 @@ grid1.3/
 ├─ logs/
 ├─ run_grid_trading.py
 ├─ setup_agent_wallet.py
-└─ tests/
-   ├─ test_lighter_public.py
-   ├─ test_tradexyz_public.py
-   ├─ test_tradexyz_order.py
-   └─ test_tradexyz_cancel_orders.py
+├─ scripts/          # Lighter diagnostics and live smoke scripts
+└─ tests/            # offline unittest suite
 ```
 
 ## 15. Security Notes
 
 - Do not commit private keys, wallet addresses, or `.env` secrets.
-- Do not commit `.env.wallets/`; each file contains a live agent trading key.
+- Do not commit `config/exchanges/wallets/` or `*_config.yaml` with keys; they hold live trading keys.
 - Start with small size and non-critical capital.
 - Treat all order-placement scripts as potentially live.
 - Review your config carefully before running any grid strategy.

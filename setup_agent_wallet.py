@@ -3,7 +3,7 @@ Hyperliquid / TradeXYZ Agent Wallet 授權工具
 
 功能:
   1. 用主錢包私鑰產生並授權一個 Agent Wallet
-  2. 將 Agent 私鑰寫入 .env 或 .env.wallets/<name>.env
+  2. 將 Agent 私鑰寫入 config/exchanges/wallets/<name>.yaml（預設 main）
   3. 驗證 Agent 可以正常查詢帳戶
 
 Agent Wallet 安全模型:
@@ -12,8 +12,8 @@ Agent Wallet 安全模型:
   - 如果 Agent 私鑰洩漏，最多只有倉位風險，資金無法被轉走
 
 執行方式:
-    uv run python setup_agent_wallet.py
-    uv run python setup_agent_wallet.py --nvda01
+    uv run python setup_agent_wallet.py            # 寫入 wallets/main.yaml
+    uv run python setup_agent_wallet.py --nvda01   # 寫入 wallets/nvda01.yaml
 
 前置條件:
   - 主錢包必須已在 Hyperliquid 存入過資金（帳戶需存在）
@@ -33,8 +33,8 @@ from hyperliquid.info import Info
 
 BASE_URL = "https://api.hyperliquid.xyz"
 CONFIG_PATH = Path("config/exchanges/tradexyz_config.yaml")
-ENV_PATH = Path(".env")
-WALLET_PROFILES_DIR = Path(".env.wallets")
+WALLET_PROFILES_DIR = Path("config/exchanges/wallets")
+DEFAULT_WALLET_NAME = "main"
 
 
 def validate_wallet_name(wallet_name: str) -> str:
@@ -49,13 +49,11 @@ def validate_wallet_name(wallet_name: str) -> str:
     return wallet_name
 
 
-def get_wallet_env_path(wallet_name: str | None) -> Path:
+def get_wallet_profile_path(wallet_name: str) -> Path:
     """
-    Return the env file path for the default or named wallet profile.
+    Return the YAML path for a named wallet profile.
     """
-    if wallet_name:
-        return WALLET_PROFILES_DIR / f"{validate_wallet_name(wallet_name)}.env"
-    return ENV_PATH
+    return WALLET_PROFILES_DIR / f"{validate_wallet_name(wallet_name)}.yaml"
 
 
 def apply_wallet_shortcut(
@@ -140,63 +138,51 @@ def authorize_agent(main_private_key: str, wallet_address: str, agent_name: str)
     return agent_key, agent_account.address
 
 
-# ─── 步驟 3: 儲存 Agent 私鑰到 .env ───────────────────────────────────────
+# ─── 步驟 3: 儲存 Agent 私鑰到 wallet profile ─────────────────────────────
 
 def ensure_secret_paths_ignored() -> None:
     """
-    Ensure generated env files stay out of git.
+    Ensure generated wallet profiles stay out of git.
     """
     gitignore = Path(".gitignore")
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
-    lines_to_add = []
-
-    for line in [".env", ".env.*", ".env.wallets/"]:
-        if line not in existing.splitlines():
-            lines_to_add.append(line)
-
-    if not lines_to_add:
+    line = "config/exchanges/wallets/"
+    if line in existing.splitlines():
         return
 
     with gitignore.open("a", encoding="utf-8") as f:
         if existing and not existing.endswith("\n"):
             f.write("\n")
-        f.write("\n# 環境變數（含 Agent 私鑰）\n")
-        for line in lines_to_add:
-            f.write(f"{line}\n")
+        f.write(f"\n# Agent wallet profiles（含 Agent 私鑰）\n{line}\n")
 
     print("  已更新 .gitignore，排除 Agent wallet profile")
 
 
-def save_to_env(
+def save_wallet_profile(
     agent_key: str,
     agent_address: str,
     wallet_address: str,
-    wallet_name: str | None,
+    wallet_name: str,
 ):
     """
-    將 Agent 私鑰寫入 .env 或命名 wallet profile。
+    將 Agent 私鑰寫入 config/exchanges/wallets/<name>.yaml。
     """
-    env_path = get_wallet_env_path(wallet_name)
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-
-    profile_comment = (
-        f"# Wallet profile: {wallet_name}\n" if wallet_name else "# Default wallet profile\n"
+    profile_path = get_wallet_profile_path(wallet_name)
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    content = {
+        "authentication": {
+            "wallet_address": wallet_address,
+            "private_key": agent_key,
+            "agent_address": agent_address,
+        }
+    }
+    profile_path.write_text(
+        "# Hyperliquid / TradeXYZ agent wallet profile (do not commit)\n"
+        "# private_key is the agent key: it can trade but cannot withdraw.\n"
+        + yaml.safe_dump(content, sort_keys=False),
+        encoding="utf-8",
     )
-    env_content = f"""# Hyperliquid / TradeXYZ Agent Wallet 設定
-# 此檔案由 setup_agent_wallet.py 自動產生，請勿 commit 到 git
-{profile_comment}
-
-# 主錢包地址（公開資訊，無安全疑慮）
-HL_WALLET_ADDRESS={wallet_address}
-
-# Agent Wallet 私鑰（可交易，無法提款）
-HL_AGENT_KEY={agent_key}
-
-# Agent 錢包地址（公開資訊）
-HL_AGENT_ADDRESS={agent_address}
-"""
-    env_path.write_text(env_content, encoding="utf-8")
-    print(f"\n[STEP 3] Agent 私鑰已儲存到 {env_path}")
+    print(f"\n[STEP 3] Agent 私鑰已儲存到 {profile_path}")
 
     ensure_secret_paths_ignored()
 
@@ -267,10 +253,10 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Create the default .env wallet
+  # Create config/exchanges/wallets/main.yaml
   uv run python setup_agent_wallet.py
 
-  # Create a named wallet profile
+  # Create config/exchanges/wallets/nvda01.yaml
   uv run python setup_agent_wallet.py --nvda01
 
 Then run:
@@ -282,7 +268,7 @@ Then run:
         "--walletname",
         dest="wallet_name",
         type=validate_wallet_name,
-        help="Save credentials to .env.wallets/<name>.env instead of .env (legacy form; prefer --<name>)",
+        help="Save credentials to config/exchanges/wallets/<name>.yaml (default: main; prefer --<name>)",
     )
     parser.add_argument(
         "--overwrite",
@@ -295,9 +281,9 @@ Then run:
 
 def main():
     args = parse_arguments()
-    wallet_name = args.wallet_name
-    agent_name = wallet_name or "grid_bot"
-    env_path = get_wallet_env_path(wallet_name)
+    wallet_name = args.wallet_name or DEFAULT_WALLET_NAME
+    agent_name = wallet_name
+    profile_path = get_wallet_profile_path(wallet_name)
 
     print("=" * 60)
     print("  Hyperliquid Agent Wallet 授權流程")
@@ -308,14 +294,11 @@ def main():
   - 完成後，私鑰會從 config 清除，改用 Agent 私鑰操作
   - Agent 只能交易，無法提款或轉帳到外部地址
 """)
-    if wallet_name:
-        print(f"Wallet profile: {wallet_name}")
-        print(f"Credentials will be saved to: {env_path}")
-    else:
-        print(f"Credentials will be saved to: {env_path}")
+    print(f"Wallet profile: {wallet_name}")
+    print(f"Credentials will be saved to: {profile_path}")
 
-    if wallet_name and env_path.exists() and not args.overwrite:
-        print(f"\nFAIL: wallet profile already exists: {env_path}")
+    if profile_path.exists() and not args.overwrite:
+        print(f"\nFAIL: wallet profile already exists: {profile_path}")
         print("Use --overwrite only if you intentionally want to replace it.")
         sys.exit(1)
 
@@ -338,8 +321,8 @@ def main():
         print("  - 私鑰不正確")
         sys.exit(1)
 
-    # 步驟 3: 儲存到 .env 或命名 profile
-    save_to_env(agent_key, agent_address, wallet_address, wallet_name)
+    # 步驟 3: 儲存到命名 profile
+    save_wallet_profile(agent_key, agent_address, wallet_address, wallet_name)
 
     # 步驟 4: 清除 config 中的明文私鑰
     print("\n[STEP 4] 清除 config 中的明文私鑰...")
@@ -351,9 +334,7 @@ def main():
     print("\n" + "=" * 60)
     print("  授權完成！")
     print("=" * 60)
-    grid_command = "uv run python run_grid_trading.py tradexyz_NVDA_long.yaml"
-    if wallet_name:
-        grid_command = f"{grid_command} --{wallet_name}"
+    grid_command = f"uv run python run_grid_trading.py tradexyz_NVDA_long.yaml --{wallet_name}"
 
     print(f"""
 後續使用方式:
@@ -361,7 +342,7 @@ def main():
   1. 啟動 grid:
        {grid_command}
 
-  2. 程式會載入對應的 HL_AGENT_KEY 與 HL_WALLET_ADDRESS，並用 Agent 金鑰建立 Exchange 客戶端:
+  2. 程式會載入 wallets/<name>.yaml 中的 Agent 私鑰與主錢包地址，並建立 Exchange 客戶端:
        agent_account = eth_account.Account.from_key(agent_key)
        exchange = Exchange(
            agent_account,

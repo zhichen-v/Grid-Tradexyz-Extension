@@ -7,7 +7,6 @@ Lighter交易所适配器
 """
 
 import asyncio
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
@@ -20,7 +19,6 @@ from ....logging import get_logger
 from ..adapter import ExchangeAdapter
 from ..interface import ExchangeConfig
 from ..models import *
-from ..subscription_manager import create_subscription_manager, DataType
 from .lighter_rest import LighterRest
 from .lighter_websocket import LighterWebSocket
 
@@ -66,11 +64,6 @@ class LighterAdapter(ExchangeAdapter):
     supports_definitive_pre_send_failure = True
     supports_definitive_submission_rejection = True
 
-    @property
-    def managed_order_integrator_fee_tick(self) -> int:
-        """Integrator fee signed into every managed limit order."""
-        return self._rest.MANAGED_ORDER_INTEGRATOR_FEE_TICK
-
     def __init__(self, config: ExchangeConfig, event_bus=None):
         super().__init__(config, event_bus)
 
@@ -83,10 +76,8 @@ class LighterAdapter(ExchangeAdapter):
 
         # 共享数据缓存
         shared_position_cache = {}
-        shared_order_cache = {}
 
         self._position_cache = shared_position_cache
-        self._order_cache = shared_order_cache
 
         # 设置回调列表
         shared_position_callbacks = []
@@ -94,6 +85,9 @@ class LighterAdapter(ExchangeAdapter):
 
         self._position_callbacks = shared_position_callbacks
         self._order_callbacks = shared_order_callbacks
+        # Adapter-level position callbacks (e.g. scalping) receive the same
+        # signed dict payload as Arcus; the websocket emits PositionData.
+        self._websocket._position_callbacks.append(self._emit_position_update)
 
         # 设置基础URL
         self.base_url = getattr(
@@ -110,55 +104,6 @@ class LighterAdapter(ExchangeAdapter):
         # 缓存支持的交易对
         self._supported_symbols = []
         self._market_info = {}
-
-        # 初始化订阅管理器
-        try:
-            extra_params = getattr(config, 'extra_params', {}) or {}
-            config_dict = (
-                self._load_lighter_config()
-                if extra_params.get('load_credentials_from_file', True)
-                else {
-                    'exchange_id': 'lighter',
-                    'subscription_mode': {
-                        'mode': 'predefined',
-                        'predefined': {'symbols': [], 'data_types': {}},
-                    },
-                }
-            )
-
-            symbol_cache_service = self._get_symbol_cache_service()
-
-            self._subscription_manager = create_subscription_manager(
-                exchange_config=config_dict,
-                symbol_cache_service=symbol_cache_service,
-                logger=self.logger
-            )
-
-            if self.logger:
-                self.logger.info(
-                    f"✅ Lighter订阅管理器初始化成功，模式: {config_dict.get('subscription_mode', {}).get('mode', 'unknown')}")
-
-        except Exception as e:
-            if self.logger:
-                self.logger.warning(f"创建Lighter订阅管理器失败，使用默认配置: {e}")
-            # 使用默认配置
-            default_config = {
-                'exchange_id': 'lighter',
-                'subscription_mode': {
-                    'mode': 'predefined',
-                    'predefined': {
-                        'symbols': ['BTC-USD', 'ETH-USD', 'SOL-USD'],
-                        'data_types': {'ticker': True, 'orderbook': True, 'trades': False, 'user_data': False}
-                    }
-                }
-            }
-
-            symbol_cache_service = self._get_symbol_cache_service()
-            self._subscription_manager = create_subscription_manager(
-                exchange_config=default_config,
-                symbol_cache_service=symbol_cache_service,
-                logger=self.logger
-            )
 
         self.logger.info("Lighter适配器初始化完成")
 
@@ -300,16 +245,6 @@ class LighterAdapter(ExchangeAdapter):
                 )
             return {'exchange_id': 'lighter'}
 
-    def _get_symbol_cache_service(self):
-        """获取符号缓存服务实例"""
-        try:
-            from core.services.symbol_manager.implementations.symbol_conversion_service import SymbolConversionService
-            return SymbolConversionService.get_instance()
-        except Exception as e:
-            if self.logger:
-                self.logger.warning(f"无法获取符号缓存服务: {e}")
-            return None
-
     # ============= 连接管理 =============
 
     async def connect(self) -> bool:
@@ -346,8 +281,6 @@ class LighterAdapter(ExchangeAdapter):
     async def disconnect(self):
         """断开连接"""
         try:
-            await self.close_read_stream()
-
             # 关闭WebSocket
             await self._websocket.disconnect()
 
@@ -541,107 +474,6 @@ class LighterAdapter(ExchangeAdapter):
         normalized_symbol = self._normalize_symbol(symbol)
         return await self._rest.get_recent_trades(normalized_symbol, limit)
 
-    async def get_account_trades(
-        self, symbol: str, limit: int = 100
-    ) -> List[TradeData]:
-        """Get authenticated trades for this configured account."""
-        normalized_symbol = self._normalize_symbol(symbol)
-        return await self._rest.get_account_trades(normalized_symbol, limit)
-
-    async def get_account_fee_and_funding(
-        self, symbol: str, limit: int = 100
-    ) -> Dict[str, Any]:
-        """Read current authenticated fee ticks and realized funding, without mutation.
-
-        V2 owns no second signer. Only finite financial values and stable funding
-        identities leave this bridge; SDK responses, tokens and errors do not.
-        """
-        if type(limit) is not int or not 1 <= limit <= 100:
-            raise ValueError("funding limit must be between 1 and 100")
-        try:
-            rest = self._rest
-            if rest.signer_client is None:
-                raise ValueError("authentication unavailable")
-            market_id = rest.get_market_index(self._normalize_symbol(symbol))
-            if market_id is None:
-                raise ValueError("unknown market")
-            token, error = rest.signer_client.create_auth_token_with_expiry(
-                deadline=600, api_key_index=rest.api_key_index,
-            )
-            if error or not token:
-                raise ValueError("authentication unavailable")
-            limits = await rest._call_api(
-                "current account fees query",
-                lambda: rest.account_api.account_limits(
-                    account_index=rest.account_index, authorization=token,
-                ),
-            )
-            rest._require_success_response(limits, "current account fees query")
-            rates = []
-            for field in ("current_maker_fee_tick", "current_taker_fee_tick"):
-                tick = getattr(limits, field, None)
-                if type(tick) is not int or not 0 <= tick < 1000000:
-                    raise ValueError("invalid current fee tick")
-                rates.append(Decimal(tick) / Decimal("1000000"))
-            response = await rest._call_api(
-                "account funding query",
-                lambda: rest.account_api.position_funding(
-                    account_index=rest.account_index, authorization=token,
-                    market_id=market_id, limit=limit,
-                ),
-            )
-            rest._require_success_response(response, "account funding query")
-            rows = getattr(response, "position_fundings", None)
-            if not isinstance(rows, list):
-                raise ValueError("funding rows unavailable")
-            fundings = []
-            for row in rows:
-                identifier, timestamp = row.funding_id, row.timestamp
-                amount = Decimal(row.change)
-                if (type(identifier) is not int or identifier < 0
-                        or type(timestamp) is not int or timestamp < 0
-                        or row.market_id != market_id or not amount.is_finite()):
-                    raise ValueError("invalid funding event")
-                # Discount is not cash received: deferred rebates need their own
-                # realized cashflow evidence, never an estimated PnL credit.
-                fundings.append({"id": str(identifier), "timestamp": timestamp,
-                                 "change": amount})
-            return {"maker_fee_rate": rates[0], "taker_fee_rate": rates[1],
-                    "fundings": tuple(fundings)}
-        except Exception:
-            raise RuntimeError("authenticated fee/funding read unavailable") from None
-
-    async def get_settlement_asset(self) -> Dict[str, Any]:
-        """Read verified USDG precision for the Robinhood settlement account."""
-        try:
-            rest = self._rest
-            if rest.network not in {"robinhood", "robinhood_testnet"}:
-                raise ValueError("unsupported settlement network")
-            response = await rest._call_api(
-                "settlement asset query", lambda: rest.order_api.asset_details(),
-            )
-            rest._require_success_response(response, "settlement asset query")
-            rows = getattr(response, "asset_details", None)
-            if type(rows) is not list:
-                raise ValueError("settlement asset metadata unavailable")
-            matches = [row for row in rows if getattr(row, "symbol", None) == "USDG"]
-            if len(matches) != 1:
-                raise ValueError("unique USDG metadata required")
-            asset = matches[0]
-            if (type(asset.asset_id) is not int or asset.asset_id < 0
-                    or sum(getattr(row, "asset_id", None) == asset.asset_id for row in rows) != 1
-                    or type(asset.decimals) is not int or not 0 <= asset.decimals <= 18
-                    or asset.margin_mode != "enabled"
-                    or type(asset.index_price) is not str or type(asset.loan_to_value) is not str):
-                raise ValueError("unsupported settlement asset metadata")
-            price, ltv = Decimal(asset.index_price), Decimal(asset.loan_to_value)
-            if not price.is_finite() or not ltv.is_finite() or price != 1 or ltv != 1:
-                raise ValueError("unit USDG valuation required")
-            return {"symbol": "USDG", "asset_id": asset.asset_id, "decimals": asset.decimals,
-                    "index_price": price, "loan_to_value": ltv}
-        except Exception:
-            raise RuntimeError("settlement asset metadata unavailable") from None
-
     async def get_ohlcv(
         self,
         symbol: str,
@@ -697,51 +529,6 @@ class LighterAdapter(ExchangeAdapter):
             OrderData列表
         """
         normalized_symbol = self._normalize_symbol(symbol) if symbol else None
-        stream = getattr(self, "_read_stream", None)
-        if stream is not None:
-            from types import SimpleNamespace
-
-            try:
-                snapshot = await stream.request_snapshot("account_all_orders")
-                orders, seen = [], set()
-                for market, rows in snapshot["orders"].items():
-                    market_id = int(market)
-                    order_symbol = self._rest._get_symbol_from_market_index(market_id)
-                    if rows and not order_symbol:
-                        raise ValueError("unknown order market")
-                    for row in rows:
-                        identifier = row.get("order_index")
-                        if (type(identifier) is not int or identifier < 0 or identifier in seen
-                                or str(row.get("order_id", identifier)) != str(identifier)
-                                or type(row.get("client_order_index")) is not int or row["client_order_index"] < 0
-                                or str(row.get("client_order_id", row["client_order_index"])) != str(row["client_order_index"])
-                                or type(row.get("market_index")) is not int or row["market_index"] != market_id
-                                or type(row.get("owner_account_index")) is not int
-                                or row["owner_account_index"] != self._rest.account_index
-                                or type(row.get("is_ask")) is not bool or type(row.get("reduce_only")) is not bool
-                                or row.get("status") not in {"open", "pending", "in-progress"}):
-                            raise ValueError("untrusted active order identity")
-                        values = []
-                        for field in ("initial_base_amount", "filled_base_amount", "remaining_base_amount",
-                                      "price", "filled_quote_amount"):
-                            if type(row.get(field)) is not str:
-                                raise ValueError("invalid order amount")
-                            value = Decimal(row[field])
-                            if not value.is_finite() or value < 0:
-                                raise ValueError("invalid order amount")
-                            values.append(value)
-                        initial, filled, remaining, price, _ = values
-                        if initial <= 0 or price <= 0 or initial != filled + remaining:
-                            raise ValueError("inconsistent order amount")
-                        seen.add(identifier)
-                        order = self._rest._parse_order(SimpleNamespace(**row), order_symbol)
-                        if normalized_symbol is None or order_symbol == normalized_symbol:
-                            orders.append(order)
-                self._rest._clear_resolved_submissions_from_orders(orders)
-                return orders
-            except Exception:
-                await stream.close()
-                raise RuntimeError("read stream active orders unavailable") from None
         return await self._rest.get_open_orders(normalized_symbol)
 
     async def get_positions(self, symbols: Optional[List[str]] = None) -> List[PositionData]:
@@ -948,7 +735,7 @@ class LighterAdapter(ExchangeAdapter):
             side: 订单方向
             quantity: 数量
             reduce_only: 只减仓模式（平仓专用，不会开新仓或加仓）
-            skip_order_index_query: 跳过 order_index 查询（Volume Maker 使用）
+            skip_order_index_query: 跳过 order_index 查询（由 WebSocket 依 client_order_id 采用）
 
         Returns:
             订单数据 或 None
@@ -1051,49 +838,6 @@ class LighterAdapter(ExchangeAdapter):
 
     # ============= WebSocket订阅 =============
 
-    async def close_read_stream(self):
-        """Close the opt-in read route before explicit failure-cleanup REST reads."""
-        stream = getattr(self, "_read_stream", None)
-        if stream is not None:
-            await stream.close()
-            self._read_stream = None
-
-    async def open_read_stream(self, symbol: str, *, clock=time.monotonic):
-        """Open an opt-in read-only stream using this adapter's existing signer."""
-        from .lighter_read_stream import LighterReadStream
-
-        try:
-            rest = self._rest
-            expected_url = {
-                "robinhood": "wss://api.rh.lighter.xyz/stream",
-                "robinhood_testnet": "wss://api.rh-testnet.lighter.xyz/stream",
-            }.get(rest.network)
-            if (not self._connected or not self._authenticated or expected_url is None
-                    or self.ws_url != expected_url or rest.signer_client is None
-                    or getattr(self, "_read_stream", None) is not None):
-                raise ValueError("read stream prerequisites unavailable")
-            market_id = rest.get_market_index(self._normalize_symbol(symbol))
-            if type(market_id) is not int or market_id < 0:
-                raise ValueError("unknown market")
-            if type(rest.account_index) is not int or rest.account_index < 0:
-                raise ValueError("invalid account identity")
-
-            def auth_factory():
-                token, error = rest.signer_client.create_auth_token_with_expiry(
-                    deadline=600, api_key_index=rest.api_key_index,
-                )
-                if error or not token:
-                    raise ValueError("authentication unavailable")
-                return token
-
-            stream = LighterReadStream(self.ws_url, rest.account_index, market_id, auth_factory,
-                                       clock=clock)
-            self._read_stream = stream
-            await stream.start()
-            return stream
-        except Exception:
-            raise RuntimeError("read stream unavailable") from None
-
     async def subscribe_user_data(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """
         订阅用户数据流（订单更新、持仓变化等）
@@ -1164,7 +908,24 @@ class LighterAdapter(ExchangeAdapter):
         """
         if callback:
             self._position_callbacks.append(callback)
-        await self._websocket.subscribe_positions(callback)
+        await self._websocket.subscribe_positions()
+
+    async def _emit_position_update(self, position: PositionData) -> None:
+        """Fan a websocket position out to adapter callbacks as a signed dict."""
+        size = -position.size if position.side == PositionSide.SHORT else position.size
+        payload = {
+            "symbol": position.symbol,
+            "size": size,
+            "entry_price": position.entry_price,
+            "unrealized_pnl": position.unrealized_pnl,
+        }
+        for callback in list(self._position_callbacks):
+            try:
+                result = callback(payload)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                self.logger.error(f"Position callback failed: {exc}")
 
     async def unsubscribe_ticker(self, symbol: str):
         """取消订阅ticker"""

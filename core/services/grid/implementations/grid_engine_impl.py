@@ -1651,7 +1651,7 @@ class GridEngineImpl(IGridEngine):
             )
             return
 
-        if status in {"CANCELLED", "CANCELED"}:
+        if status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
             await self._finalize_cancellation(
                 grid_order,
                 "WebSocket cancellation received",

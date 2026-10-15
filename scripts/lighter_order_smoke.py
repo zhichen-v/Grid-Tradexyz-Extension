@@ -8,7 +8,10 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
-from lighter_preflight import DEFAULT_CONFIG, build_adapter, load_settings
+# Run from the repo root as `python scripts/<name>.py`; make `core` importable.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.lighter_preflight import DEFAULT_CONFIG, build_adapter, load_settings
 
 SYMBOL = "BTC"
 

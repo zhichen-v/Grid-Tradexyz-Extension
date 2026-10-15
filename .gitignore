@@ -9,6 +9,8 @@
 config/exchanges/tradexyz_config.yaml
 config/exchanges/hyperliquid_config.yaml
 config/exchanges/lighter_config.yaml
+config/exchanges/arcus_config.yaml
+config/exchanges/wallets/
 
 # Python
 __pycache__/
@@ -35,4 +37,5 @@ README_old.md
 
 config/grid/tradexyz_*.yaml
 config/grid/test_*.yaml
-config/market_maker_v2/test_*.yaml
+.DS_Store
+config/grid/*_test.yaml

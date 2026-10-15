@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from lighter.endpoint_profiles import get_endpoint_profile
 
-from lighter_preflight import main, preflight_from_config
+from scripts.lighter_preflight import main, preflight_from_config
 
 
 class FakeAdapter:
@@ -243,7 +243,7 @@ class LighterPreflightCliTest(unittest.TestCase):
                 "--symbol",
                 "ETH",
             ]
-            with patch("lighter_preflight.build_adapter", side_effect=factory), patch.object(
+            with patch("scripts.lighter_preflight.build_adapter", side_effect=factory), patch.object(
                 sys, "argv", argv
             ):
                 self.assertEqual(main(), 0)
